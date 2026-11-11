@@ -12,6 +12,8 @@ Windows e no Linux, com a mesma interface nos três.
   (ícone na barra ou bandeja) e `wry` (webview nativa do sistema: WKWebView,
   WebView2 ou WebKitGTK).
 - **Interface web única** no popover, igual nos três sistemas.
+- **Idiomas da interface:** português do Brasil (`pt-BR`) e inglês dos Estados
+  Unidos (`en-US`). O protótipo visual permanece em português.
 - **Perfis de VPN** configuráveis. Os primeiros tipos previstos são IPsec IKEv2
   (strongSwan) e SSL VPN da Fortinet (openfortivpn).
 - **Estado real do túnel**: além de saber se o cliente está rodando, o vpnt
