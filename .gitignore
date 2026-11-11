@@ -1,0 +1,19 @@
+# Contexto local de trabalho: cita o ambiente de quem desenvolve, nunca vai ao repositório.
+.handoff/
+.soho/
+.agents/
+.claude/
+CLAUDE.local.md
+.ai-memory.toml
+
+# Segredos e configuração real de VPN
+.env
+*.pem
+*.key
+config.local.*
+
+# Build
+target/
+node_modules/
+dist/
+.DS_Store
