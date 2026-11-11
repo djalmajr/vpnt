@@ -1,0 +1,31 @@
+[package]
+name = "vpnt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "A menu bar app for configurable VPN connections"
+repository = "https://github.com/djalmajr/vpnt"
+default-run = "vpnt"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:tao", "dep:wry", "dep:tray-icon"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
+tray-icon = { version = "0.26.1", optional = true }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "vpnt"
+path = "src/main.rs"

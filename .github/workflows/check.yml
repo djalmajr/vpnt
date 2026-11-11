@@ -1,0 +1,59 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+      - name: Validate and build UI
+        working-directory: ui
+        run: |
+          bun install --frozen-lockfile
+          bun run lint
+          bun run typecheck
+          bun test
+          bun run build
+      - name: Check design tokens
+        run: |
+          bun scripts/design/check-tokens.ts
+          bun scripts/design/check-classes.ts
+      - name: Validate native code and demo API
+        run: |
+          cargo +1.99.0 fmt --check
+          cargo +1.99.0 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.99.0 test --locked --all-targets --all-features
+          cargo +1.99.0 build --locked
+      - name: Package unsigned development app
+        run: python3 scripts/macos/package-app.py
+
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Validate portable core
+        run: cargo +1.99.0 test --locked --no-default-features

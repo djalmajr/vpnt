@@ -1,7 +1,77 @@
-# Validação do protótipo
+# Validação
 
-Este contrato cobre a proposta estática em `vpnt.fig` e seu gerador. A validação
-de conexões, privilégios e chaveiro será definida junto da implementação do app.
+Este contrato separa o protótipo estático, o host, os fluxos de demonstração
+e a futura camada de VPN real. Nenhuma evidência de demonstração prova uma VPN.
+
+## Código do app
+
+Na raiz do repositório, após instalar as dependências da UI:
+
+```bash
+cd ui
+bun run lint
+bun run typecheck
+bun test
+bun run build
+cd ..
+bun scripts/design/check-tokens.ts
+bun scripts/design/check-classes.ts
+cargo fmt --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo test --locked --no-default-features
+cargo build --locked
+python3 scripts/macos/package-app.py --replace
+```
+
+O gate de tokens compara as 81 entradas mapeadas em `DESIGN.md` com o CSS.
+O gate de classes ainda não tem classes proibidas configuradas; sua execução
+não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
+variáveis, que podem anular medidas mesmo quando os nomes coincidem.
+
+O teste de HTTP executa um processo filho do servidor de demonstração e usa
+somente loopback. Precisa de permissão de socket. Ele verifica origem/Host,
+rejeição de JSON ambíguo, sobrevivência a UTF-8 inválido e uma resposta posterior
+válida. Os testes de sessão exercitam tokens de geração, cancelamento, reconexão
+e classificação de resultados sem subprocessos de VPN.
+
+O CI em `.github/workflows/check.yml` repete os checks de macOS e do núcleo
+portável em Linux. Preparar o workflow e executar checks locais não equivale
+a uma execução verde no GitHub; esta exige envio e execução no serviço.
+
+## Fluxos de demonstração
+
+Use `cargo run -- --demo-server 4178` e abra o endereço local do README.
+Exercite pelos controles visíveis, nos dois idiomas e temas:
+
+- Conectar e cancelar antes da conclusão; o resultado tardio não pode religar.
+- Conectar, forçar "sem resposta", reconectar e desligar todas as VPNs.
+- Editar, continuar editando após Voltar e descartar sem persistir alterações.
+- Cadastrar/remover um perfil e enviar senhas fictícias; dados reais ficam fora
+  do modo de demonstração. Porta de teste 22 deve ser rejeitada.
+- Alterar idioma e tema, recarregar e conferir persistência e traduções.
+- Navegar com teclado, usar setas/Home/End nas abas do log, cancelar diálogos
+  com Escape e verificar foco visível/contido.
+- Medir painel de 320 px, campos alinhados e ausência de corte ou overflow
+  horizontal; testar também uma viewport menor e conteúdo com rolagem.
+
+No host nativo, verifique separadamente ícone, abertura/fechamento pelo clique,
+posicionamento, Escape, diálogo antes do painel, perda de foco e saída. Uma
+janela criada, um processo ativo ou a UI em Chrome não provam esses comportamentos
+em WKWebView. Se a captura ou automação nativa estiver bloqueada pelo macOS,
+registre o limite em vez de declarar a revisão visual nativa aprovada.
+
+## VPN real
+
+Ainda pendente. Antes de declarar essa camada pronta, testar o consumidor real
+de perfis/chaveiro/helper e os clientes strongSwan/openfortivpn. Exercitar conectar,
+cancelar durante a conexão, reconectar, desligar e túnel sem tráfego. Confirmar
+que só o teste pelo túnel permite exibir "conectada", sem depender apenas de PID,
+porta pública ou rota. Preservar configurações existentes e impedir acesso a
+segredos por arquivos, argumentos, logs ou snapshots de UI.
+
+Instalação privilegiada e conexão com configurações reais exigem a autorização
+específica aplicável. Fixtures e simulações devem ser identificadas como tais.
 
 ## Arquivo e estrutura
 
@@ -50,8 +120,7 @@ Use uma cópia descartável para estes testes:
 Mudanças deliberadas de telas ou estados devem atualizar o protótipo, o gerador
 e os critérios afetados em conjunto.
 
-## Limites
+## Limites do protótipo
 
-Não há typechecker nem suíte de testes do app nesta fase. Renderização, lint e
-propagação de componentes não provam conexões de VPN ou transições funcionais;
-os controles do protótipo são estáticos.
+Renderização, lint e propagação de componentes não provam conexões de VPN ou
+transições funcionais; os controles de `vpnt.fig` são estáticos.

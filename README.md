@@ -3,8 +3,9 @@
 Ícone de bandeja (tray) para ligar, desligar e acompanhar VPNs no macOS, no
 Windows e no Linux, com a mesma interface nos três.
 
-> Estado: protótipo visual para validação. Ainda não há versão utilizável.
-> A primeira implementação será para macOS; Windows e Linux ficam para depois.
+> Protótipo visual aprovado. O host macOS e a interface bilíngue estão em
+> implementação, com um modo de demonstração explícito. A camada de VPN real
+> ainda não está disponível. Windows e Linux ficam para depois.
 
 ## Proposta
 
@@ -21,6 +22,47 @@ Windows e no Linux, com a mesma interface nos três.
   aparece como "sem resposta", com a opção de reconectar.
 - **Segredos só no chaveiro do sistema**, nunca em arquivo nem em argumento de
   linha de comando.
+
+## Desenvolvimento no macOS
+
+Requer Rust 1.99, Bun 1.4.4, Xcode Command Line Tools e Python 3.11 ou superior
+para empacotar. Compile a interface antes do Rust: seus arquivos entram no binário.
+
+```bash
+cd ui
+bun install --frozen-lockfile
+bun run build
+cd ..
+cargo build --locked
+cargo run -- --demo --show
+```
+
+O modo `--demo` oferece perfis fictícios, transições e seleção dos 14 estados.
+Os cadastros e as senhas de demonstração ficam apenas na memória; não use dados
+reais nele. Idioma e tema persistem como preferências locais da interface.
+Sem `--demo`, o app começa vazio e apresenta o primeiro uso; as operações de
+VPN, chaveiro e instalação do helper ainda informam que estão em desenvolvimento.
+
+Para exercitar a mesma UI e a ponte de comandos no navegador:
+
+```bash
+cargo run -- --demo-server 4178
+```
+
+Abra `http://127.0.0.1:4178`. Esse servidor só atende o modo de demonstração
+no loopback e não constrói um backend de VPN real.
+
+Para criar um pacote de desenvolvimento local, sem instalar:
+
+```bash
+python3 scripts/macos/package-app.py
+open target/vpnt.app --args --demo --show
+```
+
+O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
+`--replace` para substituir um pacote anterior do vpnt nesse destino. Isso não
+instala programas de VPN, componentes privilegiados ou regras do sudoers.
+Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
 ## Proposta visual
 
