@@ -758,7 +758,7 @@ function call(tool, args, pageId) {
   try {
     // Cada chamada é um processo novo e a página atual não persiste entre
     // elas: todo desenho leva o identificador da página.
-    return JSON.parse(cli(["tool", "call", tool, "--args-file", file, "--json", ...(pageId ? ["--page-id", pageId] : [])]));
+    return JSON.parse(cli(["tool", "call", tool, "--args-file", file, "--json", "--document-id", doc.id, ...(pageId ? ["--page-id", pageId] : [])]));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -856,10 +856,25 @@ function draw(pageId, t, { title, lead, specs, per = 4, y0 = 0, bg }) {
 
 const docs = JSON.parse(cli(["documents", "list", "--json"]));
 const doc = docs.find((d) => d.active) || docs[0];
+if (!doc?.pages.length) throw new Error("Open an empty document in OpenPencil first.");
 const pageIds = Object.fromEntries(doc.pages.map((p) => [p.name, p.id]));
 const anyPage = doc.pages[0].id;
+let initialPage = doc.pages.length === 1 && /^Page \d+$/.test(doc.pages[0].name)
+  && call("eval", { code: "return figma.currentPage.children.length" }, anyPage) === 0
+  ? doc.pages[0]
+  : null;
 const ensurePage = (name) => {
-  if (!pageIds[name]) pageIds[name] = call("create_page", { name }, anyPage).id;
+  if (!pageIds[name]) {
+    if (initialPage) {
+      // Reuse the empty default page so a fresh document has no unnamed extra page.
+      call("eval", { code: `figma.currentPage.name = ${JSON.stringify(name)}; return 0` }, initialPage.id);
+      delete pageIds[initialPage.name];
+      pageIds[name] = initialPage.id;
+      initialPage = null;
+    } else {
+      pageIds[name] = call("create_page", { name }, anyPage).id;
+    }
+  }
   call("eval", { code: "for (const n of [...figma.currentPage.children]) n.remove(); return 0" }, pageIds[name]);
   return pageIds[name];
 };
