@@ -39,6 +39,37 @@ O CI em `.github/workflows/check.yml` repete os checks de macOS e do núcleo
 portável em Linux. Preparar o workflow e executar checks locais não equivale
 a uma execução verde no GitHub; esta exige envio e execução no serviço.
 
+## Persistência, chaveiro e protocolo
+
+Os módulos dessa camada ainda não estão ligados ao modo normal da UI nem a um
+helper instalado. Para executar seus testes isolados no macOS:
+
+```bash
+cargo test --locked --no-default-features --test storage --test profiles --test secrets --test keychain --test helper_protocol
+```
+
+Storage usa somente `output/fixtures/`, com proprietário do processo para o
+fixture. Produção usa proprietário root e uma árvore fixa por UID. Verificar
+persistência/remoção, atualizações concorrentes, diretórios e arquivos privados,
+links, arquivo especial que não possa bloquear a leitura, limites e dados
+inválidos. O teste sem privilégio não substitui a validação do helper instalado
+contra arquivos de proprietários diferentes.
+
+O teste nativo de chaveiro cria uma base descartável com dados fictícios. Usa
+esse handle para salvar, ler, atualizar, bloquear/desbloquear e remover; verifica
+ao final que o chaveiro padrão e a lista de busca permanecem iguais. Não imprime
+a lista pessoal. Pode precisar de execução fora do sandbox para acessar
+Security.framework; uma falha de criação no sandbox não deve ser reportada como
+teste nativo aprovado. O teste de segredos cobre redigir Debug e validar os
+valores na fronteira de entrada dos clientes.
+
+O protocolo normal oferece snapshot, conectar, desligar e testar por ID de
+perfil/geração. O canal administrativo é separado e exige EOF após um único
+documento antes de retornar uma operação executável. Testar mensagens
+fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
+tentativas de cruzar os canais. Esses testes de codec não provam elevação,
+processos de VPN ou instalação de sudoers.
+
 ## Fluxos de demonstração
 
 Use `cargo run -- --demo-server 4178` e abra o endereço local do README.

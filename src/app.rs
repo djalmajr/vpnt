@@ -1,6 +1,7 @@
 use crate::{
     bridge::Command,
     model::{LogEntry, Profile, Snapshot, VpnKind, VpnView},
+    secrets::Credentials,
     session::{Completion, ConnectionState, Session},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -185,13 +186,10 @@ impl App {
                 self.scheduled.retain(|scheduled| scheduled.id != id);
             }
             Command::SaveSecrets { id, password, psk } => {
-                if password.is_empty() || password.len() > 4096 || psk.len() > 4096 {
-                    return Err("invalid_secret");
-                }
                 let connection = self.connection(&id)?;
-                if connection.profile.kind == VpnKind::Ipsec && psk.is_empty() {
-                    return Err("invalid_secret");
-                }
+                Credentials { password, psk }
+                    .validate(connection.profile.kind)
+                    .map_err(|_| "invalid_secret")?;
                 connection.has_password = true;
                 connection.has_psk = connection.profile.kind == VpnKind::Ipsec;
                 if connection.session.state() == ConnectionState::MissingSecret {

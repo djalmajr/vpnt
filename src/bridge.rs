@@ -1,5 +1,6 @@
 use crate::{
     model::{Profile, Snapshot},
+    secrets::Secret,
     session::ConnectionState,
 };
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,8 @@ pub enum Command {
     },
     SaveSecrets {
         id: String,
-        password: String,
-        psk: String,
+        password: Secret,
+        psk: Secret,
     },
     SetDemoState {
         id: String,

@@ -27,13 +27,7 @@ pub struct Profile {
 
 impl Profile {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.id.is_empty()
-            || self.id.len() > 64
-            || !self
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
+        if !valid_profile_id(&self.id) {
             return Err("invalid_profile");
         }
         if self.name.trim().is_empty()
@@ -65,6 +59,14 @@ impl Profile {
     }
 }
 
+pub(crate) fn valid_profile_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn valid_host(value: &str) -> bool {
     if value.parse::<IpAddr>().is_ok() {
         return true;
@@ -83,12 +85,15 @@ fn valid_host(value: &str) -> bool {
 }
 
 fn valid_network(value: &str) -> bool {
+    if value.len() > 49 {
+        return false;
+    }
     let Some((address, prefix)) = value.split_once('/') else {
         return false;
     };
     match (address.parse::<IpAddr>(), prefix.parse::<u8>()) {
-        (Ok(IpAddr::V4(_)), Ok(prefix)) => prefix <= 32,
-        (Ok(IpAddr::V6(_)), Ok(prefix)) => prefix <= 128,
+        (Ok(IpAddr::V4(_)), Ok(number)) => number <= 32 && prefix == number.to_string(),
+        (Ok(IpAddr::V6(_)), Ok(number)) => number <= 128 && prefix == number.to_string(),
         _ => false,
     }
 }

@@ -14,11 +14,11 @@ use tao::{
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use wry::{NewWindowResponse, WebViewBuilder, http::Response};
+use zeroize::Zeroizing;
 
-#[derive(Debug)]
 enum UserEvent {
     Tray(TrayIconEvent),
-    Ipc(String),
+    Ipc(Zeroizing<String>),
 }
 
 pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -56,8 +56,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         })
         .with_url("vpnt://localhost/index.html")
         .with_ipc_handler(move |request| {
-            if trusted_origin(&request.uri().to_string()) && request.body().len() <= 65536 {
-                let _ = proxy.send_event(UserEvent::Ipc(request.body().clone()));
+            let trusted = trusted_origin(&request.uri().to_string());
+            let body = Zeroizing::new(request.into_body());
+            if trusted && body.len() <= 65536 {
+                let _ = proxy.send_event(UserEvent::Ipc(body));
             }
         })
         .with_navigation_handler(|url| trusted_origin(&url))

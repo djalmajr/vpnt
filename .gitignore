@@ -20,3 +20,4 @@ dist/
 .playwright-cli/
 output/playwright/
 output/mutations/
+output/fixtures/

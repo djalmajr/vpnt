@@ -5,6 +5,7 @@ use crate::{
 };
 use std::io::Cursor;
 use tiny_http::{Header, Method, Response, Server};
+use zeroize::Zeroizing;
 
 /// Explicit demo server for browser validation. It never constructs a real VPN backend.
 pub fn serve(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -45,7 +46,7 @@ pub fn serve(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
                 let _ = request.respond(Response::empty(415));
                 continue;
             }
-            let mut body = String::new();
+            let mut body = Zeroizing::new(String::new());
             if request
                 .as_reader()
                 .take(65537)

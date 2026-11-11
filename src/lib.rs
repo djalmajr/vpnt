@@ -7,7 +7,13 @@ pub mod bridge;
 pub mod cli;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub mod desktop;
+pub mod helper;
+#[cfg(target_os = "macos")]
+pub mod keychain;
 pub mod model;
 #[cfg(feature = "desktop")]
 pub mod preview;
+pub mod secrets;
 pub mod session;
+#[cfg(unix)]
+pub mod storage;
