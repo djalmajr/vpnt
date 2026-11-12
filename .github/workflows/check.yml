@@ -47,6 +47,10 @@ jobs:
         run: python3 scripts/macos/package-app.py
       - name: Build graphical askpass adapter without elevation
         run: python3 scripts/macos/build-askpass.py
+      - name: Verify installation payload and preparation oracles
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

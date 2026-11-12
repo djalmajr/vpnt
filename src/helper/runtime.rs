@@ -176,9 +176,18 @@ impl Runtime {
         Self::verify_adapter(Path::new(paths::PPP_SUPERVISOR))
     }
     fn verify_adapter(path: &Path) -> Result<(), RuntimeError> {
-        check_directory(path.parent().ok_or(RuntimeError::Untrusted)?, 0)?;
-        let bytes = read_file(path, 0, true, MAX_FILE)?;
+        Self::inspect_adapter(path, 0)
+    }
+    pub(crate) fn inspect_adapter(path: &Path, owner: u32) -> Result<(), RuntimeError> {
+        check_directory(path.parent().ok_or(RuntimeError::Untrusted)?, owner)?;
+        let bytes = read_file(path, owner, true, MAX_FILE)?;
         check_macho(&bytes, &BTreeMap::new(), true)
+    }
+    pub(crate) fn file_hashes(&self) -> &BTreeMap<String, String> {
+        &self.manifest.files
+    }
+    pub(crate) fn minimum_macos(&self) -> &str {
+        &self.manifest.minimum_macos
     }
 
     /// Recheck immediately before spawning. Non-root callers cannot replace

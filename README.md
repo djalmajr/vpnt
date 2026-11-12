@@ -90,6 +90,29 @@ O manifest registra hashes, licenças, destino futuro e a versão mínima de mac
 exigida pelos binários produzidos. Esse runtime ainda não faz parte do `.app`
 de demonstração nem é instalado pelo script.
 
+O payload de instalação também pode ser preparado e inspecionado localmente:
+
+```bash
+cargo build --locked --bins
+python3 scripts/macos/build-askpass.py
+python3 scripts/macos/prepare-installation.py
+```
+
+O preparador gera `target/vpnt-installation/<sha256>`, com helper, pinentry,
+supervisor PPP, askpass, inspetor, runtime e política sudoers. O manifesto vincula
+versão, destinatário numérico e hashes. O inspetor Rust confere o conjunto inteiro,
+os binários Mach-O, as dependências e a política antes de admitir o payload.
+O destinatário padrão é o usuário atual; `--uid` prepara outro UID local no
+intervalo aceito de 501 a 2147483647, sem conceder acesso. Repetir a preparação
+reutiliza somente um build idêntico e íntegro; uma cópia corrompida é recusada.
+
+A política preparada usa digest dos executáveis e argumentos exatos: runtime
+sem senha, administração/remoção com senha, sem PTY nem registro de IO. Sua
+sintaxe é validada com `visudo` somente no arquivo de fixture. Isso não comprova
+os privilégios efetivos da máquina. Os modos disponíveis de `vpnt-install` são
+`inspect` e `policy`, ambos apenas de leitura e recusados sob root. A ativação
+transacional, a remoção e o pacote `.pkg` permanecem em desenvolvimento.
+
 O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
 à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que
 o helper possa usar um PID privado por perfil. O manifest registra o hash do

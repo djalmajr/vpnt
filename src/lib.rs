@@ -12,6 +12,8 @@ pub mod desktop;
 #[cfg(unix)]
 mod fs_permissions;
 pub mod helper;
+#[cfg(unix)]
+pub mod install;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod localization;

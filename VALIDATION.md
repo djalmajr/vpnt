@@ -230,6 +230,77 @@ SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abai
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
+## Payload e política de instalação
+
+```bash
+cargo test --locked --no-default-features --lib install::
+cargo test --locked --no-default-features --test install_preparation
+python3 scripts/macos/check-installation.py
+cargo build --locked --bins
+python3 scripts/macos/build-askpass.py
+python3 scripts/macos/prepare-installation.py
+```
+
+[executed, filesystem/contract fixture] O payload tem manifesto fechado, versão
+exata, destinatário entre 501 e 2147483647 e inventário completo com hashes.
+Recusa campos/caminhos extras, chaves duplicadas, metadados excessivos, arquivo
+faltante, diretório não listado, conteúdo alterado e identidade de build antiga.
+Exige diretórios/arquivos próprios, sem links ou permissões/ACL que permitam
+escrita alheia. Reusa a admissão de runtime/patches/Mach-O já existente; adapters
+só podem depender das bibliotecas do sistema. Rehash externo não autoriza uma
+política mais ampla ou runtime incompatível. Ownership root e execução elevada
+não são provados pelas árvores pertencentes ao usuário de teste.
+
+[executed, static contract + native parser] A política contém aliases únicos por
+UID, digest SHA-256 do helper/instalador e argumentos exatos. Somente runtime
+recebe NOPASSWD; admin/remoção usam PASSWD. Inclui NOSETENV/NOLOG_INPUT/
+NOLOG_OUTPUT/NOINTERCEPT e Defaults por comando que desativam PTY e IO/subcomandos.
+As assertions conferem esse contrato; `visudo -c -s -f` analisa somente a política
+de fixture. Sintaxe válida não comprova seleção da regra, autenticação, IO,
+herança de FD 0 nem o efeito de configurações globais/plugins. Essas provas
+continuam pendentes no caminho instalado. Referência: [sudoers](https://github.com/sudo-project/sudo/blob/main/docs/sudoers.man.in).
+
+[executed, native process + synthetic runtime] O teste do preparador usa o
+inspetor Mach-O compilado, um runtime sintético e papéis de executáveis fictícios;
+só o inspetor é executado. Atravessa o script Python e o parser visudo reais.
+Repetição conserva o build e remove cópias temporárias. Corrupção do destino
+é recusada sem repará-lo silenciosamente; saída sobreposta às entradas é recusada
+antes de escrever. Flags e SUDO_UID forjado não ativam o componente. O CLI ainda
+só oferece inspect/policy, sem operação privilegiada disponível.
+
+[executed, native file admission] O preparador também admitiu o runtime C local
+já construído e os cinco adapters reais: 17 arquivos, mínimo macOS 26.0.
+Nenhum cliente VPN foi executado para isso; é inspeção de arquivos/formato e
+integridade, sem prova funcional de VPN, assinatura ou notarização. O payload
+fica em target/vpnt-installation/<id>. A saída declara installationPerformed=false
+e activationAvailable=false. Python >=3.11 é necessário. O preparador não roda
+sudo, installer do macOS ou escrita fora da saída local escolhida.
+
+[executed] Nesta fase passaram 191 testes Rust com desktop e 188 sem desktop,
+com um teste de admissão do runtime ainda ignorado por padrão. Fmt, clippy
+all-targets/all-features com -D warnings, build de todos os binários, pacote
+local e cmp passaram. UI/catálogos/layout, dependências e patches não mudaram;
+as provas visuais e os demais oráculos conservam seus checkpoints históricos,
+sem nova execução das 157 mutações anteriores. Não são hashes do head atual.
+
+A matriz desta fase detectou 24 mutações e passou quatro baselines/restaurações:
+inventário/versão, campos/chaves extras, limite, hashes, links/permissões/ACL,
+admissão de adapters/runtime, política canônica, identidade antiga, autenticação,
+argumentos, PTY/digest, corrupção do destino, declaração falsa de instalação,
+sobreposição de saída e sucesso para comando desconhecido. Logs e hashes de
+158 entradas de fonte/teste/catálogo/preparador estão em
+output/fixtures/installation-oracles/. Compilações/âncoras inválidas não foram
+contadas; o runner agora valida todas as âncoras antes da matriz. Os casos de
+arquivos 0555 precisaram de chmod somente no fixture para simular adulteração;
+a falha inicial de preparação desses testes não conta como regressão detectada.
+
+[partial] A fase seguinte precisa implementar ativação/rollback sob lock global,
+remoção conservadora, staging root e .pkg. Preservar perfis e inodes é requisito
+para esse executor, ainda não provado por testes de aplicação. InstallHelper/
+RemoveHelper do app continuam pendentes. Não foi instalado, elevado, conectado
+ou publicado nenhum componente. O workflow inclui os oráculos desta fase;
+CI remoto, autenticação e política efetiva permanecem sem execução.
+
 ## Administração assíncrona de perfis
 
 ```bash
