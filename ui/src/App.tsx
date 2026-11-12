@@ -1,5 +1,6 @@
-import { Dialog, Group, Header, Icon, Notice } from "./components/common";
+import { Group, Header, Icon, Notice } from "./components/common";
 import { Footer } from "./components/Footer";
+import { RemoveDialog } from "./components/RemoveDialog";
 import { SecretsDialog } from "./components/SecretsDialog";
 import { VpnCard } from "./components/VpnCard";
 import { states } from "./model";
@@ -256,35 +257,16 @@ export function App() {
                 t={t}
               />
             ) : (
-              <Dialog
-                title={t("removeTitle", { name: modalVpn.profile.name })}
+              <RemoveDialog
+                vpn={modalVpn}
+                run={run}
                 close={() => setModal(undefined)}
+                removed={() => {
+                  setModal(undefined);
+                  navigate({ page: "preferences" });
+                }}
                 t={t}
-              >
-                <p>{t("removeHint")}</p>
-                <div className="actions end">
-                  <button type="button" onClick={() => setModal(undefined)}>
-                    {t("cancel")}
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-fill"
-                    onClick={() =>
-                      void run({
-                        type: "remove_profile",
-                        id: modalVpn.profile.id,
-                      }).then((ok) => {
-                        if (ok) {
-                          setModal(undefined);
-                          navigate({ page: "preferences" });
-                        }
-                      })
-                    }
-                  >
-                    {t("remove")}
-                  </button>
-                </div>
-              </Dialog>
+              />
             ))}
         </>
       )}

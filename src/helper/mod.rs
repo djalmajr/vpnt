@@ -22,4 +22,6 @@ pub mod vici;
 pub mod server;
 
 #[cfg(target_os = "macos")]
+pub mod admin_client;
+#[cfg(target_os = "macos")]
 pub mod client;

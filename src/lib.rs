@@ -14,6 +14,7 @@ mod fs_permissions;
 pub mod helper;
 #[cfg(target_os = "macos")]
 pub mod keychain;
+pub mod localization;
 pub mod model;
 #[cfg(feature = "desktop")]
 pub mod preview;

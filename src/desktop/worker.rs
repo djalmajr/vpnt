@@ -40,17 +40,35 @@ pub(super) struct Worker {
 }
 impl Worker {
     pub fn new(demo: bool, reply: impl Fn(Reply) + Send + 'static) -> Result<Self, std::io::Error> {
+        Self::spawn(
+            move || {
+                let demo = demo.then(App::demo);
+                let normal = demo
+                    .is_none()
+                    .then(|| Broker::runtime(Keychain(MacKeychain::for_current_user())));
+                (demo, normal)
+            },
+            reply,
+        )
+    }
+    fn spawn(
+        init: impl FnOnce() -> (Option<App>, Option<Broker<Keychain>>) + Send + 'static,
+        reply: impl Fn(Reply) + Send + 'static,
+    ) -> Result<Self, std::io::Error> {
         let (input, requests) = mpsc::sync_channel::<Work>(32);
         std::thread::Builder::new()
             .name("vpnt-application".into())
             .spawn(move || {
-                let mut demo = demo.then(App::demo);
-                let mut normal = demo
-                    .is_none()
-                    .then(|| Broker::runtime(Keychain(MacKeychain::for_current_user())));
+                let (mut demo, mut normal) = init();
+                let mut administrative = std::collections::BTreeMap::new();
                 loop {
                     if let Some(normal) = &mut normal {
                         normal.poll();
+                        if let Some((token, result)) = normal.take_admin_result()
+                            && let Some(id) = administrative.remove(&token)
+                        {
+                            reply(response(id, result));
+                        }
                     }
                     match requests.recv_timeout(Duration::from_millis(20)) {
                         Ok(work) => {
@@ -69,24 +87,29 @@ impl Worker {
                             } else if let Some(demo) = &mut demo {
                                 demo.dispatch(work.request.command)
                             } else {
+                                if matches!(
+                                    work.request.command,
+                                    crate::bridge::Command::SaveProfile { .. }
+                                        | crate::bridge::Command::RemoveProfile { .. }
+                                ) {
+                                    match normal.as_mut().unwrap().begin_admin(
+                                        work.request.command,
+                                        work.request.locale.unwrap_or_default(),
+                                        work.expires,
+                                    ) {
+                                        Ok(token) => {
+                                            administrative.insert(token, work.request.id);
+                                        }
+                                        Err(error) => reply(response(work.request.id, Err(error))),
+                                    }
+                                    continue;
+                                }
                                 normal
                                     .as_mut()
                                     .unwrap()
                                     .dispatch(work.request.command, work.expires)
                             };
-                            let response = match result {
-                                Ok(snapshot) => Reply {
-                                    id: work.request.id,
-                                    snapshot: Some(snapshot),
-                                    error: None,
-                                },
-                                Err(error) => Reply {
-                                    id: work.request.id,
-                                    snapshot: None,
-                                    error: Some(error.into()),
-                                },
-                            };
-                            reply(response);
+                            reply(response(work.request.id, result));
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -118,10 +141,25 @@ impl Worker {
             .map_err(|_| ())
     }
 }
+fn response(id: String, result: Result<crate::model::Snapshot, &'static str>) -> Reply {
+    match result {
+        Ok(snapshot) => Reply {
+            id,
+            snapshot: Some(snapshot),
+            error: None,
+        },
+        Err(error) => Reply {
+            id,
+            snapshot: None,
+            error: Some(error.into()),
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod administration;
     #[test]
     fn expired_native_requests_cannot_start_a_demo_or_replay_after_a_ui_timeout() {
         let (send, receive) = mpsc::sync_channel(8);
@@ -130,6 +168,7 @@ mod tests {
             .send(
                 Request {
                     id: "expired".into(),
+                    locale: None,
                     command: crate::bridge::Command::Toggle {
                         id: "office".into(),
                     },
@@ -143,6 +182,7 @@ mod tests {
             .send(
                 Request {
                     id: "fresh".into(),
+                    locale: None,
                     command: crate::bridge::Command::GetSnapshot {},
                 },
                 Instant::now(),

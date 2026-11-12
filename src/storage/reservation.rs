@@ -65,3 +65,42 @@ impl ProfileReservation {
         Ok(())
     }
 }
+
+impl Drop for ProfileReservation {
+    fn drop(&mut self) {
+        // Explicitly release our reservation even if a concurrent fork still
+        // holds this open file description briefly before its CLOEXEC boundary.
+        // The persistent inode remains in place for future owners.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn release_does_not_wait_for_a_transient_duplicate_of_the_owned_descriptor() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("output/fixtures")
+            .join(format!("reservation-duplicate-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = ProfileStore::open(&root, fs::metadata(&root).unwrap().uid()).unwrap();
+        let guard = store.reserve("one").unwrap();
+        // fork shares this open file description until CLOEXEC takes effect.
+        // A duplicate deterministically retains that same kernel reference.
+        let transient = guard.file.try_clone().unwrap();
+        assert!(matches!(store.reserve("one"), Err(StoreError::Busy)));
+        drop(guard);
+        let result = store.reserve("one");
+        drop(transient);
+        assert!(
+            result.is_ok(),
+            "only the owned reservation controls its lifetime"
+        );
+        drop(result);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

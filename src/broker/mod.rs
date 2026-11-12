@@ -1,7 +1,9 @@
 //! Normal application state. Only the authenticated helper's current generation
 //! may report a connected tunnel; demo schedules never enter this model.
+mod admin;
 mod commands;
 mod retry;
+mod snapshot;
 use crate::{
     bridge::Command,
     helper::{
@@ -37,6 +39,8 @@ pub struct Broker<S: SecretStore> {
     dead: bool,
     next: u64,
     startup: Instant,
+    administration: admin::Flow,
+    epoch: u64,
 }
 impl<S: SecretStore> Broker<S> {
     pub fn runtime(secrets: S) -> Self {
@@ -60,6 +64,8 @@ impl<S: SecretStore> Broker<S> {
             dead: false,
             next: 1,
             startup: Instant::now() + Duration::from_secs(5),
+            administration: admin::Flow::new(),
+            epoch: 1,
         };
         result.begin();
         result
@@ -82,6 +88,10 @@ impl<S: SecretStore> Broker<S> {
             .and_then(|r| r.attempt(self.client.as_ref()));
         match attempt {
             Some(Ok(client)) => {
+                self.epoch = self
+                    .epoch
+                    .checked_add(1)
+                    .expect("helper channel epoch exhausted");
                 self.client = Some(client);
                 self.dead = false;
                 self.ready = false;
@@ -117,6 +127,7 @@ impl<S: SecretStore> Broker<S> {
             self.resume();
         }
         if self.dead {
+            self.poll_admin();
             return;
         }
         let result = self.client.as_mut().map(Client::poll);
@@ -138,6 +149,7 @@ impl<S: SecretStore> Broker<S> {
         if !self.ready && self.client.is_some() && Instant::now() >= self.startup {
             self.lost(self.helper == "outdated");
         }
+        self.poll_admin();
     }
     fn receive(&mut self, message: Message) -> Result<(), ()> {
         match message {
@@ -147,53 +159,7 @@ impl<S: SecretStore> Broker<S> {
                 profiles,
                 connections,
                 ..
-            } => {
-                if self.ready || id != "snapshot-1" {
-                    return Err(());
-                }
-                if version != env!("CARGO_PKG_VERSION") {
-                    self.lost(true);
-                    return Ok(());
-                }
-                if profiles.len() != connections.len()
-                    || connections
-                        .iter()
-                        .any(|s| s.generation != 0 || s.state != State::Off)
-                {
-                    return Err(());
-                }
-                let mut current = BTreeMap::new();
-                for profile in profiles {
-                    let present = self
-                        .secrets
-                        .contains(&profile.id, profile.kind)
-                        .unwrap_or(false);
-                    current.insert(
-                        profile.id.clone(),
-                        Connection {
-                            view: VpnView {
-                                has_password: present,
-                                has_psk: present && profile.kind == VpnKind::Ipsec,
-                                profile,
-                                state: if present {
-                                    State::Off
-                                } else {
-                                    State::MissingSecret
-                                },
-                                log: vec![],
-                            },
-                            generation: 0,
-                            pending: None,
-                        },
-                    );
-                }
-                self.connections = current;
-                self.ready = true;
-                self.helper = "installed";
-                if let Some(retry) = &mut self.retry {
-                    retry.ready();
-                }
-            }
+            } => self.receive_snapshot(id, version, profiles, connections)?,
             Message::Changed {
                 profile_id,
                 generation,
@@ -221,6 +187,9 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Message::Failed { id, .. } => {
+                if self.fail_admin_query(&id) {
+                    return Ok(());
+                }
                 for c in self.connections.values_mut() {
                     if c.pending.as_ref().is_some_and(|p| p.id == id) {
                         let pending = c.pending.take().unwrap();
@@ -232,6 +201,7 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Message::Fatal { .. } => self.lost(false),
+            Message::AdminReady { .. } => return Err(()),
         }
         Ok(())
     }

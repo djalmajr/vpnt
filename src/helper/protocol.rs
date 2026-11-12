@@ -11,7 +11,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
@@ -64,7 +64,7 @@ pub enum AdminCommand {
     RemoveProfile { id: String },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
@@ -90,6 +90,10 @@ pub struct TunnelStatus {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
+    AdminReady {
+        protocol_version: u32,
+        version: String,
+    },
     Snapshot {
         id: String,
         protocol_version: u32,
@@ -179,6 +183,17 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
     let message: Message =
         serde_json::from_slice(&bytes).map_err(|_| ProtocolError::InvalidRequest)?;
     match &message {
+        Message::AdminReady {
+            protocol_version,
+            version,
+        } => {
+            if *protocol_version != VERSION {
+                return Err(ProtocolError::UnsupportedVersion);
+            }
+            if version.len() > 64 {
+                return Err(ProtocolError::InvalidRequest);
+            }
+        }
         Message::Snapshot {
             id,
             protocol_version,

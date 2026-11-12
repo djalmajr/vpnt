@@ -52,6 +52,13 @@ export function useAppState() {
           invalid_network: "invalidNetwork",
           invalid_probe: "invalidProbe",
           backend_unavailable: "backendUnavailable",
+          admin_busy: "adminBusy",
+          profile_busy: "profileBusy",
+          admin_expired: "adminExpired",
+          admin_canceled: "adminUnconfirmed",
+          admin_unconfirmed: "adminUnconfirmed",
+          admin_incompatible: "adminIncompatible",
+          secret_cleanup_failed: "secretCleanupFailed",
         };
         setError(code ? (keys[code] ?? "error") : undefined);
       }),

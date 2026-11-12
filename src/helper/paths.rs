@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub const HELPER: &str = "/Library/PrivilegedHelperTools/dev.vpnt.helper";
+pub const ASKPASS: &str = "/Library/PrivilegedHelperTools/dev.vpnt.askpass";
 pub const PINENTRY: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pinentry";
 pub const PPP_SUPERVISOR: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pppd";
 pub const USERS: &str = "/Library/Application Support/vpnt/users";

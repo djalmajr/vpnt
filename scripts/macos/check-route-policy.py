@@ -275,7 +275,7 @@ def main():
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-        for prefix in ["src", "tests"] for path in sorted((ROOT / prefix).rglob("*"))
+        for prefix in ["src", "tests", "ui/src/locales"] for path in sorted((ROOT / prefix).rglob("*"))
         if path.is_file()
     }}
     try:
@@ -283,7 +283,7 @@ def main():
             copy = Path(temporary)
             for path in ["Cargo.toml", "Cargo.lock"]:
                 shutil.copy2(ROOT / path, copy / path)
-            for path in ["src", "tests", "ui/dist", "scripts/macos/patches"]:
+            for path in ["src", "tests", "ui/dist", "scripts/macos/patches", "ui/src/locales"]:
                 shutil.copytree(ROOT / path, copy / path)
             tests = ["--test", "route_flow", "--test", "route_leases"]
             native = ["--lib", "connection::macos"]

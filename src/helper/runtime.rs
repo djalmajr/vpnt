@@ -166,6 +166,9 @@ impl Runtime {
     pub fn verify_helper() -> Result<(), RuntimeError> {
         Self::verify_adapter(Path::new(paths::HELPER))
     }
+    pub fn verify_askpass() -> Result<(), RuntimeError> {
+        Self::verify_adapter(Path::new(paths::ASKPASS))
+    }
     pub fn verify_pinentry() -> Result<(), RuntimeError> {
         Self::verify_adapter(Path::new(paths::PINENTRY))
     }

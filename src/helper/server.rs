@@ -136,6 +136,13 @@ fn admin(
 ) -> Result<(), ErrorCode> {
     let uid = caller.uid;
     let mut stream = caller.stream;
+    send(
+        &mut stream,
+        &Message::AdminReady {
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )?;
     let input = stream.try_clone().map_err(|_| ErrorCode::Unavailable)?;
     let mut input = io::Input::new(input, Arc::new(AtomicBool::new(false)))
         .map_err(|_| ErrorCode::Unavailable)?;

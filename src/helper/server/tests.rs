@@ -1,5 +1,21 @@
 use super::*;
 mod profiles;
+#[test]
+fn admin_announces_readiness_before_receiving_an_operation() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let task = thread::spawn(move || admin(caller(a), |_, _| panic!("no document was sent")));
+    let mut c = client(b);
+    assert!(matches!(
+        protocol::read_message(&mut c),
+        Ok(Some(Message::AdminReady {
+            protocol_version: protocol::VERSION,
+            ..
+        }))
+    ));
+    c.get_mut().shutdown(Shutdown::Write).unwrap();
+    let _ = protocol::read_message(&mut c);
+    assert!(task.join().unwrap().is_err());
+}
 use std::{
     io::{BufReader, Write},
     net::Shutdown,
@@ -17,6 +33,17 @@ fn client(stream: UnixStream) -> BufReader<UnixStream> {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     BufReader::new(stream)
+}
+fn admin_client(stream: UnixStream) -> BufReader<UnixStream> {
+    let mut c = client(stream);
+    assert!(matches!(
+        protocol::read_message(&mut c).unwrap(),
+        Some(Message::AdminReady {
+            protocol_version: protocol::VERSION,
+            ..
+        })
+    ));
+    c
 }
 #[test]
 fn admin_does_not_take_the_network_lock_but_runtime_must() {
@@ -186,7 +213,7 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
             apply_admin(&store, request)
         })
     });
-    let mut c = client(b);
+    let mut c = admin_client(b);
     protocol::write_admin_request(
         c.get_mut(),
         &protocol::AdminRequest {
@@ -219,7 +246,7 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
                 apply_admin(&store, request)
             })
         });
-        let mut c = client(b);
+        let mut c = admin_client(b);
         let wire=serde_json::to_vec(&serde_json::json!({"id":"admin-one","command":{"type":"remove_profile","id":profile.id}})).unwrap();
         c.get_mut().write_all(&wire).unwrap();
         c.get_mut().write_all(b"\n").unwrap();
@@ -282,7 +309,10 @@ fn an_admin_channel_kept_open_in_silence_expires_without_applying_an_operation()
             panic!("silence must not create an operation")
         })
     });
-    let mut c = BufReader::new(b);
+    let mut c = admin_client(b);
+    c.get_mut()
+        .set_read_timeout(Some(Duration::from_secs(7)))
+        .unwrap();
     let started = Instant::now();
     assert!(matches!(
         protocol::read_message(&mut c).unwrap(),

@@ -1,8 +1,22 @@
+import nativeCatalogs from "./locales/native.json";
+
 export type Locale = "pt-BR" | "en-US";
 export type LocalePreference = Locale | "system";
 
 const en = {
+  ...nativeCatalogs["en-US"],
   vpns: "VPNs",
+  adminPending:
+    "Waiting for authorization and confirmation. To cancel, use the macOS authorization dialog.",
+  adminBusy: "Another administrative change is still pending.",
+  profileBusy: "Disconnect this VPN before changing its profile.",
+  adminExpired: "Authorization timed out. No new request will be sent.",
+  adminUnconfirmed:
+    "The change could not be confirmed. Check the profile before trying again.",
+  adminIncompatible:
+    "Update the administrator component before changing profiles.",
+  secretCleanupFailed:
+    "The profile was removed, but its saved credentials could not be deleted.",
   preferences: "Preferences",
   back: "Back",
   options: "Options",
@@ -156,7 +170,19 @@ const en = {
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
+  ...nativeCatalogs["pt-BR"],
   vpns: "VPNs",
+  adminPending:
+    "Aguardando autorização e confirmação. Para cancelar, use o diálogo de autorização do macOS.",
+  adminBusy: "Outra alteração administrativa ainda está pendente.",
+  profileBusy: "Desligue esta VPN antes de alterar seu perfil.",
+  adminExpired: "A autorização expirou. Nenhum novo pedido será enviado.",
+  adminUnconfirmed:
+    "Não foi possível confirmar a alteração. Confira o perfil antes de tentar novamente.",
+  adminIncompatible:
+    "Atualize o componente de administrador antes de alterar os perfis.",
+  secretCleanupFailed:
+    "O perfil foi removido, mas não foi possível apagar suas credenciais salvas.",
   preferences: "Preferências",
   back: "Voltar",
   options: "Opções",

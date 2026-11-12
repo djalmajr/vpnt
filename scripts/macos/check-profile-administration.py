@@ -64,6 +64,7 @@ def main():
     refresh='connection::controller::engine::metadata_tests::snapshot_refresh_preserves_a_live_profile_and_exposes_edited_new_and_removed_metadata'
     atomic='connection::controller::engine::metadata_tests::a_rejected_refresh_cannot_partially_edit_idle_slots_or_cancel_a_live_slot'
     mutants=[
+        ('reservation-release-waits-for-fork',reservation,lambda s:replace(s,'let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };','let _ = self.file.as_raw_fd();'),['--lib','storage::reservation::tests::release_does_not_wait_for_a_transient_duplicate_of_the_owned_descriptor'],'storage::reservation::tests::release_does_not_wait_for_a_transient_duplicate_of_the_owned_descriptor'),
         ('save-without-target-reservation',store,lambda s:without_reservation(s,'    pub fn save(','    pub fn remove('),['--test','profile_reservations',isolated],isolated),
         ('remove-without-target-reservation',store,lambda s:without_reservation(s,'    pub fn remove(','    fn check_directory('),['--test','profile_reservations',isolated],isolated),
         ('reservation-flock-omitted',reservation,lambda s:replace(s,'if unsafe { libc::flock(guard.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0','if false'),['--test','profile_reservations',independent],independent),
@@ -84,13 +85,13 @@ def main():
         ('failed-refresh-partially-mutates-idle-slot',metadata,partial_refresh,['--lib',atomic],atomic),
         ('ipsec-dispatched-to-ssl','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if slot.profile.kind != VpnKind::Ssl {','if false {'),['--lib','connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'],'connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'),
     ]
-    receipt={'sourceSha256':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['src','tests'] for p in sorted((ROOT/base).rglob('*')) if p.is_file()}}
+    receipt={'sourceSha256':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['src','tests','ui/src/locales'] for p in sorted((ROOT/base).rglob('*')) if p.is_file()}}
     try:
         with tempfile.TemporaryDirectory(prefix='copy-',dir=REPORTS) as temporary:
             copy=Path(temporary)
             for name in ['Cargo.toml','Cargo.lock']:shutil.copy2(ROOT/name,copy/name)
-            for name in ['src','tests','scripts/macos/patches']:shutil.copytree(ROOT/name,copy/name)
-            baselines=[('filesystem',['--test','profile_reservations','--test','storage']),('custody',['--lib','connection::controller::profiles']),('metadata',['--lib','connection::controller::engine::metadata']),('admin-wire',['--lib','helper::server::tests::profiles'])]
+            for name in ['src','tests','scripts/macos/patches','ui/src/locales']:shutil.copytree(ROOT/name,copy/name)
+            baselines=[('release',['--lib','storage::reservation']),('filesystem',['--test','profile_reservations','--test','storage']),('custody',['--lib','connection::controller::profiles']),('metadata',['--lib','connection::controller::engine::metadata']),('admin-wire',['--lib','helper::server::tests::profiles'])]
             for label,args in baselines:receipt['baseline-'+label]=run(copy,'baseline-'+label,args)
             for label,file,mutate,args,expected in mutants:
                 path=copy/file;original=path.read_text()
@@ -99,6 +100,6 @@ def main():
                 finally:path.write_text(original)
             for label,args in baselines:receipt['restored-'+label]=run(copy,'restored-'+label,args)
     finally:(REPORTS/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
-    print(f'Killed {len(mutants)} profile/admin mutations; eight baselines/restorations passed; copy removed')
+    print(f'Killed {len(mutants)} profile/admin mutations; ten baselines/restorations passed; copy removed')
 
 if __name__=='__main__':main()

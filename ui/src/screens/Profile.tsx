@@ -72,6 +72,7 @@ export function Profile({
       <span>{t(label)}</span>
       <input
         value={value[key]}
+        disabled={saving}
         placeholder={placeholder}
         maxLength={key === "name" ? 120 : 253}
         onChange={(event) => set(key, event.target.value)}
@@ -82,9 +83,15 @@ export function Profile({
   );
   return (
     <>
-      <Header title={vpn?.profile.name ?? t("newVpn")} back={back} t={t} />
+      <Header
+        title={vpn?.profile.name ?? t("newVpn")}
+        back={back}
+        backDisabled={saving}
+        t={t}
+      />
       <form
         className="profile-form"
+        aria-busy={saving}
         onSubmit={(event) => {
           event.preventDefault();
           if (canSave) {
@@ -112,6 +119,7 @@ export function Profile({
             <span>{t("type")}</span>
             <select
               value={value.kind}
+              disabled={saving}
               onChange={(event) =>
                 set("kind", event.target.value as VpnProfile["kind"])
               }
@@ -126,6 +134,7 @@ export function Profile({
               <span>{t("port")}</span>
               <input
                 type="number"
+                disabled={saving}
                 min={1}
                 max={65535}
                 value={value.port || ""}
@@ -140,6 +149,7 @@ export function Profile({
                 <span>{t("networks")}</span>
                 <input
                   value={networks}
+                  disabled={saving}
                   placeholder="10.20.0.0/24"
                   onChange={(event) => setNetworks(event.target.value)}
                 />
@@ -161,6 +171,7 @@ export function Profile({
             <span>{t("method")}</span>
             <select
               value={value.probeMethod}
+              disabled={saving}
               onChange={(event) =>
                 set(
                   "probeMethod",
@@ -176,6 +187,7 @@ export function Profile({
             <span>{t("tcpPort")}</span>
             <input
               type="number"
+              disabled={saving}
               min={1}
               max={65535}
               value={value.probePort || ""}
@@ -194,7 +206,7 @@ export function Profile({
                   label={t("psk")}
                   hint={t(vpn.hasPsk ? "stored" : "notStored")}
                 >
-                  <button type="button" onClick={secrets}>
+                  <button type="button" onClick={secrets} disabled={saving}>
                     {t(vpn.hasPsk ? "change" : "provide")}
                   </button>
                 </Row>
@@ -203,17 +215,24 @@ export function Profile({
                 label={t("password")}
                 hint={t(vpn.hasPassword ? "stored" : "notStored")}
               >
-                <button type="button" onClick={secrets}>
+                <button type="button" onClick={secrets} disabled={saving}>
                   {t(vpn.hasPassword ? "change" : "provide")}
                 </button>
               </Row>
             </Group>
           </>
         )}
-        <p className="hint">{t("saveRequiresAdmin")}</p>
+        <p className="hint" role="status">
+          {t(saving ? "adminPending" : "saveRequiresAdmin")}
+        </p>
         <div className="spread">
           {vpn ? (
-            <button type="button" className="danger" onClick={remove}>
+            <button
+              type="button"
+              className="danger"
+              onClick={remove}
+              disabled={saving}
+            >
               {t("removeVpn")}
             </button>
           ) : (

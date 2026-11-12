@@ -105,3 +105,32 @@ fn helper_replies_are_typed_and_incompatible_versions_are_reported() {
         .unwrap();
     assert!(matches!(decoded, Message::Accepted { id } if id == "r-1"));
 }
+
+#[test]
+fn administrative_readiness_requires_the_current_protocol_before_any_document() {
+    for version in [1, 999] {
+        let frame = format!(
+            "{{\"type\":\"admin_ready\",\"protocol_version\":{version},\"version\":\"0.1.0\"}}\n"
+        );
+        assert!(matches!(
+            protocol::read_message(&mut BufReader::new(frame.as_bytes())),
+            Err(ProtocolError::UnsupportedVersion)
+        ));
+    }
+    let mut bytes = Vec::new();
+    protocol::write_message(
+        &mut bytes,
+        &Message::AdminReady {
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        protocol::read_message(&mut BufReader::new(bytes.as_slice())),
+        Ok(Some(Message::AdminReady {
+            protocol_version: 2,
+            ..
+        }))
+    ));
+}

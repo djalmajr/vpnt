@@ -217,6 +217,9 @@ h2 {
   height: var(--switch-width);
 }
 .icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: var(--control-height);
   padding: var(--space-xs);
   background: transparent;

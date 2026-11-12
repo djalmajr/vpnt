@@ -9,8 +9,12 @@ f = s.makefile("rb",buffering=0)
 def send(value):
     s.sendall(json.dumps(value).encode() + b"\n")
 def changed(id, generation, state):
+    if generation>=states.get(id,dict(generation=0))["generation"]:
+        states[id]=dict(id=id,generation=generation,state=state)
+        with open(marker+".states","w") as out:json.dump(states,out)
     send(dict(type="changed", profile_id=id, generation=generation, state=state))
 profiles=[dict(id=id,name=id,kind="ssl",gateway="vpn.example.test",username="fictional",networks=["10.20.0.0/24"],port=443,certificate="",probeHost="10.20.0.15",probePort=8443,probeMethod="tcp") for id in ["one","two"]]
+states={p["id"]:dict(id=p["id"],generation=0,state="off") for p in profiles}
 waiting=[]
 s.settimeout(10)
 while True:
@@ -32,7 +36,15 @@ while True:
     if command["type"]=="snapshot":
         if mode=="malformed":
             s.sendall(b'{"type":"accepted","id":"wrong","password":"fictional"}\n');continue
-        send(dict(type="snapshot",id=request["id"],protocol_version=999 if mode=="protocol" else 1,version="old" if mode=="version" else "0.1.0",profiles=profiles,connections=[dict(id=p["id"],generation=0,state="connected" if mode=="unearned" else "off") for p in profiles]))
+        if os.path.exists(marker+".catalog"):
+            with open(marker+".catalog") as data:new_profiles=json.load(data)
+            old={p["id"]:p for p in profiles}
+            for p in new_profiles:
+                if p["id"] in old and p!=old[p["id"]]:
+                    current=states.get(p["id"],dict(generation=0))
+                    states[p["id"]]=dict(id=p["id"],generation=current["generation"]+1,state="off")
+            profiles=new_profiles
+        send(dict(type="snapshot",id=request["id"],protocol_version=999 if mode=="protocol" else 2,version="old" if mode=="version" else "0.1.0",profiles=profiles,connections=[dict(id=p["id"],generation=0,state="connected") if mode=="unearned" else states.get(p["id"],dict(id=p["id"],generation=0,state="off")) for p in profiles]))
     elif command["type"]=="connect":
         assert command["credentials"]["password"]=="fictional-client-secret"
         if mode=="exit":

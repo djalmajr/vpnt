@@ -38,7 +38,8 @@ export async function invoke(command: Command): Promise<Snapshot> {
   ].includes(command.type);
   const timeout = interactive ? 120000 : 10000;
   const id = `ui-${++sequence}`;
-  const body = JSON.stringify({ id, command });
+  const locale = document.documentElement.lang === "pt-BR" ? "pt-BR" : "en-US";
+  const body = JSON.stringify({ id, command, locale });
   const ipc = window.ipc;
   if (!ipc) {
     const response = await fetch("/api/command", {

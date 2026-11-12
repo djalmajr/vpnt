@@ -45,6 +45,8 @@ jobs:
           cargo +1.99.0 build --locked
       - name: Package unsigned development app
         run: python3 scripts/macos/package-app.py
+      - name: Build graphical askpass adapter without elevation
+        run: python3 scripts/macos/build-askpass.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
@@ -53,6 +55,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-broker.py
+      - name: Verify asynchronous administration negative oracles
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-admin-client.py
       - name: Verify helper channel negative oracles
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

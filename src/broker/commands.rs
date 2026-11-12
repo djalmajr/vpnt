@@ -58,6 +58,9 @@ impl<S: SecretStore> Broker<S> {
                 )?;
             }
             Command::SaveSecrets { id, password, psk } => {
+                if self.editing(&id) {
+                    return Err("admin_busy");
+                }
                 let c = self.connections.get_mut(&id).ok_or("not_found")?;
                 let credentials = Credentials { password, psk };
                 credentials
@@ -83,6 +86,9 @@ impl<S: SecretStore> Broker<S> {
     fn connect(&mut self, id: &str, reconnect: bool, expires: Instant) -> Result<(), &'static str> {
         if !self.ready {
             return Err("backend_unavailable");
+        }
+        if self.editing(id) {
+            return Err("admin_busy");
         }
         let c = self.connections.get_mut(id).ok_or("not_found")?;
         if c.view.profile.kind != VpnKind::Ssl {

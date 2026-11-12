@@ -67,14 +67,14 @@ def main():
     recovery="broker::tests::recovery::runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection"
     pacing="broker::tests::recovery::runtime_recovery_revalidates_every_snapshot_and_backs_off_on_unavailable_launchers"
     mutations=[
-        ("version-admission-omitted",model,lambda s:replace(s,'if version != env!("CARGO_PKG_VERSION") {','if false {'),denied,False),
+        ("version-admission-omitted","src/broker/snapshot.rs",lambda s:replace(s,'if version != env!("CARGO_PKG_VERSION") {','if false {'),denied,False),
         ("accepted-substitutes-traffic-proof",model,lambda s:replace(s,"p.accepted = true;","p.accepted = true; set_state(c, State::Connected);"),flow,False),
         ("stale-generation-invalidates-session",model,lambda s:replace(s,"                if generation < c.generation {\n                    return Ok(());\n                }\n",""),flow,False),
         ("disconnect-all-only-first-profile",commands,lambda s:replace(s,"for id in ids {","for id in ids.into_iter().take(1) {"),flow,False),
         ("probe-disconnects-tunnel",commands,lambda s:replace(s,"protocol::Command::Probe {","protocol::Command::Disconnect {"),flow,False),
         ("expired-keychain-result-starts-tunnel",commands,expiry,denied,False),
         ("process-exit-becomes-off",model,lambda s:replace(s,"set_state(connection, State::HelperMissing);","set_state(connection, State::Off);"),"broker::tests::helper_loss_removes_connected_indications_without_turning_process_exit_into_off",False),
-        ("initial-active-snapshot-accepted",model,lambda s:replace(s,"s.generation != 0 || s.state != State::Off","false"),"broker::tests::an_initial_connected_snapshot_is_rejected_before_any_credential_load",False),
+        ("initial-active-snapshot-accepted","src/broker/snapshot.rs",lambda s:replace(s,".any(|s| s.generation != 0 || s.state != State::Off)",".any(|_| false)"),"broker::tests::an_initial_connected_snapshot_is_rejected_before_any_credential_load",False),
         ("owned-helper-killed-during-cleanup",worker,lambda s:replace(s,"let waited = child.wait()","let _ = child.kill(); let waited = child.wait()"),cleanup,False),
         ("channel-fault-delayed-until-child-exit",worker,early_fault,"helper::client::tests::malformed_and_incompatible_replies_fail_the_channel_instead_of_becoming_snapshots",False),
         ("inherited-environment-reaches-helper",worker,lambda s:replace(s,"            .env_clear()\n",""),cleanup,False),

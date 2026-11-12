@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct Request {
     pub id: String,
     pub command: Command,
+    #[serde(default)]
+    pub locale: Option<crate::localization::Locale>,
 }
 
 #[derive(Deserialize)]

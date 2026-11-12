@@ -22,6 +22,7 @@ cargo test --locked --all-targets --all-features
 cargo test --locked --no-default-features
 cargo build --locked
 python3 scripts/macos/package-app.py --replace
+python3 scripts/macos/build-askpass.py
 ```
 
 O gate de tokens compara as 81 entradas mapeadas em `DESIGN.md` com o CSS.
@@ -207,7 +208,7 @@ restaurações cobrem filesystem, custódia, metadata e admin por socket. Fonte 
 build descartáveis; recibos/logs em `output/fixtures/profile-admin-oracles/`.
 O workflow macOS inclui essa matriz; sem execução remota nesta entrega.
 
-No estado final passaram 167 testes Rust com desktop/165 sem desktop, fmt,
+No checkpoint fc067b4 passaram 167 testes Rust com desktop/165 sem desktop, fmt,
 clippy all-targets/all-features -D warnings, build, pacote e cmp. Um teste de
 admissão do runtime preparado continua ignorado por padrão. Foram reexecutadas
 19 mutações de perfis/oito baselines, 12 do helper/seis e 67 de rotas/oito.
@@ -224,10 +225,110 @@ desatualizado e colisão Case/case foram executadas antes das respectivas
 correções. Falha incidental de compilação ao mover o harness foi corrigida e
 não conta como Red nem como mutação detectada.
 
-**Limites:** a UI/broker ainda não implementa SaveProfile/RemoveProfile nem o
-fluxo elevado e refresh correlacionado. Nada instalado, elevado, conectado ou
+**Limites daquele checkpoint:** a UI/broker ainda não implementava
+SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abaixo. Nada instalado, elevado, conectado ou
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
+
+## Administração assíncrona de perfis
+
+```bash
+cargo test --locked --no-default-features --lib helper::admin_client
+cargo test --locked --no-default-features --lib broker::admin
+cargo test --locked --all-features --lib desktop::worker
+python3 scripts/macos/build-askpass.py
+python3 scripts/macos/check-admin-client.py
+```
+
+[executed, native/process fixture] O ator produtivo recebe SaveProfile e
+RemoveProfile com o locale tipado, inicia um worker administrativo e conserva
+a correlação até a resposta final. Outros perfis continuam controláveis durante
+a autorização. O alvo em uso não abre prompt; conectar ou trocar segredos do
+alvo em edição retorna Busy. Não há atualização otimista do catálogo.
+
+O comando preparado é somente `/usr/bin/sudo -A -k --
+/Library/PrivilegedHelperTools/dev.vpnt.helper admin`, com helper/askpass
+root verificados, ambiente reduzido, cwd fixo e socketpair duplex em FD 0.
+O protocolo 2 anuncia AdminReady antes da leitura. O cliente espera versão de
+protocolo/app compatível antes de enviar um documento e EOF. Recusa ID errado,
+duplicata, resposta excessiva, versão incompatível, prazo e exit status não zero.
+Erros chegam antes do reap; sucesso só após EOF e espera do próprio filho.
+Fechar/expirar não mata o helper nem repete o documento após autorização tardia.
+
+Depois do reap, o broker solicita um snapshot correlacionado no canal runtime.
+Preserva gerações locais mais recentes e só confirma a mudança que aparece no
+catálogo. Remover credenciais exige confirmação da ausência do perfil e recibo
+bem-sucedido. Se o chaveiro falhar depois disso, retorna `secret_cleanup_failed`:
+o perfil já foi removido; o resultado é parcial. Perda do runtime invalida sucesso.
+Uma operação incerta mantém a edição bloqueada até conseguir reler o catálogo;
+a falha reportada não comprova rollback ou conclusão do cleanup.
+
+[executed, build/static rejection] O askpass AppKit separado é compilado com
+warnings como erros, sem dependências Rust novas. Compartilha os quatro textos
+pt-BR/en-US em `ui/src/locales/native.json`. Antes de mostrar UI exige usuário
+comum, stdout pipe, pai `/usr/bin/sudo` com identidade de início preservada,
+locale fechado e deadline monotônico. O diálogo preparado usa campo de senha,
+Cancel/Escape e observa prazo/saída do pai. Escreve apenas no pipe do sudo e
+apaga o buffer mutável; objetos temporários do AppKit não são uma prova de
+apagamento de toda memória. Invocação direta por pai não autorizado foi
+recusada com exit 1, sem UI/stdout/stderr. Nenhum prompt ou PAM real foi executado.
+
+`-k` ignora o cache quando a política pede autenticação; não sobrepõe NOPASSWD.
+A futura regra admin precisa exigir PASSWD, preservar FD 0 e desativar PTY e
+registro de entrada/saída. Esses requisitos ainda não foram instalados nem
+provados. Referências primárias: [sudo](https://github.com/sudo-project/sudo/blob/main/docs/sudo.man.in)
+e [sudoers](https://github.com/sudo-project/sudo/blob/main/docs/sudoers.man.in).
+
+[executed, native Keychain] O novo teste do ator atravessa parse_request, fila
+real, broker, clientes e dois subprocessos fictícios. Um probe de outro perfil
+responde antes da autorização administrativa; salvar aguarda o filho e o
+snapshot novo. O segredo vem de uma base descartável do Security.framework e
+não aparece no snapshot. Exclusão da base, chaveiro padrão e lista de busca
+foram conferidos; não houve uso de credenciais ou VPN pessoais.
+
+[executed] A suíte final passou com 182 testes Rust com desktop e 179 sem
+desktop; um teste de admissão do runtime permanece ignorado por padrão. Fmt,
+clippy all-targets/all-features com -D warnings, build, pacote e cmp passaram.
+UI: lint, typecheck, oito testes Bun/114 assertions e 81 tokens passaram;
+o gate de classes segue sem regras. Build do runtime C não foi repetido.
+
+Foram executadas 17 mutações administrativas/seis baselines, 24 do broker/UI/
+oito baselines, 13 do helper/seis, 20 de perfis/dez, 67 de rotas/oito e 16 de
+supervisão PPP/duas. Cada mutação precisa da falha prevista no consumidor;
+erro de compilação, âncora alterada ou timeout incidental não conta. Os 148
+hashes src/tests/catálogos conferem com helper/perfis/rotas/PPP. Os inventários
+de 170 arquivos do broker/admin diferem da fonte final apenas em common.tsx,
+cujo ajuste posterior conserva o foco no diálogo ocupado; esses oráculos não
+renderizam esse componente. A prova de navegador abaixo cobre o ajuste final.
+Recibos em output/fixtures/*-oracles; arquivos anteriores preservados em
+*-before-async-admin/ e *-before-icon-alignment/.
+
+A execução paralela revelou Busy após liberar a reserva. A hipótese de uma
+referência herdada durante fork motivou reprodução determinística com descritor
+duplicado: o teste falhou antes e passou após LOCK_UN explícito no Drop. O inode
+persiste, e unwind do worker continua sem liberar uma reserva conservada pelo
+controlador. O erro inicial de importação do teste não conta como Red. A matriz
+remove LOCK_UN e exige novamente essa assertion executada.
+
+[executed, browser simulated] O build final foi operado no navegador isolado
+em pt-BR/en-US, claro/escuro e viewports 420/280: oito combinações. O painel
+mediu 320/280 px, botão de voltar 24 px, sem overflow horizontal. Durante Save,
+campos e navegação ficam indisponíveis; recusa restaura os controles sem sair.
+Durante Remove, Escape não fecha a confirmação, o foco permanece no diálogo e
+retorna ao botão original ao cancelar após a falha. Os 16 pedidos capturados
+levaram o locale correto. Save bem-sucedido na API demo voltou às Preferências.
+Capturas representativas dos dois temas/idiomas/larguras foram inspecionadas.
+A medição encontrou o descender do SVG alterando a altura do ícone; inline-flex
+corrigiu o alinhamento. Desabilitar controles retirava o foco do diálogo; agora
+o próprio diálogo recebe foco durante a espera. Os erros iniciais de seletor
+traduzido e de chamada do CLI não foram falhas do produto. Script, recibo com
+hashes da UI final e 16 capturas: output/playwright/admin-*. Respostas lentas/
+recusadas foram injetadas no browser, sem prompt macOS ou VPN real.
+
+[partial] Installer/remoção, política sudoers e admissão instalada continuam
+pendentes. Não houve sudo, elevação, instalação, system pppd, interface/rota
+nova, gateway, VPN real ou publicação. Askpass nativo, tray/WKWebView, driver
+IPsec, teste de tráfego/cleanup real, revisão final e CI remoto continuam abertos.
 
 ## Cliente do helper e broker normal
 
@@ -314,9 +415,9 @@ com esses consumidores, catálogos, layout e dependências inalterados. Helper/
 controlador foram depois reexecutados acima. PPP/runtime C conservam seus
 checkpoints históricos; o runtime C não foi reconstruído nesta rodada.
 
-**Limites:** SaveProfile/RemoveProfile/InstallHelper/RemoveHelper seguem sem
-implementação no broker. Faltam integração administrativa,
-installer/sudoers e admissão instalada. Só SSL tem despacho preparado; IPsec falta.
+**Limites daquele checkpoint:** SaveProfile/RemoveProfile ainda faltavam; foram
+ligados na etapa administrativa abaixo. InstallHelper/RemoveHelper,
+installer/sudoers e admissão instalada permanecem pendentes. Só SSL tem despacho preparado; IPsec falta.
 Nenhum teste executou sudo/elevação, pppd do sistema, interface/rota nova ou VPN.
 Lançar o .app em demo não forneceu prova visual: CUA reiniciou duas vezes e o
 fallback de clique retornou -25200. Isso é limite do driver, sem concluir falha

@@ -43,11 +43,13 @@ export function Icon({
 export function Header({
   title,
   back,
+  backDisabled = false,
   action,
   t,
 }: {
   title: string;
   back?: () => void;
+  backDisabled?: boolean;
   action?: ReactNode;
   t: T;
 }) {
@@ -58,6 +60,7 @@ export function Header({
           type="button"
           className="icon-button"
           onClick={back}
+          disabled={backDisabled}
           aria-label={t("back")}
         >
           <Icon name="back" />
@@ -125,11 +128,13 @@ export function Dialog({
   title,
   children,
   close,
+  busy = false,
   t,
 }: {
   title: string;
   children: ReactNode;
   close: () => void;
+  busy?: boolean;
   t: T;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
@@ -143,18 +148,23 @@ export function Dialog({
         previous.focus({ preventScroll: true });
     };
   }, []);
+  useLayoutEffect(() => {
+    if (busy) ref.current?.focus({ preventScroll: true });
+  }, [busy]);
   return (
     <dialog
       ref={ref}
+      tabIndex={-1}
       onCancel={(event) => {
         event.preventDefault();
-        close();
+        if (!busy) close();
       }}
       aria-label={title}
+      aria-busy={busy}
     >
       <h2>{title}</h2>
       {children}
-      <button type="button" className="sr-only" onClick={close}>
+      <button type="button" className="sr-only" onClick={close} disabled={busy}>
         {t("close")}
       </button>
     </dialog>

@@ -91,13 +91,13 @@ def main():
         ("host-foreign-parent-accepted", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "(parent != 0 && value.parent != parent)", "false")),
         ("host-eof-substitutes-child-exit", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "self.proof.as_ref().map_or(Ok(true), |proof| proof.exited())", "Ok(true)")),
     ]
-    receipt = {"sourceSha256": {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for prefix in ["src", "tests"] for path in sorted((ROOT / prefix).rglob("*")) if path.is_file()}}
+    receipt = {"sourceSha256": {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for prefix in ["src", "tests", "ui/src/locales"] for path in sorted((ROOT / prefix).rglob("*")) if path.is_file()}}
     try:
         with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
             copy = Path(temporary)
             for file in ["Cargo.toml", "Cargo.lock"]:
                 shutil.copy2(ROOT / file, copy / file)
-            for folder in ["src", "tests", "scripts/macos/patches"]:
+            for folder in ["src", "tests", "scripts/macos/patches", "ui/src/locales"]:
                 shutil.copytree(ROOT / folder, copy / folder)
             shutil.copy2(ROOT / "scripts/macos/check-ppp-supervisor.py", copy / "scripts/macos/check-ppp-supervisor.py")
             cache = copy / "target/runtime-sources"

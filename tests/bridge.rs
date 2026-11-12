@@ -29,3 +29,21 @@ fn malformed_or_ambiguous_requests_are_rejected_before_dispatch() {
     let request = parse_request(r#"{"id":"a","command":{"type":"get_snapshot"}}"#).unwrap();
     assert!(matches!(request.command, Command::GetSnapshot {}));
 }
+
+#[test]
+fn authorization_locale_is_typed_and_uses_the_shared_catalogs() {
+    use vpnt::localization::Locale;
+    for (code, locale, confirm) in [
+        ("pt-BR", Locale::PtBr, "Autorizar"),
+        ("en-US", Locale::EnUs, "Authorize"),
+    ] {
+        let body = format!(r#"{{"id":"a","command":{{"type":"get_snapshot"}},"locale":"{code}"}}"#);
+        let request = parse_request(&body).unwrap();
+        assert_eq!(request.locale, Some(locale));
+        assert_eq!(request.locale.unwrap().native().auth_confirm, confirm);
+    }
+    for code in ["pt-br", "en", "en-US\n", "/tmp/catalog.json"] {
+        let body = serde_json::json!({"id":"a","command":{"type":"get_snapshot"},"locale":code});
+        assert!(parse_request(&body.to_string()).is_err());
+    }
+}

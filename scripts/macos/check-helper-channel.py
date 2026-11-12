@@ -44,6 +44,7 @@ def main():
     modes = tests + "only_closed_modes_and_connected_unix_stream_capabilities_are_admitted"
     admin = tests + "half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_document"
     mutations = [
+        ("admin-readiness-omitted", server, lambda s: replace(s, "    send(\n        &mut stream,\n        &Message::AdminReady {\n            protocol_version: protocol::VERSION,\n            version: env!(\"CARGO_PKG_VERSION\").into(),\n        },\n    )?;\n", ""), tests + "admin_announces_readiness_before_receiving_an_operation"),
         ("extra-mode-arguments-accepted", server, lambda s: replace(s, "[arg] if arg ==", "[arg, ..] if arg ==", 2), modes),
         # On Darwin, getpeereid also rejects datagrams. Omitting SO_TYPE alone
         # is equivalent in these consumers; do not count it as a killed mutation.
@@ -59,13 +60,13 @@ def main():
         ("admin-silence-deadline-extended", io, lambda s: replace(s, "const DEADLINE: Duration = Duration::from_secs(5)", "const DEADLINE: Duration = Duration::from_secs(30)"), tests + "an_admin_channel_kept_open_in_silence_expires_without_applying_an_operation"),
         ("consumed-password-bytes-retained", io, lambda s: replace(s, "self.buffer[self.head..end].zeroize();", "let _ = &self.buffer[self.head..end];"), "helper::server::io::tests::consumed_secret_bytes_are_erased_without_corrupting_the_next_buffered_frame"),
     ]
-    receipt = {"sourceSha256": {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}}
+    receipt = {"sourceSha256": {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests", "ui/src/locales"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}}
     try:
         with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
             copy = Path(temporary)
             for file in ["Cargo.toml", "Cargo.lock"]:
                 shutil.copy2(ROOT / file, copy / file)
-            for folder in ["src", "tests", "scripts/macos/patches"]:
+            for folder in ["src", "tests", "scripts/macos/patches", "ui/src/locales"]:
                 shutil.copytree(ROOT / folder, copy / folder)
             baselines = [("transport", ["--lib", "helper::server"]), ("controller", ["--lib", "inherited_helper_channel"]), ("entrypoint", ["--test", "helper_entrypoint"])]
             for label, selector in baselines:

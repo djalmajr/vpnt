@@ -45,7 +45,8 @@ do usuário. O cliente preparado verifica o executável fixo e invoca somente
 `sudo -n -- /Library/PrivilegedHelperTools/dev.vpnt.helper runtime`, com canal
 duplex anônimo herdado em FD 0. Nenhum helper ou sudoers é instalado pelo app
 atual: sem esses pré-requisitos ele apresenta o primeiro uso. Cadastro/remoção
-de perfis e instalação/remoção do helper ainda estão em desenvolvimento.
+de perfis usa o canal administrativo separado descrito abaixo. Instalação e
+remoção do helper ainda estão em desenvolvimento.
 Essa ligação está compilada e testada com um subprocesso fictício, sem execução
 de sudo, elevação ou conexão VPN real.
 
@@ -62,12 +63,15 @@ Para criar um pacote de desenvolvimento local, sem instalar:
 
 ```bash
 python3 scripts/macos/package-app.py
+python3 scripts/macos/build-askpass.py
 open target/vpnt.app --args --demo --show
 ```
 
 O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
 `--replace` para substituir um pacote anterior do vpnt nesse destino. Isso não
 instala programas de VPN, componentes privilegiados ou regras do sudoers.
+O askpass é produzido separadamente em `target/debug/vpnt-askpass`, sem instalar
+ou executar sudo. O build só verifica sua recusa a um pai não autorizado.
 Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
 Os clientes VPN também podem ser preparados em um runtime separado, ainda sem
@@ -176,7 +180,18 @@ O cliente fecha o socket e aguarda seu filho próprio sem matá-lo; a falha cheg
 novo com intervalo crescente de um a 30 segundos. Exige novo snapshot e uma
 nova ação para conectar, sem repetir operações ou recarregar credenciais.
 O lock do helper continua exigido: saída do launcher não prova cleanup de rede.
-O fluxo administrativo da UI e seu consumo desses snapshots ainda faltam.
+Salvar/remover perfis usa outro worker e um único comando fixo:
+`sudo -A -k -- /Library/PrivilegedHelperTools/dev.vpnt.helper admin`.
+O cliente valida helper e askpass em paths root fixos. O adaptador gráfico
+AppKit usa os mesmos catálogos pt-BR/en-US da UI; a senha da conta só vai para
+o pipe privado do sudo. O protocolo 2 exige AdminReady compatível antes de enviar
+um documento com EOF; pedidos expirados não são repetidos após autorização tardia.
+A UI continua atendendo comandos de outros perfis. Sucesso exige saída do filho
+próprio e snapshot correlacionado no runtime. Só depois da remoção confirmada
+são apagados os segredos; falha no chaveiro é reportada como resultado parcial.
+Nenhuma dessas provas usa autenticação real. `-k` ignora o cache quando a política
+exige senha; a futura regra administrativa deve exigir PASSWD. PTY e registro
+de IO ainda precisam ser configurados e validados na instalação.
 A prova nativa atual do chaveiro usa uma base descartável
 com credenciais fictícias enviadas ao peer de teste, sem usar VPN pessoal.
 

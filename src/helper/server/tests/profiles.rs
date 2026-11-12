@@ -34,7 +34,7 @@ impl Fixture {
                 apply_admin(&ProfileStore::open(root, uid).unwrap(), request)
             })
         });
-        let mut c = client(b);
+        let mut c = admin_client(b);
         protocol::write_admin_request(
             c.get_mut(),
             &protocol::AdminRequest {
