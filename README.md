@@ -185,9 +185,13 @@ A primeira parte do controle IPsec reserva `reqid` na faixa manual Darwin de
 A reserva só é
 liberada quando o observador confirma produtor encerrado e recursos ausentes;
 drop ou resposta VICI não comprovam esse estado. Senha e PSK entram apenas nas
-mensagens `load-shared` em memória. Esses contratos ainda não estão ligados
-ao processo charon ou ao observador SA/SPD nativo. O helper continua recusando
-conexão IPsec até completar driver, prova de tráfego e cleanup.
+mensagens `load-shared` em memória. O produtor nativo preparado cria uma admissão
+privada antes do spawn, confere o processo original e o peer PID/UID do socket,
+e conserva tentativas incertas após encerramento. Seus testes executam um
+programa C fictício; o parser original do strongSwan verifica separadamente a
+configuração gerada, sem executar charon. Ainda faltam observador SA/SPD,
+recuperação de claims, endereço virtual, tráfego e cleanup integrados ao driver.
+O helper continua recusando conexão IPsec até completar essa integração.
 
 O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-routes.patch)
 impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver

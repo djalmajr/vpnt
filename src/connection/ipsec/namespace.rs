@@ -16,6 +16,11 @@ const MAX_MANUAL_REQID: u16 = 0x3fff;
 pub trait Observer {
     fn occupied(&mut self) -> Result<BTreeSet<u32>, Error>;
     fn producer_stopped(&mut self, owner: &Owner) -> Result<bool, Error>;
+    /// Called only after stopped + a fresh clear observation. A native observer
+    /// must durably complete its admission before the in-memory slot is freed.
+    fn completed(&mut self, _owner: &Owner, _reqid: u16) -> Result<(), Error> {
+        Ok(())
+    }
 }
 /// No Clone/Deserialize/Drop release: an uncertain producer retains its slot.
 #[derive(Debug)]
@@ -119,6 +124,8 @@ impl<N: Observer> Registry<N> {
             return Err(Error::Busy);
         }
         self.ensure_clear(reservation)?;
+        self.observer
+            .completed(&reservation.owner, reservation.reqid)?;
         self.entries.remove(&reservation.reqid);
         Ok(())
     }

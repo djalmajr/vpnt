@@ -2,7 +2,7 @@
 //! not VPN route/SA cleanup; each driver must verify its own tunnel resources.
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -21,6 +21,7 @@ pub struct ManagedChild {
 pub(crate) enum Environment {
     System,
     PrivateVpn,
+    Charon(PathBuf),
 }
 
 impl ManagedChild {
@@ -35,6 +36,13 @@ impl ManagedChild {
         environment: Environment,
     ) -> io::Result<Self> {
         Self::spawn_configured(command, environment, false)
+    }
+    pub(crate) fn spawn_charon(command: &mut Command, configuration: &Path) -> io::Result<Self> {
+        Self::spawn_configured(
+            command,
+            Environment::Charon(configuration.to_owned()),
+            false,
+        )
     }
 
     /// PPP already owns a PTY supplied by its admitted parent. Preserve only
@@ -60,7 +68,10 @@ impl ManagedChild {
             .env("LANG", "C")
             .env("LC_ALL", "C")
             .current_dir("/");
-        if matches!(environment, Environment::PrivateVpn) {
+        if matches!(
+            environment,
+            Environment::PrivateVpn | Environment::Charon(_)
+        ) {
             let runtime = super::paths::runtime_directory();
             command
                 .env("OPENSSL_CONF", "/dev/null")
@@ -68,7 +79,13 @@ impl ManagedChild {
                 .env("OPENSSL_ENGINES", runtime.join("lib/engines"))
                 .env("SSL_CERT_FILE", runtime.join("certs/ca-bundle.pem"));
         }
-        if terminal {
+        if let Environment::Charon(configuration) = environment {
+            command
+                .env("STRONGSWAN_CONF", configuration)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        } else if terminal {
             command
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())

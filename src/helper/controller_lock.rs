@@ -32,6 +32,9 @@ pub struct ControllerLock {
 }
 
 impl ControllerLock {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
     /// Fixed production location; no owner/path comes from IPC. This does not
     /// create directories or a lock file, and never changes their permissions.
     pub fn acquire() -> Result<Self, LockError> {

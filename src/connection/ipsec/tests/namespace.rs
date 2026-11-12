@@ -104,3 +104,77 @@ fn the_profile_capacity_is_bounded_without_reusing_dropped_or_unconfirmed_reserv
         Err(Error::Exhausted)
     ));
 }
+
+// Mutations: omit durable completion, free the slot before it succeeds, or
+// finalize before fresh absence and original producer exit are both observed.
+#[test]
+fn durable_completion_follows_both_observations_and_failure_keeps_the_slot_exclusive() {
+    #[derive(Default)]
+    struct State {
+        stopped: bool,
+        occupied: BTreeSet<u32>,
+        fail: bool,
+        calls: Vec<&'static str>,
+    }
+    struct Completion(Arc<Mutex<State>>);
+    impl Observer for Completion {
+        fn occupied(&mut self) -> Result<BTreeSet<u32>, Error> {
+            let mut s = self.0.lock().unwrap();
+            s.calls.push("occupied");
+            Ok(s.occupied.clone())
+        }
+        fn producer_stopped(&mut self, _: &Owner) -> Result<bool, Error> {
+            let mut s = self.0.lock().unwrap();
+            s.calls.push("stopped");
+            Ok(s.stopped)
+        }
+        fn completed(&mut self, o: &Owner, id: u16) -> Result<(), Error> {
+            assert_eq!(*o, owner("Case", 1));
+            assert_eq!(id, 0x3fff);
+            let mut s = self.0.lock().unwrap();
+            s.calls.push("completed");
+            if s.fail {
+                Err(Error::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut registry = Registry::new(Completion(state.clone()));
+    let reservation = registry.reserve(owner("Case", 1)).unwrap();
+    state.lock().unwrap().calls.clear();
+    assert_eq!(registry.release(&reservation), Err(Error::Busy));
+    assert_eq!(state.lock().unwrap().calls, ["stopped"]);
+    {
+        let mut s = state.lock().unwrap();
+        s.stopped = true;
+        s.occupied.insert(0x3fff);
+        s.calls.clear();
+    }
+    assert_eq!(registry.release(&reservation), Err(Error::Busy));
+    assert_eq!(state.lock().unwrap().calls, ["stopped", "occupied"]);
+    {
+        let mut s = state.lock().unwrap();
+        s.occupied.clear();
+        s.fail = true;
+        s.calls.clear();
+    }
+    assert_eq!(registry.release(&reservation), Err(Error::Unavailable));
+    assert_eq!(
+        state.lock().unwrap().calls,
+        ["stopped", "occupied", "completed"]
+    );
+    assert_eq!(registry.validate(&reservation), Ok(()));
+    assert!(matches!(
+        registry.reserve(owner("Case", 2)),
+        Err(Error::Busy)
+    ));
+    state.lock().unwrap().fail = false;
+    registry.release(&reservation).unwrap();
+    assert_eq!(registry.validate(&reservation), Err(Error::Changed));
+    assert_eq!(
+        registry.reserve(owner("Case", 2)).unwrap().reqid(),
+        reservation.reqid()
+    );
+}

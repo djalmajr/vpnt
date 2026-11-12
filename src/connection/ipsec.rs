@@ -3,10 +3,14 @@
 mod config;
 mod control;
 mod namespace;
+#[cfg(target_os = "macos")]
+mod producer;
 mod snapshot;
 pub use config::Config;
 pub use control::{Control, Peer, Phase};
 pub use namespace::{Observer, Registry, Reservation};
+#[cfg(target_os = "macos")]
+pub use producer::{KernelClaims, NativeContext, NativeObserver, NativePeer};
 pub use snapshot::Candidate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +24,7 @@ pub enum Error {
     Timeout,
     Incompatible,
     Rejected,
+    PermissionDenied,
 }
 
 #[cfg(test)]

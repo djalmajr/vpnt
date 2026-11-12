@@ -76,7 +76,76 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## IPsec: controle VICI e snapshots
+## IPsec: produtor nativo e admissão durável (B1)
+
+```bash
+cargo test --locked --no-default-features --lib connection::ipsec
+python3 scripts/macos/check-ipsec-producer.py
+# Requer os artefatos locais verificados de build-runtime.py; não instala:
+python3 scripts/macos/check-charon-config.py
+```
+
+[PASS, native process/socket/filesystem fixture] Oito testes do produtor usam
+um executável Mach-O C fictício, sem charon ou VPN. NativeContext produtivo
+recusa usuário comum antes de criar estado; somente cfg(test) admite o runtime
+do fixture. Configuração conserva o selo da reserva. Claim privado e configuração
+sem segredos são escritos e sincronizados antes do primeiro spawn. O observador
+inclui claims não representados após recriar o contexto; Drop/exit não os apagam.
+Isso prova retenção conservadora, sem implementar ainda recuperação após crash.
+
+O produtor confere processo original por PID/nascimento/pai/UID/executável,
+socket privado por inode/modo/ACL e peer PID/UID obtidos do kernel. O PIDfile
+nunca autoriza sinais ou posse. Alteração de configuração, inode ou permissão
+recusa IO, mas ainda encerra o próprio Child. Prazo/cancelamento mantêm esse
+filho vivo até retirement explícito. O socket preexistente permanece intacto
+e a admissão continua Prepared, sem filho. A máquina persistente não retorna
+a uma tentativa anterior. Uma falha do gancho de conclusão durável conserva
+a reserva; seu teste verifica a ordem stopped, observação nova, conclusão.
+As observações SA/SPD/rotas/VIP ainda são injetadas, não leituras nativas.
+
+[PASS, original settings parser] Dois casos compilam o renderer e validador
+de caminhos produtivos, depois carregam a saída pelo parser da libstrongswan
+6.1.0 preparada. O script confere o arquivo fonte fixado e registra hashes
+da biblioteca estática/config.h/crypto preparados, sem carregar plugins ou
+executar charon. Verifica caminhos com espaços, PID/socket próprios, portas
+aleatórias, plugins fixos e ausência de rotas/VIP automáticos. Ausência dos
+artefatos é erro, nunca skip silencioso. Gate local separado do workflow:
+o job normal ainda não prepara essa biblioteca estática.
+
+[PASS, pinned native consumers] A mudança em ManagedChild foi revalidada por
+12 cenários do leitor C de senha e 25 cenários de supervisão PPP/forkpty/exec,
+com valores e programas fictícios. Nenhum system pppd, interface ou rota criada.
+Logs em output/fixtures/ipsec-producer-{pinentry,ppp,settings}.log.
+
+[PASS, negative oracles] Trinta mutações detectadas por assertions executadas
+nos testes previstos, com baseline/restauração em cópia descartável. Os 230
+hashes de entrada conferem. A primeira rodada deixou escapar o gate do socket
+preexistente; exigir Prepared/child ausente tornou a falha discriminante.
+Recibos/logs finais em output/fixtures/ipsec-producer-oracles/; a primeira
+rodada e a matriz anterior à barreira de cancelamento foram preservadas.
+O workflow inclui a matriz do produtor, sem execução remota.
+
+[PASS, local] 265 testes Rust com desktop e 261 sem desktop; dois ignored
+(runtime opcional e harness de crash exercitado pelo pai). As suítes completas
+passaram em sequência. A primeira execução simultânea falhou em arranque/prazo
+do fixture; logs em ipsec-producer-{desktop,core}-concurrent-failure.log.
+Os oito casos passaram isolados, e a barreira de cancelamento passou a esperar
+a inicialização real do filho fictício. O teste explícito de prazo continua
+em 150 ms sobre esse mesmo filho, sem reiniciar a tentativa. Fmt/clippy
+all-targets/all-features -D warnings, build Rust e sintaxe Python/YAML passaram. Logs em
+output/fixtures/ipsec-producer-*; nenhum benchmark de performance executado.
+UI/tokens/catálogos mantêm os checkpoints anteriores, sem nova prova visual;
+as matrizes A1/A2/transporte não foram repetidas nesta B1.
+
+[NOT RUN] Daemon charon, observador SAD/SPD nativo, recuperação/conclusão de
+claims após crash, leases de VIP/rotas, origem/probe e Factory/dispatch IPsec.
+Antes de habilitar IPsec, instalação/remoção também deve recusar claims
+pendentes, inclusive após perda do controlador. install_virtual_ip=no deixa
+o endereço sob responsabilidade futura do helper; não foi provado um VIP.
+Nenhuma instalação, elevação, configuração de VPN ou publicação. O .app/payload
+conservado continua em 692489d; UI/catálogos/dependências/patches não mudaram.
+
+## IPsec: controle VICI e snapshots (checkpoint A2, bb01b21)
 
 ```bash
 cargo test --locked --no-default-features --lib connection::ipsec
