@@ -3,6 +3,7 @@ use std::path::PathBuf;
 pub const HELPER: &str = "/Library/PrivilegedHelperTools/dev.vpnt.helper";
 pub const PINENTRY: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pinentry";
 pub const USERS: &str = "/Library/Application Support/vpnt/users";
+pub const STATE: &str = "/Library/Application Support/vpnt";
 
 pub fn runtime_directory() -> PathBuf {
     PathBuf::from("/Library/PrivilegedHelperTools/dev.vpnt.runtime").join(env!("CARGO_PKG_VERSION"))

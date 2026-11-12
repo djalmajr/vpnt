@@ -110,6 +110,18 @@ def main():
         ("probe-dns-unscoped", "src/connection/macos/resolve.rs",
          lambda s: replace_once(s, "    if index == 0 {\n        return Err(Error::Invalid);\n    }\n", ""),
          ["--lib", "native_localhost_queries"]),
+        ("controller-flock-bypassed", "src/helper/controller_lock.rs",
+         lambda s: replace_once(s, "unsafe { libc::flock(guard.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0", "false"),
+         ["--lib", "independent_process_cannot_enter"]),
+        ("controller-inode-identity-ignored", "src/helper/controller_lock.rs",
+         lambda s: replace_once(s, " || named.dev() != opened.dev() || named.ino() != opened.ino()", ""),
+         ["--lib", "replaced_inode_and_changed_permissions"]),
+        ("controller-acl-ignored", "src/helper/controller_lock.rs",
+         lambda s: replace_once(s, "        crate::fs_permissions::check_file(&self.file, true)\n            .map_err(|_| LockError::UntrustedPath)?;\n", ""),
+         ["--lib", "an_extended_acl_cannot_expose"]),
+        ("controller-hardlink-accepted", "src/helper/controller_lock.rs",
+         lambda s: replace_once(s, "        || metadata.nlink() != 1\n", ""),
+         ["--lib", "absent_special_linked_or_exposed_lock"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -125,8 +137,10 @@ def main():
                 shutil.copytree(ROOT / path, copy / path)
             tests = ["--test", "route_flow", "--test", "route_leases"]
             native = ["--lib", "connection::macos"]
+            lock = ["--lib", "helper::controller_lock"]
             receipt["baseline-policy"] = run(copy, "baseline-policy", tests, 0)
             receipt["baseline-native-read"] = run(copy, "baseline-native-read", native, 0)
+            receipt["baseline-controller-lock"] = run(copy, "baseline-controller-lock", lock, 0)
             for name, path, mutation, arguments in mutations:
                 file = copy / path
                 original = file.read_text()
@@ -137,6 +151,7 @@ def main():
                     file.write_text(original)
             receipt["restored-policy"] = run(copy, "restored-policy", tests, 0)
             receipt["restored-native-read"] = run(copy, "restored-native-read", native, 0)
+            receipt["restored-controller-lock"] = run(copy, "restored-controller-lock", lock, 0)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"Killed {len(mutations)} mutations; copy removed. Reports: {REPORTS.relative_to(ROOT)}")

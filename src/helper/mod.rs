@@ -1,4 +1,6 @@
 #[cfg(unix)]
+pub mod controller_lock;
+#[cfg(unix)]
 mod local_socket;
 pub mod paths;
 pub mod pinentry;

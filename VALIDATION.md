@@ -75,6 +75,30 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
+## Exclusão entre controladores
+
+```bash
+cargo test --locked --no-default-features --lib helper::controller_lock
+```
+
+São cinco testes locais no macOS. Um processo Python independente tenta o
+mesmo `flock` e deve receber ocupado até o handle Rust sair do escopo; depois
+consegue adquirir. Conferir CLOEXEC, inode/conteúdo preservados após fechar,
+troca do arquivo e mudança de modo detectadas, proprietário incorreto, arquivo
+ausente, diretório exposto, link/hardlink/FIFO e ACL de leitura recusados.
+Somente arquivos de `output/fixtures/` são criados/modificados. A fábrica
+produtiva deve recusar o usuário comum antes de abrir o estado instalado.
+
+Produção exige root e o arquivo persistente `.controller.lock` em
+`/Library/Application Support/vpnt`, preparado pela futura instalação com
+diretório `0700` e arquivo `0600`, ambos root. A fábrica não cria, substitui,
+apaga ou corrige permissões. O instalador/atualizador deve preservar o inode
+existente. O controlador deverá manter o handle durante todas as gerações e
+o cleanup pendente, não só durante o despacho de um comando. Isso limita
+controladores cooperantes; não impede outro processo root de alterar rotas,
+nem é uma prova de ownership do kernel. Integração e execução privilegiada
+ainda pendentes; nenhum lock real foi criado nesta máquina.
+
 ## Runtime privado dos clientes
 
 ```bash
@@ -293,12 +317,16 @@ compilação não contam como mutações detectadas. A mutação de opcode execu
 **somente o teste puro do codec**, sem enviar o opcode alterado a um socket de
 rotas. As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 16 mutações, incluindo remoção do vínculo de perfil da saída SSL e
-aceitação indevida de DNS sem escopo para probe. As baselines nativas incluem
+São 20 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
+de inode, ACL ou checagem de hardlink do controlador. As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
+Baseline e restauração também executam os cinco testes do lock. O processo
+Python independente detecta a mutação que omite o flock; bookkeeping interno
+não basta para satisfazer o teste.
 O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
 
-Backend privilegiado de escrita, lock global entre helpers, recibos de criação
+Backend privilegiado de escrita, consumo do lock global, recibos de criação
 reais e integração helper/UI continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
 seleciona a chave destino/máscara/escopo, sem comparação atômica dos atributos
 observados antes. O backend deverá lidar com alterações concorrentes e identidade

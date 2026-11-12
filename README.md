@@ -109,8 +109,11 @@ O controle de rotas tem um coordenador de leases por UID, perfil e geração,
 com compartilhamento, conflitos exatos, extensão após PPP e rollback. O plano
 de túnel completo usa pares `/1` e bloqueia a família IP sem suporte. A leitura
 nativa consulta a tabela e faz somente `RTM_GET`; os testes de aplicação e
-remoção usam um kernel simulado. Backend de escrita, lock global, confirmação
-de recursos nativos e ligação ao controlador/helper ainda precisam ser entregues.
+remoção usam um kernel simulado. O lock global do controlador tem testes de
+exclusão real entre processos e validação de inode/permissões/ACL; a fábrica
+produtiva exige root e um arquivo persistente preparado pela instalação.
+Ainda falta consumi-lo no controlador/helper. Backend de escrita e confirmação
+de recursos nativos continuam pendentes.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
