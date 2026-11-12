@@ -163,9 +163,12 @@ com um payload fictício no lugar de `/usr/sbin/pppd`. Esse componente
 já está ligado ao runtime e ao controlador preparados, mas não está instalado.
 O receptor autentica UID, programa, pai e identidade nativa antes de conceder
 cada permissão; EOF ou recibo final não substituem os watches de saída.
-O runtime recompilado exige o patch e o hash desse caminho fixo. A auditoria
-das opções/scripts globais, a execução privilegiada e a prova de remoção dos
-recursos reais continuam pendentes. Não foi executado o pppd do sistema.
+O runtime recompilado exige o patch e o hash desse caminho fixo. A admissão
+recusa opções, hooks ou segredos globais que poderiam interferir na sessão,
+incluindo postoptions, opções por TTY e arquivos do home root. Não os lê ou
+altera. O comando interno desativa ACSP/DHCP, proxy ARP e persistência.
+A execução privilegiada e a prova de remoção dos recursos reais continuam
+pendentes. Não foi executado o pppd do sistema.
 
 ## Proposta visual
 

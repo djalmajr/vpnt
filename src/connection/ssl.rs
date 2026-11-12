@@ -92,6 +92,7 @@ impl SslDriver {
         if !cfg!(target_os = "macos") || unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {
             return Err(StartError::PermissionDenied);
         }
+        crate::helper::ppp_config::verify().map_err(|_| StartError::Unavailable)?;
         let runtime = Runtime::installed().map_err(map_runtime)?;
         Runtime::verify_pinentry().map_err(map_runtime)?;
         Runtime::verify_ppp_supervisor().map_err(map_runtime)?;

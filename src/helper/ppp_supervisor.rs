@@ -38,6 +38,23 @@ pub const ARGUMENTS: &[&str] = &[
     "logfd",
     "2",
 ];
+// Private safety options are appended by our entrypoint, never accepted from
+// the C caller or IPC. ACSP is enabled by default in Apple's ppp-884 and may
+// install routes/domains independently from nodefaultroute.
+pub const SYSTEM_OPTIONS: &[&str] = &[
+    "noacsp",
+    "no-use-dhcp",
+    "no-intercept-dhcp",
+    "noproxyarp",
+    "nopersist",
+];
+/// Fixed production command. Configuration admission is performed by the
+/// root entrypoint before using this builder; callers cannot supply paths.
+pub fn system_command() -> Command {
+    let mut command = Command::new(SYSTEM_PPP);
+    command.args(ARGUMENTS).args(SYSTEM_OPTIONS);
+    command
+}
 pub fn valid_arguments(arguments: &[std::ffi::OsString]) -> bool {
     arguments.len() == ARGUMENTS.len()
         && arguments

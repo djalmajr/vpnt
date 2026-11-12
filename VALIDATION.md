@@ -474,7 +474,7 @@ precisam indicar saída, mesmo que o recibo final tenha sido perdido.
 O driver passa senha em FD 3 e controle em FD 4 no mesmo pre_exec; pinentry
 fecha FD 4, e o filho PPP não recebe nenhum dos dois canais após exec.
 
-Os 14 cenários de wire usam um receptor independente. Cobrem término normal,
+Os 16 cenários de wire usam um receptor independente. Cobrem término normal,
 EOF, TERM ignorado/escalation, saída do cliente, fechamento real do PTY/HUP,
 dado extra, PID incorreto nas duas permissões, revogação durante pre_exec,
 peer errado, exec ausente, call/opções adicionais e rejeição do binário
@@ -485,16 +485,24 @@ saída do pai, programa errado, pai estrangeiro, falha de exec, cancelamento
 prévio e órfão. No último, o cliente de teste mata somente seu supervisor filho;
 o payload ignora HUP/TERM e termina sozinho. O receptor precisa manter cleanup
 pendente depois do EOF/saída dos pais até o watch do PPP original indicar saída.
-Os prazos estão implementados, mas silêncio por cinco segundos ainda não é
-um cenário separado dessa suíte.
+Dois casos deixam o canal aberto em silêncio: antes da permissão do supervisor
+e antes da permissão do filho. Ambos precisam terminar entre 4,5 e sete segundos
+sem executar o payload; o segundo também exige saída do filho original antes
+do recibo final. Esses casos exercitam o prazo monotônico de cinco segundos.
 
-A matriz usa cópia descartável com source/build próprios: baseline de 14 casos
-wire e nove do receptor, 11 mutações e restauração dos mesmos 23 casos.
+A matriz usa cópia descartável com source/build próprios: baseline de 16 casos
+wire e nove do receptor, 16 mutações e restauração dos mesmos 25 casos.
 Compilação/formatação não contam como falha discriminante: exige assertion
 executada do consumidor. As mutações removem as duas permissões, comparação de
 PID, CLOEXEC, fechamento da senha, tratamento de HUP/wait, ordem do recibo,
 preservação do PTY, limite de argv, verificação de pai no receptor e espera do
-PPP órfão. Comandos, exits e hashes de src/tests ficam em
+PPP órfão. Cinco adicionais omitem opções internas de segurança, estendem o
+prazo para 30 segundos ou aceitam postoptions, opções por TTY e política do
+home root. As três últimas executam assertions dos testes de filesystem;
+as demais exigem falha do consumidor de processos. A matriz exige o consumidor
+previsto para cada mutação; falha incidental de outro teste não conta. Os nomes
+temporários dos testes de configuração usam contador atômico, e a lista de
+entradas é independente da lista produtiva. Comandos, exits e hashes de src/tests ficam em
 `output/fixtures/ppp-supervisor/` e `output/fixtures/ppp-supervisor-oracles/`;
 fonte/build descartáveis são removidos.
 
@@ -505,11 +513,56 @@ executada com esses mesmos patches passou os seis casos e três mutações;
 o consumidor nativo de senha passou 12 casos. Isso não instala o runtime.
 
 **Limites:** o receptor, o driver e o backend estão integrados em código, sem
-helper/UI instalado. Validar options/scripts efetivos do pppd antes de habilitar
-a execução real; argv fechado não elimina sua configuração global. A checagem
+helper/UI instalado. A admissão de configuração abaixo ainda precisa ser
+exercitada no caminho root instalado, com o pppd do sistema. A checagem
 de cleanup precoce descrita abaixo tem evidência de fixture, não de recursos PPP
 reais. Nenhum teste chamou system pppd, criou interface, alterou rotas ou usou
 credenciais de VPN.
+
+## Admissão da configuração global PPP
+
+```bash
+cargo test --locked --no-default-features --offline --lib helper::ppp_config
+```
+
+A inspeção foi somente de leitura: manual local, strings/metadados de assinatura do executável
+e fonte pública da Apple. O binário local contém `ppp-884`; isso orienta a versão
+da fonte, sem provar equivalência entre fonte e binário. A fonte consultada é
+[Apple ppp-884](https://github.com/apple-oss-distributions/ppp/tree/ppp-884/Helpers/pppd):
+`main.c` lê options, o home obtido por getpwuid, argv e depois postoptions;
+`tty.c`/`options.c` leem opções da TTY. `pathnames.h` e os consumidores de IP/auth
+mostram os hooks e arquivos de segredos. A verificação `codesign --verify --strict -R '=anchor apple' /usr/sbin/pppd`
+passou como usuário comum fora do sandbox. Dentro dele retornou
+CSSMERR_TP_NOT_TRUSTED; o resultado fora dele é a evidência de confiança.
+A inspeção não executou pppd/dryrun:
+a carga de plugins já pode acontecer enquanto o parser lê configuração.
+
+O entrypoint root e o início do driver recusam arquivos de opções/hooks/segredos
+ambientes, inclusive arquivos vazios, diretórios ou symlinks pendentes. Recusam
+todo `options.*`, sem adivinhar o nome do PTY futuro. O home vem de getpwuid(0),
+sem confiar em HOME; `.ppprc` e `.ppp_pseudonym` precisam estar ausentes. Caminhos
+e ancestrais exigem proprietário confiável, sem symlink ou escrita concedida a
+outros por modo/ACL. Erro de leitura e diretório excessivo recusam admissão.
+O pppd fixo também tem arquivo/ancestrais/proprietário/permissões conferidos.
+Não há leitura do conteúdo de segredos, parser de configuração, exclusão ou
+correção da configuração existente. `peers` é preservado; call/file/plugin são
+recusados no argv. Mudanças concorrentes feitas por outro processo root não
+são impedidas atomicamente por esse gate; administradores root são confiáveis.
+
+A fonte de `acscp.c` habilita ACSP por padrão. O comando interno acrescenta
+`noacsp`, `no-use-dhcp`, `no-intercept-dhcp`, `noproxyarp` e `nopersist`, sem
+aceitar essas opções do caller/IPC. Os nomes também estão presentes no binário
+local. O payload C fictício recebe o argv do mesmo builder produtivo e confere
+a lista completa, além dos canais/PTY; isso não executa o parser do sistema.
+
+Dois testes de filesystem próprio cobrem opções/scripts/segredos inacessíveis,
+postoptions, PTY com pontos, symlinks pendentes, diretórios no lugar dos arquivos,
+permissões inseguras e diretório inacessível. O conteúdo e um perfil estrangeiro
+em peers permanecem intactos. Três mutações exigem falha desses testes; a omissão
+das opções internas exige falha do consumidor de processos. Evidência e hashes
+das fontes Apple ficam localmente em `output/fixtures/pppd-audit-source/`.
+Nenhuma configuração global foi alterada. A admissão root instalada e seu
+comportamento com o pppd real ainda não foram executados.
 
 ## Controlador SSL por geração
 
@@ -564,7 +617,7 @@ Dois testes puros e duas mutações discriminantes exercitam esse fallback,
 incluindo PPP anterior inativa que aparece ativa, rota local residual,
 neighbor cache físico e rota cujo índice já desapareceu. Não houve execução
 privilegiada desse caminho ou prova de purge real. Não há timeout que transforme
-incerteza em Off. A ligação ao helper/broker/UI, auditoria de opções/scripts,
+incerteza em Off. A ligação ao helper/broker/UI, validação instalada da admissão,
 instalação e conexão real continuam pendentes.
 
 ## Política de rotas e leitura nativa

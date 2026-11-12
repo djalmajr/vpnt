@@ -8,7 +8,14 @@
 #include <string.h>
 #include <unistd.h>
 int main(int argc,char **argv) {
-    assert(argc==3);
+    static const char *expected[]={
+        "230400", ":169.254.2.1", "noipdefault", "ipcp-accept-local", "noaccomp",
+        "noauth", "default-asyncmap", "nopcomp", "receive-all", "nodefaultroute",
+        "nodetach", "lcp-max-configure", "40", "mru", "1354", "logfd", "2",
+        "noacsp", "no-use-dhcp", "no-intercept-dhcp", "noproxyarp", "nopersist"
+    };
+    assert(argc==3+(int)(sizeof(expected)/sizeof(expected[0])));
+    for(int i=3;i<argc;i++) assert(strcmp(argv[i],expected[i-3])==0);
     assert(isatty(STDIN_FILENO) && isatty(STDOUT_FILENO));
     assert(fcntl(3,F_GETFD)==-1 && errno==EBADF);
     assert(fcntl(4,F_GETFD)==-1 && errno==EBADF);

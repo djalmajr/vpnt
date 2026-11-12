@@ -1,4 +1,4 @@
-// Includes the unmodified pppd_run and argv builder extracted from the pinned
+// Includes the patched pppd_run and argv builder extracted from the pinned
 // openfortivpn archive. Only the surrounding client/config/network are fixtures.
 #include <assert.h>
 #include <errno.h>

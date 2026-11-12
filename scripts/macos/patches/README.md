@@ -52,4 +52,5 @@ o caminho do executável por um supervisor de fixture. Exercita o forkpty/argv
 C real, um payload PPP fictício e tanto o receptor independente quanto o
 produtivo. O runtime nativo foi recompilado e admitido com esse patch; não foi
 instalado e nenhum pppd do sistema foi executado. A auditoria de configuração
-global e scripts do pppd continua sendo requisito antes de execução real.
+global e scripts resultou num gate de recusa de arquivos ambientes no supervisor;
+sua validação instalada/root com pppd real continua pendente.

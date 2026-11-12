@@ -132,6 +132,15 @@ fn main() {
         !args[2].exists(),
         "no PPP exec before supervisor permission"
     );
+    if mode == "silence-supervisor" {
+        let held = Instant::now();
+        assert_eq!(owner.channel.read(&mut [0]).unwrap(), 0);
+        assert!(held.elapsed() >= Duration::from_millis(4_500));
+        assert!(held.elapsed() < Duration::from_secs(7));
+        assert!(!args[2].exists());
+        wait_exit(&mut supervisor_exit);
+        return;
+    }
     if mode == "deny-supervisor" {
         owner
             .channel
@@ -152,7 +161,11 @@ fn main() {
     assert_eq!(preexec.executable, args[1], "child is held before exec");
     let mut ppp_exit = observe::ExitWatch::attach(&preexec.identity).unwrap();
     assert!(!args[2].exists(), "no PPP exec before child permission");
-    if mode == "deny-child" {
+    let held = Instant::now();
+    if mode == "silence-child" {
+        // Keep the channel open without granting exec; the native deadline
+        // must release the blocked spawn and reap its unexecuted child.
+    } else if mode == "deny-child" {
         owner.channel.write_all(&frame(b"VPC1", ppp + 1)).unwrap();
     } else if mode == "revoke-child" {
         owner.channel.shutdown(Shutdown::Write).unwrap();
@@ -177,6 +190,10 @@ fn main() {
         }
     }
     assert_eq!(receive(&mut owner.channel, b"VPF1"), ppp);
+    if mode == "silence-child" {
+        assert!(held.elapsed() >= Duration::from_millis(4_500));
+        assert!(held.elapsed() < Duration::from_secs(7));
+    }
     assert!(
         !observe::Process::read(ppp)
             .is_ok_and(|process| process.identity == preexec.identity && process.running),
@@ -184,7 +201,10 @@ fn main() {
     );
     wait_exit(&mut ppp_exit);
     wait_exit(&mut supervisor_exit);
-    if matches!(mode, "deny-child" | "revoke-child" | "exec-failure") {
+    if matches!(
+        mode,
+        "deny-child" | "revoke-child" | "exec-failure" | "silence-child"
+    ) {
         assert!(!args[2].exists());
     }
     owner.child.stop(Duration::from_secs(1)).unwrap();

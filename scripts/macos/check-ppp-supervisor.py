@@ -38,11 +38,12 @@ def main():
         raise SystemExit("Prepare the verified openfortivpn archive with build-runtime.py first")
     REPORTS.mkdir(parents=True, exist_ok=True)
     run("build", ["cargo", "build", "--locked", "--offline", "--no-default-features", "--lib", "--bin", "vpnt-pppd"])
+    run("configuration", ["cargo", "test", "--locked", "--offline", "--no-default-features", "--lib", "helper::ppp_config"])
     library = ["--edition=2024", "--extern", f"vpnt={ROOT}/target/debug/libvpnt.rlib", "-L", f"dependency={ROOT}/target/debug/deps"]
     # The read-only observer used by the fixture also needs this same libc.
     libc = max((ROOT / "target/debug/deps").glob("liblibc-*.rlib"), key=lambda path: path.stat().st_mtime)
     run("format", ["rustfmt", "--edition", "2024", "--check", FIXTURE / "adapter.rs", FIXTURE / "owner.rs", FIXTURE / "owner-host.rs"])
-    cases = ["normal", "revoke", "ignore-term", "parent-exit", "hup", "extra-control", "deny-supervisor", "deny-child", "revoke-child", "wrong-peer", "exec-failure", "bad-argv", "extra-argv", "production-gate"]
+    cases = ["normal", "revoke", "ignore-term", "parent-exit", "hup", "extra-control", "deny-supervisor", "deny-child", "revoke-child", "wrong-peer", "exec-failure", "bad-argv", "extra-argv", "production-gate", "silence-supervisor", "silence-child"]
     receipt = {"upstream": "openfortivpn 1.24.1 pppd_run", "archiveSha256": ARCHIVE_SHA, "systemPppdStarted": False, "vpnStarted": False, "cases": {}}
     with tempfile.TemporaryDirectory(prefix="consumer-", dir=REPORTS) as temporary:
         directory = Path(temporary)

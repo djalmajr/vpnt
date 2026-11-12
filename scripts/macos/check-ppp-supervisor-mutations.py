@@ -33,11 +33,33 @@ def run(copy, label, expected):
     if any(result["exit"] for name, result in executions.items() if name.startswith("compile-") or name in ["build", "format"]):
         raise RuntimeError(f"{label}: compilation/format failure does not count")
     failed = {name: result for name, result in executions.items() if result["exit"] == 101}
-    if expected and not failed:
-        raise RuntimeError(f"{label}: no executed consumer assertion failed")
+    allowed = {
+        "supervisor-permission-skipped": {"normal"},
+        "child-permission-skipped": {"normal"},
+        "permission-pid-ignored": {"deny-supervisor"},
+        "supervision-fd-leaks-through-exec": {"normal"},
+        "password-capability-reaches-ppp": {"normal"},
+        "hup-terminates-parent-without-wait": {"parent-exit"},
+        "final-receipt-before-child-wait": {"normal", "revoke"},
+        "ppp-stdio-replaced-with-pipes": {"normal"},
+        "extra-ppp-options-accepted": {"extra-argv"},
+        "private-system-options-omitted": {"normal"},
+        "handshake-timeout-extended": {"silence-supervisor"},
+        "ambient-postoptions-accepted": {"configuration"},
+        "ambient-tty-options-accepted": {"configuration"},
+        "root-home-policy-accepted": {"configuration"},
+        "host-foreign-parent-accepted": {"host-foreign-parent"},
+        "host-eof-substitutes-child-exit": {"host-orphan"},
+    }
+    if expected and not (set(failed) & allowed[label]):
+        raise RuntimeError(f"{label}: expected discriminating consumer did not fail; got {list(failed)}")
+    if expected and "configuration" in failed:
+        log = (copy / "output/fixtures/ppp-supervisor/configuration.log").read_text()
+        if "panicked at src/helper/ppp_config_tests.rs:" not in log or "test result: FAILED." not in log:
+            raise RuntimeError(f"{label}: configuration compilation/error is not an executed assertion")
     if not expected:
         receipt = json.loads((copy / "output/fixtures/ppp-supervisor/receipt.json").read_text())
-        if len(receipt["cases"]) != 14 or any(case["exit"] for case in receipt["cases"].values()):
+        if len(receipt["cases"]) != 16 or any(case["exit"] for case in receipt["cases"].values()):
             raise RuntimeError(f"{label}: incomplete baseline")
         if len(receipt.get("hostCases", {})) != 9 or any(case["exit"] for case in receipt["hostCases"].values()):
             raise RuntimeError(f"{label}: incomplete production-host baseline")
@@ -61,6 +83,11 @@ def main():
         ("final-receipt-before-child-wait", supervisor, early_receipt),
         ("ppp-stdio-replaced-with-pipes", "src/helper/process.rs", lambda s: replace_once(s, "Self::spawn_configured(command, Environment::System, true)", "Self::spawn_configured(command, Environment::System, false)")),
         ("extra-ppp-options-accepted", supervisor, lambda s: replace_once(s, "arguments.len() == ARGUMENTS.len()", "arguments.len() >= ARGUMENTS.len()")),
+        ("private-system-options-omitted", supervisor, lambda s: replace_once(s, "command.args(ARGUMENTS).args(SYSTEM_OPTIONS);", "command.args(ARGUMENTS);")),
+        ("handshake-timeout-extended", "src/helper/ppp_supervisor/raw.rs", lambda s: replace_once(s, "const TIMEOUT_MS: i64 = 5_000;", "const TIMEOUT_MS: i64 = 30_000;")),
+        ("ambient-postoptions-accepted", "src/helper/ppp_config.rs", lambda s: replace_once(s, 'b"postoptions",', 'b"unused-postoptions",')),
+        ("ambient-tty-options-accepted", "src/helper/ppp_config.rs", lambda s: replace_once(s, 'AMBIENT.contains(&name) || name.starts_with(b"options.")', 'AMBIENT.contains(&name)')),
+        ("root-home-policy-accepted", "src/helper/ppp_config.rs", lambda s: replace_once(s, '    absent(&home.join(".ppprc"))?;', '    // incorrectly ignored root home policy')),
         ("host-foreign-parent-accepted", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "(parent != 0 && value.parent != parent)", "false")),
         ("host-eof-substitutes-child-exit", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "self.proof.as_ref().map_or(Ok(true), |proof| proof.exited())", "Ok(true)")),
     ]
@@ -88,7 +115,7 @@ def main():
             receipt["restored"] = run(copy, "restored", 0)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    print(f"Killed {len(mutations)} supervision mutations; both 14-wire/9-host baselines passed; copy removed")
+    print(f"Killed {len(mutations)} supervision mutations; both 16-wire/9-host baselines passed; copy removed")
 
 
 if __name__ == "__main__":

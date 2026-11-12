@@ -25,6 +25,7 @@ fn main() {
     command
         .arg(payload_mode)
         .arg(directory.join(format!("marker-{mode}")))
+        .args(ppp_supervisor::system_command().get_args())
         .env("VPNT_MUST_NOT_REACH_PPP", "fixture");
     // SAFETY: this fixture is a one-shot supervisor; the C parent reserved
     // FD 3/4. Production has no UID, command, path or mode overrides.
