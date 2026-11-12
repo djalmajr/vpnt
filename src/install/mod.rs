@@ -3,11 +3,14 @@
 #[cfg(target_os = "macos")]
 pub mod bundle;
 #[cfg(target_os = "macos")]
+pub mod client;
+#[cfg(target_os = "macos")]
 pub mod engine;
 pub mod payload;
 pub mod policy;
+pub mod protocol;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Error {
     InvalidManifest,

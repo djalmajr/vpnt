@@ -43,6 +43,9 @@ impl Change {
     }
 }
 impl Flow {
+    pub(super) fn busy(&self) -> bool {
+        self.current.is_some() || self.completion.is_some()
+    }
     pub(super) fn new() -> Self {
         Self {
             connect: Box::new(Admin::start),
@@ -69,6 +72,9 @@ impl<S: SecretStore> Broker<S> {
         expires: Instant,
     ) -> Result<u64, &'static str> {
         self.poll();
+        if self.component.busy() {
+            return Err("component_busy");
+        }
         if !self.ready || Instant::now() >= expires {
             return Err("backend_unavailable");
         }

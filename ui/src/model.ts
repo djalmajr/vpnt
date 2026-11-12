@@ -39,6 +39,7 @@ export type Snapshot = {
   version: string;
   demo: boolean;
   helper: "installed" | "missing" | "outdated";
+  componentOperation?: "installing" | "removing" | "settling";
   vpns: VpnView[];
 };
 export type Command =

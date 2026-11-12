@@ -9,12 +9,25 @@ impl<S: SecretStore> Broker<S> {
         if Instant::now() >= expires {
             return Err("backend_unavailable");
         }
+        if self.component.busy()
+            && !matches!(
+                command,
+                Command::GetSnapshot {}
+                    | Command::Resize { .. }
+                    | Command::Hide {}
+                    | Command::OpenProject {}
+                    | Command::Quit {}
+            )
+        {
+            return Err("component_busy");
+        }
         match command {
             Command::GetSnapshot {}
             | Command::Resize { .. }
             | Command::Hide {}
             | Command::OpenProject {} => {}
             Command::Quit {} => {
+                self.component.close();
                 self.retry = None;
                 self.lost(false);
             }

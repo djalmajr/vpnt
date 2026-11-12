@@ -69,6 +69,11 @@ impl Worker {
                         {
                             reply(response(id, result));
                         }
+                        if let Some((token, result)) = normal.take_component_result()
+                            && let Some(id) = administrative.remove(&token)
+                        {
+                            reply(response(id, result));
+                        }
                     }
                     match requests.recv_timeout(Duration::from_millis(20)) {
                         Ok(work) => {
@@ -91,12 +96,30 @@ impl Worker {
                                     work.request.command,
                                     crate::bridge::Command::SaveProfile { .. }
                                         | crate::bridge::Command::RemoveProfile { .. }
+                                        | crate::bridge::Command::InstallHelper {}
+                                        | crate::bridge::Command::RemoveHelper {}
                                 ) {
-                                    match normal.as_mut().unwrap().begin_admin(
-                                        work.request.command,
-                                        work.request.locale.unwrap_or_default(),
-                                        work.expires,
-                                    ) {
+                                    let component = matches!(
+                                        &work.request.command,
+                                        crate::bridge::Command::InstallHelper {}
+                                            | crate::bridge::Command::RemoveHelper {}
+                                    );
+                                    let normal = normal.as_mut().unwrap();
+                                    let locale = work.request.locale.unwrap_or_default();
+                                    let started = if component {
+                                        normal.begin_component(
+                                            work.request.command,
+                                            locale,
+                                            work.expires,
+                                        )
+                                    } else {
+                                        normal.begin_admin(
+                                            work.request.command,
+                                            locale,
+                                            work.expires,
+                                        )
+                                    };
+                                    match started {
                                         Ok(token) => {
                                             administrative.insert(token, work.request.id);
                                         }
@@ -160,6 +183,7 @@ fn response(id: String, result: Result<crate::model::Snapshot, &'static str>) ->
 mod tests {
     use super::*;
     mod administration;
+    mod component;
     #[test]
     fn expired_native_requests_cannot_start_a_demo_or_replay_after_a_ui_timeout() {
         let (send, receive) = mpsc::sync_channel(8);

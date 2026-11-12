@@ -43,4 +43,8 @@ impl Retry {
     pub(super) fn ready(&mut self) {
         self.delay = self.minimum;
     }
+    pub(super) fn wake(&mut self) {
+        self.next = Instant::now();
+        self.delay = self.minimum;
+    }
 }

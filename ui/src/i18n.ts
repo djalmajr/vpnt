@@ -6,6 +6,25 @@ export type LocalePreference = Locale | "system";
 const en = {
   ...nativeCatalogs["en-US"],
   vpns: "VPNs",
+  componentInstallTitle: "Install the VPN component?",
+  componentRemoveTitle: "Remove the VPN component?",
+  componentInstallHint:
+    "Current tunnels will disconnect. macOS Installer will open and request administrator authorization. Profiles and saved credentials are kept.",
+  componentRemoveHint:
+    "Current tunnels will disconnect and this account will lose tunnel access. Profiles and saved credentials are kept. Other registered accounts keep access.",
+  componentInstallPending:
+    "Complete or cancel in macOS Installer, then close its window. Waiting for the installed component to confirm it is ready.",
+  componentRemovePending:
+    "Authorize or cancel in the macOS password dialog. Waiting for removal to finish.",
+  componentSettling:
+    "Waiting for the previous operation to finish. Another installation or removal cannot start yet.",
+  componentBusy: "A component change is still pending.",
+  componentExpired:
+    "The operation timed out. It may still be finishing. No new request will be sent automatically.",
+  componentUnconfirmed:
+    "The component change could not be confirmed. Check its status before trying again.",
+  componentIncompatible:
+    "This app cannot use its component package or the installed component. Reopen a complete, compatible vpnt app.",
   adminPending:
     "Waiting for authorization and confirmation. To cancel, use the macOS authorization dialog.",
   adminBusy: "Another administrative change is still pending.",
@@ -55,7 +74,7 @@ const en = {
   ssl: "Fortinet SSL VPN",
   ipsecHint: "strongSwan: username, password and key",
   sslHint: "openfortivpn: username and password",
-  programsHint: "Install both programs separately with Homebrew.",
+  programsHint: "The VPN component includes the required clients.",
   name: "Name",
   type: "Type",
   gateway: "Gateway",
@@ -172,6 +191,25 @@ export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
   ...nativeCatalogs["pt-BR"],
   vpns: "VPNs",
+  componentInstallTitle: "Instalar o componente de VPN?",
+  componentRemoveTitle: "Remover o componente de VPN?",
+  componentInstallHint:
+    "Os túneis atuais serão desligados. O Instalador do macOS abrirá e pedirá autorização de administrador. Perfis e credenciais salvas serão mantidos.",
+  componentRemoveHint:
+    "Os túneis atuais serão desligados e esta conta perderá o acesso aos túneis. Perfis e credenciais salvas serão mantidos. Outras contas cadastradas continuam com acesso.",
+  componentInstallPending:
+    "Conclua ou cancele no Instalador do macOS e feche a janela dele. Aguardando o componente instalado confirmar que está pronto.",
+  componentRemovePending:
+    "Autorize ou cancele no diálogo de senha do macOS. Aguardando o término da remoção.",
+  componentSettling:
+    "Aguardando o encerramento da operação anterior. Ainda não é possível iniciar outra instalação ou remoção.",
+  componentBusy: "Uma alteração do componente ainda está pendente.",
+  componentExpired:
+    "O prazo da operação venceu. Ela ainda pode estar terminando. Nenhum novo pedido será enviado automaticamente.",
+  componentUnconfirmed:
+    "Não foi possível confirmar a alteração do componente. Confira o estado dele antes de tentar novamente.",
+  componentIncompatible:
+    "Este app não pode usar seu pacote ou o componente instalado. Abra novamente um app vpnt completo e compatível.",
   adminPending:
     "Aguardando autorização e confirmação. Para cancelar, use o diálogo de autorização do macOS.",
   adminBusy: "Outra alteração administrativa ainda está pendente.",
@@ -221,7 +259,7 @@ const pt: Record<MessageKey, string> = {
   ssl: "SSL VPN Fortinet",
   ipsecHint: "strongSwan: usuário, senha e chave",
   sslHint: "openfortivpn: usuário e senha",
-  programsHint: "Os dois programas são instalados à parte, pelo Homebrew.",
+  programsHint: "O componente de VPN inclui os clientes necessários.",
   name: "Nome",
   type: "Tipo",
   gateway: "Gateway",

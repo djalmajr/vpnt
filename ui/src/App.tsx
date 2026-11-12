@@ -1,3 +1,4 @@
+import { ComponentDialog, ComponentStatus } from "./components/ComponentDialog";
 import { Group, Header, Icon, Notice } from "./components/common";
 import { Footer } from "./components/Footer";
 import { RemoveDialog } from "./components/RemoveDialog";
@@ -26,6 +27,9 @@ export function App() {
     selected,
     modalVpn,
     run,
+    componentAction,
+    setComponentAction,
+    componentInstalled,
   } = useAppState();
   return (
     <main id="panel" className="panel">
@@ -49,6 +53,7 @@ export function App() {
         </>
       ) : (
         <>
+          <ComponentStatus snapshot={snapshot} t={t} />
           {route.page === "panel" && (
             <>
               <Header
@@ -77,6 +82,7 @@ export function App() {
                   <button
                     type="button"
                     className="primary"
+                    disabled={!!snapshot.componentOperation}
                     onClick={() => navigate({ page: "onboarding" })}
                   >
                     {t(snapshot.helper === "outdated" ? "update" : "install")}
@@ -122,7 +128,7 @@ export function App() {
               settings={settings}
               update={updateSettings}
               navigate={navigate}
-              run={run}
+              removeComponent={() => setComponentAction("remove")}
               t={t}
             />
           )}
@@ -183,7 +189,12 @@ export function App() {
             />
           )}
           {route.page === "onboarding" && (
-            <Onboarding navigate={navigate} run={run} t={t} />
+            <Onboarding
+              navigate={navigate}
+              install={() => setComponentAction("install")}
+              busy={!!snapshot.componentOperation}
+              t={t}
+            />
           )}
           {route.page === "about" && (
             <>
@@ -268,6 +279,15 @@ export function App() {
                 t={t}
               />
             ))}
+          {componentAction && (
+            <ComponentDialog
+              kind={componentAction}
+              run={run}
+              close={() => setComponentAction(undefined)}
+              installed={componentInstalled}
+              t={t}
+            />
+          )}
         </>
       )}
     </main>

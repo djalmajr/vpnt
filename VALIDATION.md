@@ -230,6 +230,77 @@ SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abai
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
+## Instalação e remoção assíncronas pelo app
+
+```bash
+cargo test --locked --no-default-features --lib install::client
+cargo test --locked --no-default-features --lib broker::component
+cargo test --locked --all-features --lib desktop::worker::tests::component
+python3 scripts/macos/check-component-client.py
+```
+
+O cliente admite o pacote/instalador em thread própria, espera o gate do broker
+e revalida antes de iniciar. O broker fecha o canal runtime anterior e exige
+saída do seu Child antes de liberar o gate. Pausa retry e alterações concorrentes;
+snapshot/hide continuam responsivos. Instalação prepara somente
+`/usr/bin/open -W -n -b com.apple.installer <pacote admitido>`, sem shell ou -F.
+Exit zero não confirma instalação: exige digest esperado do helper instalado e
+snapshot compatível em uma sessão nova. O comportamento real do Installer e
+essa admissão positiva como root continuam NOT RUN.
+
+Remoção prepara somente sudo -A -k com instalador fixo + remove. Reusa os tipos
+do servidor, anuncia Ready antes de enviar um id + EOF em socketpair anônimo;
+exige versão, limite, id, ausência de resposta extra, EOF e exit zero. Preserva
+perfis/segredos e desativa retomada para a conta removida. Prazo/erro é reportado
+sem matar filho; enquanto ele vive, conserva exclusão e mostra componentOperation
+settling. Sair do app mantém o launcher desativado mesmo após esse filho terminar.
+
+[PASS, process/socket fixtures] Os consumidores produtivos são exercitados por
+processos ordinários próprios. Gate não liberado deve expirar sem spawn;
+remover não confirma sucesso antes de seu filho sair; prazo chega antes da
+espera e não permite sucesso tardio. O ator atravessa parse_request/fila/correlação
+do reply e confirma consultas/hide durante a operação. Isso não executa open,
+sudo, prompt, PackageKit, componente instalado ou rede VPN.
+
+[PASS, browser simulated] `tests/browser/component.js` é uma função para
+Playwright CLI run-code sobre o servidor demo local. Intercepta todo transporte
+de componente com respostas sintéticas; nunca constrói backend privilegiado.
+Dezesseis cenários cobrem instalar/remover nos dois idiomas, temas e larguras
+420/280. Conferem confirmação antes de envio, Escape/cancelar sem pedido, foco
+contido/restaurado, espera sem fechar/repetir, erro de prazo, retenção observada
+por polling e navegação somente após sucesso. Painel medido em 320/280 px,
+diálogo em 280/256 px, sem overflow horizontal. Capturas dos dois temas foram
+inspecionadas. Recibo/capturas em output/playwright/component-*.
+
+O caso de catálogo recuperado também falhou antes da correção: a continuação
+usava o snapshot anterior ao pedido e abria cadastro mesmo havendo perfis.
+Agora consulta o último snapshot recebido; catálogo vazio abre cadastro e
+perfis existentes voltam ao painel. O cenário final cobre ambos nos dois idiomas.
+
+[PASS, local] Suítes completas: 232 testes Rust com desktop e 228 sem desktop,
+dois ignored (runtime opcional e child harness de crash exercitado pelo pai).
+Após fortalecer as assertions de concorrência, a biblioteca desktop foi repetida
+e as baselines seletivas revalidaram cliente/broker sem desktop. Fmt, clippy
+-D warnings, lint/typecheck/build, oito testes Bun/114 assertions, 81 tokens,
+bins/askpass, pacote e inspeção headless passaram; classes segue sem regras.
+
+A matriz detectou 24 mutações/seis baselines-restaurações e mais duas seletivas/
+quatro. Também passaram 24 do executor/quatro e 17 administrativas/seis.
+Gate e recibo prematuro sobreviveram às primeiras assertions instantâneas:
+os testes agora retêm a operação até o prazo antes de liberar o filho; só a
+falha discriminante posterior foi contada. Erros de compilação não contam.
+Recibos em output/fixtures/component-client-oracles{,-selected},
+installation-engine-oracles e admin-client-oracles. Depois dessas matrizes,
+mudaram apenas UI/navegação e o script de browser, revalidados no navegador;
+o runner ganhou seleção de labels. O recibo do executor precede ainda o
+fortalecimento do teste do cliente, fora dos consumidores que ele exercita.
+As demais matrizes conservam seus checkpoints históricos, sem nova execução.
+
+[NOT RUN] Tray/WKWebView, autenticação nativa, sudoers efetivo/FD 0/PAM/IO/PTY,
+instalação/remoção elevadas, VPN/tráfego/cleanup reais, driver IPsec, assinatura/
+notarização, revisão final e CI remoto continuam abertos. Nenhuma prova de
+fixture ou navegador encerra esses gates. O artefato local é de desenvolvimento.
+
 ## Componente incluído no app e admissão sem Installer
 
 ```bash

@@ -1,6 +1,6 @@
 import { Group, Header, Icon, Row, type T, Toggle } from "../components/common";
 import type { Snapshot } from "../model";
-import type { Navigate, Run } from "../navigation";
+import type { Navigate } from "../navigation";
 import type { Settings } from "../settings";
 
 export function Preferences({
@@ -8,14 +8,14 @@ export function Preferences({
   settings,
   update,
   navigate,
-  run,
+  removeComponent,
   t,
 }: {
   snapshot: Snapshot;
   settings: Settings;
   update: (settings: Settings) => void;
   navigate: Navigate;
-  run: Run;
+  removeComponent: () => void;
   t: T;
 }) {
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
@@ -136,6 +136,7 @@ export function Preferences({
             <button
               type="button"
               className="primary"
+              disabled={!!snapshot.componentOperation}
               onClick={() => navigate({ page: "onboarding" })}
             >
               {t("install")}
@@ -147,7 +148,8 @@ export function Preferences({
             <button
               type="button"
               className="danger"
-              onClick={() => void run({ type: "remove_helper" })}
+              disabled={!!snapshot.componentOperation}
+              onClick={removeComponent}
             >
               {t("remove")}
             </button>

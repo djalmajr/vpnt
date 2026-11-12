@@ -80,6 +80,7 @@ impl App {
             version: env!("CARGO_PKG_VERSION"),
             demo: self.demo,
             helper: if self.demo { "installed" } else { "missing" },
+            component_operation: None,
             vpns: self
                 .connections
                 .iter()

@@ -1,30 +1,9 @@
 use super::*;
-use serde::{Deserialize, Serialize};
+use crate::install::protocol::{FORMAT, Reply, Request};
 use std::{
     io::{Read, Write},
     time::{Duration, Instant},
 };
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    id: String,
-}
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Reply<'a> {
-    Ready {
-        format: u32,
-        version: &'a str,
-    },
-    Removed {
-        id: &'a str,
-        component_present: bool,
-    },
-    Failed {
-        id: Option<&'a str>,
-        error: Error,
-    },
-}
 
 pub(in crate::install::engine) fn serve(
     mut caller: Caller,
@@ -35,8 +14,8 @@ pub(in crate::install::engine) fn serve(
     write(
         &mut caller.stream,
         &Reply::Ready {
-            format: 1,
-            version: env!("CARGO_PKG_VERSION"),
+            format: FORMAT,
+            version: env!("CARGO_PKG_VERSION").into(),
         },
         deadline,
     )?;
@@ -84,11 +63,11 @@ pub(in crate::install::engine) fn serve(
     let reply = match &request {
         Ok(request) => match executor.remove(caller.uid) {
             Ok(outcome) => Reply::Removed {
-                id: &request.id,
+                id: request.id.clone(),
                 component_present: !outcome.users.is_empty(),
             },
             Err(error) => Reply::Failed {
-                id: Some(&request.id),
+                id: Some(request.id.clone()),
                 error,
             },
         },
@@ -107,7 +86,7 @@ pub(in crate::install::engine) fn serve(
 }
 fn write(
     stream: &mut std::os::unix::net::UnixStream,
-    reply: &Reply<'_>,
+    reply: &Reply,
     deadline: Instant,
 ) -> Result<(), Error> {
     let mut bytes = serde_json::to_vec(reply).map_err(|_| Error::Io)?;

@@ -166,6 +166,9 @@ impl Runtime {
     pub fn verify_helper() -> Result<(), RuntimeError> {
         Self::verify_adapter(Path::new(paths::HELPER))
     }
+    pub fn verify_installer() -> Result<(), RuntimeError> {
+        Self::verify_adapter(Path::new(paths::INSTALLER))
+    }
     pub fn verify_askpass() -> Result<(), RuntimeError> {
         Self::verify_adapter(Path::new(paths::ASKPASS))
     }

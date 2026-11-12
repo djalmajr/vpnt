@@ -15,6 +15,7 @@ use std::{
     },
     time::Instant,
 };
+pub(crate) use worker::monotonic_ns;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

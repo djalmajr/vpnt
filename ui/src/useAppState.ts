@@ -18,8 +18,12 @@ export function useAppState() {
     () => matchMedia("(prefers-color-scheme: dark)").matches,
   );
   const [snapshot, setSnapshot] = useState<Snapshot>();
+  const receivedSnapshot = useRef<Snapshot | undefined>(undefined);
   const [route, navigate] = useState<Route>({ page: "panel" });
   const [error, setError] = useState<MessageKey>();
+  const [componentAction, setComponentAction] = useState<
+    "install" | "remove"
+  >();
   const [modal, setModal] = useState<{
     type: "secrets" | "remove";
     id: string;
@@ -27,6 +31,7 @@ export function useAppState() {
   }>();
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
+    receivedSnapshot.current = snapshot;
     setSnapshot((previous) =>
       JSON.stringify(previous) === JSON.stringify(snapshot)
         ? previous
@@ -59,6 +64,11 @@ export function useAppState() {
           admin_unconfirmed: "adminUnconfirmed",
           admin_incompatible: "adminIncompatible",
           secret_cleanup_failed: "secretCleanupFailed",
+          component_busy: "componentBusy",
+          component_expired: "componentExpired",
+          component_canceled: "componentUnconfirmed",
+          component_unconfirmed: "componentUnconfirmed",
+          component_incompatible: "componentIncompatible",
         };
         setError(code ? (keys[code] ?? "error") : undefined);
       }),
@@ -147,6 +157,14 @@ export function useAppState() {
     setModal,
     selected,
     modalVpn,
+    componentAction,
+    setComponentAction,
+    componentInstalled: () => {
+      setComponentAction(undefined);
+      navigate({
+        page: receivedSnapshot.current?.vpns.length ? "panel" : "new",
+      });
+    },
     run: flow.run,
   };
 }

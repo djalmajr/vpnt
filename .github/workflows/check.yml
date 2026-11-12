@@ -75,6 +75,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-admin-client.py
+      - name: Verify component operations without Installer or elevation
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-component-client.py
       - name: Verify helper channel negative oracles
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

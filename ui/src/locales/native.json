@@ -1,13 +1,13 @@
 {
   "en-US": {
     "authTitle": "vpnt — Administrator access",
-    "authPrompt": "Enter your account password to change VPN profiles.",
+    "authPrompt": "Enter your account password to authorize this VPN administration change.",
     "authConfirm": "Authorize",
     "authCancel": "Cancel"
   },
   "pt-BR": {
     "authTitle": "vpnt — Acesso de administrador",
-    "authPrompt": "Digite a senha da sua conta para alterar os perfis de VPN.",
+    "authPrompt": "Digite a senha da sua conta para autorizar esta alteração administrativa de VPN.",
     "authConfirm": "Autorizar",
     "authCancel": "Cancelar"
   }

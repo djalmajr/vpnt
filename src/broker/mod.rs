@@ -2,6 +2,7 @@
 //! may report a connected tunnel; demo schedules never enter this model.
 mod admin;
 mod commands;
+mod component;
 mod retry;
 mod snapshot;
 use crate::{
@@ -40,6 +41,7 @@ pub struct Broker<S: SecretStore> {
     next: u64,
     startup: Instant,
     administration: admin::Flow,
+    component: component::Flow,
     epoch: u64,
 }
 impl<S: SecretStore> Broker<S> {
@@ -65,6 +67,7 @@ impl<S: SecretStore> Broker<S> {
             next: 1,
             startup: Instant::now() + Duration::from_secs(5),
             administration: admin::Flow::new(),
+            component: component::Flow::new(),
             epoch: 1,
         };
         result.begin();
@@ -120,14 +123,15 @@ impl<S: SecretStore> Broker<S> {
         }
     }
     pub fn starting(&self) -> bool {
-        !self.dead && !self.ready && self.client.is_some()
+        !self.component.busy() && !self.dead && !self.ready && self.client.is_some()
     }
     pub fn poll(&mut self) {
-        if self.dead || self.client.is_none() {
+        if (self.dead || self.client.is_none()) && !self.component.blocks_retry() {
             self.resume();
         }
         if self.dead {
             self.poll_admin();
+            self.poll_component();
             return;
         }
         let result = self.client.as_mut().map(Client::poll);
@@ -150,6 +154,7 @@ impl<S: SecretStore> Broker<S> {
             self.lost(self.helper == "outdated");
         }
         self.poll_admin();
+        self.poll_component();
     }
     fn receive(&mut self, message: Message) -> Result<(), ()> {
         match message {
@@ -211,6 +216,7 @@ impl<S: SecretStore> Broker<S> {
             version: env!("CARGO_PKG_VERSION"),
             demo: false,
             helper: self.helper,
+            component_operation: self.component.status(),
             vpns: self.connections.values().map(|c| c.view.clone()).collect(),
         }
     }

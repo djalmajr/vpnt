@@ -1,18 +1,19 @@
 import { useState } from "react";
 import { Header, Icon, type T } from "../components/common";
-import type { Navigate, Run } from "../navigation";
+import type { Navigate } from "../navigation";
 
 export function Onboarding({
   navigate,
-  run,
+  install,
+  busy,
   t,
 }: {
   navigate: Navigate;
-  run: Run;
+  install: () => void;
+  busy: boolean;
   t: T;
 }) {
   const [details, setDetails] = useState(false);
-  const [installing, setInstalling] = useState(false);
   return (
     <>
       <Header
@@ -22,41 +23,28 @@ export function Onboarding({
       />
       <div className="empty">
         <span className="primary-text">
-          <Icon name={installing ? "loader" : "shield"} large />
+          <Icon name={busy ? "loader" : "shield"} large />
         </span>
         <strong>
-          {t(
-            installing ? "installing" : details ? "component" : "welcomeTitle",
-          )}
+          {t(busy ? "componentBusy" : details ? "component" : "welcomeTitle")}
         </strong>
         <p>
           {t(
-            installing
-              ? "installConfirm"
+            busy
+              ? "componentSettling"
               : details
                 ? "installDetails"
                 : "welcomeHint",
           )}
         </p>
-        {!installing && (
+        {!busy && (
           <div className="actions fill">
             {!details && (
               <button type="button" onClick={() => setDetails(true)}>
                 {t("details")}
               </button>
             )}
-            <button
-              type="button"
-              className="primary"
-              onClick={() => {
-                setInstalling(true);
-                void run({ type: "install_helper" })
-                  .then((ok) => {
-                    if (ok) navigate({ page: "new" });
-                  })
-                  .finally(() => setInstalling(false));
-              }}
-            >
+            <button type="button" className="primary" onClick={install}>
               {t("install")}
             </button>
           </div>

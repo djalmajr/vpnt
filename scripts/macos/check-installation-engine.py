@@ -56,7 +56,7 @@ def mutations():
         ('committed-state-rolled-back', base + '/journal/settlement.rs', lambda s: replace(s, 'b"after\\n" => Ok(Some(true)),', 'b"after\\n" => Ok(None),'), journal + 'durable_commit_is_finalized_and_an_inconsistent_commit_marker_is_preserved'),
         ('committed-state-unverified', base + '/journal/settlement.rs', lambda s: replace(replace(s, 'journal.verify(tree, after)?;', 'let _ = after;'), 'self.verify(tree, after)?;', 'let _ = after;'), journal + 'durable_commit_is_finalized_and_an_inconsistent_commit_marker_is_preserved'),
         ('unknown-garbage-collected', base + '/journal/settlement.rs', lambda s: replace(s, 'return Err(Error::RecoveryRequired);\n            }\n            fs::remove_dir(&root)', 'fs::remove_dir_all(&root).map_err(|_| Error::RecoveryRequired)?;\n                return Ok(());\n            }\n            fs::remove_dir(&root)'), journal + 'interrupted_collection_accepts_only_recorded_terminal_contents'),
-        ('ipc-unknown-fields-accepted', base + '/access/channel.rs', lambda s: replace(s, '#[serde(deny_unknown_fields)]\n', ''), channel),
+        ('ipc-unknown-fields-accepted', 'src/install/protocol.rs', lambda s: replace(s, '#[serde(deny_unknown_fields)]\n', ''), channel),
         ('unregistered-user-admitted', base + '/access.rs', lambda s: replace(s, '|| !receipt.users.contains_key(&uid)', '|| false'), inventory),
     ]
     return [(label, file, mutate, ['--lib', test], test) for label, file, mutate, test in cases] + [

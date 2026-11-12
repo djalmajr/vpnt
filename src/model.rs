@@ -130,5 +130,7 @@ pub struct Snapshot {
     pub version: &'static str,
     pub demo: bool,
     pub helper: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_operation: Option<&'static str>,
     pub vpns: Vec<VpnView>,
 }

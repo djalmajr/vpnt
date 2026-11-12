@@ -43,10 +43,11 @@ reais nele. Idioma e tema persistem como preferências locais da interface.
 Sem `--demo`, um worker separado atende a UI, consulta o helper e usa o chaveiro
 do usuário. O cliente preparado verifica o executável fixo e invoca somente
 `sudo -n -- /Library/PrivilegedHelperTools/dev.vpnt.helper runtime`, com canal
-duplex anônimo herdado em FD 0. Nenhum helper ou sudoers é instalado pelo app
-atual: sem esses pré-requisitos ele apresenta o primeiro uso. Cadastro/remoção
-de perfis usa o canal administrativo separado descrito abaixo. Instalação e
-remoção do helper ainda estão em desenvolvimento.
+duplex anônimo herdado em FD 0. Sem o componente ele apresenta o primeiro uso.
+Instalar/remover exige ação e confirmação explícitas; nunca ocorre ao abrir o
+app. Cadastro/remoção de perfis usa o canal administrativo separado descrito
+abaixo. A integração do componente tem provas com processos fictícios; seu
+caminho instalado ainda precisa de validação privilegiada.
 Essa ligação está compilada e testada com um subprocesso fictício, sem execução
 de sudo, elevação ou conexão VPN real.
 
@@ -142,8 +143,8 @@ Repetir reutiliza apenas uma saída íntegra; corrupção é recusada. `--verify
 audita um pacote existente contra o mesmo payload. O pacote é verificado como
 sem assinatura; distribuição assinada/notarizada continua pendente.
 
-Execução positiva como root, efeito do Installer no sistema e ligação de
-instalação/remoção ao app continuam pendentes. Veja os limites e os comandos de
+Execução positiva como root e efeito do Installer no sistema continuam
+pendentes. Veja os limites e os comandos de
 reprodução em `VALIDATION.md`.
 
 Para incluir esse componente no próprio `.app`, use o payload admitido:
@@ -159,8 +160,19 @@ do executável atual e só lê os arquivos; não aceita path/UID alternativo nem
 abre o Installer. Um pacote ausente, alterado ou de outro usuário é recusado.
 O mínimo do `.app` passa a considerar o componente incluído, atualmente macOS
 26.0 no runtime local preparado. Sem essa opção, o pacote simples para demo
-continua disponível. A ligação dos botões de instalar/remover ao fluxo nativo
-ainda está em desenvolvimento.
+continua disponível.
+
+Os botões de instalar/remover abrem uma confirmação bilíngue. A instalação
+preparada valida o pacote incluído, aguarda o controlador anterior encerrar e
+abre somente esse pacote no Installer. Conclua ou cancele lá e feche sua janela:
+o app aguarda o processo, confere o helper esperado e exige uma sessão nova
+compatível antes de confirmar sucesso. A remoção preparada usa somente
+`sudo -A -k -- /Library/PrivilegedHelperTools/dev.vpnt.install remove`, com canal
+anônimo, recibo e saída confirmados. Perfis e credenciais são mantidos.
+Prazo vencido não encerra o Installer/helper à força nem repete a operação;
+enquanto o filho vive, o app mostra a espera e recusa outra alteração. Sair
+mantém a retomada desativada. Testes de processos e navegador usam apenas
+componentes fictícios; não executam esses comandos reais.
 
 O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
 à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que
@@ -239,7 +251,8 @@ inativos sem interromper os ativos; IPsec aparece no catálogo, com seu driver
 ainda pendente. Leitura e escrita rodam fora do controlador, com filas e
 prazos limitados; EOF/sinais encerram admissões e aguardam cleanup. Há testes de
 socket, arquivos/flock reais de fixture e controlador com rede simulada.
-O binário ainda não está instalado ou no .app. Installer/sudoers e
+O binário faz parte do payload que pode ser incluído no .app; não está instalado.
+Installer/sudoers e
 comportamento após elevação continuam pendentes; o modo runtime deve ser a
 única autorização sem senha da futura regra restrita.
 
@@ -272,8 +285,8 @@ O runtime inclui uma cópia dos certificados públicos de
 pode precisar de acesso ao Security.framework fora do sandbox; uma lista vazia
 interrompe o build. Chaveiros pessoais não são usados para esse bundle.
 
-O binário auxiliar `vpnt-pinentry` também é compilado, mas ainda não é
-instalado ou incluído no `.app`. Ele recebe a senha por um socket anônimo
+O binário auxiliar `vpnt-pinentry` também é compilado e incluído no payload,
+sem instalar. Ele recebe a senha por um socket anônimo
 herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
 A camada de processo SSL e o caminho compilado do helper já consomem esse
 transporte. A instalação e a prova privilegiada completa pela UI seguem pendentes.
