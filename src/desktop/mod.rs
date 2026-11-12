@@ -1,7 +1,7 @@
 mod icon;
+mod worker;
 
 use crate::{
-    app::App,
     assets::{CONTENT_SECURITY_POLICY, asset},
     bridge::{Command, Reply, parse_request, trusted_origin},
 };
@@ -18,7 +18,8 @@ use zeroize::Zeroizing;
 
 enum UserEvent {
     Tray(TrayIconEvent),
-    Ipc(Zeroizing<String>),
+    Ipc(Zeroizing<String>, std::time::Instant),
+    Reply(Reply),
 }
 
 pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -59,13 +60,16 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
             let trusted = trusted_origin(&request.uri().to_string());
             let body = Zeroizing::new(request.into_body());
             if trusted && body.len() <= 65536 {
-                let _ = proxy.send_event(UserEvent::Ipc(body));
+                let _ = proxy.send_event(UserEvent::Ipc(body, std::time::Instant::now()));
             }
         })
         .with_navigation_handler(|url| trusted_origin(&url))
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .build(&window)?;
-    let mut app = if demo { App::demo() } else { App::new() };
+    let reply_proxy = event_loop.create_proxy();
+    let application = worker::Worker::new(demo, move |reply| {
+        let _ = reply_proxy.send_event(UserEvent::Reply(reply));
+    })?;
     let mut tray = None;
     let mut open = false;
     event_loop.run(move |event, _, control_flow| {
@@ -114,7 +118,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     window.set_focus();
                 }
             }
-            Event::UserEvent(UserEvent::Ipc(body)) => {
+            Event::UserEvent(UserEvent::Ipc(body, received)) => {
                 if let Ok(request) = parse_request(&body) {
                     if matches!(request.command, Command::Quit {}) {
                         *control_flow = ControlFlow::Exit;
@@ -134,23 +138,26 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     if let Command::Resize { height } = request.command {
                         window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
                     }
-                    let reply = match app.dispatch(request.command) {
-                        Ok(snapshot) => Reply {
-                            id: request.id,
-                            snapshot: Some(snapshot),
-                            error: None,
-                        },
-                        Err(error) => Reply {
-                            id: request.id,
+                    let id = request.id.clone();
+                    if application.send(request, received).is_err() {
+                        let reply = Reply {
+                            id,
                             snapshot: None,
-                            error: Some(error.into()),
-                        },
-                    };
-                    if let Ok(json) = serde_json::to_string(&reply) {
-                        let _ = webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
+                            error: Some("backend_unavailable".into()),
+                        };
+                        if let Ok(json) = serde_json::to_string(&reply) {
+                            let _ =
+                                webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
+                        }
                     }
                 }
             }
+            Event::UserEvent(UserEvent::Reply(reply)) => {
+                if let Ok(json) = serde_json::to_string(&reply) {
+                    let _ = webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
+                }
+            }
+
             Event::WindowEvent {
                 event: WindowEvent::Focused(false) | WindowEvent::CloseRequested,
                 ..

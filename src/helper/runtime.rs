@@ -163,6 +163,9 @@ impl Runtime {
 
     /// Only the fixed auxiliary executable is admitted in production. Root
     /// ownership and all ancestors are checked independently from the C runtime.
+    pub fn verify_helper() -> Result<(), RuntimeError> {
+        Self::verify_adapter(Path::new(paths::HELPER))
+    }
     pub fn verify_pinentry() -> Result<(), RuntimeError> {
         Self::verify_adapter(Path::new(paths::PINENTRY))
     }

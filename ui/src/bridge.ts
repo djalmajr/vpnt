@@ -27,6 +27,16 @@ window.__vpntReply = (reply) => {
 };
 
 export async function invoke(command: Command): Promise<Snapshot> {
+  const interactive = [
+    "toggle",
+    "reconnect",
+    "save_secrets",
+    "save_profile",
+    "remove_profile",
+    "install_helper",
+    "remove_helper",
+  ].includes(command.type);
+  const timeout = interactive ? 120000 : 10000;
   const id = `ui-${++sequence}`;
   const body = JSON.stringify({ id, command });
   const ipc = window.ipc;
@@ -35,7 +45,7 @@ export async function invoke(command: Command): Promise<Snapshot> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(timeout),
     });
     if (!response.ok) throw new Error("backend_unavailable");
     const reply: Reply = await response.json();
@@ -47,7 +57,7 @@ export async function invoke(command: Command): Promise<Snapshot> {
     const timer = setTimeout(() => {
       pending.delete(id);
       reject(new Error("backend_unavailable"));
-    }, 10000);
+    }, timeout);
     pending.set(id, { resolve, reject, timer });
     try {
       ipc.postMessage(body);

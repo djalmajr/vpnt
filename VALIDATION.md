@@ -41,8 +41,8 @@ a uma execução verde no GitHub; esta exige envio e execução no serviço.
 
 ## Persistência, chaveiro e protocolo
 
-Os módulos dessa camada ainda não estão ligados ao modo normal da UI nem a um
-helper instalado. Para executar seus testes isolados no macOS:
+O broker normal já consome o protocolo e o chaveiro; o caminho instalado ainda
+não foi exercitado. Para executar os testes isolados dessa camada no macOS:
 
 ```bash
 cargo test --locked --no-default-features --test storage --test profiles --test secrets --test keychain --test helper_protocol --test runtime_policy --test vici
@@ -137,20 +137,94 @@ contada como mutação detectada. Recibos/hashes de src/tests e logs ficam em
 `output/fixtures/helper-channel-oracles/`. O workflow macOS inclui essa matriz;
 CI remoto ainda não executado.
 
-**Limites:** helper não instalado, sem broker/UI normal ou política sudoers
-aplicada. A preparação da elevação também precisa conferir a passagem de FD 0,
+**Limites:** helper não instalado e política sudoers não aplicada. O cliente e
+o broker normal estão preparados abaixo. A elevação precisa conferir a passagem de FD 0,
 PTY e política de registro de IO, preservando o sigilo das credenciais.
 Snapshot/conexões do adaptador atual incluem apenas SSL; o despacho IPsec
 permanece por implementar. Installer, sinal/UID após elevação, recursos
 privilegiados e testes com gateways reais continuam pendentes. Nada foi
 instalado, elevado, conectado ou publicado.
 
-Checkpoint executado: `016d1cf`, com 143 testes Rust com desktop/142 sem desktop,
+Checkpoint histórico executado: `016d1cf`, com 143 testes Rust com desktop/142 sem desktop,
 11 mutações do helper, 67 de rotas e 16 da supervisão PPP. Os hashes dos 118
-arquivos src/tests conferem com os três recibos desse commit. A revisão seguinte
-atualiza README/VALIDATION e somente um comentário de documentação em
-`controller/native.rs`; a evidência comportamental é reutilizada por não haver
-mudança de código, configuração ou dependência executável.
+arquivos src/tests conferem com os três recibos desse commit. Essas três matrizes
+são reutilizadas neste avanço: servidor/controlador, PPP e rotas não mudaram.
+Seus recibos não são hashes do novo cliente/broker. A nova matriz abaixo cobre
+esses consumidores e tem seu próprio inventário de fontes.
+
+## Cliente do helper e broker normal
+
+```bash
+cargo test --locked --no-default-features --offline --lib helper::client
+cargo test --locked --no-default-features --offline --lib broker::tests
+cargo test --locked --all-features --offline --lib desktop::worker
+python3 scripts/macos/check-broker.py
+```
+
+Executar no macOS como usuário comum. O cliente produtivo admite o helper fixo
+com as verificações existentes de proprietário, modo, ACL e Mach-O. Prepara
+somente `sudo -n -- /Library/PrivilegedHelperTools/dev.vpnt.helper runtime`,
+sem caminho/comando/UID recebido da UI. O teste substitui o Command apenas na
+API compilada com cfg(test); não executa sudo. O filho recebe socketpair duplex
+em FD 0, ambiente reduzido e cwd `/`; stdout/stderr são descartados. Filas e
+frames são limitados, com prazo de cinco segundos por frame iniciado/escrita.
+O frame de credenciais é zeroizado. Erro/EOF fecha admissões, publica falha e
+descarta credenciais enfileiradas antes de esperar o Child próprio. Não há kill
+ou prazo que transforme a saída do launcher em prova de cleanup da rede.
+
+O broker exige protocolo e versão exata do app, snapshot inicial solicitado e
+geração zero/Off antes de consultar metadados do chaveiro. Lê credenciais apenas
+em conectar/reconectar e confere expiração novamente após essa leitura.
+Accepted não produz Connected; somente Changed da geração atual pode fazê-lo.
+Resultados antigos não afetam uma geração nova. Probe não reconecta; desligar
+todas envia uma operação para cada perfil ativo. Perda/versão incompatível
+retira a disponibilidade do helper, sem declarar Off. O canal morto não aceita
+mensagens restantes como uma nova sessão. Logs têm somente estado/horário,
+com limite de 60; snapshots contêm indicadores de presença, nunca credenciais.
+
+Dois testes do cliente usam um processo Python independente e sockets nativos:
+conferem FD/ambiente, fluxo/EOF, protocolo incompatível, saída e frame malformado.
+O peer de erro segura o cleanup após receber EOF: a aplicação precisa observar
+a falha antes de permitir seu término. Cinco testes do broker exercitam esse
+peer, Keychain de fixture, gerações/cancelamento, probe, dois perfis, versão,
+expiração, perda e snapshot inicial indevidamente conectado. Um deles usa
+Security.framework real numa base descartável, interação desabilitada, salva
+credenciais fictícias via broker e as carrega para o filho fictício. Ao final
+exige exclusão bem-sucedida e chaveiro padrão/lista de busca inalterados.
+
+O worker do host usa fila limitada e mantém Keychain/helper fora do event loop.
+Um teste exige que um pedido expirado não inicie nem repita uma operação.
+Pedidos interativos têm 119 segundos no worker/120 na ponte; os demais, nove/dez.
+O polling da UI pausa enquanto uma ação aguarda resposta. Ainda falta um gate
+de ordenação para descartar respostas de polling já em voo ao iniciar uma ação.
+Não foi validado um prompt de autenticação real nem o deadline sob esse prompt.
+
+A matriz descartável executa três baselines/restaurações (broker, cliente,
+worker) e 12 mutações. Exige a assertion do teste previsto, não falha de build:
+versão, Accepted promovido a Connected, geração antiga, desligar só um perfil,
+probe que desliga, expiração após Keychain, saída que vira Off, snapshot ativo,
+kill do helper, falha atrasada até o cleanup, ambiente herdado e pedido expirado.
+A primeira tentativa de Accepted->Connected sobreviveu por ser sobrescrita pelo
+evento Connecting no mesmo lote; o teste passou a conferir também o log público.
+Na execução final as 12 foram detectadas e as seis baselines passaram. Logs,
+comandos e hashes dos 145 arquivos src/tests/ui/src estão em
+`output/fixtures/broker-oracles/`; o workflow macOS inclui a matriz.
+
+Neste avanço passaram 151 testes Rust com desktop/149 sem desktop, fmt,
+clippy -D warnings, lint/typecheck da UI, quatro testes Bun com 89 assertions,
+81 entradas de tokens, build e pacote local. O gate de classes segue sem regras.
+As matrizes anteriores de helper/rotas/PPP conservam os limites do checkpoint
+016d1cf acima. O runtime C não foi reconstruído neste avanço.
+
+**Limites:** SaveProfile/RemoveProfile/InstallHelper/RemoveHelper seguem sem
+implementação no broker. Falta reabrir o canal após falha, integração administrativa,
+installer/sudoers e admissão instalada. Só SSL tem despacho preparado; IPsec falta.
+Nenhum teste executou sudo/elevação, pppd do sistema, interface/rota nova ou VPN.
+Lançar o .app em demo não forneceu prova visual: CUA reiniciou duas vezes e o
+fallback de clique retornou -25200. Isso é limite do driver, sem concluir falha
+do painel. A instância própria foi encerrada e sua saída conferida. Tray,
+WKWebView, temas/idiomas e prompts nativos ainda exigem inspeção real.
+Nada instalado, conectado ou publicado; CI remoto e revisão final pendentes.
 
 ## Exclusão entre controladores
 
@@ -653,7 +727,8 @@ cargo test --locked --no-default-features --lib connection::controller
 O consumidor preparado `run_ssl` exige root e o lock persistente, carrega do
 storage root apenas os perfis SSL do UID autenticado pelo helper e mantém
 workers separados por perfil. O executável preparado chama a fábrica e o
-adaptador nativo, sem execução root ou integração com a UI nesta entrega.
+adaptador nativo, ligado em código ao broker normal, sem execução root ou prova
+de VPN pela UI nesta entrega.
 IPsec ainda precisa do seu driver e do despacho correspondente.
 
 Conectar e desligar exigem geração maior que a anterior daquele perfil;

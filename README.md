@@ -40,8 +40,14 @@ cargo run -- --demo --show
 O modo `--demo` oferece perfis fictícios, transições e seleção dos 14 estados.
 Os cadastros e as senhas de demonstração ficam apenas na memória; não use dados
 reais nele. Idioma e tema persistem como preferências locais da interface.
-Sem `--demo`, o app começa vazio e apresenta o primeiro uso; as operações de
-VPN, chaveiro e instalação do helper ainda informam que estão em desenvolvimento.
+Sem `--demo`, um worker separado atende a UI, consulta o helper e usa o chaveiro
+do usuário. O cliente preparado verifica o executável fixo e invoca somente
+`sudo -n -- /Library/PrivilegedHelperTools/dev.vpnt.helper runtime`, com canal
+duplex anônimo herdado em FD 0. Nenhum helper ou sudoers é instalado pelo app
+atual: sem esses pré-requisitos ele apresenta o primeiro uso. Cadastro/remoção
+de perfis e instalação/remoção do helper ainda estão em desenvolvimento.
+Essa ligação está compilada e testada com um subprocesso fictício, sem execução
+de sudo, elevação ou conexão VPN real.
 
 Para exercitar a mesma UI e a ponte de comandos no navegador:
 
@@ -91,11 +97,11 @@ impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O dri
 SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos
 recursos que autorizou. A camada de processo está implementada; propriedade da
 interface e probe nativo são consumidos pelo controlador preparado em Rust,
-ainda sem ligação ao helper/UI. O vínculo PPP combina registros do `configd`, processos de pai/filho
+ligados em código ao helper e ao broker normal. O vínculo PPP combina registros do `configd`, processos de pai/filho
 verificados e observação de saída pelo kernel. O probe exige interface e origem
 explícitas, com ping e fallback TCP. Os fixtures usam loopback e interfaces
 sintéticas; não provam PPP ou tráfego VPN. Aplicação/cleanup de recursos reais,
-helper e integração normal da UI continuam pendentes.
+helper instalado e prova da integração completa continuam pendentes.
 
 O transporte SSL recebe um vínculo de saída selecionado por leitura nativa da
 rota, ligado ao ID, hostname e porta do perfil. O patch
@@ -136,7 +142,8 @@ anterior; fechar o canal cancela os workers e aguarda também a fila de recursos
 de cadastros que falharam. Estados de worker são mantidos em memória de forma
 limitada; saída lenta não bloqueia o cancelamento. Os testes passam pelo codec
 real, coordenador e processos de teste próprios, com rede e PPP simuladas.
-O adaptador root está compilado, mas não foi executado nem exposto na UI.
+O adaptador root está compilado e ligado ao broker normal, mas não foi executado
+como root nem validado por uma conexão da UI.
 O canal herdado já observa o cliente, o supervisor e o filho PPP desde as
 barreiras anteriores ao exec, conservando os três watches originais. Falhas
 após spawn mantêm o driver e seus recibos. Se houve permissão antes de descobrir
@@ -151,9 +158,18 @@ sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil,
 revalidando o lock. Leitura e escrita rodam fora do controlador, com filas e
 prazos limitados; EOF/sinais encerram admissões e aguardam cleanup. Há testes de
 socket, arquivos/flock reais de fixture e controlador com rede simulada.
-O binário ainda não está instalado ou no .app. Installer/sudoers, broker e
+O binário ainda não está instalado ou no .app. Installer/sudoers e
 comportamento após elevação continuam pendentes; o modo runtime deve ser a
 única autorização sem senha da futura regra restrita.
+
+O broker exige snapshot inicial compatível antes de consultar os indicadores
+de segredos; lê credenciais somente ao conectar/reconectar por ação explícita.
+Só eventos da geração atual do helper podem informar conexão. Accepted não
+significa túnel conectado, e perda do canal não significa cleanup concluído.
+O cliente fecha o socket e aguarda seu filho próprio sem matá-lo; a falha chega
+à UI antes dessa espera. Ainda falta reabrir o canal após falha e integrar o
+fluxo administrativo. A prova nativa atual do chaveiro usa uma base descartável
+com credenciais fictícias enviadas ao peer de teste, sem usar VPN pessoal.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
@@ -164,7 +180,7 @@ O binário auxiliar `vpnt-pinentry` também é compilado, mas ainda não é
 instalado ou incluído no `.app`. Ele recebe a senha por um socket anônimo
 herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
 A camada de processo SSL e o caminho compilado do helper já consomem esse
-transporte. A instalação, o broker da UI e a prova privilegiada seguem pendentes.
+transporte. A instalação e a prova privilegiada completa pela UI seguem pendentes.
 
 O binário separado `vpnt-pppd` prepara a supervisão do filho PPP. Ele aceita
 somente a lista fixa de argumentos, exige root e um canal herdado em FD 4,

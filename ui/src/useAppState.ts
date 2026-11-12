@@ -24,6 +24,7 @@ export function useAppState() {
     id: string;
     connect?: boolean;
   }>();
+  const running = useRef(0);
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
     setSnapshot((previous) =>
@@ -44,6 +45,7 @@ export function useAppState() {
   const run: Run = useCallback(
     async (command) => {
       setError(undefined);
+      running.current += 1;
       try {
         receive(await invoke(command));
         return true;
@@ -58,6 +60,8 @@ export function useAppState() {
         };
         setError(keys[error instanceof Error ? error.message : ""] ?? "error");
         return false;
+      } finally {
+        running.current -= 1;
       }
     },
     [receive],
@@ -66,6 +70,10 @@ export function useAppState() {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
+      if (running.current) {
+        timer = setTimeout(() => void poll(), 500);
+        return;
+      }
       try {
         const snapshot = await invoke({ type: "get_snapshot" });
         if (!disposed) receive(snapshot);
