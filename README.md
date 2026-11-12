@@ -126,8 +126,25 @@ Essas operações têm testes em árvores privadas do usuário comum. O modo roo
 `remove` só recebe a identidade pelo canal Unix anônimo herdado. Não há override
 de path/UID pela linha de comando ou ambiente. O helper também exige recibo
 íntegro, usuário registrado e ausência de transação pendente antes de servir.
-Execução elevada, pacote `.pkg` e ligação de instalação/remoção ao app continuam
-pendentes. Veja os limites e os comandos de reprodução em `VALIDATION.md`.
+O pacote de desenvolvimento do componente pode ser produzido e auditado a
+partir do payload admitido, ainda sem instalar:
+
+```bash
+python3 scripts/macos/package-installation.py --payload "target/vpnt-installation/ID_DO_PAYLOAD"
+```
+
+Ele fica em `target/vpnt-packages/<id>/vpnt-component-<versão>-<uid>.pkg`.
+O script extrai o produto e confere scripts, payload, hashes, destino, modos e
+ownership `root:wheel` gravados no BOM. Exige domínio do sistema, volume de boot,
+arquitetura e macOS mínimo admitidos, sem relocação. O payload do pacote só
+aponta ao staging versionado; o postinstall preparado ativa o executável fixo.
+Repetir reutiliza apenas uma saída íntegra; corrupção é recusada. `--verify`
+audita um pacote existente contra o mesmo payload. O pacote é verificado como
+sem assinatura; distribuição assinada/notarizada continua pendente.
+
+Execução positiva como root, efeito do Installer no sistema e ligação de
+instalação/remoção ao app continuam pendentes. Veja os limites e os comandos de
+reprodução em `VALIDATION.md`.
 
 O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
 à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que

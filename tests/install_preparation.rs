@@ -1,67 +1,11 @@
 #![cfg(target_os = "macos")]
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
-// Share the synthetic runtime format with payload admission tests.
 mod helper {
     pub use vpnt::helper::paths;
 }
-#[path = "../src/install/payload/tests/runtime.rs"]
-mod runtime;
-
-struct Repository {
-    root: PathBuf,
-    _runtime: runtime::RuntimeFixture,
-}
-impl Repository {
-    fn new() -> Self {
-        let mut runtime = runtime::RuntimeFixture::new();
-        let root = runtime.directory.with_file_name(format!(
-            "install-preparer-{}",
-            runtime.directory.file_name().unwrap().to_str().unwrap()
-        ));
-        fs::create_dir_all(root.join("scripts/macos")).unwrap();
-        fs::create_dir_all(root.join("target/debug")).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::rename(&runtime.directory, root.join("target/vpnt-runtime")).unwrap();
-        runtime.directory = root.join("target/vpnt-runtime");
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        fs::copy(source.join("Cargo.toml"), root.join("Cargo.toml")).unwrap();
-        fs::copy(
-            source.join("scripts/macos/prepare-installation.py"),
-            root.join("scripts/macos/prepare-installation.py"),
-        )
-        .unwrap();
-        // Role executables are fictional in this fixture. Each has a real native
-        // Mach-O header; only the read-only inspector itself is ever executed.
-        for name in [
-            "vpnt-install",
-            "vpnt-helper",
-            "vpnt-pinentry",
-            "vpnt-pppd",
-            "vpnt-askpass",
-        ] {
-            fs::copy(
-                env!("CARGO_BIN_EXE_vpnt-install"),
-                root.join("target/debug").join(name),
-            )
-            .unwrap();
-        }
-        Self {
-            root,
-            _runtime: runtime,
-        }
-    }
-    fn run(&self) -> std::process::Output {
-        Command::new("python3")
-            .arg(self.root.join("scripts/macos/prepare-installation.py"))
-            .output()
-            .unwrap()
-    }
-}
-impl Drop for Repository {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+#[path = "installation/fixture.rs"]
+mod fixture;
+use fixture::Repository;
 
 #[test]
 fn preparation_is_repeatable_parses_its_own_policy_and_refuses_to_replace_a_corrupted_build() {
@@ -74,7 +18,7 @@ fn preparation_is_repeatable_parses_its_own_policy_and_refuses_to_replace_a_corr
     );
     let result: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(result["installationPerformed"], false);
-    assert_eq!(result["uid"], repository._runtime.uid);
+    assert_eq!(result["uid"], repository.uid());
     assert_eq!(result["activationAvailable"], true);
     assert_eq!(result["visudoParsed"], true);
     assert_eq!(result["files"], 10);

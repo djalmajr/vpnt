@@ -55,6 +55,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-installation-engine.py
+      - name: Verify unsigned component packages without installation
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation-package.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

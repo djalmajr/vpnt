@@ -230,7 +230,90 @@ SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abai
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
-## Executor de instalação e recuperação
+## Pacote local do componente privilegiado
+
+```bash
+cargo test --locked --no-default-features --test install_package --test install_preparation
+python3 scripts/macos/check-installation-package.py
+python3 scripts/macos/package-installation.py --payload "target/vpnt-installation/ID_DO_PAYLOAD"
+```
+
+[executed, native packaging + fictional roles] Quatro testes Rust atravessam
+o preparador e pkgbuild/productbuild/pkgutil/lsbom reais, com runtime sintético
+e executáveis fictícios que só oferecem inspect/policy nos testes. O pacote
+gerado é extraído novamente e o mesmo inspetor nativo admite o payload extraído.
+O BOM precisa registrar root:wheel, os modos exatos e todos os alvos conhecidos.
+Entradas AppleDouble só são aceitas quando correspondem a um alvo conhecido,
+com o mesmo modo e ownership. Os bytes do payload são copiados sem forks/ACLs
+do arquivo de origem; metadados de proveniência gerados pelo macOS podem
+continuar no arquivo. Ownership gravado no BOM não prova instalação como root.
+
+[executed, native archive admission] Distribution confere domínio localSystem,
+volume de boot, arquitetura nativa e mínimo de macOS do payload, sem relocação
+ou scripts externos de JavaScript. PackageInfo confere autoridade root,
+identidade/versão/destino fixos, actions e scripts exatos. Somente os acréscimos
+calculados de tamanho, referência local e bundle-version vazio do productbuild
+são normalizados. Payload de arquivo aponta apenas para
+/Library/PrivilegedHelperTools/dev.vpnt.staging/<hash>; os alvos live são do
+executor. Referência de esquema: [Apple Distribution XML](https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html).
+
+[executed, ordinary-user script rejection; partial root execution] sh -n
+analisa preinstall/postinstall extraídos. Ambos recusam volume alternativo com
+exit 64 e o usuário comum com exit 77, inclusive com SUDO_UID forjado. A última
+linha do postinstall confere executável fixo e o único argumento activate.
+O preinstall preparado confere donos/modos/links dos ancestrais e, se o build
+já existir, exige todos os arquivos com hashes/modos exatos e nenhum item extra.
+Essas verificações positivas de árvore root, a convenção de argumentos sob
+PackageKit e a ativação pelo postinstall ainda não foram executadas como root.
+Não chamar installer nem abrir o pacote para instalar durante esses testes.
+
+[executed, well-formed altered archives] O teste reconstrói arquivos válidos
+com volume/domínio alterados, root XML desconhecido, destino/autoridade/relocação
+alterados, bundle action ou script action diferente e BOM de usuário comum.
+Todos são recusados pela fronteira específica esperada. Outros produtos válidos
+com bytes de script ou payload alterados, modo alterado e arquivo extra são
+recusados; isso distingue admissão de apenas detectar arquivo quebrado.
+Repetição conserva inode/hash do pacote saudável; corrupção não é substituída.
+Saída sobreposta à entrada e flag --install são recusadas antes de criar pacote.
+Árvores temporárias próprias são removidas ao final.
+
+[executed, regression] O teste sob umask 077 falhou primeiro porque os diretórios
+novos do payload congelado conservavam 0700. O preparador do pacote agora aplica
+0755 somente aos diretórios dessa cópia nova, conservando o root privado 0700 e
+a entrada original. O teste passou; a auditoria exige os modos gravados exatos.
+O comando --verify também resolve o alias do diretório temporário do macOS
+antes da admissão, sem relaxar a recusa a links do inspetor.
+
+[executed, unsigned artifact] O pacote do runtime C/adapters locais foi gerado
+e extraído sem elevar: 18 arquivos de dados, 53 entradas no BOM, incluindo
+26 entradas de metadados, mínimo macOS 26.0. pkgutil --check-signature confirmou
+ausência de assinatura. A auditoria exige esse estado para este pacote de
+desenvolvimento; signed=false é verificado, não inferido só pela falta de --sign.
+O pacote fica em target/vpnt-packages/<id> e declara installationPerformed=false.
+Ele não instala o .app e não foi instalado na máquina. Distribuição assinada/
+notarizada, execução elevada e efeitos do Installer permanecem pendentes.
+
+[executed, local] Passaram 210 testes Rust com desktop e 207 sem desktop,
+com os mesmos dois ignored descritos no checkpoint do executor. Fmt, clippy
+all-targets/all-features com -D warnings, build dos binários/askpass e pacote
+.app/cmp passaram. A matriz do pacote detectou 15 mutações e passou quatro
+baselines/restaurações: guards de volume/root, operação de postinstall, contrato
+de Distribution/PackageInfo/root XML/actions, conteúdo de script/payload/modos,
+ownership, declaração falsa de instalação, sobreposição e umask. Cada mutação
+exige falha executada da assertion esperada. Os 182 hashes de fontes/testes/
+catálogos/scripts conferem em output/fixtures/installation-package-oracles/.
+As 48 mutações de payload/executor continuam vinculadas ao checkpoint e8f4b7e;
+nesta fase não foram reexecutadas, nem as outras 157 anteriores. O código de
+src/ é o mesmo, e o fixture compartilhado do preparador foi revalidado nas
+baselines. O workflow inclui a matriz nova; CI remoto não foi executado.
+
+[partial] Ainda faltam a ligação InstallHelper/RemoveHelper ao app, os gates
+positivos root/PackageKit/sudo/PAM/FD 0/IO/PTY, aceite de tray/WKWebView, IPsec,
+VPN/tráfego/cleanup reais, revisão final e CI remoto. Os fixtures não encerram
+esses gates. Fontes de src/, UI, dependências e patches permanecem iguais a
+e8f4b7e; o fixture do preparador foi compartilhado com os novos testes.
+
+## Executor de instalação e recuperação — checkpoint e8f4b7e
 
 ```bash
 cargo test --locked --no-default-features --lib install::engine::tests
@@ -311,7 +394,7 @@ fontes atuais. UI/catálogos/layout, dependências e patches não mudaram; prova
 visuais e as 157 mutações anteriores às fases de instalação mantêm seus
 checkpoints históricos, sem reexecução neste ciclo.
 
-[partial] A fase prepara apenas código e artefatos locais. Staging root/.pkg,
+[partial, histórico e8f4b7e] A fase preparou apenas código e artefatos locais. Staging root/.pkg,
 integração InstallHelper/RemoveHelper ao app, instalação e remoção elevadas,
 política efetiva/askpass/PAM, IPsec, VPN/tráfego/cleanup real, aceite de
 tray/WKWebView, revisão final e CI remoto continuam pendentes. O workflow inclui
