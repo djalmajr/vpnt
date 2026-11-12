@@ -15,6 +15,7 @@ desktop = ["dep:tao", "dep:wry", "dep:tray-icon"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10.9"
 tiny_http = "0.12"
 zeroize = { version = "1", features = ["serde"] }
 

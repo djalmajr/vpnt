@@ -45,7 +45,7 @@ Os módulos dessa camada ainda não estão ligados ao modo normal da UI nem a um
 helper instalado. Para executar seus testes isolados no macOS:
 
 ```bash
-cargo test --locked --no-default-features --test storage --test profiles --test secrets --test keychain --test helper_protocol
+cargo test --locked --no-default-features --test storage --test profiles --test secrets --test keychain --test helper_protocol --test runtime_policy --test vici
 ```
 
 Storage usa somente `output/fixtures/`, com proprietário do processo para o
@@ -54,6 +54,11 @@ persistência/remoção, atualizações concorrentes, diretórios e arquivos pri
 links, arquivo especial que não possa bloquear a leitura, limites e dados
 inválidos. O teste sem privilégio não substitui a validação do helper instalado
 contra arquivos de proprietários diferentes.
+
+No macOS, os testes criam ACLs descartáveis: uma permissão de escrita deve ser
+rejeitada no executável mesmo com modo `0555`, e uma permissão de leitura deve
+ser rejeitada no perfil mesmo com modo `0600`. ACLs que apenas negam acesso nos
+ancestrais permanecem válidas. Nenhuma ACL pessoal é modificada.
 
 O teste nativo de chaveiro cria uma base descartável com dados fictícios. Usa
 esse handle para salvar, ler, atualizar, bloquear/desbloquear e remover; verifica
@@ -92,6 +97,21 @@ Esses checks não provam carregamento dos plugins privilegiados, criação de SA
 PPP, tráfego pelo túnel ou cleanup de rotas. O controle de filhos tem testes de
 processos reais para ambiente limpo, TERM, KILL após prazo e reap; isso prova
 saída do processo direto, enquanto cada driver ainda deve verificar seus recursos.
+
+A admissão em Rust repete inventário, SHA-256, proprietário, permissões e ACLs,
+rejeita links e verifica os comandos de carregamento Mach-O. Os fixtures incluem
+binários sintéticos inválidos e dependências em caminhos mutáveis. Para aplicar
+esse mesmo código ao artefato nativo preparado, execute separadamente:
+
+```bash
+cargo test --locked --no-default-features --test runtime_policy -- --ignored
+```
+
+O cliente VICI usa sockets Unix com verificação do UID remoto, buffers de valores
+apagados ao sair do escopo e `Debug` sem os valores. Testes exercitam o formato
+binário, respostas/eventos intercalados, truncamento, fechamento do peer e prazo
+total durante mensagens fragmentadas. O teste de listener precisa de permissão
+de socket local. Esses fixtures não iniciam charon nem provam controle de uma SA.
 
 ## Fluxos de demonstração
 

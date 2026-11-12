@@ -269,3 +269,23 @@ fn a_named_pipe_cannot_block_profile_loading() {
         "profile loading must reject special files without waiting for a writer"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn private_profile_data_rejects_acl_read_grants_even_with_mode_0600() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store.save(profile("a")).unwrap();
+    let database = fixture.path.join("profiles.json");
+    assert!(
+        std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&database)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(fs::metadata(&database).unwrap().mode() & 0o777, 0o600);
+    assert!(matches!(store.load(), Err(StoreError::UntrustedPath)));
+    assert!(store.save(profile("b")).is_err());
+}

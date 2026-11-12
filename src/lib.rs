@@ -7,6 +7,8 @@ pub mod bridge;
 pub mod cli;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub mod desktop;
+#[cfg(unix)]
+mod fs_permissions;
 pub mod helper;
 #[cfg(target_os = "macos")]
 pub mod keychain;

@@ -75,6 +75,7 @@ impl ProfileStore {
             Err(_) => return Err(StoreError::Io),
         };
         self.check_file(&file.metadata().map_err(|_| StoreError::Io)?)?;
+        crate::fs_permissions::check_file(&file, true).map_err(|_| StoreError::UntrustedPath)?;
         let mut data = vec![];
         file.take(MAX_BYTES + 1)
             .read_to_end(&mut data)
@@ -148,6 +149,8 @@ impl ProfileStore {
             {
                 return Err(StoreError::UntrustedPath);
             }
+            crate::fs_permissions::check_path(path, path == self.directory)
+                .map_err(|_| StoreError::UntrustedPath)?;
         }
         Ok(())
     }
@@ -175,6 +178,7 @@ impl ProfileStore {
             .open(self.directory.join(".profiles.lock"))
             .map_err(|_| StoreError::Io)?;
         self.check_file(&file.metadata().map_err(|_| StoreError::Io)?)?;
+        crate::fs_permissions::check_file(&file, true).map_err(|_| StoreError::UntrustedPath)?;
         // SAFETY: file owns a valid descriptor for the duration of the lock.
         // Closing this owned File releases flock, including on error/unwind.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {

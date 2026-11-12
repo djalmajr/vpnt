@@ -1,0 +1,13 @@
+use std::path::PathBuf;
+
+pub const HELPER: &str = "/Library/PrivilegedHelperTools/dev.vpnt.helper";
+pub const PINENTRY: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pinentry";
+pub const USERS: &str = "/Library/Application Support/vpnt/users";
+
+pub fn runtime_directory() -> PathBuf {
+    PathBuf::from("/Library/PrivilegedHelperTools/dev.vpnt.runtime").join(env!("CARGO_PKG_VERSION"))
+}
+
+pub fn user_directory(uid: u32) -> Option<PathBuf> {
+    (uid != 0).then(|| PathBuf::from(USERS).join(uid.to_string()))
+}
