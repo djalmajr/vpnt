@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
-mod files;
+pub(crate) mod files;
 mod manifest;
 use manifest::Manifest;
 
@@ -110,6 +110,32 @@ impl Payload {
         }
         Ok(())
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn owner(&self) -> u32 {
+        self.owner
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn materialize(&self) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+        self.revalidate()?;
+        let manifest: Manifest = serde_json::from_slice(&files::read(
+            &self.root.join("payload.json"),
+            self.owner,
+            65_536,
+        )?)
+        .map_err(|_| Error::InvalidManifest)?;
+        let mut total = 0usize;
+        let mut data = BTreeMap::new();
+        for (name, expected) in manifest.files {
+            let bytes = files::read(&self.root.join(&name), self.owner, 64 * 1024 * 1024)?;
+            total = total.checked_add(bytes.len()).ok_or(Error::Integrity)?;
+            if total > 256 * 1024 * 1024 || hash(&bytes) != expected {
+                return Err(Error::Integrity);
+            }
+            data.insert(name, bytes);
+        }
+        self.revalidate()?;
+        Ok(data)
+    }
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -117,4 +143,4 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

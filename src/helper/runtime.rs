@@ -228,7 +228,7 @@ impl Runtime {
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 240
         && name.split('/').count() <= 8

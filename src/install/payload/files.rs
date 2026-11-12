@@ -6,7 +6,7 @@ use std::{
     path::Component,
 };
 
-pub(super) fn directory(path: &Path, owner: u32, private: bool) -> Result<(), Error> {
+pub(crate) fn directory(path: &Path, owner: u32, private: bool) -> Result<(), Error> {
     if !path.is_absolute()
         || path
             .components()
@@ -30,7 +30,7 @@ pub(super) fn directory(path: &Path, owner: u32, private: bool) -> Result<(), Er
     Ok(())
 }
 
-pub(super) fn read(path: &Path, owner: u32, limit: u64) -> Result<Vec<u8>, Error> {
+pub(crate) fn read(path: &Path, owner: u32, limit: u64) -> Result<Vec<u8>, Error> {
     directory(path.parent().ok_or(Error::UntrustedPath)?, owner, false)?;
     let file = OpenOptions::new()
         .read(true)

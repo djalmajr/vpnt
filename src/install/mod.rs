@@ -1,5 +1,7 @@
 //! Closed installation payloads. Admission alone never grants access or writes
 //! to the machine; privileged activation must retain its own controller lock.
+#[cfg(target_os = "macos")]
+pub mod engine;
 pub mod payload;
 pub mod policy;
 
@@ -11,6 +13,12 @@ pub enum Error {
     Integrity,
     Incompatible,
     Io,
+    PermissionDenied,
+    Busy,
+    Conflict,
+    RecoveryRequired,
+    PolicyRejected,
+    InvalidRequest,
 }
 
 fn valid_hash(value: &str) -> bool {

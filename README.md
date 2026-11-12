@@ -109,9 +109,25 @@ reutiliza somente um build idêntico e íntegro; uma cópia corrompida é recusa
 A política preparada usa digest dos executáveis e argumentos exatos: runtime
 sem senha, administração/remoção com senha, sem PTY nem registro de IO. Sua
 sintaxe é validada com `visudo` somente no arquivo de fixture. Isso não comprova
-os privilégios efetivos da máquina. Os modos disponíveis de `vpnt-install` são
-`inspect` e `policy`, ambos apenas de leitura e recusados sob root. A ativação
-transacional, a remoção e o pacote `.pkg` permanecem em desenvolvimento.
+os privilégios efetivos da máquina. Os modos `inspect` e `policy` de
+`vpnt-install` são apenas de leitura e recusados sob root. A saída do preparador
+declara `installationPerformed=false`; não instala nem concede acesso.
+
+O executor Rust de ativação/remoção usa um journal privado, backups com hash,
+recibo de instalação e o mesmo lock persistente do controlador. Suspende as
+políticas antes de trocar arquivos e só as habilita depois dos binários e do
+recibo. Repetição preserva os arquivos idênticos; falhas observadas desfazem a
+transação e encerramento abrupto permite recuperação na próxima tentativa.
+Remover um usuário conserva o componente para os demais; a última remoção
+preserva perfis, segredos e inodes dos locks. Adulterações são recusadas.
+
+Essas operações têm testes em árvores privadas do usuário comum. O modo root
+`activate` só admite o próprio executável em staging fixo, pertencente a root;
+`remove` só recebe a identidade pelo canal Unix anônimo herdado. Não há override
+de path/UID pela linha de comando ou ambiente. O helper também exige recibo
+íntegro, usuário registrado e ausência de transação pendente antes de servir.
+Execução elevada, pacote `.pkg` e ligação de instalação/remoção ao app continuam
+pendentes. Veja os limites e os comandos de reprodução em `VALIDATION.md`.
 
 O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
 à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que

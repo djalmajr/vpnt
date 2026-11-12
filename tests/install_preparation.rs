@@ -75,7 +75,7 @@ fn preparation_is_repeatable_parses_its_own_policy_and_refuses_to_replace_a_corr
     let result: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(result["installationPerformed"], false);
     assert_eq!(result["uid"], repository._runtime.uid);
-    assert_eq!(result["activationAvailable"], false);
+    assert_eq!(result["activationAvailable"], true);
     assert_eq!(result["visudoParsed"], true);
     assert_eq!(result["files"], 10);
     let second = repository.run();
@@ -139,6 +139,10 @@ fn read_only_preparation_has_no_environment_or_argument_switch_to_activation() {
             "{args:?} cannot activate a payload"
         );
         assert!(output.stdout.is_empty());
+        if matches!(args.as_slice(), ["activate"] | ["remove"]) {
+            assert_eq!(output.status.code(), Some(77), "root admission/{args:?}");
+            assert_eq!(output.stderr, b"\"permission_denied\"\n");
+        }
     }
     assert_eq!(
         fs::read_dir(&repository.root).unwrap().count(),

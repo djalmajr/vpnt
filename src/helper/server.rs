@@ -1,6 +1,6 @@
 //! Root entrypoint with closed modes and a private inherited Unix channel.
 //! The socket's kernel peer UID, not IPC or sudo environment, selects storage.
-mod caller;
+pub(crate) mod caller;
 mod io;
 use super::{
     controller_lock::ControllerLock,
@@ -76,6 +76,8 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
         let lock = mode_lock(mode, ControllerLock::acquire)?;
+        crate::install::engine::admit_uid(caller.uid)
+            .map_err(|_| ErrorCode::UntrustedConfiguration)?;
         Ok((store, lock))
     })();
     let (store, lock) = match admitted {

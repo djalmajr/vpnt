@@ -15,7 +15,7 @@ concurrency:
 jobs:
   macos:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -51,6 +51,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-installation.py
+      - name: Verify installation transactions and crash recovery without elevation
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation-engine.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

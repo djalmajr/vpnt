@@ -5,12 +5,12 @@ use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf
 mod runtime;
 use runtime::{RuntimeFixture, macho};
 
-struct Fixture {
-    root: PathBuf,
+pub(crate) struct Fixture {
+    pub(crate) root: PathBuf,
     runtime: RuntimeFixture,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut runtime = RuntimeFixture::new();
         let root = runtime.directory.with_file_name(format!(
             "payload-{}",
@@ -37,7 +37,7 @@ impl Fixture {
         result.manifest(601);
         result
     }
-    fn manifest(&self, uid: u32) {
+    pub(crate) fn manifest(&self, uid: u32) {
         let mut files = BTreeMap::new();
         fn inventory(root: &Path, dir: &Path, files: &mut BTreeMap<String, String>) {
             for entry in fs::read_dir(dir).unwrap() {
@@ -55,7 +55,7 @@ impl Fixture {
         inventory(&self.root, &self.root, &mut files);
         fs::write(self.root.join("payload.json"), serde_json::to_vec(&serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"uid":uid,"files":files})).unwrap()).unwrap();
     }
-    fn inspect(&self) -> Result<Payload, Error> {
+    pub(crate) fn inspect(&self) -> Result<Payload, Error> {
         Payload::inspect(&self.root, self.runtime.uid)
     }
 }

@@ -230,7 +230,94 @@ SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abai
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
-## Payload e política de instalação
+## Executor de instalação e recuperação
+
+```bash
+cargo test --locked --no-default-features --lib install::engine::tests
+cargo test --locked --no-default-features --test install_preparation
+python3 scripts/macos/check-installation-engine.py
+```
+
+[executed, ordinary-user filesystem + native parser] O mesmo executor de
+ativação/remoção trabalha sobre uma árvore privada cfg(test). Instala, repete,
+atualiza os digests de todos os usuários registrados e remove um usuário ou os
+últimos arquivos comuns. Recibo canônico exige inventário completo, hashes e
+modos; links, permissões inseguras, alteração alheia, UID não registrado e
+escapes de namespace são recusados antes de mutação. Um ProfileStore real salva
+e relê um perfil fictício: bytes e inodes do perfil, reserva e lock global
+persistem após instalação/repetição/remoção. Nenhum segredo pessoal é usado.
+
+[executed, filesystem/process fixture] O journal privado contém hashes
+antes/depois e backups conferidos. A transação retém o ControllerLock persistente,
+suspende políticas, troca componentes e recibo e só então repõe políticas.
+Falhas após 11 prefixos de instalação, quatro de atualização e 12 de remoção
+restauram as imagens anteriores. Quatro filhos reais terminam com _exit após
+cada escrita de uma atualização; o processo pai aguarda seu próprio Child,
+confere a ordem de política/binário/recibo, readquire o mesmo inode de lock e
+recupera as imagens anteriores. Isso prova interrupção nos pontos exercitados,
+sem equivaler a falha em qualquer syscall ou perda de energia.
+
+[executed, filesystem fixture] Recuperação recusa imagens desconhecidas,
+backups ausentes necessários ou corrompidos antes de restauração parcial.
+Preparação incompleta de backups só pode ser descartada com imagens live ainda
+iguais ao estado anterior. Marker de commit durável exige imagens finais
+correspondentes; recuperação finaliza esse commit. Coleta interrompida aceita
+apenas manifesto/backups registrados ou diretório terminal vazio/com marker
+válido. Conteúdo desconhecido é conservado com RecoveryRequired. Journal sem
+manifesto válido e temporário órfão de escrita interrompida também são
+conservadores: não há recuperação por palpite. O lock advisory não cerca
+modificações de outro root arbitrário.
+
+[executed, native parser; partial installed policy] O executor chama visudo
+real para a política gerada e uma configuração de fixture com @includedir.
+Exige que cada arquivo esperado apareça como parsed OK; sintaxe global sem
+incluir a regra é recusada e revertida. O código limita tempo/saídas do parser;
+seus casos de prazo e saturação ainda não têm consumidor de subprocesso
+dedicado. Isso não prova privilégios efetivos, PAM, PTY, IO ou herança após sudo.
+
+[executed, native Unix fixture + unprivileged entrypoint] Remoção usa o peer UID
+do socketpair anônimo, um único documento limitado seguido de EOF e respostas
+sem expor outros UIDs. UID forjado/campo extra/segundo documento são recusados.
+Os modos activate/remove recusam o processo comum com exit 77, mesmo com
+SUDO_UID ou path de fixture no ambiente. Nenhum modo produtivo aceita override
+de instalação, UID ou paths. A entrada root preparada só admite activate pelo
+próprio executável no staging fixo e remove pelo instalador live; esses gates
+positivos de root, conta local e versão mínima ainda não foram executados.
+O helper agora exige recibo íntegro, usuário registrado e ausência de journal
+pendente; runtime conserva o lock durante essa admissão. A ligação dessa
+admissão ao entrypoint root permanece sem prova elevada.
+
+[executed] Quinze testes novos do executor passaram, além do child harness
+marcado ignored e chamado explicitamente pelo teste pai. A matriz detectou
+24 mutações com quatro baselines/restaurações: retenção do lock, repetição,
+arquivos alheios, hashes/inventário/modos/canonicalização, links, namespace,
+ordem de política, rollback, backups, commit/coleta, IPC e root/UID admission.
+Cada caso exige assertion executada do consumidor; erro de build/âncora não
+conta. Logs e inventário de hashes estão em
+output/fixtures/installation-engine-oracles/. A primeira tentativa revelou que
+o teste de crash ainda não observava retenção do lock durante as escritas;
+o observador agora tenta adquirir o lock real em cada prefixo e exige Busy.
+Essa mutação só foi contabilizada após falhar na assertion e a baseline passar.
+
+[executed, local] A suíte completa passou com 206 testes Rust com desktop e
+203 sem desktop. Os dois ignored são a admissão opcional do runtime e o child
+harness de crash, este exercitado pelo pai. A tentativa dentro do sandbox teve
+14 falhas de acesso a sockets/leituras nativas/chaveiro; a execução como usuário
+comum fora do sandbox passou. Fmt, clippy all-targets/all-features com -D warnings,
+build dos binários, build do askpass, pacote .app e cmp passaram. A matriz
+anterior de payload/preparador também foi reexecutada: mais 24 mutações e quatro
+baselines/restaurações. Os 176 hashes da matriz do executor conferem com as
+fontes atuais. UI/catálogos/layout, dependências e patches não mudaram; provas
+visuais e as 157 mutações anteriores às fases de instalação mantêm seus
+checkpoints históricos, sem reexecução neste ciclo.
+
+[partial] A fase prepara apenas código e artefatos locais. Staging root/.pkg,
+integração InstallHelper/RemoveHelper ao app, instalação e remoção elevadas,
+política efetiva/askpass/PAM, IPsec, VPN/tráfego/cleanup real, aceite de
+tray/WKWebView, revisão final e CI remoto continuam pendentes. O workflow inclui
+a nova matriz. Nenhum sudo, installer do macOS, instalação ou VPN foi executado.
+
+## Payload e política de instalação — checkpoint f2e6793
 
 ```bash
 cargo test --locked --no-default-features --lib install::
@@ -265,15 +352,18 @@ inspetor Mach-O compilado, um runtime sintético e papéis de executáveis fict�
 só o inspetor é executado. Atravessa o script Python e o parser visudo reais.
 Repetição conserva o build e remove cópias temporárias. Corrupção do destino
 é recusada sem repará-lo silenciosamente; saída sobreposta às entradas é recusada
-antes de escrever. Flags e SUDO_UID forjado não ativam o componente. O CLI ainda
-só oferece inspect/policy, sem operação privilegiada disponível.
+antes de escrever. Flags e SUDO_UID forjado não ativam o componente. Naquele
+checkpoint o CLI só oferecia inspect/policy; os modos preparados posteriores
+estão descritos na seção do executor acima.
 
 [executed, native file admission] O preparador também admitiu o runtime C local
 já construído e os cinco adapters reais: 17 arquivos, mínimo macOS 26.0.
 Nenhum cliente VPN foi executado para isso; é inspeção de arquivos/formato e
 integridade, sem prova funcional de VPN, assinatura ou notarização. O payload
 fica em target/vpnt-installation/<id>. A saída declara installationPerformed=false
-e activationAvailable=false. Python >=3.11 é necessário. O preparador não roda
+e, naquele checkpoint, activationAvailable=false. O executor posterior mudou
+esse segundo campo para true; isso indica código disponível, sem instalação.
+Python >=3.11 é necessário. O preparador não roda
 sudo, installer do macOS ou escrita fora da saída local escolhida.
 
 [executed] Nesta fase passaram 191 testes Rust com desktop e 188 sem desktop,
@@ -294,7 +384,7 @@ contadas; o runner agora valida todas as âncoras antes da matriz. Os casos de
 arquivos 0555 precisaram de chmod somente no fixture para simular adulteração;
 a falha inicial de preparação desses testes não conta como regressão detectada.
 
-[partial] A fase seguinte precisa implementar ativação/rollback sob lock global,
+[partial, histórico f2e6793] A fase seguinte precisava implementar ativação/rollback sob lock global,
 remoção conservadora, staging root e .pkg. Preservar perfis e inodes é requisito
 para esse executor, ainda não provado por testes de aplicação. InstallHelper/
 RemoveHelper do app continuam pendentes. Não foi instalado, elevado, conectado

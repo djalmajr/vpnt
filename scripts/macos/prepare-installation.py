@@ -92,7 +92,7 @@ def prepare(uid, output):
         summary['payload'] = str(final)
         summary['visudoParsed'] = validation.returncode == 0
         summary['installationPerformed'] = False
-        summary['activationAvailable'] = False
+        summary['activationAvailable'] = True
         return summary
 
 

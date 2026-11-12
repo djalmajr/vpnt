@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-pub(super) struct Caller {
+pub(crate) struct Caller {
     pub uid: u32,
     pub stream: UnixStream,
 }
