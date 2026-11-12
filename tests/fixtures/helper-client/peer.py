@@ -14,6 +14,9 @@ profiles=[dict(id=id,name=id,kind="ssl",gateway="vpn.example.test",username="fic
 waiting=[]
 s.settimeout(10)
 while True:
+    if mode=="restart" and os.path.exists(marker+".fault"):
+        s.sendall(b'{"type":"accepted","id":"wrong","extra":"invalid"}\n')
+        mode="retiring"
     if waiting and os.path.exists(marker+".advance"):
         for id,generation in waiting:
             changed(id,generation,"verifying");changed(id,generation,"connected")
@@ -24,6 +27,8 @@ while True:
     if not line:
         break
     request=json.loads(line);command=request["command"]
+    with open(marker+".commands","a") as record:
+        record.write(command["type"]+"\n")
     if command["type"]=="snapshot":
         if mode=="malformed":
             s.sendall(b'{"type":"accepted","id":"wrong","password":"fictional"}\n');continue
@@ -44,7 +49,7 @@ while True:
     else:
         raise AssertionError("unexpected fixture command")
 open(marker+".retiring","w").close()
-if mode=="malformed":
+if mode in ["malformed","retiring"]:
     until=time.monotonic()+5
     while not os.path.exists(marker+".allow_cleanup") and time.monotonic()<until:
         time.sleep(0.005)

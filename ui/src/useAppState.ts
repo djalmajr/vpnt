@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "./bridge";
+import { commandFlow } from "./commandFlow";
 import type { T } from "./components/common";
 import { type MessageKey, resolveLocale, translate } from "./i18n";
 import type { Snapshot } from "./model";
-import type { Route, Run } from "./navigation";
+import type { Route } from "./navigation";
 import { loadSettings, saveSettings } from "./settings";
 
 export function useAppState() {
@@ -24,7 +25,6 @@ export function useAppState() {
     id: string;
     connect?: boolean;
   }>();
-  const running = useRef(0);
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
     setSnapshot((previous) =>
@@ -42,14 +42,9 @@ export function useAppState() {
         navigate({ page: "onboarding" });
     }
   }, []);
-  const run: Run = useCallback(
-    async (command) => {
-      setError(undefined);
-      running.current += 1;
-      try {
-        receive(await invoke(command));
-        return true;
-      } catch (error) {
+  const flow = useMemo(
+    () =>
+      commandFlow(invoke, receive, (code) => {
         const keys: Record<string, MessageKey> = {
           not_implemented: "notImplemented",
           invalid_name: "invalidName",
@@ -58,28 +53,15 @@ export function useAppState() {
           invalid_probe: "invalidProbe",
           backend_unavailable: "backendUnavailable",
         };
-        setError(keys[error instanceof Error ? error.message : ""] ?? "error");
-        return false;
-      } finally {
-        running.current -= 1;
-      }
-    },
+        setError(code ? (keys[code] ?? "error") : undefined);
+      }),
     [receive],
   );
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
-      if (running.current) {
-        timer = setTimeout(() => void poll(), 500);
-        return;
-      }
-      try {
-        const snapshot = await invoke({ type: "get_snapshot" });
-        if (!disposed) receive(snapshot);
-      } catch {
-        if (!disposed) setError("backendUnavailable");
-      }
+      await flow.poll(() => !disposed);
       if (!disposed) timer = setTimeout(() => void poll(), 500);
     };
     void poll();
@@ -87,7 +69,7 @@ export function useAppState() {
       disposed = true;
       clearTimeout(timer);
     };
-  }, [receive]);
+  }, [flow]);
   useEffect(() => {
     saveSettings(settings);
     document.documentElement.lang = locale;
@@ -158,6 +140,6 @@ export function useAppState() {
     setModal,
     selected,
     modalVpn,
-    run,
+    run: flow.run,
   };
 }

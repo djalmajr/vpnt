@@ -185,39 +185,58 @@ com limite de 60; snapshots contêm indicadores de presença, nunca credenciais.
 Dois testes do cliente usam um processo Python independente e sockets nativos:
 conferem FD/ambiente, fluxo/EOF, protocolo incompatível, saída e frame malformado.
 O peer de erro segura o cleanup após receber EOF: a aplicação precisa observar
-a falha antes de permitir seu término. Cinco testes do broker exercitam esse
+a falha antes de permitir seu término. Sete testes do broker exercitam esse
 peer, Keychain de fixture, gerações/cancelamento, probe, dois perfis, versão,
 expiração, perda e snapshot inicial indevidamente conectado. Um deles usa
 Security.framework real numa base descartável, interação desabilitada, salva
 credenciais fictícias via broker e as carrega para o filho fictício. Ao final
 exige exclusão bem-sucedida e chaveiro padrão/lista de busca inalterados.
 
+Dois casos adicionais atravessam o ciclo de retomada com processos reais
+fictícios. Enquanto o primeiro peer segura o cleanup, nenhum substituto pode
+ser lançado. Depois de reap do filho direto, um canal novo exige novo snapshot,
+versão e estado inicial Off; só uma nova ação carrega credenciais/conecta.
+O peer registra apenas tipos de comando para conferir ausência de replay.
+Falhas sucessivas de lançamento e versão são recusadas e espaçadas; Quit
+desabilita relançamento. O código produtivo começa em um segundo, dobra até
+30 e reinicia após admissão válida. O fixture usa 20 ms para percorrer o mesmo
+ciclo. Não prova que sudo/descendentes ou recursos de rede terminaram; o lock
+global do helper continua obrigatório antes de admitir uma sessão real.
+
 O worker do host usa fila limitada e mantém Keychain/helper fora do event loop.
 Um teste exige que um pedido expirado não inicie nem repita uma operação.
 Pedidos interativos têm 119 segundos no worker/120 na ponte; os demais, nove/dez.
-O polling da UI pausa enquanto uma ação aguarda resposta. Ainda falta um gate
-de ordenação para descartar respostas de polling já em voo ao iniciar uma ação.
+O polling da UI pausa enquanto qualquer ação aguarda resposta. O controlador
+compartilhado commandFlow descarta snapshots/erros de polling anterior a uma
+ação e de ações anteriores à mais recente. Uma ação ultrapassada retorna false,
+impedindo que seu callback autorize navegação tardia. Polling desmontado não
+publica. Quatro testes Bun com Promises controladas exercitam sucesso/erro,
+dois pedidos pendentes, retomada e descarte, sem depender de sleeps.
 Não foi validado um prompt de autenticação real nem o deadline sob esse prompt.
 
-A matriz descartável executa três baselines/restaurações (broker, cliente,
-worker) e 12 mutações. Exige a assertion do teste previsto, não falha de build:
+A matriz descartável executa quatro baselines/restaurações (broker, cliente,
+worker e UI) e 24 mutações. Exige a assertion do teste previsto, não falha de build:
 versão, Accepted promovido a Connected, geração antiga, desligar só um perfil,
 probe que desliga, expiração após Keychain, saída que vira Off, snapshot ativo,
 kill do helper, falha atrasada até o cleanup, ambiente herdado e pedido expirado.
 A primeira tentativa de Accepted->Connected sobreviveu por ser sobrescrita pelo
 evento Connecting no mesmo lote; o teste passou a conferir também o log público.
-Na execução final as 12 foram detectadas e as seis baselines passaram. Logs,
-comandos e hashes dos 145 arquivos src/tests/ui/src estão em
-`output/fixtures/broker-oracles/`; o workflow macOS inclui a matriz.
+Cinco novas retiram retomada, espera de reap, backoff, novo snapshot ou a
+desativação por Quit. Sete da UI retiram os gates de resposta antiga,
+ação ultrapassada, polling durante ação e publicação após desmontar.
+Na execução final as 24 foram detectadas e as oito baselines passaram. Logs,
+comandos e hashes dos 149 arquivos src/tests/ui/src estão em
+`output/fixtures/broker-oracles/`; o workflow macOS inclui a matriz. O recibo e
+logs anteriores de 9c4df14 foram preservados em `broker-oracles-9c4df14/`.
 
-Neste avanço passaram 151 testes Rust com desktop/149 sem desktop, fmt,
-clippy -D warnings, lint/typecheck da UI, quatro testes Bun com 89 assertions,
-81 entradas de tokens, build e pacote local. O gate de classes segue sem regras.
+Neste avanço passaram 153 testes Rust com desktop/151 sem desktop, fmt,
+clippy -D warnings, lint/typecheck da UI, oito testes Bun com 114 assertions,
+81 entradas de tokens, build, pacote local e cmp do binário. O gate de classes segue sem regras.
 As matrizes anteriores de helper/rotas/PPP conservam os limites do checkpoint
 016d1cf acima. O runtime C não foi reconstruído neste avanço.
 
 **Limites:** SaveProfile/RemoveProfile/InstallHelper/RemoveHelper seguem sem
-implementação no broker. Falta reabrir o canal após falha, integração administrativa,
+implementação no broker. Faltam integração administrativa,
 installer/sudoers e admissão instalada. Só SSL tem despacho preparado; IPsec falta.
 Nenhum teste executou sudo/elevação, pppd do sistema, interface/rota nova ou VPN.
 Lançar o .app em demo não forneceu prova visual: CUA reiniciou duas vezes e o
@@ -225,6 +244,18 @@ fallback de clique retornou -25200. Isso é limite do driver, sem concluir falha
 do painel. A instância própria foi encerrada e sua saída conferida. Tray,
 WKWebView, temas/idiomas e prompts nativos ainda exigem inspeção real.
 Nada instalado, conectado ou publicado; CI remoto e revisão final pendentes.
+
+[executed, browser simulated] Na nova UI de demonstração em navegador isolado,
+uma resposta de polling fictícia com Connected foi retida até após conectar e
+cancelar. O MutationObserver observou Connecting/Disconnecting/Disconnected,
+sem Connected transitório ou alerta. O caso usa API Rust de demonstração e
+injeção controlada da resposta antiga, não helper/VPN. Script e captura locais:
+`output/playwright/recovery-ui.js`, `recovery-race.log` e `recovery-en-light.png`.
+Painel pt-BR/escuro medido em viewports 800/320/280: larguras 320/320/280,
+sem overflow horizontal e com foco por teclado de 2 px. Captura inspecionada:
+`recovery-pt-dark-narrow.png`; medidas em `recovery-layout.log`. A captura
+en-US/clara também foi inspecionada. Layout/catálogos/tokens não mudaram.
+Essas inspeções no navegador não substituem o aceite nativo do WKWebView.
 
 ## Exclusão entre controladores
 

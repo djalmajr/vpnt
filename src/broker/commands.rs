@@ -15,9 +15,8 @@ impl<S: SecretStore> Broker<S> {
             | Command::Hide {}
             | Command::OpenProject {} => {}
             Command::Quit {} => {
-                if let Some(c) = &mut self.client {
-                    c.close();
-                }
+                self.retry = None;
+                self.lost(false);
             }
             Command::Toggle { id } => {
                 let state = self.connections.get(&id).ok_or("not_found")?.view.state;

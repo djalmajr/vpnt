@@ -2,7 +2,6 @@ use crate::{
     app::App,
     bridge::{Reply, Request},
     broker::Broker,
-    helper::client::Client,
     keychain::MacKeychain,
     model::VpnKind,
     secrets::{Credentials, SecretError, SecretStore},
@@ -46,12 +45,9 @@ impl Worker {
             .name("vpnt-application".into())
             .spawn(move || {
                 let mut demo = demo.then(App::demo);
-                let mut normal = demo.is_none().then(|| {
-                    Broker::new(
-                        Client::runtime().ok(),
-                        Keychain(MacKeychain::for_current_user()),
-                    )
-                });
+                let mut normal = demo
+                    .is_none()
+                    .then(|| Broker::runtime(Keychain(MacKeychain::for_current_user())));
                 loop {
                     if let Some(normal) = &mut normal {
                         normal.poll();

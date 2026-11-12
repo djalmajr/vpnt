@@ -7,6 +7,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+
+mod recovery;
 #[derive(Clone)]
 struct Secrets {
     loads: Arc<AtomicUsize>,

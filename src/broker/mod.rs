@@ -1,6 +1,7 @@
 //! Normal application state. Only the authenticated helper's current generation
 //! may report a connected tunnel; demo schedules never enter this model.
 mod commands;
+mod retry;
 use crate::{
     bridge::Command,
     helper::{
@@ -28,6 +29,7 @@ struct Connection {
 }
 pub struct Broker<S: SecretStore> {
     client: Option<Client>,
+    retry: Option<retry::Retry>,
     secrets: S,
     connections: BTreeMap<String, Connection>,
     helper: &'static str,
@@ -37,9 +39,20 @@ pub struct Broker<S: SecretStore> {
     startup: Instant,
 }
 impl<S: SecretStore> Broker<S> {
-    pub fn new(client: Option<Client>, secrets: S) -> Self {
+    pub fn runtime(secrets: S) -> Self {
+        Self::reconnecting(retry::Retry::runtime(), secrets)
+    }
+    fn reconnecting(retry: retry::Retry, secrets: S) -> Self {
+        let mut result = Self::new(None, secrets);
+        result.retry = Some(retry);
+        result.dead = true;
+        result.resume();
+        result
+    }
+    fn new(client: Option<Client>, secrets: S) -> Self {
         let mut result = Self {
             client,
+            retry: None,
             secrets,
             connections: BTreeMap::new(),
             helper: "missing",
@@ -48,18 +61,43 @@ impl<S: SecretStore> Broker<S> {
             next: 1,
             startup: Instant::now() + Duration::from_secs(5),
         };
-        if result.client.as_ref().is_some_and(|c| {
+        result.begin();
+        result
+    }
+    fn begin(&mut self) {
+        if self.client.as_ref().is_some_and(|c| {
             c.send(Request {
                 id: "snapshot-1".into(),
                 command: protocol::Command::Snapshot {},
             })
             .is_err()
         }) {
-            result.lost(false);
+            self.lost(false);
         }
-        result
+    }
+    fn resume(&mut self) {
+        let attempt = self
+            .retry
+            .as_mut()
+            .and_then(|r| r.attempt(self.client.as_ref()));
+        match attempt {
+            Some(Ok(client)) => {
+                self.client = Some(client);
+                self.dead = false;
+                self.ready = false;
+                self.startup = Instant::now() + Duration::from_secs(5);
+                self.begin();
+            }
+            Some(Err(error)) => self.lost(error == Error::Incompatible),
+            None => {}
+        }
     }
     fn lost(&mut self, outdated: bool) {
+        if !self.dead
+            && let Some(retry) = &mut self.retry
+        {
+            retry.defer();
+        }
         self.dead = true;
         self.ready = false;
         self.helper = if outdated { "outdated" } else { "missing" };
@@ -75,6 +113,9 @@ impl<S: SecretStore> Broker<S> {
         !self.dead && !self.ready && self.client.is_some()
     }
     pub fn poll(&mut self) {
+        if self.dead || self.client.is_none() {
+            self.resume();
+        }
         if self.dead {
             return;
         }
@@ -149,6 +190,9 @@ impl<S: SecretStore> Broker<S> {
                 self.connections = current;
                 self.ready = true;
                 self.helper = "installed";
+                if let Some(retry) = &mut self.retry {
+                    retry.ready();
+                }
             }
             Message::Changed {
                 profile_id,

@@ -62,6 +62,8 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        // Release the fixture barrier even when a negative oracle panics.
+        let _ = std::fs::write(self.marker.with_extension("allow_cleanup"), b"");
         if let Some(c) = &mut self.client {
             c.close();
         }

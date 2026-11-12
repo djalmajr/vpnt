@@ -167,8 +167,11 @@ de segredos; lê credenciais somente ao conectar/reconectar por ação explícit
 Só eventos da geração atual do helper podem informar conexão. Accepted não
 significa túnel conectado, e perda do canal não significa cleanup concluído.
 O cliente fecha o socket e aguarda seu filho próprio sem matá-lo; a falha chega
-à UI antes dessa espera. Ainda falta reabrir o canal após falha e integrar o
-fluxo administrativo. A prova nativa atual do chaveiro usa uma base descartável
+à UI antes dessa espera. A retomada preparada espera esse filho e tenta um canal
+novo com intervalo crescente de um a 30 segundos. Exige novo snapshot e uma
+nova ação para conectar, sem repetir operações ou recarregar credenciais.
+O lock do helper continua exigido: saída do launcher não prova cleanup de rede.
+O fluxo administrativo ainda falta. A prova nativa atual do chaveiro usa uma base descartável
 com credenciais fictícias enviadas ao peer de teste, sem usar VPN pessoal.
 
 O runtime inclui uma cópia dos certificados públicos de
