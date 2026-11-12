@@ -178,6 +178,58 @@ Interface citada no log é somente candidata. Esses testes não provam proprieda
 de PPP, leases/cleanup de rotas, probe pelo túnel ou estado conectado. Isso
 continua pendente de controlador/helper e verificação nativa/real.
 
+## Propriedade PPP e probe nativo
+
+```bash
+cargo test --locked --no-default-features --lib connection::macos
+```
+
+No macOS, `OwnedPpp` identifica o filho do cliente ainda sob handle por UID,
+executável fixo, pai, instante de início e registro PPP do `configd`. A interface
+deve estar ativa, ter índice/endereços e não estar ativa no snapshot anterior.
+Registros ausentes, duplicados ou incompatíveis não autorizam o vínculo. O nome
+do log não seleciona a interface: dois túneis podem ter endereços iguais.
+`kqueue` acompanha a saída dos dois processos sem sinalizar PIDs descobertos.
+Cada uso revalida processos, registro, índice e endereços. PPP encerrado não
+equivale a rotas limpas; uma interface ainda ativa sem novo dono verificado não
+é declarada removida apenas pela saída do cliente.
+
+`/private/var/run` é gravável pelo grupo de sistema no macOS. A implementação
+não trata seus pidfiles como prova confiável e não modifica suas permissões.
+A associação vem da leitura do serviço de configuração e da identidade nativa
+dos processos. O código publicado do [pppd da Apple](https://github.com/apple-oss-distributions/ppp/blob/main/Helpers/pppd/sys-MacOSX.c)
+define os campos `pid` e `InterfaceName`; o [controle do configd](https://github.com/apple-oss-distributions/configd/blob/main/configd.tproj/session.c)
+exige root ou entitlement de escrita. O módulo de propriedade só lê esses registros.
+
+O probe público aceita somente um `OwnedPpp`, revalida o vínculo antes/depois
+da resposta e não promove sozinho o estado Connected. Ping usa binários do
+sistema, interface/origem explícitas e prazo; TCP exige `IP_BOUND_IF` ou
+`IPV6_BOUND_IF`, bind da origem e conferência das opções após o handshake.
+O socket permanece sob handle durante a checagem final. Não há fallback para
+socket sem vínculo, payload de aplicação ou porta 22. Alvos locais, loopback,
+multicast, não especificados e broadcast global são rejeitados em produção,
+incluindo loopback representado como IPv4-mapped IPv6.
+
+DNS-SD recebe o índice explícito, com consultas A/AAAA separadas, limite de
+resultados e de espera. Os serviços são desalocados antes dos contextos; não
+sobram threads de resolução após cancelar. O lookup não prova tráfego: uma
+resposta local/cacheada ainda precisa passar pelo teste no socket vinculado.
+
+Separar as evidências deste comando:
+
+- **Nativa, local:** leitura somente de PPP no `configd`; identidade/UID/pai e
+  saída de processos próprios; TCP e ping em `lo0`, IPv4/IPv6; DNS de localhost;
+  prazo e cancelamento de espera no kernel.
+- **Fixture:** registros CF tipados e snapshot PPP sintético para associação,
+  recusas de dono/pai/executável, interface já ativa ou inativa, registros
+  ausentes/duplicados; vínculo de teste invalidado após handshake TCP real.
+- **Pendente:** descoberta de PPP real criado pelo cliente, tráfego remoto pelo
+  túnel, integração com gerações/helper/UI, leases e remoção real de recursos.
+
+Os testes não criam interfaces, rotas, SAs ou registros no `configd`. O comando
+pode precisar sair do sandbox para sockets, ICMP e o serviço nativo. Isso é
+execução como usuário comum; não instala componentes nem se torna root.
+
 ## Fluxos de demonstração
 
 Use `cargo run -- --demo-server 4178` e abra o endereço local do README.

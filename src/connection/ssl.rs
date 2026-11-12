@@ -57,6 +57,10 @@ pub struct SslDriver {
 }
 
 impl SslDriver {
+    #[cfg(target_os = "macos")]
+    pub(super) fn id(&self) -> u32 {
+        self.child.id()
+    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     pub fn start(profile: &Profile, credentials: Credentials) -> Result<Self, StartError> {

@@ -90,7 +90,12 @@ O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-r
 impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver
 SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos
 recursos que autorizou. A camada de processo está implementada; propriedade da
-interface, leases de rotas e probe ainda precisam ser ligados ao controlador.
+interface e probe nativo têm módulos e testes locais, ainda sem ligação ao
+controlador. O vínculo PPP combina registros do `configd`, processos de pai/filho
+verificados e observação de saída pelo kernel. O probe exige interface e origem
+explícitas, com ping e fallback TCP. Os fixtures usam loopback e interfaces
+sintéticas; não provam PPP ou tráfego VPN. Leases/cleanup de rotas, helper e
+integração real da UI continuam pendentes.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
