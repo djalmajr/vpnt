@@ -7,6 +7,8 @@ pub mod pinentry;
 #[cfg(unix)]
 pub mod pinentry_channel;
 #[cfg(unix)]
+pub mod ppp_supervisor;
+#[cfg(unix)]
 pub mod process;
 pub mod protocol;
 #[cfg(unix)]

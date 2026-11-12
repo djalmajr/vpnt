@@ -38,6 +38,7 @@ struct Kernel {
     routes: BTreeMap<Key, (Route, u64)>,
     serial: u64,
     retired_pending: bool,
+    retirement_observed: bool,
     test_shutdown: bool,
 }
 type Shared = Arc<Mutex<Kernel>>;
@@ -130,7 +131,9 @@ impl Factory for Fixture {
     fn idle(&self) -> bool {
         let mut routes = self.routes.lock().unwrap();
         routes.retry_cleanup();
-        !routes.has_resources() && !self.kernel.lock().unwrap().retired_pending
+        let mut kernel = self.kernel.lock().unwrap();
+        kernel.retirement_observed = true;
+        !routes.has_resources() && !kernel.retired_pending
     }
 }
 struct FixtureAttempt {
@@ -568,6 +571,11 @@ fn profiles_run_concurrently_and_eof_waits_for_workers_leases_and_retirement() {
             .attempts
             .values()
             .all(|c| c.finished)
+    });
+    // Wait for a controller observation (or an incorrect return), rather
+    // than racing its next instruction with an instantaneous check.
+    h.wait(|h| {
+        h.kernel.lock().unwrap().retirement_observed || h.worker.as_ref().unwrap().is_finished()
     });
     assert!(!h.worker.as_ref().unwrap().is_finished());
     h.kernel.lock().unwrap().retired_pending = false;

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub const HELPER: &str = "/Library/PrivilegedHelperTools/dev.vpnt.helper";
 pub const PINENTRY: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pinentry";
+pub const PPP_SUPERVISOR: &str = "/Library/PrivilegedHelperTools/dev.vpnt.pppd";
 pub const USERS: &str = "/Library/Application Support/vpnt/users";
 pub const STATE: &str = "/Library/Application Support/vpnt";
 

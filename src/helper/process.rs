@@ -34,6 +34,20 @@ impl ManagedChild {
         command: &mut Command,
         environment: Environment,
     ) -> io::Result<Self> {
+        Self::spawn_configured(command, environment, false)
+    }
+
+    /// PPP already owns a PTY supplied by its admitted parent. Preserve only
+    /// stdin/stdout/stderr; callers keep their private capabilities CLOEXEC.
+    pub(crate) fn spawn_terminal(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_configured(command, Environment::System, true)
+    }
+
+    fn spawn_configured(
+        command: &mut Command,
+        environment: Environment,
+        terminal: bool,
+    ) -> io::Result<Self> {
         if !Path::new(command.get_program()).is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -54,11 +68,18 @@ impl ManagedChild {
                 .env("OPENSSL_ENGINES", runtime.join("lib/engines"))
                 .env("SSL_CERT_FILE", runtime.join("certs/ca-bundle.pem"));
         }
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        if terminal {
+            command
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        } else {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+        let child = command.spawn()?;
         Ok(Self {
             child,
             status: None,

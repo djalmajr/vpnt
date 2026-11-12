@@ -436,6 +436,64 @@ e consumir `reap_retired`/`has_resources`, além das leases, antes de encerrar.
 Fixtures não executam a fábrica privilegiada. Releitura e leases também não
 substituem o probe pelo túnel para promover a sessão a Connected.
 
+## Supervisor PPP e barreiras antes do exec
+
+```bash
+python3 scripts/macos/check-ppp-supervisor.py
+python3 scripts/macos/check-ppp-supervisor-mutations.py
+```
+
+Os comandos exigem macOS, usuário comum e o tarball do openfortivpn 1.24.1
+preparado pelo build de runtime/consumidor de pinentry. O SHA-256 é conferido
+antes de extrair somente `pppd_run` e seu construtor de argv. O programa C
+executa esse código original em fixture de configuração, sem rede. O próprio
+forkpty, PTY e exec são reais; `/usr/sbin/pppd` é substituído por um programa C
+fictício. Ele confere stdio no PTY, ambiente limpo, ausência de FD 3/4 e grava
+somente um marcador local para provar que chegou ao exec.
+
+O supervisor preparado aceita a lista completa e exata de argumentos; não
+aceita call, file, plugin, caminhos ou opções adicionais. O entrypoint produtivo
+exige UID real/efetivo root; não oferece override de UID, caminho ou modo.
+FD 4 precisa ser um stream do proprietário esperado e fica CLOEXEC. FD 3 é
+fechado. Supervisor e filho fazem handshakes separados com tags/PID, antes do
+fork/exec; só operações nativas sem alocação/locks rodam no pre_exec. O PID
+também é comunicado ao próprio pai por pipe CLOEXEC, para registrar falha de
+exec. I/O de cada handshake tem prazo monotônico de cinco segundos.
+
+EOF, dados de controle inesperados e HUP/INT/TERM revogam a execução. O
+supervisor sinaliza apenas seu Child não reaped, espera término e pode escalar
+para KILL desse mesmo handle após um segundo. O recibo final vem após wait;
+falha de protocolo/exec não é transformada em sucesso. O controlador futuro
+deverá autenticar o programa, pai, UID e início com observação nativa antes de
+conceder cada permissão, e manter os watches originais até a saída.
+
+O consumidor de teste implementa o outro lado do wire sem usar o codec do
+supervisor. Confere identidades nativas antes do exec e mantém três ExitWatch
+reais. Os 14 cenários cobrem término normal, EOF, TERM ignorado/escalation,
+saída do cliente, fechamento real do PTY/HUP, dado extra, PID incorreto nas duas
+permissões, revogação durante o pre_exec, peer errado, exec ausente, call e
+opções adicionais e rejeição do binário produtivo como usuário comum. Um
+marcador não pode existir antes das permissões. No recibo final o filho
+original não pode continuar executando; todos os watches e EOF são conferidos.
+Os prazos estão implementados, mas silêncio por cinco segundos ainda não é
+um cenário separado dessa suíte.
+
+A matriz usa cópia descartável com source/build próprios: baseline de 14 casos,
+nove mutações e restauração de 14 casos. Compilação/formatação não contam como
+falha discriminante: exige assertion executada do consumidor. As mutações
+removem as duas permissões, comparação de PID, CLOEXEC, fechamento da senha,
+tratamento de HUP/wait, ordem do recibo, preservação do PTY e limite de argv.
+Comandos, exits e hashes de src/tests ficam em `output/fixtures/ppp-supervisor/`
+e `output/fixtures/ppp-supervisor-oracles/`; fonte/build descartáveis são removidos.
+
+**Limites:** código do receptor/recibos no controlador, passagem isolada de FD 4
+com FD 3, admissão do binário, patch do runtime, nova cadeia cliente/supervisor/
+pppd na prova de propriedade e cleanup de interfaces/rotas ainda precisam ser
+integrados. O supervisor não está no .app ou instalado. Validar options/scripts
+efetivos do pppd antes de habilitar a execução real; argv fechado não elimina
+automaticamente sua configuração global. Nenhum teste chamou system pppd,
+criou interface, alterou rotas ou usou credenciais de VPN.
+
 ## Controlador SSL por geração
 
 ```bash
@@ -472,7 +530,10 @@ recuperar/desligar, probe tardio, nova geração aguardando cleanup, cancelament
 antes de descoberta, cancelamento de reconexão enfileirada, falha após probe,
 dois perfis concorrentes, EOF com aposentadoria pendente, requisições antigas,
 segredos inválidos e consumidor que deixa de ler. Nenhum teste inicia pppd,
-openfortivpn ou strongSwan, atribui endereços ou altera rotas reais.
+openfortivpn ou strongSwan, atribui endereços ou altera rotas reais. O caso de
+EOF espera uma observação real da barreira de aposentadoria ou um término
+indevido do controlador; uma consulta instantânea a `is_finished` sozinha
+não prova que o loop já chegou a essa barreira.
 
 **Limite obrigatório antes da integração instalada:** o adaptador nativo mantém
 cleanup pendente se houve tentativa de spawn e não foi possível comprovar a PPP,

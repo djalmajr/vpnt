@@ -152,6 +152,16 @@ herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
 A camada de processo SSL já consome esse transporte. A integração com o helper,
 a instalação e a prova privilegiada seguem pendentes.
 
+O binário separado `vpnt-pppd` prepara a supervisão do filho PPP. Ele aceita
+somente a lista fixa de argumentos, exige root e um canal herdado em FD 4,
+autoriza supervisor e filho antes do exec, conserva o PTY e espera o filho
+próprio antes de emitir seu recibo final. Não encaminha os canais de senha e
+controle ao programa PPP. Os testes executam forks, sinais e watches reais,
+com um payload fictício no lugar de `/usr/sbin/pppd`. Esse componente ainda
+não está instalado nem ligado ao runtime/controlador; o caso de cleanup
+precoce acima permanece pendente até essa integração e a prova de recursos
+de rede. Não foi executado o pppd do sistema.
+
 ## Proposta visual
 
 O arquivo [`vpnt.fig`](vpnt.fig), na raiz do projeto, abre no OpenPencil.

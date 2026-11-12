@@ -53,6 +53,14 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-route-policy.py
+      - name: Verify PPP subprocess supervision
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ppp-supervisor.py
+      - name: Verify PPP supervision negative oracles
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ppp-supervisor-mutations.py
       - name: Verify bound SSL transport consumer
         run: |
           brew install openssl@4
