@@ -1,4 +1,5 @@
 use super::*;
+mod profiles;
 use std::{
     io::{BufReader, Write},
     net::Shutdown,
@@ -16,6 +17,35 @@ fn client(stream: UnixStream) -> BufReader<UnixStream> {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     BufReader::new(stream)
+}
+#[test]
+fn admin_does_not_take_the_network_lock_but_runtime_must() {
+    let root = std::env::current_dir()
+        .unwrap()
+        .join("output/fixtures")
+        .join(format!("helper-mode-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.join(".controller.lock"))
+        .unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let runtime = ControllerLock::fixture(&root, uid).unwrap();
+    assert!(matches!(
+        mode_lock(Mode::Runtime, || ControllerLock::fixture(&root, uid)),
+        Err(ErrorCode::ProfileBusy)
+    ));
+    assert!(matches!(
+        mode_lock(Mode::Admin, || ControllerLock::fixture(&root, uid)),
+        Ok(None)
+    ));
+    runtime.validate().unwrap();
+    drop(runtime);
+    std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn only_closed_modes_and_connected_unix_stream_capabilities_are_admitted() {
@@ -152,9 +182,8 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
     let directory = root.clone();
     let task = thread::spawn(move || {
         admin(caller(a), |uid, request| {
-            let lock = ControllerLock::fixture(&directory, uid).unwrap();
             let store = ProfileStore::open(directory, uid).unwrap();
-            apply_admin(&lock, &store, request)
+            apply_admin(&store, request)
         })
     });
     let mut c = client(b);
@@ -186,9 +215,8 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
             admin(caller(a), |uid, request| {
                 assert_eq!(uid, unsafe { libc::geteuid() });
                 observed.send(()).unwrap();
-                let lock = ControllerLock::fixture(&directory, uid).unwrap();
                 let store = ProfileStore::open(&directory, uid).unwrap();
-                apply_admin(&lock, &store, request)
+                apply_admin(&store, request)
             })
         });
         let mut c = client(b);
@@ -221,15 +249,13 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
             assert!(store.load().unwrap().is_empty());
         }
     }
-    // A changed persistent lock cannot authorize a subsequent profile write.
-    let lock = ControllerLock::fixture(&root, unsafe { libc::geteuid() }).unwrap();
+    // A changed per-profile reservation cannot authorize a profile write.
     std::fs::set_permissions(
-        root.join(".controller.lock"),
+        root.join(".profile-6f6e65.lock"),
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
     let result = apply_admin(
-        &lock,
         &store,
         protocol::AdminRequest {
             id: "invalid-lock".into(),
@@ -244,7 +270,6 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
         }
     ));
     assert!(store.load().unwrap().is_empty());
-    drop(lock);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -1,4 +1,5 @@
 mod dispatch;
+mod metadata;
 use super::{
     worker::{self, Finished, Signals},
     *,
@@ -100,22 +101,10 @@ pub(super) fn run<F: Factory>(
     output: SyncSender<Message>,
     timing: Timing,
 ) -> Result<(), ErrorCode> {
-    if uid == 0
-        || profiles.len() > 64
-        || profiles
-            .iter()
-            .any(|profile| profile.validate().is_err() || profile.kind != VpnKind::Ssl)
-    {
+    if uid == 0 {
         return Err(ErrorCode::UntrustedConfiguration);
     }
-    let count = profiles.len();
-    let profiles: BTreeMap<_, _> = profiles
-        .into_iter()
-        .map(|profile| (profile.id.clone(), profile))
-        .collect();
-    if profiles.len() != count {
-        return Err(ErrorCode::UntrustedConfiguration);
-    }
+    let profiles = metadata::map(profiles)?;
     thread::scope(|scope| {
         let mut slots: BTreeMap<_, _> = profiles
             .into_iter()
@@ -142,7 +131,26 @@ pub(super) fn run<F: Factory>(
                     break;
                 }
                 match requests.try_recv() {
-                    Ok(request) => dispatch(request, &mut slots, &mut outgoing),
+                    Ok(request) => {
+                        let refreshed = if matches!(request.command, Command::Snapshot {}) {
+                            factory.profiles().and_then(|profiles| {
+                                if let Some(profiles) = profiles {
+                                    metadata::refresh(&mut slots, profiles)?;
+                                }
+                                Ok(())
+                            })
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(error) = refreshed {
+                            outgoing.push_back(Message::Failed {
+                                id: request.id,
+                                error,
+                            });
+                        } else {
+                            dispatch(request, &mut slots, &mut outgoing);
+                        }
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         closing = true;
@@ -251,6 +259,8 @@ pub(super) fn run<F: Factory>(
     })
 }
 
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;

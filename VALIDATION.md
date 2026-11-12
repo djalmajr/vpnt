@@ -94,9 +94,10 @@ SUDO_UID/SUDO_USER como autoridade. A herança do peer UID através da elevaçã
 ainda não foi exercitada; os testes do canal rodam sob o usuário comum.
 
 O UID autenticado seleciona exclusivamente `ProfileStore::for_user`; o diretório
-root já precisa existir. O entrypoint adquire o lock global e o mantém por toda
-a sessão. Runtime chama `run_ssl`; admin exige documento único mais EOF em até
-cinco segundos, revalida o lock e chama save/remove do store. Runtime não edita
+root já precisa existir. Runtime adquire o lock global e o mantém por toda
+a sessão. Chama `run_ssl`; admin exige documento único mais EOF em até
+cinco segundos e chama save/remove sob a reserva do perfil alvo, sem tomar o
+lock de rede. Runtime não edita
 perfis. A futura regra sudoers deve liberar sem senha somente o comando exato
 runtime; a administração precisa da autorização de elevação separada. Nenhuma
 regra foi criada ou instalada por estes testes.
@@ -112,12 +113,15 @@ cancela também uma leitura parcial ou ociosa antes de juntar os threads.
 Sinais reais do entrypoint root e backpressure até o prazo da escrita ainda
 precisam de cenário próprio; o prazo da administração/leitura foi executado.
 
-Seis testes do servidor exercitam sockets nativos, fragmentação, injeção de
+Oito testes do servidor exercitam sockets nativos, fragmentação, injeção de
 campos/comandos, CLOEXEC, cancelamento de leitura parcial, silêncio por cinco
 segundos e apagamento do buffer sem corromper o frame seguinte. A administração
 passa pelo aplicador produtivo com storage/flock próprios de fixture: salva,
-relê e remove perfil; segundo documento ou falta de EOF não pode mutar; lock
-alterado não autoriza escrita. Um teste do executável final confirma a recusa
+relê e remove perfil; segundo documento ou falta de EOF não pode mutar; reserva
+alterada não autoriza escrita. A seleção de modo mantém runtime exclusivo e
+permite admin com o lock de rede ocupado. O caso adicional por socket edita
+outro perfil e recusa save/remove do alvo reservado, conservando ambos os locks.
+Um teste do executável final confirma a recusa
 do usuário comum mesmo com SUDO_UID/SUDO_USER forjados e argumentos adicionais.
 
 Um oitavo cenário do controlador atravessa o transporte produtivo, codec real,
@@ -127,9 +131,10 @@ A tabela/PPP/probe/cleanup são simulados; isso não executa `run_ssl` como root
 retém uma PPP real, altera rotas ou comprova uma conexão VPN.
 
 A matriz usa uma cópia descartável de fonte/build: três baselines e três
-restaurações (servidor, controlador pelo socket e entrypoint), mais 11 mutações.
+restaurações (servidor, controlador pelo socket e entrypoint), mais 12 mutações.
 Remove restrição de argv, recusa de socket nomeado, CLOEXEC, UID encaminhado,
-EOF administrativo, save/remove, revalidação do lock, cancelamento da leitura,
+EOF administrativo, save/remove, validação da reserva, disputa incorreta do
+lock de rede pelo admin, cancelamento da leitura,
 prazo e apagamento do buffer. Exige assertion executada no teste previsto;
 compilação ou falha incidental não contam. Omissão isolada de SO_TYPE sobreviveu
 porque getpeereid também recusou o datagrama com EINVAL neste macOS; não foi
@@ -140,17 +145,89 @@ CI remoto ainda não executado.
 **Limites:** helper não instalado e política sudoers não aplicada. O cliente e
 o broker normal estão preparados abaixo. A elevação precisa conferir a passagem de FD 0,
 PTY e política de registro de IO, preservando o sigilo das credenciais.
-Snapshot/conexões do adaptador atual incluem apenas SSL; o despacho IPsec
+Snapshot inclui metadados IPsec/SSL; só SSL tem despacho de conexão. O driver IPsec
 permanece por implementar. Installer, sinal/UID após elevação, recursos
 privilegiados e testes com gateways reais continuam pendentes. Nada foi
 instalado, elevado, conectado ou publicado.
 
 Checkpoint histórico executado: `016d1cf`, com 143 testes Rust com desktop/142 sem desktop,
 11 mutações do helper, 67 de rotas e 16 da supervisão PPP. Os hashes dos 118
-arquivos src/tests conferem com os três recibos desse commit. Essas três matrizes
-são reutilizadas neste avanço: servidor/controlador, PPP e rotas não mudaram.
-Seus recibos não são hashes do novo cliente/broker. A nova matriz abaixo cobre
-esses consumidores e tem seu próprio inventário de fontes.
+arquivos src/tests conferem com os três recibos desse commit. Cliente/broker
+foram depois validados em c687e96. Servidor/controlador e suas matrizes foram
+reexecutados no avanço de reservas/refresh abaixo; PPP/runtime C conservam
+os respectivos limites históricos. Recibos antigos não são hashes do head novo.
+
+## Administração e reserva por perfil
+
+```bash
+cargo test --locked --no-default-features --test profile_reservations --test storage
+cargo test --locked --no-default-features --lib connection::controller::profiles
+cargo test --locked --no-default-features --lib connection::controller::engine::metadata
+cargo test --locked --no-default-features --lib helper::server::tests::profiles
+python3 scripts/macos/check-profile-administration.py
+```
+
+O store mantém `.profile-<id-em-hex>.lock`, owner/modo privados, flock exclusivo
+não bloqueante e CLOEXEC. IDs são codificados byte a byte, sem hash ou colisão
+por maiúsculas: no APFS local, Case/case colidiram antes da correção; o teste
+reproduziu Busy indevido e passou depois da codificação. O inode é persistente,
+inclusive após remover o perfil; instalação/atualização não podem substituí-lo.
+Save/remove disputam a mesma reserva do controlador e revalidam antes da escrita.
+O lock do documento continua serializando atualizações de perfis diferentes.
+
+Cinco testes de filesystem/subprocesso usam somente diretórios próprios:
+alvo reservado não muda, outro perfil continua editável, processo Python
+independente observa flock, nenhum FD da reserva atravessa exec, inode sobrevive
+ao release e permissões/ACL/symlink/hardlink/substituição são recusados.
+Administradores root continuam confiáveis; validação de inode não é um fence
+atômico contra outro root que substitui manualmente o arquivo de lock.
+
+O registro do controlador conserva as reservas fora da pilha do worker.
+Dois testes reais de store/lock verificam releitura antes de admitir o perfil,
+recusa de cache alterado/removido, validação antes de release e reserva após
+unwind. No adaptador nativo, a reserva precede egress/spawn; só a confirmação de
+cleanup da rede permite removê-la. O corpo anterior de cleanup foi movido para
+native/cleanup.rs sem mudança de comportamento. Essa ligação foi compilada e
+revisada; ainda não foi executada como root com PPP/recursos reais.
+
+O snapshot pode reler o store por Factory::profiles. A atualização dos slots
+valida o conjunto inteiro antes de mudar qualquer um: worker ativo ou conexão
+enfileirada impedem alteração/remoção do alvo; metadados inativos mudam com
+geração crescente, sem overflow. Slots ativos e seus recursos são preservados.
+Três cenários atravessam o controlador/codec/store/reservas produtivos com
+worker e plano de dados simulados: novo/editar/remover, cleanup retido, rollback
+de refresh rejeitado e metadados IPsec sem despacho ao worker SSL. Dois casos
+puros cobrem conexão enfileirada e limites u64::MAX-1/u64::MAX.
+
+Dezenove mutações exigem falha no consumidor previsto: save/remove sem reserva,
+flock, caixa do ID, validação/inode/hardlink/ACL/CLOEXEC, cache antigo, release
+no unwind/sem validar, omissão de refresh/geração/remoção, alteração de slot
+enfileirado/ativo, commit parcial e IPsec despachado como SSL. Oito baselines/
+restaurações cobrem filesystem, custódia, metadata e admin por socket. Fonte e
+build descartáveis; recibos/logs em `output/fixtures/profile-admin-oracles/`.
+O workflow macOS inclui essa matriz; sem execução remota nesta entrega.
+
+No estado final passaram 167 testes Rust com desktop/165 sem desktop, fmt,
+clippy all-targets/all-features -D warnings, build, pacote e cmp. Um teste de
+admissão do runtime preparado continua ignorado por padrão. Foram reexecutadas
+19 mutações de perfis/oito baselines, 12 do helper/seis e 67 de rotas/oito.
+Os 137 hashes de src/tests conferem entre as três matrizes e a fonte final.
+Recibos anteriores do helper e rotas foram preservados nos diretórios
+`helper-channel-oracles-before-profile-admin/` e
+`route-oracles-before-profile-admin/`. Os 24 oráculos do broker/UI de c687e96
+e os 16 de PPP do checkpoint anterior são reutilizados, sem nova execução.
+UI, dependências, patches e runtime C não mudaram; nenhuma inspeção visual
+nativa ou prova de rede real foi acrescentada por esses checks.
+
+As falhas de editar alvo reservado, admin disputando lock global, snapshot
+desatualizado e colisão Case/case foram executadas antes das respectivas
+correções. Falha incidental de compilação ao mover o harness foi corrigida e
+não conta como Red nem como mutação detectada.
+
+**Limites:** a UI/broker ainda não implementa SaveProfile/RemoveProfile nem o
+fluxo elevado e refresh correlacionado. Nada instalado, elevado, conectado ou
+publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
+sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
 ## Cliente do helper e broker normal
 
@@ -229,11 +306,13 @@ comandos e hashes dos 149 arquivos src/tests/ui/src estão em
 `output/fixtures/broker-oracles/`; o workflow macOS inclui a matriz. O recibo e
 logs anteriores de 9c4df14 foram preservados em `broker-oracles-9c4df14/`.
 
-Neste avanço passaram 153 testes Rust com desktop/151 sem desktop, fmt,
+No checkpoint c687e96 passaram 153 testes Rust com desktop/151 sem desktop, fmt,
 clippy -D warnings, lint/typecheck da UI, oito testes Bun com 114 assertions,
 81 entradas de tokens, build, pacote local e cmp do binário. O gate de classes segue sem regras.
-As matrizes anteriores de helper/rotas/PPP conservam os limites do checkpoint
-016d1cf acima. O runtime C não foi reconstruído neste avanço.
+Os 24 oráculos do broker/UI e as provas de navegador abaixo são reutilizados
+com esses consumidores, catálogos, layout e dependências inalterados. Helper/
+controlador foram depois reexecutados acima. PPP/runtime C conservam seus
+checkpoints históricos; o runtime C não foi reconstruído nesta rodada.
 
 **Limites:** SaveProfile/RemoveProfile/InstallHelper/RemoveHelper seguem sem
 implementação no broker. Faltam integração administrativa,
@@ -756,8 +835,9 @@ cargo test --locked --no-default-features --lib connection::controller
 ```
 
 O consumidor preparado `run_ssl` exige root e o lock persistente, carrega do
-storage root apenas os perfis SSL do UID autenticado pelo helper e mantém
-workers separados por perfil. O executável preparado chama a fábrica e o
+storage root os perfis do UID autenticado pelo helper e mantém
+workers SSL separados por perfil; IPsec aparece somente nos metadados.
+O executável preparado chama a fábrica e o
 adaptador nativo, ligado em código ao broker normal, sem execução root ou prova
 de VPN pela UI nesta entrega.
 IPsec ainda precisa do seu driver e do despacho correspondente.

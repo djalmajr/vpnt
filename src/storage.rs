@@ -1,5 +1,7 @@
 //! Private, atomic profile persistence. The privileged helper uses owner 0;
 //! unprivileged tests exercise the same implementation in an owned fixture.
+mod reservation;
+pub use reservation::ProfileReservation;
 
 use crate::model::{Profile, valid_profile_id};
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ pub enum StoreError {
     InvalidData,
     NotFound,
     Limit,
+    Busy,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -100,6 +103,7 @@ impl ProfileStore {
 
     pub fn save(&self, profile: Profile) -> Result<(), StoreError> {
         profile.validate().map_err(|_| StoreError::InvalidData)?;
+        let reservation = self.reserve(&profile.id)?;
         let _lock = self.lock()?;
         let mut profiles = self.load()?;
         if let Some(existing) = profiles
@@ -113,6 +117,7 @@ impl ProfileStore {
             }
             profiles.push(profile);
         }
+        reservation.validate()?;
         self.write(profiles)
     }
 
@@ -120,6 +125,7 @@ impl ProfileStore {
         if !valid_profile_id(id) {
             return Err(StoreError::InvalidData);
         }
+        let reservation = self.reserve(id)?;
         let _lock = self.lock()?;
         let mut profiles = self.load()?;
         let count = profiles.len();
@@ -127,6 +133,7 @@ impl ProfileStore {
         if count == profiles.len() {
             return Err(StoreError::NotFound);
         }
+        reservation.validate()?;
         self.write(profiles)
     }
 

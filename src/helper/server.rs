@@ -40,6 +40,18 @@ impl Mode {
 fn interrupted() -> bool {
     signals::INTERRUPTED.load(Ordering::Acquire)
 }
+fn mode_lock(
+    mode: Mode,
+    acquire: impl FnOnce() -> Result<ControllerLock, super::controller_lock::LockError>,
+) -> Result<Option<ControllerLock>, ErrorCode> {
+    if mode == Mode::Admin {
+        return Ok(None);
+    }
+    acquire().map(Some).map_err(|error| match error {
+        super::controller_lock::LockError::Busy => ErrorCode::ProfileBusy,
+        _ => ErrorCode::UntrustedConfiguration,
+    })
+}
 
 /// Only for the standalone helper process, before it starts any threads.
 /// No path, target UID or ownership override is accepted.
@@ -63,10 +75,7 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     let admitted = (|| {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
-        let lock = ControllerLock::acquire().map_err(|error| match error {
-            super::controller_lock::LockError::Busy => ErrorCode::ProfileBusy,
-            _ => ErrorCode::UntrustedConfiguration,
-        })?;
+        let lock = mode_lock(mode, ControllerLock::acquire)?;
         Ok((store, lock))
     })();
     let (store, lock) = match admitted {
@@ -79,9 +88,14 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     };
     match mode {
         Mode::Runtime => runtime(caller, |uid, requests, output| {
-            crate::connection::controller::run_ssl(&lock, uid, requests, output)
+            crate::connection::controller::run_ssl(
+                lock.as_ref().ok_or(ErrorCode::Unavailable)?,
+                uid,
+                requests,
+                output,
+            )
         }),
-        Mode::Admin => admin(caller, |_, request| apply_admin(&lock, &store, request)),
+        Mode::Admin => admin(caller, |_, request| apply_admin(&store, request)),
     }
 }
 
@@ -89,27 +103,21 @@ fn store_error(error: StoreError) -> ErrorCode {
     match error {
         StoreError::NotFound => ErrorCode::ProfileNotFound,
         StoreError::Io => ErrorCode::Unavailable,
+        StoreError::Busy => ErrorCode::ProfileBusy,
         _ => ErrorCode::UntrustedConfiguration,
     }
 }
-fn apply_admin(
-    lock: &ControllerLock,
-    store: &ProfileStore,
-    request: protocol::AdminRequest,
-) -> Message {
-    let result = lock
-        .validate()
-        .map_err(|_| ErrorCode::UntrustedConfiguration)
-        .and_then(|()| {
-            if interrupted() {
-                return Err(ErrorCode::Unavailable);
-            }
-            match request.command {
-                AdminCommand::SaveProfile { profile } => store.save(profile),
-                AdminCommand::RemoveProfile { id } => store.remove(&id),
-            }
-            .map_err(store_error)
-        });
+fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message {
+    let result = (|| {
+        if interrupted() {
+            return Err(ErrorCode::Unavailable);
+        }
+        match request.command {
+            AdminCommand::SaveProfile { profile } => store.save(profile),
+            AdminCommand::RemoveProfile { id } => store.remove(&id),
+        }
+        .map_err(store_error)
+    })();
     match result {
         Ok(()) => Message::Accepted { id: request.id },
         Err(error) => Message::Failed {

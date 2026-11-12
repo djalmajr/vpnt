@@ -154,8 +154,13 @@ O executável `vpnt-helper` aceita somente `runtime` ou `admin`, exige UID real 
 efetivo root e um socketpair anônimo herdado em FD 0. O UID do peer vem do kernel;
 SUDO_UID e campos de UID do IPC não selecionam o storage. Somente usuários com
 storage root já preparado podem entrar. O modo runtime chama o controlador SSL
-sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil,
-revalidando o lock. Leitura e escrita rodam fora do controlador, com filas e
+sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil.
+A administração disputa uma reserva persistente por perfil, sem tomar o lock
+de rede: um perfil em uso é recusado e os demais podem ser editados. O controlador
+conserva a reserva até comprovar cleanup, inclusive se o worker falhar.
+Antes de iniciar, relê o perfil sob essa reserva. Snapshot atualiza os metadados
+inativos sem interromper os ativos; IPsec aparece no catálogo, com seu driver
+ainda pendente. Leitura e escrita rodam fora do controlador, com filas e
 prazos limitados; EOF/sinais encerram admissões e aguardam cleanup. Há testes de
 socket, arquivos/flock reais de fixture e controlador com rede simulada.
 O binário ainda não está instalado ou no .app. Installer/sudoers e
@@ -171,7 +176,8 @@ O cliente fecha o socket e aguarda seu filho próprio sem matá-lo; a falha cheg
 novo com intervalo crescente de um a 30 segundos. Exige novo snapshot e uma
 nova ação para conectar, sem repetir operações ou recarregar credenciais.
 O lock do helper continua exigido: saída do launcher não prova cleanup de rede.
-O fluxo administrativo ainda falta. A prova nativa atual do chaveiro usa uma base descartável
+O fluxo administrativo da UI e seu consumo desses snapshots ainda faltam.
+A prova nativa atual do chaveiro usa uma base descartável
 com credenciais fictícias enviadas ao peer de teste, sem usar VPN pessoal.
 
 O runtime inclui uma cópia dos certificados públicos de

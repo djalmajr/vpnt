@@ -4,6 +4,8 @@
 mod engine;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(any(target_os = "macos", test))]
+mod profiles;
 mod worker;
 use crate::{
     helper::protocol::ErrorCode, model::Profile, secrets::Credentials, session::ConnectionState,
@@ -39,6 +41,9 @@ trait Attempt {
 }
 trait Factory: Sync {
     type Attempt: Attempt;
+    fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
+        Ok(None)
+    }
     fn create(
         &self,
         profile: Profile,

@@ -1,4 +1,6 @@
+use super::profiles::{ProfileUse, Profiles};
 use super::*;
+mod cleanup;
 use crate::{
     connection::{
         macos::{
@@ -17,7 +19,7 @@ use crate::{
         runtime::{Runtime, RuntimeError},
     },
     model::VpnKind,
-    storage::ProfileStore,
+    storage::StoreError,
 };
 use std::sync::{
     Mutex,
@@ -28,12 +30,13 @@ use std::sync::{
 type Routes<'a> = Arc<Mutex<Coordinator<NativeBackend<'a>>>>;
 struct NativeFactory<'a> {
     routes: Routes<'a>,
+    profiles: Arc<Profiles>,
 }
 
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
 /// The prepared helper binds uid to its inherited caller and keeps this
 /// controller/lock alive through EOF and every outstanding cleanup. Installed
-/// execution and the application broker remain unverified.
+/// execution through the application broker remains unverified.
 pub fn run_ssl(
     controller: &ControllerLock,
     uid: u32,
@@ -47,19 +50,19 @@ pub fn run_ssl(
     controller
         .validate()
         .map_err(|_| ErrorCode::UntrustedConfiguration)?;
-    let profiles = ProfileStore::for_user(uid)
-        .and_then(|store| store.load())
+    let store = Arc::new(Profiles::for_user(uid).map_err(|_| ErrorCode::UntrustedConfiguration)?);
+    let profiles = store
+        .load()
         .map_err(|_| ErrorCode::UntrustedConfiguration)?;
-    let profiles = profiles
-        .into_iter()
-        .filter(|profile| profile.kind == VpnKind::Ssl)
-        .collect();
     let backend = NativeBackend::new(controller).map_err(|_| ErrorCode::Unavailable)?;
     let routes = Arc::new(Mutex::new(
         Coordinator::new(backend).map_err(|_| ErrorCode::Unavailable)?,
     ));
     engine::run(
-        NativeFactory { routes },
+        NativeFactory {
+            routes,
+            profiles: store,
+        },
         uid,
         profiles,
         requests,
@@ -69,6 +72,12 @@ pub fn run_ssl(
 }
 impl<'a> Factory for NativeFactory<'a> {
     type Attempt = NativeAttempt<'a>;
+    fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
+        self.profiles
+            .load()
+            .map(Some)
+            .map_err(|_| ErrorCode::UntrustedConfiguration)
+    }
     fn create(
         &self,
         profile: Profile,
@@ -84,6 +93,8 @@ impl<'a> Factory for NativeFactory<'a> {
                 generation,
             },
             profile,
+            profiles: self.profiles.clone(),
+            profile_use: None,
             credentials: Some(credentials),
             routes: self.routes.clone(),
             canceled,
@@ -106,11 +117,14 @@ impl<'a> Factory for NativeFactory<'a> {
         routes.backend_mut().reap_retired().is_ok()
             && !routes.has_resources()
             && !routes.backend_mut().has_resources()
+            && self.profiles.idle()
     }
 }
 struct NativeAttempt<'a> {
     owner: Owner,
     profile: Profile,
+    profiles: Arc<Profiles>,
+    profile_use: Option<ProfileUse>,
     credentials: Option<Credentials>,
     routes: Routes<'a>,
     canceled: Arc<AtomicBool>,
@@ -126,6 +140,11 @@ struct NativeAttempt<'a> {
 }
 impl NativeAttempt<'_> {
     fn client_health(&mut self) -> Result<(), Failure> {
+        self.profile_use
+            .as_ref()
+            .ok_or_else(Failure::unavailable)?
+            .validate()
+            .map_err(|_| Failure::unavailable())?;
         let update = self
             .client
             .as_mut()
@@ -167,6 +186,24 @@ impl NativeAttempt<'_> {
 }
 impl Attempt for NativeAttempt<'_> {
     fn start(&mut self, canceled: &AtomicBool) -> Result<(), Failure> {
+        if self.profile.kind != VpnKind::Ssl {
+            return Err(Failure {
+                state: ConnectionState::MissingProgram,
+                error: ErrorCode::MissingProgram,
+            });
+        }
+        self.profile_use = Some(
+            self.profiles
+                .begin(&self.profile, self.owner.generation)
+                .map_err(|error| Failure {
+                    state: ConnectionState::Dropped,
+                    error: match error {
+                        StoreError::Busy => ErrorCode::ProfileBusy,
+                        StoreError::NotFound => ErrorCode::ProfileNotFound,
+                        _ => ErrorCode::UntrustedConfiguration,
+                    },
+                })?,
+        );
         // Preflight failures have no spawned child. After attempting spawn,
         // uncertainty must survive even if setup returns an error.
         Runtime::installed()
@@ -257,69 +294,15 @@ impl Attempt for NativeAttempt<'_> {
         }
     }
     fn cleanup(&mut self) -> bool {
-        // A canceled connection may have reached PPP before the last poll.
-        // Capture proof while its original parent is still alive, if possible.
-        if self.link.is_none() && self.client.is_some() && !self.stopped {
-            let _ = self.discover();
-        }
-        if !self.stopped {
-            self.stopped = self
-                .client
-                .as_mut()
-                .is_none_or(|client| client.stop().is_ok());
-        }
-        self.credentials = None;
-        if !self.stopped || self.uncertain_cleanup {
+        if !self.cleanup_network() {
             return false;
         }
-        if !self.spawn_attempted {
-            return true;
-        }
-        let Some(client) = &mut self.client else {
-            return false;
-        };
-        if !client.children_complete().unwrap_or(false) {
-            return false;
-        }
-        // A birth grant predates configd/address discovery. Process receipts
-        // alone cannot prove that implicit network resources were removed.
-        let Some(link) = &self.link else {
-            if !client.ppp_may_have_run() {
-                return true;
-            }
-            let (Some(before), Some(routes), Some(proof)) =
-                (&self.before, &self.before_routes, client.supervised_ppp())
-            else {
-                return false;
-            };
-            return ppp_early_cleanup::complete(before, routes, proof.child()).unwrap_or(false);
-        };
-        let Ok(mut routes) = self.routes.lock() else {
-            return false;
-        };
-        if let Some(lease) = self.lease.take()
-            && routes.release(lease).is_err()
+        if let Some(profile) = &self.profile_use
+            && profile.complete().is_err()
         {
-            self.uncertain_cleanup = true;
             return false;
         }
-        if let Some(token) = &self.token {
-            if !routes.backend_mut().begin_cleanup(token).unwrap_or(false) {
-                return false;
-            }
-            routes.retry_cleanup();
-            if routes.has_owner(&self.owner) || routes.backend_mut().finish_cleanup(token).is_err()
-            {
-                return false;
-            }
-            self.token = None;
-        }
-        routes.retry_cleanup();
-        !routes.has_owner(&self.owner)
-            && routes.backend_mut().reap_retired().is_ok()
-            && routes
-                .backend_mut()
-                .ppp_cleanup_complete(link)
-                .unwrap_or(false)
+        self.profile_use = None;
+        true
     }
 }

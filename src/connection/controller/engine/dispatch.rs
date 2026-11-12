@@ -52,6 +52,10 @@ pub(super) fn dispatch(
     }
     match request.command {
         Command::Connect { credentials, .. } => {
+            if slot.profile.kind != VpnKind::Ssl {
+                fail(output, ErrorCode::MissingProgram);
+                return;
+            }
             if credentials.validate(VpnKind::Ssl).is_err() {
                 fail(output, ErrorCode::InvalidSecret);
                 return;
