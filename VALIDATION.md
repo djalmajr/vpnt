@@ -76,6 +76,74 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
+## IPsec: identidade, namespace e mensagens preparadas
+
+```bash
+cargo test --locked --no-default-features --lib connection::ipsec
+python3 scripts/macos/check-ipsec.py
+```
+
+[PASS, contract + SDK] Nove testes exercitam o registro de reservas e as mensagens
+construídas, usando o codec VICI produtivo. Não existe observador de kernel
+nativo nesta fase: os conjuntos de reqids e o encerramento do produtor são
+injetados. Reservas são opacas, vinculadas à instância/token e UID/perfil/geração;
+recusam conflito externo/local, reuso antes de cleanup, token alheio/antigo,
+falha de observação, excesso de 64 perfis e namespace maior que 16 bits.
+Ausência de SA/SPD sem encerramento do produtor não libera o slot.
+Observadores futuros também precisam incluir admissões duráveis incompletas;
+o lock do controlador não cerca outro root arbitrário.
+
+O campo sadb_x_ipsecrequest_reqid do SDK Darwin local foi inspecionado como
+u_int16_t, e o fonte fixado do kernel-pfkey atribui o reqid nesse campo. Isso
+é inspeção estática, sem leitura ou escrita PF_KEY executada. O allocator não
+trunca hashes e não usa nome/reqid como permissão para apagar recursos.
+
+Um consumidor C compilado contra o SDK confirma os 16 bits do campo e
+IPSEC_MANUAL_REQID_MAX = 0x3fff. O teste falhou com a primeira faixa 1..65535:
+o [parser do XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netkey/key.c)
+substitui reqids manuais acima desse limite. A faixa emitida agora é 1..16383;
+observações podem incluir também IDs automáticos até 65535. O consumidor só
+imprime tamanho/constante, sem socket, SA, política ou privilégio.
+
+[PASS, codec/schema assertions] Nomes reversíveis conservam UID, geração e
+todos os bytes/caso do perfil, dentro do limite do protocolo. load-conn fixa
+IKEv2, endpoints resolvidos, identidade EAP/PSK, reqid e seletores canônicos;
+não carrega segredo nem configura trap/restart automático. Senha/PSK só entram
+em load-shared, com donos exatos e Debug redigido. Prazos positivos limitados
+e arredondamento para cima impedem timeout zero/infinito nos comandos de ciclo
+de vida. Catálogo vazio de redes prepara seletores IPv4/IPv6; não comprova
+proteção de tráfego em nenhuma família. Referência de esquema:
+[VICI 6.1.0](https://github.com/strongswan/strongswan/blob/6.1.0/src/libcharon/plugins/vici/README.md).
+
+O nome de usuário é codificado como KEY_ID binário explícito nos campos local/
+EAP e no dono do segredo. O fonte fixado de identification.c reconhece aliases,
+prefixos tipados, subnets e ranges; passar `%any` diretamente criava um curinga.
+O teste falhou antes da correção e agora distingue `%any`, `*`, prefixo, subnet e
+tipo numérico como bytes literais. Gateway não especificado também é recusado.
+Essa prova de construção não substitui a negociação de identidade com um servidor.
+
+[PASS, local] 241 testes Rust com desktop e 237 sem desktop, com dois ignored
+(runtime opcional e harness de crash chamado pelo pai). O alvo IPsec foi repetido
+após tornar a limpeza do fixture SDK dependente da criação bem-sucedida da pasta.
+Fmt/clippy all-targets/all-features -D warnings e sintaxe Python passaram.
+UI, catálogos, dependências e patches não mudaram; evidências desses consumidores
+permanecem no checkpoint 692489d, sem nova execução ou inspeção visual.
+
+A matriz final detectou 42 mutações e passou baseline/restauração: namespace,
+tokens, conflito/limite manual, dono/configuração, identidade binária, endpoints,
+seletores, segredos e prazo. Exige assertion executada no teste previsto, sem
+contar erro de compilação. Os 201 hashes de fonte/testes/runner conferem com o
+estado final; logs/recibo em output/fixtures/ipsec-oracles/. Cópia/build descartáveis
+removidos. O workflow inclui o gate, sem execução remota. Matrizes anteriores
+conservam seus commits e limites; não foram reexecutadas nesta fase.
+
+[NOT RUN] As mensagens não foram enviadas a charon. Faltam consumidor de
+respostas/eventos, admissão de processo/socket, observador SA/SPD, retenção de
+admissão entre falhas, probe/origem, integração Factory/dispatch e cleanup
+nativo. Broker/helper continuam recusando IPsec. Nada instalado ou conectado;
+o .app/payload de desenvolvimento conservado pertence ao checkpoint 692489d.
+Esta fase não reempacota ou atualiza um componente instalado.
+
 ## Helper com modos fechados e canal herdado
 
 ```bash

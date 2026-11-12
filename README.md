@@ -180,6 +180,15 @@ o helper possa usar um PID privado por perfil. O manifest registra o hash do
 patch, e a admissão Rust exige essa mesma versão. Configuração, socket, credenciais
 e recursos de rede por perfil ainda dependem da integração do driver.
 
+A primeira parte do controle IPsec reserva `reqid` na faixa manual Darwin de
+1 a 16383, sem truncar identidades, e prepara mensagens VICI por UID/perfil/geração.
+A reserva só é
+liberada quando o observador confirma produtor encerrado e recursos ausentes;
+drop ou resposta VICI não comprovam esse estado. Senha e PSK entram apenas nas
+mensagens `load-shared` em memória. Esses contratos ainda não estão ligados
+ao processo charon ou ao observador SA/SPD nativo. O helper continua recusando
+conexão IPsec até completar driver, prova de tráfego e cleanup.
+
 O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-routes.patch)
 impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver
 SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos

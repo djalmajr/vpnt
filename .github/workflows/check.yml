@@ -91,6 +91,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-route-policy.py
+      - name: Verify IPsec namespace and request contracts without charon
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ipsec.py
       - name: Verify PPP subprocess supervision
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
