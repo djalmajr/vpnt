@@ -31,9 +31,9 @@ struct NativeFactory<'a> {
 }
 
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
-/// The installed helper must bind uid to its authenticated caller and keep
-/// this controller/lock alive through EOF and every outstanding cleanup.
-/// It is not currently connected to the application or a helper executable.
+/// The prepared helper binds uid to its inherited caller and keeps this
+/// controller/lock alive through EOF and every outstanding cleanup. Installed
+/// execution and the application broker remain unverified.
 pub fn run_ssl(
     controller: &ControllerLock,
     uid: u32,

@@ -112,7 +112,7 @@ nativa consulta a tabela e faz somente `RTM_GET`; os testes de aplicação e
 remoção usam um kernel simulado. O lock global do controlador tem testes de
 exclusão real entre processos e validação de inode/permissões/ACL; a fábrica
 produtiva exige root e um arquivo persistente preparado pela instalação.
-O controlador preparado já o consome; o helper ainda falta. Há um vínculo PPP por descritor
+O controlador e o entrypoint preparado do helper já o consomem. Há um vínculo PPP por descritor
 e um escritor separado de `ADD`, ambos preparados para exigir root, o lock e
 a interface comprovada. Seus testes usam ioctls simulados e um consumidor C
 da ABI Darwin em sockets Unix privados: nenhuma retenção PPP ou escrita real
@@ -127,7 +127,7 @@ remoção observada. A liberação fecha só os descritores próprios.
 Os fluxos do backend usam tabela e ciclo de vida simulados; os pedidos UTUN e
 de endereço têm fixtures e consumidor C independente do SDK. Watches de
 processos e leitura nativa têm evidência separada. Execução privilegiada,
-bloqueio de tráfego real e ligação ao helper/UI continuam pendentes;
+bloqueio de tráfego real e ligação instalada ao helper/UI continuam pendentes;
 detalhes em `VALIDATION.md`.
 
 O controlador SSL usa um worker por perfil, gerações crescentes, cancelamento
@@ -143,6 +143,18 @@ após spawn mantêm o driver e seus recibos. Se houve permissão antes de descob
 a interface, o cleanup compara interfaces/rotas com a observação anterior:
 recursos novos sem atribuição segura mantêm pendência, sem remoção por palpite.
 
+O executável `vpnt-helper` aceita somente `runtime` ou `admin`, exige UID real e
+efetivo root e um socketpair anônimo herdado em FD 0. O UID do peer vem do kernel;
+SUDO_UID e campos de UID do IPC não selecionam o storage. Somente usuários com
+storage root já preparado podem entrar. O modo runtime chama o controlador SSL
+sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil,
+revalidando o lock. Leitura e escrita rodam fora do controlador, com filas e
+prazos limitados; EOF/sinais encerram admissões e aguardam cleanup. Há testes de
+socket, arquivos/flock reais de fixture e controlador com rede simulada.
+O binário ainda não está instalado ou no .app. Installer/sudoers, broker e
+comportamento após elevação continuam pendentes; o modo runtime deve ser a
+única autorização sem senha da futura regra restrita.
+
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
 pode precisar de acesso ao Security.framework fora do sandbox; uma lista vazia
@@ -151,8 +163,8 @@ interrompe o build. Chaveiros pessoais não são usados para esse bundle.
 O binário auxiliar `vpnt-pinentry` também é compilado, mas ainda não é
 instalado ou incluído no `.app`. Ele recebe a senha por um socket anônimo
 herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
-A camada de processo SSL já consome esse transporte. A integração com o helper,
-a instalação e a prova privilegiada seguem pendentes.
+A camada de processo SSL e o caminho compilado do helper já consomem esse
+transporte. A instalação, o broker da UI e a prova privilegiada seguem pendentes.
 
 O binário separado `vpnt-pppd` prepara a supervisão do filho PPP. Ele aceita
 somente a lista fixa de argumentos, exige root e um canal herdado em FD 4,

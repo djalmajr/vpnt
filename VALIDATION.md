@@ -75,6 +75,83 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
+## Helper com modos fechados e canal herdado
+
+```bash
+cargo test --locked --no-default-features --offline --lib helper::server
+cargo test --locked --no-default-features --offline --lib inherited_helper_channel
+cargo test --locked --no-default-features --offline --test helper_entrypoint
+python3 scripts/macos/check-helper-channel.py
+```
+
+Executar como usuário comum no macOS. O binário `vpnt-helper` aceita somente
+`runtime` e `admin`, sem flags de fixture, paths ou UID alvo. Rejeita antes do
+storage UID real/efetivo diferente de root. Depois exige FD 0 válido, stream Unix
+conectado, sem nome em ambas as extremidades, com peer não root obtido pelo
+kernel. Pipes, datagramas, TCP e serviços Unix nomeados são recusados. O helper
+usa esse único FD duplex, com CLOEXEC, sem protocolo em stdout/stderr. Não usa
+SUDO_UID/SUDO_USER como autoridade. A herança do peer UID através da elevação
+ainda não foi exercitada; os testes do canal rodam sob o usuário comum.
+
+O UID autenticado seleciona exclusivamente `ProfileStore::for_user`; o diretório
+root já precisa existir. O entrypoint adquire o lock global e o mantém por toda
+a sessão. Runtime chama `run_ssl`; admin exige documento único mais EOF em até
+cinco segundos, revalida o lock e chama save/remove do store. Runtime não edita
+perfis. A futura regra sudoers deve liberar sem senha somente o comando exato
+runtime; a administração precisa da autorização de elevação separada. Nenhuma
+regra foi criada ou instalada por estes testes.
+
+A entrada tem deadline por frame iniciado; uma sessão runtime ociosa pode
+continuar aberta. Admin inclui documento e EOF no mesmo prazo. O buffer de
+entrada apaga os bytes consumidos e zeroiza no drop. Há dois threads de IO,
+filas de 32 mensagens/pedidos e prazo de cinco segundos por frame de saída.
+Erro de escrita fecha a admissão; EOF, HUP/INT/TERM e erro de protocolo fecham o
+canal de pedidos. O controlador conserva workers/leases/aposentadorias durante
+o cleanup, sem timeout que declare recursos removidos. Encerrar o controlador
+cancela também uma leitura parcial ou ociosa antes de juntar os threads.
+Sinais reais do entrypoint root e backpressure até o prazo da escrita ainda
+precisam de cenário próprio; o prazo da administração/leitura foi executado.
+
+Seis testes do servidor exercitam sockets nativos, fragmentação, injeção de
+campos/comandos, CLOEXEC, cancelamento de leitura parcial, silêncio por cinco
+segundos e apagamento do buffer sem corromper o frame seguinte. A administração
+passa pelo aplicador produtivo com storage/flock próprios de fixture: salva,
+relê e remove perfil; segundo documento ou falta de EOF não pode mutar; lock
+alterado não autoriza escrita. Um teste do executável final confirma a recusa
+do usuário comum mesmo com SUDO_UID/SUDO_USER forjados e argumentos adicionais.
+
+Um oitavo cenário do controlador atravessa o transporte produtivo, codec real,
+Coordinator e um sleep próprio. Confere UID, conectar/verificar e EOF enquanto
+aposentadoria está pendente; o helper precisa esperar a remoção observada.
+A tabela/PPP/probe/cleanup são simulados; isso não executa `run_ssl` como root,
+retém uma PPP real, altera rotas ou comprova uma conexão VPN.
+
+A matriz usa uma cópia descartável de fonte/build: três baselines e três
+restaurações (servidor, controlador pelo socket e entrypoint), mais 11 mutações.
+Remove restrição de argv, recusa de socket nomeado, CLOEXEC, UID encaminhado,
+EOF administrativo, save/remove, revalidação do lock, cancelamento da leitura,
+prazo e apagamento do buffer. Exige assertion executada no teste previsto;
+compilação ou falha incidental não contam. Omissão isolada de SO_TYPE sobreviveu
+porque getpeereid também recusou o datagrama com EINVAL neste macOS; não foi
+contada como mutação detectada. Recibos/hashes de src/tests e logs ficam em
+`output/fixtures/helper-channel-oracles/`. O workflow macOS inclui essa matriz;
+CI remoto ainda não executado.
+
+**Limites:** helper não instalado, sem broker/UI normal ou política sudoers
+aplicada. A preparação da elevação também precisa conferir a passagem de FD 0,
+PTY e política de registro de IO, preservando o sigilo das credenciais.
+Snapshot/conexões do adaptador atual incluem apenas SSL; o despacho IPsec
+permanece por implementar. Installer, sinal/UID após elevação, recursos
+privilegiados e testes com gateways reais continuam pendentes. Nada foi
+instalado, elevado, conectado ou publicado.
+
+Checkpoint executado: `016d1cf`, com 143 testes Rust com desktop/142 sem desktop,
+11 mutações do helper, 67 de rotas e 16 da supervisão PPP. Os hashes dos 118
+arquivos src/tests conferem com os três recibos desse commit. A revisão seguinte
+atualiza README/VALIDATION e somente um comentário de documentação em
+`controller/native.rs`; a evidência comportamental é reutilizada por não haver
+mudança de código, configuração ou dependência executável.
+
 ## Exclusão entre controladores
 
 ```bash
@@ -96,8 +173,9 @@ apaga ou corrige permissões. O instalador/atualizador deve preservar o inode
 existente. O controlador deverá manter o handle durante todas as gerações e
 o cleanup pendente, não só durante o despacho de um comando. Isso limita
 controladores cooperantes; não impede outro processo root de alterar rotas,
-nem é uma prova de ownership do kernel. Integração e execução privilegiada
-ainda pendentes; nenhum lock real foi criado nesta máquina.
+nem é uma prova de ownership do kernel. O helper compilado já adquire esse
+lock; sua execução privilegiada ainda está pendente. Nenhum lock instalado
+foi criado nesta máquina.
 
 ## Runtime privado dos clientes
 
@@ -167,7 +245,8 @@ diferente; não existe endpoint de senhas no filesystem.
 `vpnt-pinentry` não aceita argumentos nem override de UID/caminho: exige UID real
 e efetivo root e usa o canal herdado. O teste roda como usuário comum com
 adaptador de fixture e UID explícito; isso não substitui a instalação e o teste
-root do binário final. A ligação ao helper/driver completo continua pendente.
+root do binário final. O caminho do driver/helper está compilado, sem execução
+instalada ou privilegiada.
 
 ```bash
 cargo test --locked --no-default-features --test pinentry --test pinentry_channel --test profiles --test secrets
@@ -388,8 +467,9 @@ cargo test --locked --no-default-features --lib owned_ppp_exit_requires_both_ori
 `Snapshot` ao contrato de `Coordinator`. O registro é ligado a UID/perfil/geração
 e a um plano de redes. O coordenador consulta essa autorização antes de criar
 ou emprestar uma rota. O escritor só recebe destinos desse plano e de interfaces
-retidas; o cancelamento usa uma flag própria da geração. O helper ainda precisa
-consumir esse backend, em vez de se limitar à camada de processo SSL.
+retidas; o cancelamento usa uma flag própria da geração. O entrypoint compilado
+do helper já o consome pelo controlador SSL. O adaptador root ainda não foi
+executado no caminho instalado.
 
 A confirmação exige ACK e releitura da chave exata destino/máscara/escopo.
 Prefixo que apenas contém o destino, outro escopo ou duplicidade de chave não
@@ -571,9 +651,9 @@ cargo test --locked --no-default-features --lib connection::controller
 ```
 
 O consumidor preparado `run_ssl` exige root e o lock persistente, carrega do
-storage root apenas os perfis SSL do UID que o helper deverá autenticar e
-mantém workers separados por perfil. A fábrica e o adaptador nativo estão
-compilados; nenhum helper executável ou caminho da UI os chama nesta entrega.
+storage root apenas os perfis SSL do UID autenticado pelo helper e mantém
+workers separados por perfil. O executável preparado chama a fábrica e o
+adaptador nativo, sem execução root ou integração com a UI nesta entrega.
 IPsec ainda precisa do seu driver e do despacho correspondente.
 
 Conectar e desligar exigem geração maior que a anterior daquele perfil;
@@ -593,7 +673,7 @@ Uma saída cheia não bloqueia cancelamento/cleanup. EOF ou consumidor de saída
 perdido cancela todos os workers e aguarda leases e aposentadorias antes de
 retornar e permitir a liberação do lock.
 
-Os sete testes usam os codecs reais de request/message, Coordinator e processos
+Os sete testes originais usam os codecs reais de request/message, Coordinator e processos
 `sleep` próprios, parados e reaped pelo mesmo ManagedChild. A tabela, vínculo,
 probe e condição de purge são simulados. Cobrem conectar/verificar/sem tráfego/
 recuperar/desligar, probe tardio, nova geração aguardando cleanup, cancelamento
@@ -617,7 +697,7 @@ Dois testes puros e duas mutações discriminantes exercitam esse fallback,
 incluindo PPP anterior inativa que aparece ativa, rota local residual,
 neighbor cache físico e rota cujo índice já desapareceu. Não houve execução
 privilegiada desse caminho ou prova de purge real. Não há timeout que transforme
-incerteza em Off. A ligação ao helper/broker/UI, validação instalada da admissão,
+incerteza em Off. A ligação instalada ao helper/broker/UI, validação da admissão,
 instalação e conexão real continuam pendentes.
 
 ## Política de rotas e leitura nativa
@@ -678,7 +758,7 @@ antes de cleanup, omitem a espera de cleanup/aposentadoria, promovem conexão
 sem teste, aceitam probe sem resposta ou preservam uma reconexão após desligar.
 Duas adicionais retiram a espera por PPP nova/alterada sem atribuição e por
 rotas residuais no cleanup precoce. Baseline e restauração também executam os
-sete cenários do controlador e os dois testes desse fallback.
+oito cenários do controlador e os dois testes desse fallback.
 As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo
