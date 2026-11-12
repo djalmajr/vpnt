@@ -18,22 +18,43 @@ pub struct ManagedChild {
     status: Option<ExitStatus>,
 }
 
+pub(crate) enum Environment {
+    System,
+    PrivateVpn,
+}
+
 impl ManagedChild {
     /// The driver must admit a fixed trusted executable before calling this.
     /// This layer additionally blocks relative paths and inherited environment.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_with_environment(command, Environment::System)
+    }
+
+    pub(crate) fn spawn_with_environment(
+        command: &mut Command,
+        environment: Environment,
+    ) -> io::Result<Self> {
         if !Path::new(command.get_program()).is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "absolute executable required",
             ));
         }
-        let child = command
+        command
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("LANG", "C")
             .env("LC_ALL", "C")
-            .current_dir("/")
+            .current_dir("/");
+        if matches!(environment, Environment::PrivateVpn) {
+            let runtime = super::paths::runtime_directory();
+            command
+                .env("OPENSSL_CONF", "/dev/null")
+                .env("OPENSSL_MODULES", runtime.join("lib/ossl-modules"))
+                .env("OPENSSL_ENGINES", runtime.join("lib/engines"))
+                .env("SSL_CERT_FILE", runtime.join("certs/ca-bundle.pem"));
+        }
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

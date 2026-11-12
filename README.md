@@ -66,15 +66,15 @@ Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
 Os clientes VPN também podem ser preparados em um runtime separado, ainda sem
 instalação. Esse build usa Python 3.12 ou superior, o compilador do Xcode e as
-instalações locais de `openssl@4` e `openfortivpn` 1.24.1:
+instalações locais de `openssl@4` e GNU `m4`:
 
 ```bash
 python3 scripts/macos/build-runtime.py
 ```
 
-O script verifica e compila strongSwan 6.1.0 com plugins incorporados, prepara
-uma cópia do openfortivpn e copia suas bibliotecas para `target/vpnt-runtime`.
-O pkgconf necessário ao build é compilado em `target/build-tools`. As fontes
+O script compila strongSwan 6.1.0 com plugins incorporados e openfortivpn 1.24.1
+a partir de fontes verificadas, com bibliotecas em `target/vpnt-runtime`.
+pkgconf, autoconf e automake são compilados só em `target/build-tools`. As fontes
 baixadas têm SHA-256 fixado; os programas do Homebrew permanecem intactos.
 O manifest registra hashes, licenças, destino futuro e a versão mínima de macOS
 exigida pelos binários produzidos. Esse runtime ainda não faz parte do `.app`
@@ -86,6 +86,12 @@ o helper possa usar um PID privado por perfil. O manifest registra o hash do
 patch, e a admissão Rust exige essa mesma versão. Configuração, socket, credenciais
 e recursos de rede por perfil ainda dependem da integração do driver.
 
+O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-routes.patch)
+impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver
+SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos
+recursos que autorizou. A camada de processo está implementada; propriedade da
+interface, leases de rotas e probe ainda precisam ser ligados ao controlador.
+
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
 pode precisar de acesso ao Security.framework fora do sandbox; uma lista vazia
@@ -94,7 +100,8 @@ interrompe o build. Chaveiros pessoais não são usados para esse bundle.
 O binário auxiliar `vpnt-pinentry` também é compilado, mas ainda não é
 instalado ou incluído no `.app`. Ele recebe a senha por um socket anônimo
 herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
-A integração com o helper/driver real e a prova privilegiada seguem pendentes.
+A camada de processo SSL já consome esse transporte. A integração com o helper,
+a instalação e a prova privilegiada seguem pendentes.
 
 ## Proposta visual
 

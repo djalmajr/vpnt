@@ -17,6 +17,7 @@ target/
 node_modules/
 dist/
 .DS_Store
+__pycache__/
 .playwright-cli/
 output/playwright/
 output/mutations/

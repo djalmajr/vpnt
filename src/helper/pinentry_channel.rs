@@ -3,7 +3,7 @@
 use super::{
     local_socket::{TimedStream, peer_uid},
     pinentry,
-    process::{ManagedChild, StopOutcome},
+    process::{Environment, ManagedChild, StopOutcome},
 };
 use crate::{
     model::VpnKind,
@@ -35,7 +35,19 @@ pub struct PinentryChild {
 }
 
 impl PinentryChild {
-    pub fn spawn(mut command: Command, password: Secret) -> io::Result<Self> {
+    pub fn spawn(command: Command, password: Secret) -> io::Result<Self> {
+        Self::spawn_in(command, password, Environment::System)
+    }
+
+    pub(crate) fn spawn_private_runtime(command: Command, password: Secret) -> io::Result<Self> {
+        Self::spawn_in(command, password, Environment::PrivateVpn)
+    }
+
+    fn spawn_in(
+        mut command: Command,
+        password: Secret,
+        environment: Environment,
+    ) -> io::Result<Self> {
         let credentials = Credentials {
             password,
             psk: Secret::from(""),
@@ -60,7 +72,7 @@ impl PinentryChild {
                 Ok(())
             });
         }
-        let mut child = ManagedChild::spawn(&mut command)?;
+        let mut child = ManagedChild::spawn_with_environment(&mut command, environment)?;
         drop(child_socket);
         // Unexpected interactive input must fail instead of waiting on the UI.
         drop(child.take_stdin());

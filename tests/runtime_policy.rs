@@ -85,7 +85,7 @@ impl Fixture {
         }
         let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
             "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/charon-private-pid.patch")))}},
-            "openfortivpn":{"version":"1.24.1","source":"https://github.com/adrienverge/openfortivpn/tree/v1.24.1"},"files":files});
+            "openfortivpn":{"version":"1.24.1","source":"https://github.com/adrienverge/openfortivpn/archive/refs/tags/v1.24.1.tar.gz","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/openfortivpn-no-routes.patch")))}},"files":files});
         fs::write(
             self.directory.join("manifest.json"),
             serde_json::to_vec(&data).unwrap(),
@@ -177,7 +177,7 @@ fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
     let fixture = Fixture::new();
     let path = fixture.directory.join("manifest.json");
     let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    for change in 0..3 {
+    for change in 0..5 {
         let mut document = original.clone();
         match change {
             0 => {
@@ -190,16 +190,28 @@ fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
                 document["strongswan"]["patches"]["charon-private-pid.patch"] =
                     "0".repeat(64).into()
             }
-            _ => {
+            2 => {
                 document["files"]
                     .as_object_mut()
                     .unwrap()
                     .remove("certs/ca-bundle.pem");
                 fs::remove_file(fixture.directory.join("certs/ca-bundle.pem")).unwrap();
             }
+            3 => {
+                document["openfortivpn"]["patches"]["openfortivpn-no-routes.patch"] =
+                    "0".repeat(64).into()
+            }
+            _ => document["openfortivpn"]["sha256"] = "0".repeat(64).into(),
         }
         fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
         assert!(Runtime::inspect(&fixture.directory, fixture.uid).is_err());
+        if change == 2 {
+            fs::write(
+                fixture.directory.join("certs/ca-bundle.pem"),
+                b"fixture public CA",
+            )
+            .unwrap();
+        }
     }
 }
 

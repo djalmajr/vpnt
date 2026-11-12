@@ -60,6 +60,8 @@ struct Forti {
     version: String,
     #[serde(rename = "source")]
     _source: String,
+    sha256: String,
+    patches: BTreeMap<String, String>,
 }
 
 pub struct Runtime {
@@ -96,6 +98,18 @@ impl Runtime {
                     ),
                 )])
             || manifest.openfortivpn.version != "1.24.1"
+            || manifest.openfortivpn.sha256
+                != "c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465"
+            || manifest.openfortivpn.patches
+                != BTreeMap::from([(
+                    "openfortivpn-no-routes.patch".into(),
+                    format!(
+                        "{:x}",
+                        Sha256::digest(include_bytes!(
+                            "../../scripts/macos/patches/openfortivpn-no-routes.patch"
+                        ))
+                    ),
+                )])
             || manifest.files.len() > 64
             || !valid_version(&manifest.minimum_macos)
             || !manifest.files.contains_key("bin/charon")
@@ -118,6 +132,19 @@ impl Runtime {
             Program::Charon => "bin/charon",
             Program::Fortinet => "bin/openfortivpn",
         })
+    }
+
+    pub fn ca_bundle(&self) -> PathBuf {
+        self.directory.join("certs/ca-bundle.pem")
+    }
+
+    /// Only the fixed auxiliary executable is admitted in production. Root
+    /// ownership and all ancestors are checked independently from the C runtime.
+    pub fn verify_pinentry() -> Result<(), RuntimeError> {
+        let path = Path::new(paths::PINENTRY);
+        check_directory(path.parent().ok_or(RuntimeError::Untrusted)?, 0)?;
+        let bytes = read_file(path, 0, true, MAX_FILE)?;
+        check_macho(&bytes, &BTreeMap::new(), true)
     }
 
     /// Recheck immediately before spawning. Non-root callers cannot replace

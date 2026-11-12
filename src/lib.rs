@@ -5,6 +5,8 @@ pub mod app;
 pub mod assets;
 pub mod bridge;
 pub mod cli;
+#[cfg(unix)]
+pub mod connection;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub mod desktop;
 #[cfg(unix)]

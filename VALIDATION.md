@@ -82,12 +82,13 @@ python3 scripts/macos/build-runtime.py
 python3 scripts/macos/build-runtime.py --verify-only
 ```
 
-O build fica em `target/`, incluindo o pkgconf local e fontes verificadas por
+O build fica em `target/`, incluindo pkgconf/autoconf/automake locais e fontes verificadas por
 SHA-256. O strongSwan é compilado com os plugins necessários incorporados; seu
 PID padrão fica em um prefixo próprio. O patch versionado permite ao futuro
 driver indicar um PID diferente por perfil em configuração privada. A fonte
-é extraída novamente do arquivo verificado antes de cada build. O openfortivpn é copiado da versão local
-declarada no README. Nenhum comando instala em `/Library` ou inicia túneis.
+é extraída novamente do arquivo verificado antes de cada build. O openfortivpn
+também é compilado da fonte restaurada, com o patch de `--no-routes` e suporte
+ao pppd legado do macOS. Nenhum comando instala em `/Library` ou inicia túneis.
 
 A verificação confere inventário/hashes, dependências Mach-O com prefixos
 privados ou do sistema, assinaturas ad hoc e a versão mínima real do macOS.
@@ -98,7 +99,10 @@ compatibilidade com um macOS anterior ao mínimo dos componentes.
 O bundle de CAs contém somente certificados públicos exportados do chaveiro de
 raízes do sistema. Exportação vazia ou inválida interrompe o build; o sandbox
 pode retornar uma lista vazia sem erro. O bundle e o patch de PID integram a
-verificação do manifest. Isso não prova que o driver já os utiliza.
+verificação do manifest. O patch de rotas do openfortivpn também é exigido.
+O build executa o callback C original de interface pronta, com chamadas de
+rota/DNS interceptadas: nenhuma com `--no-routes`, chamadas preservadas ao
+habilitar rotas. Esse fixture não faz escritas reais de rede.
 
 Esses checks não provam carregamento dos plugins privilegiados, criação de SAs,
 PPP, tráfego pelo túnel ou cleanup de rotas. O controle de filhos tem testes de
@@ -149,6 +153,30 @@ separado do app. Os testes de entrada
 rejeitam usuário SSL acima de 64 bytes, senha SSL acima de 256 bytes e fingerprint
 fora dos 64 dígitos hexadecimais. O protocolo inicial só valida a forma dos
 segredos; o tipo do perfil root determina o limite efetivo do cliente.
+
+## Camada de processo SSL
+
+```bash
+cargo test --locked --no-default-features --lib
+```
+
+No macOS, os testes compilam um processo C descartável que consome os argv,
+ambiente e canal herdado reais do driver. Ele verifica configuração vazia,
+rotas/DNS/peerdns desativados, paths fixos, ambiente OpenSSL privado, ausência
+de senha em argv e entrega pelo socket. Emite deliberadamente log com uma
+senha fictícia, linha excessiva e mensagens de interface/falhas. O driver retém
+somente observações tipadas; buffers de leitura são limitados e apagados.
+
+Verificar cancelamento/reap e a preservação da causa após saída do processo.
+Timeout inclui o texto real do Darwin (Operation timed out). O entrypoint
+produtivo exige root, runtime instalado verificado e pinentry fixo com dono e
+dependências confiáveis. O fixture usa explicitamente uma árvore do usuário e
+não substitui essa prova privilegiada. Gateway SSL literal IPv6 é rejeitado;
+o transporte do cliente usa IPv4/DNS.
+
+Interface citada no log é somente candidata. Esses testes não provam propriedade
+de PPP, leases/cleanup de rotas, probe pelo túnel ou estado conectado. Isso
+continua pendente de controlador/helper e verificação nativa/real.
 
 ## Fluxos de demonstração
 

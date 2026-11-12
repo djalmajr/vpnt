@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import tomllib
 from urllib.request import urlopen
+from runtime_sources import build_fortinet, FORTI_VERSION, FORTI_URL, FORTI_SHA
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
@@ -19,11 +20,11 @@ PREFIX = Path("/Library/PrivilegedHelperTools/dev.vpnt.runtime") / VERSION
 SWAN_VERSION = "6.1.0"
 SWAN_URL = f"https://download.strongswan.org/strongswan-{SWAN_VERSION}.tar.bz2"
 SWAN_SHA = "fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4"
-FORTI_VERSION = "1.24.1"
 PKGCONF_VERSION = "3.0.10"
 PKGCONF_SHA = "9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de"
 MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
 PID_PATCH = ROOT / "scripts/macos/patches/charon-private-pid.patch"
+FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 
 
 def digest(path):
@@ -168,6 +169,8 @@ def verify_runtime(root):
         raise RuntimeError("Runtime manifest does not match this app")
     if manifest["strongswan"]["patches"] != {PID_PATCH.name: digest(PID_PATCH)}:
         raise RuntimeError("Runtime does not include the expected private PID patch")
+    if manifest["openfortivpn"]["patches"] != {FORTI_PATCH.name: digest(FORTI_PATCH)}:
+        raise RuntimeError("Runtime does not include the expected route isolation patch")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
     actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
@@ -206,7 +209,12 @@ def verify_runtime(root):
         env = {key: value for key, value in os.environ.items() if not key.startswith(("DYLD_", "LD_"))}
         env.update(DYLD_LIBRARY_PATH=str(root / "lib"), STRONGSWAN_CONF=str(configuration), OPENSSL_CONF="/dev/null", OPENSSL_MODULES=str(root / "lib/ossl-modules"))
         for program, expected in [("charon", f"strongSwan {SWAN_VERSION}"), ("openfortivpn", FORTI_VERSION)]:
-            result = subprocess.run([str(root / "bin" / program), "--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
+            arguments = [str(root / "bin" / program)]
+            if program == "openfortivpn":
+                # Parse the driver's fixed options in the real client, then
+                # exit via --version before config, credentials or networking.
+                arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", "--pinentry=/Library/PrivilegedHelperTools/dev.vpnt.pinentry", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--trusted-cert=" + "a1" * 32]
+            result = subprocess.run(arguments + ["--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
             if result.returncode or result.stdout.strip() != expected:
                 raise RuntimeError(f"Private {program} startup/version check failed")
     print(f"Verified {len(manifest['files'])} runtime files; minimum macOS {minimum}; versions OK", flush=True)
@@ -225,13 +233,10 @@ def main():
         verify_runtime(ROOT / "target/vpnt-runtime")
         return
     openssl = Path(capture(["brew", "--prefix", "openssl@4"]))
-    forti_prefix = Path(capture(["brew", "--prefix", "openfortivpn"]))
-    forti = forti_prefix / "bin/openfortivpn"
-    if capture([forti, "--version"]) != FORTI_VERSION:
-        parser.error(f"Expected installed openfortivpn {FORTI_VERSION}.")
     cache = ROOT / "target/runtime-sources"
     cache.mkdir(parents=True, exist_ok=True)
     pkgconf = local_pkgconf(cache, args.jobs)
+    forti, forti_source = build_fortinet(ROOT, cache, openssl, pkgconf, args.jobs, run, PREFIX)
     archive = cache / f"strongswan-{SWAN_VERSION}.tar.bz2"
     if not archive.exists():
         print("Downloading verified strongSwan source", flush=True)
@@ -325,13 +330,8 @@ def main():
         licenses = payload / "licenses"
         licenses.mkdir()
         shutil.copy2(source / "COPYING", licenses / "strongswan.txt")
-        for candidate in [forti_prefix / "LICENSE", forti_prefix / "share/doc/openfortivpn/COPYING", forti_prefix / "COPYING"]:
-            if candidate.is_file():
-                shutil.copy2(candidate, licenses / "openfortivpn.txt")
-                break
-        else:
-            raise RuntimeError("openfortivpn license missing")
-        shutil.copy2(forti_prefix / "LICENSE.OpenSSL", licenses / "openfortivpn-openssl-exception.txt")
+        shutil.copy2(forti_source / "LICENSE", licenses / "openfortivpn.txt")
+        shutil.copy2(forti_source / "LICENSE.OpenSSL", licenses / "openfortivpn-openssl-exception.txt")
         openssl_license = openssl / "LICENSE.txt"
         if not openssl_license.is_file():
             raise RuntimeError("OpenSSL license missing")
@@ -351,7 +351,9 @@ def main():
             },
             "openfortivpn": {
                 "version": FORTI_VERSION,
-                "source": "https://github.com/adrienverge/openfortivpn/tree/v1.24.1",
+                "source": FORTI_URL,
+                "sha256": FORTI_SHA,
+                "patches": {FORTI_PATCH.name: digest(FORTI_PATCH)},
             },
             "files": files,
         }
