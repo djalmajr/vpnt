@@ -95,6 +95,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-ipsec.py
+      - name: Verify VICI deadlines and cancellation with independent peers
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-vici-deadlines.py
       - name: Verify PPP subprocess supervision
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

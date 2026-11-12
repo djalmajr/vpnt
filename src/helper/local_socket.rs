@@ -3,17 +3,15 @@ use std::{
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[path = "local_socket/budget.rs"]
+mod budget;
+pub(crate) use budget::{Budget, Canceled};
 
-pub(crate) fn connect_deadline(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+pub(crate) fn connect_deadline(path: &Path, budget: &Budget) -> io::Result<UnixStream> {
     use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-    if timeout.is_zero() {
-        return Err(io::Error::from(io::ErrorKind::TimedOut));
-    }
+    budget.check()?;
     let path = path.as_os_str().as_bytes();
     // SAFETY: sockaddr_un is a C struct whose all-zero representation is valid.
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -62,7 +60,7 @@ pub(crate) fn connect_deadline(path: &Path, timeout: Duration) -> io::Result<Uni
         }
         let pending = TimedStream {
             stream,
-            deadline,
+            budget: budget.clone(),
             received: 0,
             limit: 1,
         };
@@ -72,27 +70,34 @@ pub(crate) fn connect_deadline(path: &Path, timeout: Duration) -> io::Result<Uni
         }
         return Ok(pending.stream);
     }
+    budget.check()?;
     Ok(stream)
 }
 
 pub(crate) struct TimedStream {
     stream: UnixStream,
-    deadline: Instant,
+    budget: Budget,
     received: usize,
     limit: usize,
 }
 
 impl TimedStream {
     pub(crate) fn new(stream: UnixStream, timeout: Duration, limit: usize) -> io::Result<Self> {
-        if timeout.is_zero() || limit == 0 {
+        Self::with_budget(stream, Budget::new(timeout)?, limit)
+    }
+    pub(crate) fn with_budget(
+        stream: UnixStream,
+        budget: Budget,
+        limit: usize,
+    ) -> io::Result<Self> {
+        if limit == 0 {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        budget.check()?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,
-            deadline: Instant::now()
-                .checked_add(timeout)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+            budget,
             received: 0,
             limit,
         })
@@ -103,15 +108,7 @@ impl TimedStream {
 
     fn wait(&self, events: libc::c_short) -> io::Result<()> {
         loop {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|duration| !duration.is_zero())
-                .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
-            let milliseconds = remaining
-                .as_millis()
-                .saturating_add(1)
-                .min(i32::MAX as u128) as i32;
+            let milliseconds = self.budget.poll_timeout()?;
             let mut descriptor = libc::pollfd {
                 fd: self.stream.as_raw_fd(),
                 events,
@@ -125,6 +122,7 @@ impl TimedStream {
                     return Err(error);
                 }
             } else if result > 0 {
+                self.budget.check()?;
                 // HUP is readable: drain buffered data before returning EOF.
                 // In particular, Darwin rejects setting SO_RCVTIMEO after the
                 // peer closes even when a complete reply remains buffered.
@@ -178,6 +176,7 @@ impl Write for TimedStream {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.budget.check()?;
         self.stream.flush()
     }
 }

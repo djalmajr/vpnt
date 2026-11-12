@@ -18,6 +18,7 @@ pub use client::{Client, CommandResult};
 pub enum Error {
     Io,
     Timeout,
+    Canceled,
     InvalidMessage,
     Limit,
     UntrustedPeer,
@@ -28,7 +29,12 @@ pub enum Error {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        if matches!(
+        if error
+            .get_ref()
+            .is_some_and(|source| source.is::<super::local_socket::Canceled>())
+        {
+            Self::Canceled
+        } else if matches!(
             error.kind(),
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ) {

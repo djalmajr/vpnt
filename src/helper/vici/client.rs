@@ -1,10 +1,11 @@
 //! One command per peer-authenticated connection, with a total I/O deadline.
 use super::{Error, Message, Packet, read_packet, valid_name, write_packet};
-use crate::helper::local_socket::{TimedStream, connect_deadline, peer_uid};
+use crate::helper::local_socket::{Budget, TimedStream, connect_deadline, peer_uid};
 use std::{
     collections::BTreeSet,
     os::unix::net::UnixStream,
     path::Path,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 const MAX_EVENTS: usize = 256;
@@ -17,27 +18,50 @@ pub struct CommandResult {
 
 pub struct Client {
     stream: UnixStream,
-    timeout: Duration,
+    budget: Budget,
 }
 
 impl Client {
     /// The driver supplies a socket inside its admitted root-owned directory.
     /// This check also rejects a different user impersonating a charon peer.
     pub fn connect(path: &Path, owner: u32, timeout: Duration) -> Result<Self, Error> {
+        Self::open(path, owner, Budget::new(timeout)?)
+    }
+    pub fn from_stream(stream: UnixStream, owner: u32, timeout: Duration) -> Result<Self, Error> {
+        Self::admit(stream, owner, Budget::new(timeout)?)
+    }
+    /// Shares the caller's deadline with connection admission and the command.
+    /// Cancellation is cooperative: it does not undo a request already sent.
+    pub fn connect_until(
+        path: &Path,
+        owner: u32,
+        expires: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
+        Self::open(path, owner, Budget::until(expires, Some(cancel))?)
+    }
+    pub fn from_stream_until(
+        stream: UnixStream,
+        owner: u32,
+        expires: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
+        Self::admit(stream, owner, Budget::until(expires, Some(cancel))?)
+    }
+    fn open(path: &Path, owner: u32, budget: Budget) -> Result<Self, Error> {
         if !path.is_absolute() {
             return Err(Error::InvalidMessage);
         }
-        Self::from_stream(connect_deadline(path, timeout)?, owner, timeout)
+        Self::admit(connect_deadline(path, &budget)?, owner, budget)
     }
-    pub fn from_stream(stream: UnixStream, owner: u32, timeout: Duration) -> Result<Self, Error> {
-        if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
-            return Err(Error::Timeout);
-        }
+    fn admit(stream: UnixStream, owner: u32, budget: Budget) -> Result<Self, Error> {
+        budget.check()?;
         if peer_uid(&stream)? != owner {
             return Err(Error::UntrustedPeer);
         }
         stream.set_nonblocking(true)?;
-        Ok(Self { stream, timeout })
+        budget.check()?;
+        Ok(Self { stream, budget })
     }
     pub fn command(
         self,
@@ -52,7 +76,8 @@ impl Client {
         if registered.len() != events.len() || registered.len() > 16 {
             return Err(Error::Limit);
         }
-        let mut stream = TimedStream::new(self.stream, self.timeout, MAX_RECEIVED)?;
+        let budget = self.budget;
+        let mut stream = TimedStream::with_budget(self.stream, budget.clone(), MAX_RECEIVED)?;
         let mut received = Vec::new();
         // Do not expect confirmations before events from subscriptions that
         // have already been confirmed: charon can emit at any time.
@@ -77,6 +102,7 @@ impl Client {
         loop {
             match read_packet(&mut stream)? {
                 Packet::Response(response) => {
+                    budget.check()?;
                     return Ok(CommandResult {
                         response,
                         events: received,

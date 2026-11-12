@@ -76,7 +76,55 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## IPsec: identidade, namespace e mensagens preparadas
+## VICI: prazo absoluto e cancelamento
+
+```bash
+cargo test --locked --no-default-features --test vici --test vici_deadlines
+python3 scripts/macos/check-vici-deadlines.py
+```
+
+O cliente conserva um único prazo absoluto desde connect/from_stream até a
+resposta. Os construtores *_until também recebem prazo e cancelamento do
+chamador. O transporte consulta o sinal em intervalos de poll de até 25 ms;
+isso não desfaz um comando já enviado nem comprova cleanup no daemon/kernel.
+Timeout e cancelamento são erros distintos, sem repassar texto do peer.
+
+[PASS, socket/process fixture] Cinco testes novos exercitam o consumidor público.
+Um teste falhou antes da correção: aguardar após from_stream reiniciava o prazo
+em command e enviava uma solicitação expirada. Agora o peer não recebe bytes.
+Um listener Unix real verifica UID, cancelamento antes/depois da admissão,
+prazo e path absoluto. Um peer Python independente verifica respostas válidas
+e mantém o próprio processo/canal vivo durante cancelamento de resposta,
+cabeçalho parcial, confirmação de assinatura e escrita bloqueada. A escrita
+cancelada deixa o corpo incompleto. O peer usa uma barreira separada, prazo
+próprio finito e espera pelo Child; testes não o matam para produzir o resultado.
+Também distinguem abort de IO nativo do marcador privado de cancelamento.
+
+[PASS, negative oracles] Dez mutações detectadas por assertions executadas nos
+testes previstos, com baseline/restauração em cópia descartável. Recibo, hashes
+e logs em output/fixtures/vici-deadline-oracles/. O workflow inclui esse gate;
+isso não é uma execução remota do CI. A evidência A1 abaixo conserva seu
+checkpoint histórico; a matriz A1 não foi repetida nesta mudança de transporte.
+
+[PASS, local] 246 testes Rust com desktop e 242 sem desktop; os dois ignored
+continuam sendo o runtime opcional e o harness de crash exercitado pelo pai.
+Fmt, clippy all-targets/all-features -D warnings e sintaxe Python passaram.
+Os 207 hashes de entrada da matriz conferem com o estado final.
+
+[PASS, pinned native consumers] Revalidados 12 cenários do leitor de senha C
+do openfortivpn e 25 cenários PPP/forkpty/exec com programas e dados fictícios.
+A primeira revalidação PPP falhou na resolução do novo submódulo ao incluir
+local_socket.rs fora do crate; o path explícito corrigiu a compilação isolada.
+Log anterior em output/fixtures/vici-deadline-ppp-red.log. UI, catálogos,
+dependências e patches não mudaram; nenhuma nova validação visual foi feita.
+
+[NOT RUN] Sem charon, admissão nativa por PID/socket/generation, comandos de
+ciclo de vida IPsec, observação SA/SPD ou VPN real. O teste de listener não
+força um connect pendente por backlog cheio. IPsec continua indisponível no
+broker/helper até integrar processo, kernel, probe e cleanup. Esta mudança
+não reempacota o .app/payload conservado do checkpoint 692489d.
+
+## IPsec: identidade, namespace e mensagens preparadas (checkpoint A1)
 
 ```bash
 cargo test --locked --no-default-features --lib connection::ipsec
