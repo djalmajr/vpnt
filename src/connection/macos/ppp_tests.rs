@@ -151,3 +151,47 @@ fn matching_parent_program_and_fresh_interface_are_all_required() {
         Err(OwnershipError::NotReady)
     ));
 }
+
+#[test]
+fn owned_ppp_exit_requires_both_original_process_watches() {
+    for parent_first in [true, false] {
+        let mut parent = Fixture::new();
+        let mut child = Fixture::new();
+        let parent_info = Process::read(parent.child.id()).unwrap();
+        let child_info = Process::read(child.child.id()).unwrap();
+        let watches = (
+            ExitWatch::attach(&parent_info.identity).unwrap(),
+            ExitWatch::attach(&child_info.identity).unwrap(),
+        );
+        // Association/interface are synthetic; only the two original kernel
+        // process exit watches and their conjunction are exercised natively.
+        let proof = OwnedPpp {
+            interface: Fixture::interfaces().entries["ppp42"].clone(),
+            parent: parent_info.identity,
+            ppp: child_info.identity,
+            watches: Mutex::new(watches),
+            service_key: "fixture".into(),
+            owner: parent.owner,
+            parent_program: PathBuf::from("/bin/sleep"),
+            ppp_program: PathBuf::from("/bin/sleep"),
+        };
+        assert!(!proof.processes_exited().unwrap());
+        if parent_first {
+            parent.child.stop(Duration::from_secs(1)).unwrap();
+        } else {
+            child.child.stop(Duration::from_secs(1)).unwrap();
+        }
+        assert!(!proof.processes_exited().unwrap());
+        if parent_first {
+            child.child.stop(Duration::from_secs(1)).unwrap();
+        } else {
+            parent.child.stop(Duration::from_secs(1)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !proof.processes_exited().unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(proof.processes_exited().unwrap());
+    }
+}

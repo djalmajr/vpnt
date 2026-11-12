@@ -31,6 +31,12 @@ def forward_cleanup(source):
     return replace_once(source, "claim.keys.pop();", "claim.keys.remove(0);")
 
 
+def omit_scope_sweep(source):
+    start = source.index("        for route in plan {")
+    end = source.index("        self.entries.remove(&token.index);", start)
+    return source[:start] + source[end:]
+
+
 def run(copy, label, arguments, expected):
     command = ["cargo", "test", "--locked", "--no-default-features", "--offline", *arguments]
     # The child owns a fresh session; timeout cleanup signals only that group
@@ -154,6 +160,50 @@ def main():
         ("ppp-attachment-final-owner-check-omitted", "src/connection/macos/ppp_attachment.rs",
          lambda s: replace_once(s, "    socket.verify(api)?;\n    if !current()? {", "    socket.verify(api)?;\n    if false && !current()? {"),
          ["--lib", "a_raced_or_mismatched_attachment"]),
+        ("native-coordinator-authorization-omitted", lease,
+         lambda s: replace_once(s, "        self.backend.authorize(owner, route)?;\n", ""),
+         ["--lib", "coordinator_admission_checks_the_registered"]),
+        ("native-network-plan-guard-omitted", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "        if !entry.plan.contains(&route) {\n            return Err(Error::Invalid);\n        }\n", ""),
+         ["--lib", "only_registered_networks"]),
+        ("native-exact-postflight-omitted", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "Ok(_) => Err(Error::Changed),", "Ok(_) => Ok(()),"),
+         ["--lib", "an_ack_without_an_observed_exact"]),
+        ("native-unconfirmed-attempt-accepted", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "receipt.confirmation.is_err()", "false"),
+         ["--lib", "lost_ack_or_postflight_read_failure"]),
+        ("native-attempt-receipt-forgotten", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "        Ok(NativeReceipt {", "        attempt.confirmation?;\n        Ok(NativeReceipt {"),
+         ["--lib", "lost_ack_or_postflight_read_failure"]),
+        ("native-read-failure-clears-receipt", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "self.table.exact(key).map_err(|_| Error::Unavailable)", "self.table.exact(key)"),
+         ["--lib", "lost_ack_or_postflight_read_failure"]),
+        ("native-scope-sweep-forgotten", "src/connection/macos/routing/backend/registry.rs", omit_scope_sweep,
+         ["--lib", "borrowed_routes_are_still_checked"]),
+        ("native-detach-gate-omitted", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "if !entry.scope.detach_if_stopped()?", "if false && !entry.scope.detach_if_stopped()?"),
+         ["--lib", "confirmed_routes_stay_pending"]),
+        ("native-scope-generation-ignored", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, ".filter(|entry| entry.serial == token.scope)", ".filter(|_| true)"),
+         ["--lib", "backend_and_generation_tokens"]),
+        ("native-scope-backend-ignored", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "        if token.backend != self.id {\n            return Err(Error::Invalid);\n        }\n", ""),
+         ["--lib", "backend_and_generation_tokens"]),
+        ("native-same-index-change-called-foreign", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "        if now != receipt.route {\n            return Err(Error::Busy);\n        }", "        if now != receipt.route { return Ok(Presence::Replaced); }"),
+         ["--lib", "replacements_are_preserved"]),
+        ("native-secondary-target-ignored", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "&& self.entry(token)?.scope.owns(now.interface)", "&& now.interface == token.index"),
+         ["--lib", "mixed_owned_targets_all"]),
+        ("native-other-owned-target-called-foreign", "src/connection/macos/routing/backend/registry.rs",
+         lambda s: replace_once(s, "return if still_ours {", "return if false && still_ours {"),
+         ["--lib", "a_route_moved_to_another_owned_target"]),
+        ("native-exact-key-approximated", "src/connection/macos/routing/read.rs",
+         lambda s: replace_once(s, "record.key == key", "record.key.network.contains(key.network.address())"),
+         ["--lib", "exact_snapshot_lookup_cannot_substitute"]),
+        ("ppp-one-process-exit-accepted", "src/connection/macos/ppp.rs",
+         lambda s: replace_once(s, "            && watches\n", "            || watches\n"),
+         ["--lib", "owned_ppp_exit_requires_both_original"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()

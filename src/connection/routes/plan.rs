@@ -3,17 +3,17 @@ use std::collections::BTreeSet;
 
 /// Empty networks mean full tunnel, including suppression of an unsupported
 /// IP family. Defaults are expanded into /1 pairs rather than replacing /0.
-/// The caller must acquire its gateway pins before acquiring these networks.
+/// The caller supplies a retained sink only when a family needs blocking.
+/// Transport egress must be fixed before acquiring these networks.
 pub fn ppp_networks(
     networks: &[String],
     interface: u16,
     ipv4: bool,
     ipv6: bool,
-    loopback: u16,
+    sink: Option<u16>,
 ) -> Result<Vec<Route>, Error> {
     if interface == 0
-        || loopback == 0
-        || interface == loopback
+        || sink.is_some_and(|sink| sink == 0 || sink == interface)
         || (!ipv4 && !ipv6)
         || networks.len() > 64
     {
@@ -42,7 +42,11 @@ pub fn ppp_networks(
         } else {
             NextHop::Blackhole
         };
-        let index = if supported { interface } else { loopback };
+        let index = if supported {
+            interface
+        } else {
+            sink.ok_or(Error::Invalid)?
+        };
         let expanded = if network.prefix() == 0 {
             if network.address().is_ipv4() {
                 vec!["0.0.0.0/1".parse()?, "128.0.0.0/1".parse()?]

@@ -337,8 +337,58 @@ reler a tabela e executar o probe antes de Connected. Nem ACK nem igualdade de
 atributos fornece identidade para DELETE. Não há API de DELETE/CHANGE.
 
 Nenhum teste chama a fábrica privilegiada de ADD, anexa um socket PPP real,
-cria interface ou escreve no kernel de rotas. A aplicação/remoção nativa,
-integração ao coordenador de leases e helper/controlador seguem pendentes.
+cria interface ou escreve no kernel de rotas. A aplicação/remoção nativa e a
+integração ao helper/controlador seguem pendentes.
+
+## Backend de leases e cleanup por interface
+
+```bash
+cargo test --locked --no-default-features --lib connection::macos::routing::backend
+cargo test --locked --no-default-features --lib owned_ppp_exit_requires_both_original
+```
+
+`NativeBackend` liga `AddWriter`, `PppAttachment`, `OwnedPpp`, o lock global e
+`Snapshot` ao contrato de `Coordinator`. O registro é ligado a UID/perfil/geração
+e a um plano de redes. O coordenador consulta essa autorização antes de criar
+ou emprestar uma rota. O escritor só recebe destinos desse plano e de interfaces
+retidas; o cancelamento usa uma flag própria da geração. O helper ainda precisa
+consumir esse backend, em vez de se limitar à camada de processo SSL.
+
+A confirmação exige ACK e releitura da chave exata destino/máscara/escopo.
+Prefixo que apenas contém o destino, outro escopo ou duplicidade de chave não
+substituem essa prova. Falha posterior ao envio permanece num recibo, inclusive
+se a tabela depois voltar a coincidir. O backend converte falhas de leitura em
+indisponibilidade; não permite que `Error::Changed` do adaptador seja confundido
+com recurso substituído e descartável pelo coordenador.
+
+O ciclo de encerramento preparado é: parar o cliente, marcar a geração em
+cleanup, aguardar ambos os watches de saída, fechar apenas a referência PPP
+própria, repetir o cleanup das leases e conferir todos os destinos do plano.
+Fechar a referência não significa que as rotas sumiram. Rotas emprestadas
+também entram na conferência final. Mesma interface ainda presente, mesmo com
+atributos diferentes ou possível reutilização do índice, mantém pendência.
+Uma rota observada em interface estrangeira é preservada; uma movida para
+outro destino próprio continua pendente. Não há DELETE/CHANGE por chave.
+
+Os dez testes do registro exercitam o consumidor `Coordinator` com tabela e
+ciclo de vida de interface simulados. Cobrem autorização, redes não registradas,
+ACK perdido, ACK sem rota, falha de leitura após ADD, bloqueio de nova geração
+durante cleanup, fechamento único, empréstimos, substituição/reuso, tokens de
+outro backend, dois destinos próprios e migração entre eles. Isso não executa
+o adaptador privilegiado e não prova retenção PPP, ADD ou purge de rotas reais.
+
+O teste de saída usa quatro processos próprios ao todo, em duas ordens de
+encerramento. Executa `OwnedPpp::processes_exited` com os dois watches reais e
+exige que ambos tenham saído. A associação/interface desse teste é sintética;
+não inicia pppd nem openfortivpn. A leitura real de loopback também confere a
+chave exata no snapshot; um teste puro recusa prefixo mais amplo, escopo
+diferente e duplicidade.
+
+O plano aceita ausência de sink somente quando ele não é necessário. A fábrica
+PPP atual fornece `None`: full tunnel com família sem origem no vínculo é recusado
+antes do vínculo/escrita. O recurso nativo próprio de bloqueio continua como
+próxima entrega; o fixture de dois destinos não o substitui. Releitura e leases
+também não substituem o probe pelo túnel para promover a sessão a Connected.
 
 ## Política de rotas e leitura nativa
 
@@ -378,20 +428,24 @@ compilação não contam como mutações detectadas. A mutação de opcode GET e
 C/AF_UNIX. Nenhuma envia o opcode alterado a um socket de rotas.
 As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 30 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+São 45 mutações, incluindo remoção do vínculo de perfil da saída SSL,
 aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
 de inode, ACL ou checagem de hardlink do controlador. As dez novas de ADD/PPP
 retiram opcode correto, índice, zona da origem, PID/seq, comparação de origem,
 recusa de ACK perdido, recibo após cancelamento, leitura da unidade ou validação
-final do dono. As baselines nativas incluem
+final do dono. As 15 novas do backend retiram autorização, plano de redes,
+releitura exata, confirmação, retenção de recibos, tratamento de erro, varredura
+de destinos, espera de saída, vínculo ao backend/geração ou checagem de destinos
+próprios. Também alteram a busca exata e a conjunção dos watches.
+As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo
 Python independente detecta a mutação que omite o flock; bookkeeping interno
 não basta para satisfazer o teste.
 O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
 
-Consumo do escritor/lock no backend de leases, confirmação/cleanup de recursos
-reais e integração helper/UI continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
+Confirmação/cleanup de recursos reais, sink nativo e integração helper/UI
+continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
 seleciona a chave destino/máscara/escopo, sem comparação atômica dos atributos
 observados antes. O backend deverá lidar com alterações concorrentes e identidade
 perdida; a identidade monotônica do fixture não fornece essa prova no macOS.

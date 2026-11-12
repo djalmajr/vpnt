@@ -30,6 +30,11 @@ fn manager_id() -> Result<u64, Error> {
 /// then refuse promotion until it has sufficient evidence.
 pub trait Backend {
     type Receipt;
+    /// Platform resources may be reserved to one UID/profile/generation.
+    /// The coordinator calls this before borrowing or creating any route.
+    fn authorize(&mut self, _owner: &Owner, _route: Route) -> Result<(), Error> {
+        Ok(())
+    }
     fn existing(&mut self, key: Key) -> Result<Option<Route>, Error>;
     fn create(&mut self, route: Route) -> Result<Self::Receipt, Error>;
     fn receipt_state(&mut self, receipt: &Self::Receipt) -> Result<Presence, Error>;
@@ -111,6 +116,11 @@ impl<B: Backend> Coordinator<B> {
             claims: BTreeMap::new(),
         })
     }
+    /// Platform lifecycle operations (such as closing an owned interface) can
+    /// precede retry_cleanup. This never discards outstanding lease receipts.
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
     pub fn validate(&mut self, lease: &Lease) -> Result<(), Error> {
         if lease.manager != self.manager {
             return Err(Error::Invalid);
@@ -132,7 +142,8 @@ impl<B: Backend> Coordinator<B> {
         }
         Ok(())
     }
-    pub(super) fn admit(&mut self, route: Route) -> Result<(), Error> {
+    pub(super) fn admit(&mut self, owner: &Owner, route: Route) -> Result<(), Error> {
+        self.backend.authorize(owner, route)?;
         if let Some(entry) = self.entries.get(&route.key) {
             if entry.route != route || entry.users.is_empty() {
                 return Err(Error::Conflict);
@@ -151,7 +162,8 @@ impl<B: Backend> Coordinator<B> {
     }
     pub(super) fn attach(&mut self, token: u64, route: Route) -> Result<(), Error> {
         // State may have changed since preflight; never replace on create.
-        self.admit(route)?;
+        let owner = self.claims.get(&token).ok_or(Error::Invalid)?.owner.clone();
+        self.admit(&owner, route)?;
         if !self.entries.contains_key(&route.key) {
             let receipt = if self.backend.existing(route.key)?.is_some() {
                 None

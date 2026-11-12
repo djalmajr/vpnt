@@ -105,25 +105,28 @@ impl OwnedPpp {
             && now.addresses == self.interface.addresses
             && !self.exited()?)
     }
-    /// PPP only, not route cleanup. A still-up interface without a new verified
-    /// owner is not declared clean merely because the direct client exited.
-    pub fn ppp_gone(&self) -> Result<bool, OwnershipError> {
+    /// Both retained kernel exit watches, not a PID lookup. Interface and route
+    /// cleanup still need independent observation after these processes exit.
+    pub fn processes_exited(&self) -> Result<bool, OwnershipError> {
         let mut watches = self
             .watches
             .lock()
             .map_err(|_| OwnershipError::Unavailable)?;
-        if !watches
+        Ok(watches
             .0
             .exited()
             .map_err(|_| OwnershipError::Unavailable)?
-            || !watches
+            && watches
                 .1
                 .exited()
-                .map_err(|_| OwnershipError::Unavailable)?
-        {
+                .map_err(|_| OwnershipError::Unavailable)?)
+    }
+    /// PPP only, not route cleanup. A still-up interface without a new verified
+    /// owner is not declared clean merely because the direct client exited.
+    pub fn ppp_gone(&self) -> Result<bool, OwnershipError> {
+        if !self.processes_exited()? {
             return Ok(false);
         }
-        drop(watches);
         let interfaces = Interfaces::read().map_err(|_| OwnershipError::Unavailable)?;
         let Some(now) = interfaces.entries.get(&self.interface.name) else {
             return Ok(true);

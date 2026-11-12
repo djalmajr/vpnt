@@ -116,8 +116,14 @@ Ainda falta consumi-lo no controlador/helper. Há um vínculo PPP por descritor
 e um escritor separado de `ADD`, ambos preparados para exigir root, o lock e
 a interface comprovada. Seus testes usam ioctls simulados e um consumidor C
 da ABI Darwin em sockets Unix privados: nenhuma retenção PPP ou escrita real
-de rota foi executada. Backend de leases/cleanup nativo, bloqueio da família
-IP não suportada e integração continuam pendentes; detalhes em `VALIDATION.md`.
+de rota foi executada. O backend SSL já liga esses componentes ao coordenador,
+autoriza UID/perfil/geração, relê a chave exata da rota e retém recibos incertos.
+Só fecha sua referência após os dois processos saírem e só termina o cleanup
+após conferir todas as redes planejadas, incluindo empréstimos. Os fluxos do
+backend usam tabela e ciclo de vida simulados; os watches de processos e a
+leitura nativa têm evidência separada. Execução privilegiada, bloqueio nativo
+da família IP não suportada e ligação ao helper/UI continuam pendentes;
+detalhes em `VALIDATION.md`.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação

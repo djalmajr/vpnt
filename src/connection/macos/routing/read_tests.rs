@@ -72,6 +72,11 @@ fn native_table_and_get_queries_agree_on_loopback_without_mutation() {
             .lookup(address, 0, Duration::from_secs(1), &AtomicBool::new(false))
             .unwrap();
         assert_eq!(route.interface as u32, loopback);
+        let exact = snapshot
+            .exact(route.key)
+            .unwrap()
+            .expect("loopback exact key must exist");
+        assert_eq!(exact.interface as u32, loopback);
         assert!(route.key.network.contains(address.ip));
         assert!(
             snapshot
@@ -90,4 +95,37 @@ fn native_table_and_get_queries_agree_on_loopback_without_mutation() {
         ),
         Err(Error::Canceled)
     ));
+}
+
+#[test]
+fn exact_snapshot_lookup_cannot_substitute_a_covering_or_differently_scoped_route() {
+    use crate::connection::routes::{Key, Network};
+    let key = Key {
+        network: "10.20.0.0/16".parse::<Network>().unwrap(),
+        scope: 0,
+    };
+    let make = |key, index| Record {
+        key,
+        interface: index,
+        flags: libc::RTF_UP,
+        gateway: None,
+        source: None,
+    };
+    let mut snapshot = Snapshot {
+        records: vec![
+            make(
+                Key {
+                    network: "10.0.0.0/8".parse().unwrap(),
+                    scope: 0,
+                },
+                9,
+            ),
+            make(Key { scope: 5, ..key }, 5),
+        ],
+    };
+    assert!(snapshot.exact(key).unwrap().is_none());
+    snapshot.records.push(make(key, 3));
+    assert_eq!(snapshot.exact(key).unwrap().unwrap().interface, 3);
+    snapshot.records.push(make(key, 3));
+    assert!(matches!(snapshot.exact(key), Err(Error::Conflict)));
 }

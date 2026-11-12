@@ -15,6 +15,16 @@ pub struct Snapshot {
     pub records: Vec<Record>,
 }
 impl Snapshot {
+    /// Exact destination/mask/scope, never a longest-prefix approximation.
+    /// Multiple entries with the same key are uncertain, not an arbitrary hit.
+    pub fn exact(&self, key: super::Key) -> Result<Option<&Record>, Error> {
+        let mut records = self.records.iter().filter(|record| record.key == key);
+        let first = records.next();
+        if records.next().is_some() {
+            return Err(Error::Conflict);
+        }
+        Ok(first)
+    }
     pub fn read() -> Result<Self, Error> {
         for _ in 0..3 {
             let mut mib = [

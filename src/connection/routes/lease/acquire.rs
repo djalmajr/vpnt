@@ -68,8 +68,14 @@ impl<B: Backend> Coordinator<B> {
         if keep + keys.len() > 128 || self.entries.len() + keys.len() > 8192 {
             return Err(Error::Limit.into());
         }
+        let owner = self
+            .claims
+            .get(&lease.token)
+            .ok_or(Error::Invalid)?
+            .owner
+            .clone();
         for route in desired.values() {
-            self.admit(*route)?;
+            self.admit(&owner, *route)?;
         }
         for key in keys {
             if let Err(reason) = self.attach(lease.token, desired[&key]) {

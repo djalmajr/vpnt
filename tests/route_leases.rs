@@ -144,7 +144,7 @@ fn manager_uid_profile_and_generation_boundaries_do_not_cross() {
 #[test]
 fn full_tunnel_plan_preserves_defaults_and_blocks_unsupported_families() {
     // Mutation: omit unsupported-family blackholes, or retain only one /1.
-    let routes = ppp_networks(&[], 3, true, false, 1).unwrap();
+    let routes = ppp_networks(&[], 3, true, false, Some(1)).unwrap();
     assert_eq!(routes.len(), 4);
     for ip in [
         "0.0.0.0",
@@ -170,18 +170,19 @@ fn full_tunnel_plan_preserves_defaults_and_blocks_unsupported_families() {
             assert_eq!(route.interface, 1);
         }
     }
-    let both = ppp_networks(&[], 3, true, true, 1).unwrap();
+    let both = ppp_networks(&[], 3, true, true, None).unwrap();
     assert!(
         both.iter()
             .all(|route| route.next_hop == NextHop::Interface)
     );
-    assert!(ppp_networks(&["::/0".into()], 3, true, false, 1).is_err());
+    assert!(ppp_networks(&[], 3, true, false, None).is_err());
+    assert!(ppp_networks(&["::/0".into()], 3, true, false, Some(1)).is_err());
     let normalized = ppp_networks(
         &["10.20.1.9/16".into(), "10.20.0.0/16".into()],
         3,
         true,
         false,
-        1,
+        None,
     )
     .unwrap();
     assert_eq!(normalized, vec![route("10.20.0.0/16", 3)]);
