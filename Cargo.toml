@@ -39,3 +39,7 @@ strip = true
 [[bin]]
 name = "vpnt"
 path = "src/main.rs"
+
+[[bin]]
+name = "vpnt-pinentry"
+path = "src/bin/vpnt-pinentry.rs"

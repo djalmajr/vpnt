@@ -91,6 +91,11 @@ O runtime inclui uma cópia dos certificados públicos de
 pode precisar de acesso ao Security.framework fora do sandbox; uma lista vazia
 interrompe o build. Chaveiros pessoais não são usados para esse bundle.
 
+O binário auxiliar `vpnt-pinentry` também é compilado, mas ainda não é
+instalado ou incluído no `.app`. Ele recebe a senha por um socket anônimo
+herdado do filho SSL que o helper iniciou, sem servidor de senhas no filesystem.
+A integração com o helper/driver real e a prova privilegiada seguem pendentes.
+
 ## Proposta visual
 
 O arquivo [`vpnt.fig`](vpnt.fig), na raiz do projeto, abre no OpenPencil.

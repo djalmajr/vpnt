@@ -122,18 +122,30 @@ de socket local. Esses fixtures não iniciam charon nem provam controle de uma S
 
 O codec de pinentry implementa a troca usada por openfortivpn 1.24.1, com limite
 de comandos/linha, consulta única da senha e resposta de erro fixa. Não usa
-`SETKEYINFO` ou o texto do prompt para selecionar credenciais. O transporte
-privilegiado que vincula essa consulta a um filho próprio ainda está pendente.
+`SETKEYINFO` ou o texto do prompt para selecionar credenciais. `PinentryChild`
+passa um socket anônimo pelo descritor 3 ao filho que iniciou. O adaptador
+verifica o UID remoto; o helper exige o PID do filho esperado e uma única
+mensagem completa antes de entregar a senha. O canal expira em cinco segundos
+e é revogado em cancelamento, saída ou Drop. Cada tentativa tem um socket
+diferente; não existe endpoint de senhas no filesystem.
+
+`vpnt-pinentry` não aceita argumentos nem override de UID/caminho: exige UID real
+e efetivo root e usa o canal herdado. O teste roda como usuário comum com
+adaptador de fixture e UID explícito; isso não substitui a instalação e o teste
+root do binário final. A ligação ao helper/driver completo continua pendente.
 
 ```bash
-cargo test --locked --no-default-features --test pinentry --test profiles --test secrets
+cargo test --locked --no-default-features --test pinentry --test pinentry_channel --test profiles --test secrets
 python3 scripts/macos/check-pinentry-consumer.py
 ```
 
 O segundo comando compila o leitor C original de senha do openfortivpn a partir
 de fonte com SHA-256 fixado e o exercita contra o codec Rust. Verifica valores
-fictícios com espaços, `%`, `+`, UTF-8 e os limites de 256 bytes; não inicia o
-cliente VPN. O código C fica no fixture, separado do app. Os testes de entrada
+fictícios com espaços, `%`, `+`, UTF-8 e os limites de 256 bytes. Os 12 cenários
+incluem PID incorreto, protocolo/pedido duplicado, UID remoto errado, rejeição
+do binário final sem root, revogação, expiração e filhos concorrentes com
+senhas diferentes; não iniciam o cliente VPN. O código C fica no fixture,
+separado do app. Os testes de entrada
 rejeitam usuário SSL acima de 64 bytes, senha SSL acima de 256 bytes e fingerprint
 fora dos 64 dígitos hexadecimais. O protocolo inicial só valida a forma dos
 segredos; o tipo do perfil root determina o limite efetivo do cliente.
