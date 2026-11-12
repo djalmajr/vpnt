@@ -64,6 +64,22 @@ O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
 instala programas de VPN, componentes privilegiados ou regras do sudoers.
 Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
+Os clientes VPN também podem ser preparados em um runtime separado, ainda sem
+instalação. Esse build usa Python 3.12 ou superior, o compilador do Xcode e as
+instalações locais de `openssl@4` e `openfortivpn` 1.24.1:
+
+```bash
+python3 scripts/macos/build-runtime.py
+```
+
+O script verifica e compila strongSwan 6.1.0 com plugins incorporados, prepara
+uma cópia do openfortivpn e copia suas bibliotecas para `target/vpnt-runtime`.
+O pkgconf necessário ao build é compilado em `target/build-tools`. As fontes
+baixadas têm SHA-256 fixado; os programas do Homebrew permanecem intactos.
+O manifest registra hashes, licenças, destino futuro e a versão mínima de macOS
+exigida pelos binários produzidos. Esse runtime ainda não faz parte do `.app`
+de demonstração nem é instalado pelo script.
+
 ## Proposta visual
 
 O arquivo [`vpnt.fig`](vpnt.fig), na raiz do projeto, abre no OpenPencil.

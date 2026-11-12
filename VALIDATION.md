@@ -70,6 +70,29 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
+## Runtime privado dos clientes
+
+```bash
+python3 scripts/macos/build-runtime.py
+python3 scripts/macos/build-runtime.py --verify-only
+```
+
+O build fica em `target/`, incluindo o pkgconf local e fontes verificadas por
+SHA-256. O strongSwan é compilado com os plugins necessários incorporados; seu
+PID fica em um prefixo próprio. O openfortivpn é copiado da versão local
+declarada no README. Nenhum comando instala em `/Library` ou inicia túneis.
+
+A verificação confere inventário/hashes, dependências Mach-O com prefixos
+privados ou do sistema, assinaturas ad hoc e a versão mínima real do macOS.
+Executa apenas `--version` sem privilégios, com bibliotecas da cópia de staging
+e um arquivo de configuração fictício regular. O manifest não pode presumir
+compatibilidade com um macOS anterior ao mínimo dos componentes.
+
+Esses checks não provam carregamento dos plugins privilegiados, criação de SAs,
+PPP, tráfego pelo túnel ou cleanup de rotas. O controle de filhos tem testes de
+processos reais para ambiente limpo, TERM, KILL após prazo e reap; isso prova
+saída do processo direto, enquanto cada driver ainda deve verificar seus recursos.
+
 ## Fluxos de demonstração
 
 Use `cargo run -- --demo-server 4178` e abra o endereço local do README.
