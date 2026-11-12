@@ -242,6 +242,30 @@ def main():
         ("native-pending-retirement-admitted", "src/connection/macos/routing/backend/retirement.rs",
          lambda s: replace_once(s, "if !queue.lock().map_err(|_| Error::Unavailable)?.is_empty()", "if false && !queue.lock().map_err(|_| Error::Unavailable)?.is_empty()"),
          ["--lib", "failed_scope_retains_retirement"]),
+        ("controller-old-worker-status-accepted", "src/connection/controller/engine.rs",
+         lambda s: replace_once(s, "worker.generation == slot.generation", "true"),
+         ["--lib", "reconnect_waits_for_cleanup"]),
+        ("controller-replacement-starts-before-cleanup", "src/connection/controller/engine.rs",
+         lambda s: replace_once(s, "if !closing && slot.worker.is_none() && slot.pending.is_some()", "if !closing && slot.pending.is_some()"),
+         ["--lib", "reconnect_waits_for_cleanup"]),
+        ("controller-stale-operation-accepted", "src/connection/controller/engine/dispatch.rs",
+         lambda s: replace_once(s, "generation <= slot.generation", "false"),
+         ["--lib", "stale_operations_and_invalid_secrets"]),
+        ("controller-cleanup-loop-forgotten", "src/connection/controller/worker.rs",
+         lambda s: replace_once(s, "while !attempt.cleanup()", "while false && !attempt.cleanup()"),
+         ["--lib", "controller_connects_only_after_leases"]),
+        ("controller-retirement-exit-gate-omitted", "src/connection/controller/engine.rs",
+         lambda s: replace_once(s, "&& factory.idle()", "&& true"),
+         ["--lib", "profiles_run_concurrently_and_eof"]),
+        ("controller-untested-tunnel-connected", "src/connection/controller/worker.rs",
+         lambda s: replace_once(s, "send(ConnectionState::Verifying)", "send(ConnectionState::Connected)"),
+         ["--lib", "controller_connects_only_after_leases"]),
+        ("controller-unresponsive-probe-accepted", "src/connection/controller/worker.rs",
+         lambda s: replace_once(s, "send(if responsive {", "send(if true {"),
+         ["--lib", "controller_connects_only_after_leases"]),
+        ("controller-queued-reconnect-survives-disconnect", "src/connection/controller/engine/dispatch.rs",
+         lambda s: replace_once(s, "            slot.pending = None;\n", ""),
+         ["--lib", "cancel_before_discovery_does_not_forget"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -258,9 +282,11 @@ def main():
             tests = ["--test", "route_flow", "--test", "route_leases"]
             native = ["--lib", "connection::macos"]
             lock = ["--lib", "helper::controller_lock"]
+            controller = ["--lib", "connection::controller"]
             receipt["baseline-policy"] = run(copy, "baseline-policy", tests, 0)
             receipt["baseline-native-consumers"] = run(copy, "baseline-native-consumers", native, 0)
             receipt["baseline-controller-lock"] = run(copy, "baseline-controller-lock", lock, 0)
+            receipt["baseline-controller"] = run(copy, "baseline-controller", controller, 0)
             for name, path, mutation, arguments in mutations:
                 file = copy / path
                 original = file.read_text()
@@ -272,6 +298,7 @@ def main():
             receipt["restored-policy"] = run(copy, "restored-policy", tests, 0)
             receipt["restored-native-consumers"] = run(copy, "restored-native-consumers", native, 0)
             receipt["restored-controller-lock"] = run(copy, "restored-controller-lock", lock, 0)
+            receipt["restored-controller"] = run(copy, "restored-controller", controller, 0)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"Killed {len(mutations)} mutations; copy removed. Reports: {REPORTS.relative_to(ROOT)}")

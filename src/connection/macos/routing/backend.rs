@@ -123,6 +123,16 @@ impl<'a> NativeBackend<'a> {
     pub fn has_resources(&self) -> bool {
         !self.registry.is_empty() || self.retired.lock().map_or(true, |queue| !queue.is_empty())
     }
+    /// Also needed when discovery succeeded but registration failed before a
+    /// scope was returned. This observes implicit PPP routes without deleting.
+    pub fn ppp_cleanup_complete(&self, ppp: &Arc<OwnedPpp>) -> Result<bool, Error> {
+        self.controller.validate().map_err(|_| Error::Unavailable)?;
+        retirement::Retirement {
+            ppp: Some(ppp.clone()),
+            sink: None,
+        }
+        .complete()
+    }
     /// Failed registration may have configured an alias before failing. Keep
     /// its passive retirement record until the original processes/ifnets and
     /// implicit routes are gone. This method never mutates machine resources.

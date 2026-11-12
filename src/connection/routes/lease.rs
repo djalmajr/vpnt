@@ -121,6 +121,12 @@ impl<B: Backend> Coordinator<B> {
     pub fn backend_mut(&mut self) -> &mut B {
         &mut self.backend
     }
+    pub fn has_resources(&self) -> bool {
+        !self.claims.is_empty() || !self.entries.is_empty()
+    }
+    pub fn has_owner(&self, owner: &Owner) -> bool {
+        self.claims.values().any(|claim| claim.owner == *owner)
+    }
     pub fn validate(&mut self, lease: &Lease) -> Result<(), Error> {
         if lease.manager != self.manager {
             return Err(Error::Invalid);

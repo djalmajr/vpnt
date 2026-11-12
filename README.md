@@ -90,12 +90,12 @@ O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-r
 impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver
 SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos
 recursos que autorizou. A camada de processo está implementada; propriedade da
-interface e probe nativo têm módulos e testes locais, ainda sem ligação ao
-controlador. O vínculo PPP combina registros do `configd`, processos de pai/filho
+interface e probe nativo são consumidos pelo controlador preparado em Rust,
+ainda sem ligação ao helper/UI. O vínculo PPP combina registros do `configd`, processos de pai/filho
 verificados e observação de saída pelo kernel. O probe exige interface e origem
 explícitas, com ping e fallback TCP. Os fixtures usam loopback e interfaces
-sintéticas; não provam PPP ou tráfego VPN. Leases/cleanup de rotas, helper e
-integração real da UI continuam pendentes.
+sintéticas; não provam PPP ou tráfego VPN. Aplicação/cleanup de recursos reais,
+helper e integração normal da UI continuam pendentes.
 
 O transporte SSL recebe um vínculo de saída selecionado por leitura nativa da
 rota, ligado ao ID, hostname e porta do perfil. O patch
@@ -112,7 +112,7 @@ nativa consulta a tabela e faz somente `RTM_GET`; os testes de aplicação e
 remoção usam um kernel simulado. O lock global do controlador tem testes de
 exclusão real entre processos e validação de inode/permissões/ACL; a fábrica
 produtiva exige root e um arquivo persistente preparado pela instalação.
-Ainda falta consumi-lo no controlador/helper. Há um vínculo PPP por descritor
+O controlador preparado já o consome; o helper ainda falta. Há um vínculo PPP por descritor
 e um escritor separado de `ADD`, ambos preparados para exigir root, o lock e
 a interface comprovada. Seus testes usam ioctls simulados e um consumidor C
 da ABI Darwin em sockets Unix privados: nenhuma retenção PPP ou escrita real
@@ -129,6 +129,17 @@ de endereço têm fixtures e consumidor C independente do SDK. Watches de
 processos e leitura nativa têm evidência separada. Execução privilegiada,
 bloqueio de tráfego real e ligação ao helper/UI continuam pendentes;
 detalhes em `VALIDATION.md`.
+
+O controlador SSL usa um worker por perfil, gerações crescentes, cancelamento
+compartilhado, leases e revalidação após o probe. Reconectar aguarda o cleanup
+anterior; fechar o canal cancela os workers e aguarda também a fila de recursos
+de cadastros que falharam. Estados de worker são mantidos em memória de forma
+limitada; saída lenta não bloqueia o cancelamento. Os testes passam pelo codec
+real, coordenador e processos de teste próprios, com rede e PPP simuladas.
+O adaptador root está compilado, mas não foi executado nem exposto na UI.
+Ainda falta observar criação/saída de pppd desde o início do cliente: sem essa
+prova, cancelamento ou falha antes de descobrir a PPP mantém cleanup pendente,
+sem presumir que a saída do cliente removeu todos os recursos.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação

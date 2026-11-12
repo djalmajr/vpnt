@@ -436,6 +436,54 @@ e consumir `reap_retired`/`has_resources`, além das leases, antes de encerrar.
 Fixtures não executam a fábrica privilegiada. Releitura e leases também não
 substituem o probe pelo túnel para promover a sessão a Connected.
 
+## Controlador SSL por geração
+
+```bash
+cargo test --locked --no-default-features --lib connection::controller
+```
+
+O consumidor preparado `run_ssl` exige root e o lock persistente, carrega do
+storage root apenas os perfis SSL do UID que o helper deverá autenticar e
+mantém workers separados por perfil. A fábrica e o adaptador nativo estão
+compilados; nenhum helper executável ou caminho da UI os chama nesta entrega.
+IPsec ainda precisa do seu driver e do despacho correspondente.
+
+Conectar e desligar exigem geração maior que a anterior daquele perfil;
+probe exige a geração atual. Credenciais são validadas antes de invalidar uma
+operação anterior. Reconectar cancela o worker antigo e guarda somente uma
+tentativa nova, em memória, até o cleanup terminar. Desligar ou EOF descartam
+essa tentativa e seus segredos. Estados antigos são rejeitados tanto ao ler o
+worker quanto ao entregar mensagens que aguardavam uma saída lenta.
+
+O worker seleciona egress/snapshot antes do cliente, descobre OwnedPpp, registra
+o plano no backend e adquire as leases. Só então entra em Verifying. Um probe
+responsivo exige revalidar cliente, vínculo e leases antes de Connected; falta
+de tráfego produz Unresponsive. Probes periódicos ou pedidos pela geração atual
+podem recuperar a resposta. A fila de saída tem limite; a leitura trabalha em
+lotes, e o estado mais recente de cada worker é coalescido em seu próprio slot.
+Uma saída cheia não bloqueia cancelamento/cleanup. EOF ou consumidor de saída
+perdido cancela todos os workers e aguarda leases e aposentadorias antes de
+retornar e permitir a liberação do lock.
+
+Os sete testes usam os codecs reais de request/message, Coordinator e processos
+`sleep` próprios, parados e reaped pelo mesmo ManagedChild. A tabela, vínculo,
+probe e condição de purge são simulados. Cobrem conectar/verificar/sem tráfego/
+recuperar/desligar, probe tardio, nova geração aguardando cleanup, cancelamento
+antes de descoberta, cancelamento de reconexão enfileirada, falha após probe,
+dois perfis concorrentes, EOF com aposentadoria pendente, requisições antigas,
+segredos inválidos e consumidor que deixa de ler. Nenhum teste inicia pppd,
+openfortivpn ou strongSwan, atribui endereços ou altera rotas reais.
+
+**Limite obrigatório antes da integração instalada:** o adaptador nativo mantém
+cleanup pendente se houve tentativa de spawn e não foi possível comprovar a PPP,
+inclusive em erro de setup após possível criação do cliente. Não há timeout que
+transforme essa incerteza em Off ou libere uma nova geração. Falta o canal de
+criação/saída dos filhos desde o início do cliente, para fechar esse caso de
+cancelamento/falha precoce. Auditar também options/scripts efetivos de pppd antes
+de executar conexão privilegiada. A descoberta posterior pelo configd e o exit
+do cliente, sozinhos, não fornecem essa prova. A ligação ao helper/broker/UI,
+instalação e conexão real continuam pendentes.
+
 ## Política de rotas e leitura nativa
 
 ```bash
@@ -474,7 +522,7 @@ compilação não contam como mutações detectadas. A mutação de opcode GET e
 C/AF_UNIX. Nenhuma envia o opcode alterado a um socket de rotas.
 As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 57 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+São 65 mutações, incluindo remoção do vínculo de perfil da saída SSL,
 aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
 de inode, ACL ou checagem de hardlink do controlador. As dez novas de ADD/PPP
 retiram opcode correto, índice, zona da origem, PID/seq, comparação de origem,
@@ -489,6 +537,10 @@ máscara IPv6 host, NODAD, unidade automática, gate de cleanup implícito,
 retenção de aposentadoria, observação da rota local PPP e bloqueio de admissão
 pendente. Executam somente fixtures de chamadas/AF_UNIX e o consumidor stdin;
 nenhuma dessas mutações cria uma UTUN ou endereço real.
+Oito novas do controlador aceitam estado/operador antigo, iniciam substituto
+antes de cleanup, omitem a espera de cleanup/aposentadoria, promovem conexão
+sem teste, aceitam probe sem resposta ou preservam uma reconexão após desligar.
+Baseline e restauração também executam os sete cenários do controlador.
 As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo
