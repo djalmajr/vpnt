@@ -45,6 +45,10 @@ jobs:
           cargo +1.99.0 build --locked
       - name: Package unsigned development app
         run: python3 scripts/macos/package-app.py
+      - name: Validate native pinentry password reader
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-pinentry-consumer.py
 
   core:
     runs-on: ubuntu-24.04

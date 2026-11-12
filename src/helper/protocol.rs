@@ -1,6 +1,6 @@
 //! Private pipe protocol. Runtime commands cannot modify administrative policy.
 use crate::{
-    model::{Profile, VpnKind, valid_profile_id},
+    model::{Profile, valid_profile_id},
     secrets::Credentials,
     session::ConnectionState,
 };
@@ -134,7 +134,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
             // The root runtime additionally checks PSK requirements against its
             // own stored profile type, never a type supplied by this request.
             credentials
-                .validate(VpnKind::Ssl)
+                .validate_shape()
                 .map_err(|_| ProtocolError::InvalidRequest)?;
         }
         Command::Disconnect { id, generation } | Command::Probe { id, generation } => {

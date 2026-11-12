@@ -19,6 +19,17 @@ fn runtime_cannot_edit_profiles_or_accept_arbitrary_paths_and_commands() {
 }
 
 #[test]
+fn pipe_shape_validation_does_not_apply_ssl_limits_to_an_unknown_profile_type() {
+    let bytes=serde_json::to_vec(&serde_json::json!({"id":"request-1","command":{"type":"connect","id":"profile-1","generation":1,"credentials":{"password":"p".repeat(257),"psk":"fictional"}}})).unwrap();
+    let request = protocol::parse_request(&bytes).unwrap();
+    let Command::Connect { credentials, .. } = request.command else {
+        panic!("wrong operation");
+    };
+    assert!(credentials.validate(vpnt::model::VpnKind::Ipsec).is_ok());
+    assert!(credentials.validate(vpnt::model::VpnKind::Ssl).is_err());
+}
+
+#[test]
 fn framed_input_is_bounded_and_requires_a_complete_document() {
     let wire = b"{\"id\":\"r-1\",\"command\":{\"type\":\"snapshot\"}}\n{\"id\":\"r-2\",\"command\":{\"type\":\"snapshot\"}}\n";
     let mut reader = BufReader::with_capacity(1, Cursor::new(wire));

@@ -44,8 +44,21 @@ pub struct Credentials {
 }
 
 impl Credentials {
+    /// The pipe parser does not know the root-owned profile type yet.
+    pub fn validate_shape(&self) -> Result<(), SecretError> {
+        if !self.password.valid(true) || !self.psk.valid(false) {
+            return Err(SecretError::InvalidData);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, kind: VpnKind) -> Result<(), SecretError> {
-        if !self.password.valid(true) || !self.psk.valid(kind == VpnKind::Ipsec) {
+        self.validate_shape()?;
+        // openfortivpn 1.24.1 stores at most PASSWORD_SIZE=256 bytes. Reject
+        // excess before sending to pinentry instead of silently truncating.
+        if (kind == VpnKind::Ssl && self.password.expose().len() > 256)
+            || (kind == VpnKind::Ipsec && self.psk.expose().is_empty())
+        {
             return Err(SecretError::InvalidData);
         }
         Ok(())

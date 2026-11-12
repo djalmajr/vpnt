@@ -80,6 +80,17 @@ O manifest registra hashes, licenças, destino futuro e a versão mínima de mac
 exigida pelos binários produzidos. Esse runtime ainda não faz parte do `.app`
 de demonstração nem é instalado pelo script.
 
+O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
+à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que
+o helper possa usar um PID privado por perfil. O manifest registra o hash do
+patch, e a admissão Rust exige essa mesma versão. Configuração, socket, credenciais
+e recursos de rede por perfil ainda dependem da integração do driver.
+
+O runtime inclui uma cópia dos certificados públicos de
+`SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
+pode precisar de acesso ao Security.framework fora do sandbox; uma lista vazia
+interrompe o build. Chaveiros pessoais não são usados para esse bundle.
+
 ## Proposta visual
 
 O arquivo [`vpnt.fig`](vpnt.fig), na raiz do projeto, abre no OpenPencil.

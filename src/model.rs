@@ -39,7 +39,8 @@ impl Profile {
         if !valid_host(&self.gateway) || self.port == 0 {
             return Err("invalid_gateway");
         }
-        if self.username.len() > 200 || self.username.chars().any(char::is_control) {
+        let username_limit = if self.kind == VpnKind::Ssl { 64 } else { 200 };
+        if self.username.len() > username_limit || self.username.chars().any(char::is_control) {
             return Err("invalid_profile");
         }
         if self.networks.len() > 64 || self.networks.iter().any(|network| !valid_network(network)) {
@@ -52,7 +53,16 @@ impl Profile {
         {
             return Err("invalid_probe");
         }
-        if self.certificate.len() > 128 || self.certificate.chars().any(char::is_control) {
+        if self.certificate.len() > 128
+            || self.certificate.chars().any(char::is_control)
+            || (self.kind == VpnKind::Ssl
+                && !self.certificate.is_empty()
+                && (self.certificate.len() != 64
+                    || !self
+                        .certificate
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())))
+        {
             return Err("invalid_profile");
         }
         Ok(())

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -22,6 +23,7 @@ FORTI_VERSION = "1.24.1"
 PKGCONF_VERSION = "3.0.10"
 PKGCONF_SHA = "9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de"
 MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
+PID_PATCH = ROOT / "scripts/macos/patches/charon-private-pid.patch"
 
 
 def digest(path):
@@ -164,6 +166,8 @@ def verify_runtime(root):
     manifest = json.loads((root / "manifest.json").read_text())
     if manifest["format"] != 1 or manifest["appVersion"] != VERSION or manifest["prefix"] != str(PREFIX):
         raise RuntimeError("Runtime manifest does not match this app")
+    if manifest["strongswan"]["patches"] != {PID_PATCH.name: digest(PID_PATCH)}:
+        raise RuntimeError("Runtime does not include the expected private PID patch")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
     actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
@@ -188,6 +192,9 @@ def verify_runtime(root):
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(path)], check=True, capture_output=True)
     if str(PREFIX / "run/charon.pid").encode() not in (root / "bin/charon").read_bytes():
         raise RuntimeError("charon does not use its private PID directory")
+    if b"charon.vpnt_pid_file" not in (root / "bin/charon").read_bytes():
+        raise RuntimeError("charon does not support a private PID per profile")
+    ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(root / "certs/ca-bundle.pem")
     # Test actual loading in the staging directory. These overrides are for this
     # unprivileged --version check; installed clients use their fixed private paths.
     temporary_parent = ROOT / "target/runtime-build"
@@ -236,12 +243,20 @@ def main():
     if digest(archive) != SWAN_SHA:
         raise RuntimeError("strongSwan source digest mismatch")
     source = cache / f"strongswan-{SWAN_VERSION}"
-    if not source.exists():
+    # Restore all sources from the verified archive on every build; an old
+    # extracted cache must not silently supply changed source to the root runtime.
+    with tempfile.TemporaryDirectory(prefix="vpnt-swan-", dir=cache) as temporary:
         with tarfile.open(archive) as package:
-            package.extractall(cache, filter="data")
+            package.extractall(temporary, filter="data")
+        if source.exists():
+            if source.is_symlink() or not (source / "src/charon/charon.c").is_file():
+                raise RuntimeError("Refusing to replace unrecognized source directory")
+            shutil.rmtree(source)
+        shutil.move(str(Path(temporary) / source.name), source)
     build = ROOT / "target/runtime-build/strongswan"
     build.mkdir(parents=True, exist_ok=True)
     log = ROOT / "target/runtime-build/strongswan.log"
+    run(["/usr/bin/patch", "-t", "-p1", "-i", PID_PATCH], source, os.environ.copy(), log)
     env = {key: value for key, value in os.environ.items() if not key.startswith(("DYLD_", "LD_"))}
     env.update(CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib", PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"))
     configure = [
@@ -286,6 +301,19 @@ def main():
         (payload / "bin").mkdir(parents=True)
         shutil.copy2(installed / "libexec/ipsec/charon", payload / "bin/charon")
         shutil.copy2(forti, payload / "bin/openfortivpn")
+        # Only public system roots, never the user's login/custom keychains or
+        # a CA path under a user-writable package-manager prefix.
+        certificates = payload / "certs/ca-bundle.pem"
+        certificates.parent.mkdir()
+        public_roots = subprocess.check_output([
+            "/usr/bin/security", "find-certificate", "-a", "-p",
+            "/System/Library/Keychains/SystemRootCertificates.keychain",
+        ])
+        if b"-----BEGIN CERTIFICATE-----" not in public_roots:
+            raise RuntimeError("No public system roots exported; Security.framework access may be restricted")
+        certificates.write_bytes(public_roots)
+        certificates.chmod(0o444)
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(certificates)
         providers = openssl / "lib/ossl-modules"
         if providers.is_dir():
             for provider in providers.glob("*.dylib"):
@@ -319,6 +347,7 @@ def main():
                 "source": SWAN_URL,
                 "sha256": SWAN_SHA,
                 "pidDirectory": str(PREFIX / "run"),
+                "patches": {PID_PATCH.name: digest(PID_PATCH)},
             },
             "openfortivpn": {
                 "version": FORTI_VERSION,

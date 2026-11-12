@@ -1,4 +1,5 @@
 pub mod paths;
+pub mod pinentry;
 #[cfg(unix)]
 pub mod process;
 pub mod protocol;

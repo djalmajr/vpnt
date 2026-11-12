@@ -65,13 +65,15 @@ impl Fixture {
             )
             .unwrap();
         }
+        fs::create_dir(directory.join("certs")).unwrap();
+        fs::write(directory.join("certs/ca-bundle.pem"), b"fixture public CA").unwrap();
         let fixture = Self { directory, uid };
         fixture.manifest();
         fixture
     }
     fn manifest(&self) {
         let mut files = serde_json::Map::new();
-        for name in ["bin/charon", "bin/openfortivpn"] {
+        for name in ["bin/charon", "bin/openfortivpn", "certs/ca-bundle.pem"] {
             files.insert(
                 name.into(),
                 format!(
@@ -82,7 +84,7 @@ impl Fixture {
             );
         }
         let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
-            "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","pidDirectory":paths::runtime_directory().join("run")},
+            "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/charon-private-pid.patch")))}},
             "openfortivpn":{"version":"1.24.1","source":"https://github.com/adrienverge/openfortivpn/tree/v1.24.1"},"files":files});
         fs::write(
             self.directory.join("manifest.json"),
@@ -168,6 +170,37 @@ fn prepared_native_runtime_passes_the_same_admission_code() {
     let directory = std::env::current_dir().unwrap().join("target/vpnt-runtime");
     let owner = fs::metadata(&directory).unwrap().uid();
     Runtime::inspect(directory, owner).unwrap();
+}
+
+#[test]
+fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
+    let fixture = Fixture::new();
+    let path = fixture.directory.join("manifest.json");
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for change in 0..3 {
+        let mut document = original.clone();
+        match change {
+            0 => {
+                document["strongswan"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("patches");
+            }
+            1 => {
+                document["strongswan"]["patches"]["charon-private-pid.patch"] =
+                    "0".repeat(64).into()
+            }
+            _ => {
+                document["files"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("certs/ca-bundle.pem");
+                fs::remove_file(fixture.directory.join("certs/ca-bundle.pem")).unwrap();
+            }
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(Runtime::inspect(&fixture.directory, fixture.uid).is_err());
+    }
 }
 
 #[cfg(target_os = "macos")]

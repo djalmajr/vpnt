@@ -51,6 +51,7 @@ struct Swan {
     #[serde(rename = "sha256")]
     _sha256: String,
     pid_directory: String,
+    patches: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -84,11 +85,22 @@ impl Runtime {
             || Path::new(&manifest.strongswan.pid_directory)
                 != paths::runtime_directory().join("run")
             || manifest.strongswan.version != "6.1.0"
+            || manifest.strongswan.patches
+                != BTreeMap::from([(
+                    "charon-private-pid.patch".into(),
+                    format!(
+                        "{:x}",
+                        Sha256::digest(include_bytes!(
+                            "../../scripts/macos/patches/charon-private-pid.patch"
+                        ))
+                    ),
+                )])
             || manifest.openfortivpn.version != "1.24.1"
             || manifest.files.len() > 64
             || !valid_version(&manifest.minimum_macos)
             || !manifest.files.contains_key("bin/charon")
             || !manifest.files.contains_key("bin/openfortivpn")
+            || !manifest.files.contains_key("certs/ca-bundle.pem")
         {
             return Err(RuntimeError::InvalidManifest);
         }
@@ -158,8 +170,10 @@ fn valid_name(name: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
         })
-        && (matches!(name, "bin/charon" | "bin/openfortivpn")
-            || (name.starts_with("lib/") && name.ends_with(".dylib"))
+        && (matches!(
+            name,
+            "bin/charon" | "bin/openfortivpn" | "certs/ca-bundle.pem"
+        ) || (name.starts_with("lib/") && name.ends_with(".dylib"))
             || (name.starts_with("licenses/") && name.ends_with(".txt")))
 }
 

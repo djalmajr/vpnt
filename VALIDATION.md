@@ -84,7 +84,9 @@ python3 scripts/macos/build-runtime.py --verify-only
 
 O build fica em `target/`, incluindo o pkgconf local e fontes verificadas por
 SHA-256. O strongSwan é compilado com os plugins necessários incorporados; seu
-PID fica em um prefixo próprio. O openfortivpn é copiado da versão local
+PID padrão fica em um prefixo próprio. O patch versionado permite ao futuro
+driver indicar um PID diferente por perfil em configuração privada. A fonte
+é extraída novamente do arquivo verificado antes de cada build. O openfortivpn é copiado da versão local
 declarada no README. Nenhum comando instala em `/Library` ou inicia túneis.
 
 A verificação confere inventário/hashes, dependências Mach-O com prefixos
@@ -92,6 +94,11 @@ privados ou do sistema, assinaturas ad hoc e a versão mínima real do macOS.
 Executa apenas `--version` sem privilégios, com bibliotecas da cópia de staging
 e um arquivo de configuração fictício regular. O manifest não pode presumir
 compatibilidade com um macOS anterior ao mínimo dos componentes.
+
+O bundle de CAs contém somente certificados públicos exportados do chaveiro de
+raízes do sistema. Exportação vazia ou inválida interrompe o build; o sandbox
+pode retornar uma lista vazia sem erro. O bundle e o patch de PID integram a
+verificação do manifest. Isso não prova que o driver já os utiliza.
 
 Esses checks não provam carregamento dos plugins privilegiados, criação de SAs,
 PPP, tráfego pelo túnel ou cleanup de rotas. O controle de filhos tem testes de
@@ -112,6 +119,24 @@ apagados ao sair do escopo e `Debug` sem os valores. Testes exercitam o formato
 binário, respostas/eventos intercalados, truncamento, fechamento do peer e prazo
 total durante mensagens fragmentadas. O teste de listener precisa de permissão
 de socket local. Esses fixtures não iniciam charon nem provam controle de uma SA.
+
+O codec de pinentry implementa a troca usada por openfortivpn 1.24.1, com limite
+de comandos/linha, consulta única da senha e resposta de erro fixa. Não usa
+`SETKEYINFO` ou o texto do prompt para selecionar credenciais. O transporte
+privilegiado que vincula essa consulta a um filho próprio ainda está pendente.
+
+```bash
+cargo test --locked --no-default-features --test pinentry --test profiles --test secrets
+python3 scripts/macos/check-pinentry-consumer.py
+```
+
+O segundo comando compila o leitor C original de senha do openfortivpn a partir
+de fonte com SHA-256 fixado e o exercita contra o codec Rust. Verifica valores
+fictícios com espaços, `%`, `+`, UTF-8 e os limites de 256 bytes; não inicia o
+cliente VPN. O código C fica no fixture, separado do app. Os testes de entrada
+rejeitam usuário SSL acima de 64 bytes, senha SSL acima de 256 bytes e fingerprint
+fora dos 64 dígitos hexadecimais. O protocolo inicial só valida a forma dos
+segredos; o tipo do perfil root determina o limite efetivo do cliente.
 
 ## Fluxos de demonstração
 
