@@ -23,6 +23,8 @@ pub(super) trait Scope {
     fn active(&self) -> Result<(), Error>;
     fn add(&mut self, route: Route) -> Result<Attempt, Error>;
     fn detach_if_stopped(&mut self) -> Result<bool, Error>;
+    /// Includes implicit alias/local routes outside the explicit plan.
+    fn cleanup_complete(&mut self) -> Result<bool, Error>;
 }
 /// Opaque machine/backend-bound generation. Not accepted from IPC.
 pub struct InterfaceToken {
@@ -177,11 +179,22 @@ impl<S: Scope, K: Table> Registry<S, K> {
                 return Err(Error::Busy);
             }
         }
+        if !self
+            .entry(token)?
+            .scope
+            .cleanup_complete()
+            .map_err(|_| Error::Unavailable)?
+        {
+            return Err(Error::Busy);
+        }
         self.entries.remove(&token.index);
         Ok(())
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
     fn observed(&mut self, key: Key) -> Result<Option<Route>, Error> {
         // Coordinator treats Error::Changed as disposable. Read failures must

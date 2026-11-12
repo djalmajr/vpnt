@@ -312,12 +312,13 @@ fork; não depende de fechamento instantâneo. O gate de UID é exercitado sem r
 Isso é fixture de controle/lifecycle, não uma retenção PPP nativa executada.
 
 `AddWriter` é separado de `Reader`. Sua fábrica exige root e lock; o método
-produtivo aceita somente uma PPP comprovada e sua referência retida, derivando
-índice e origem. Revalida antes/depois do envio e emite somente `RTM_ADD`, sem
-substituir ou apagar rotas. Famílias sem origem no vínculo são recusadas.
-O codec suporta IPv4/IPv6, origem link-local com escopo, máscaras, host e
-blackhole. **O blackhole deste teste é apenas ABI**: o recurso nativo próprio
-para bloquear uma família não negociada ainda precisa ser entregue.
+PPP aceita somente uma interface comprovada e sua referência retida, derivando
+índice e origem. O método de blackhole deriva esses dados de uma UTUN própria
+e exige o mesmo lock. Ambos revalidam antes/depois do envio e emitem somente
+`RTM_ADD`, sem substituir ou apagar rotas. Famílias sem origem no recurso são
+recusadas. O codec suporta IPv4/IPv6, origem link-local com escopo, máscaras,
+host e blackhole. Os testes de ADD continuam sendo prova de ABI, sem escrita
+no kernel; não provam bloqueio de tráfego.
 
 Os dois testes de ADD usam somente `AF_UNIX`. Um processo C independente,
 compilado contra `net/route.h` e `net/if_dl.h` do SDK, decodifica o pacote real
@@ -339,6 +340,42 @@ atributos fornece identidade para DELETE. Não há API de DELETE/CHANGE.
 Nenhum teste chama a fábrica privilegiada de ADD, anexa um socket PPP real,
 cria interface ou escreve no kernel de rotas. A aplicação/remoção nativa e a
 integração ao helper/controlador seguem pendentes.
+
+## Interface própria para a família IP ausente
+
+```bash
+cargo test --locked --no-default-features --lib connection::macos::sink
+```
+
+O adaptador preparado abre um controle UTUN com unidade automática, guarda o
+descritor CLOEXEC e recusa nomes/índices já presentes no snapshot anterior,
+inclusive interfaces inativas. Exige root e lock. Antes de atribuir endereço,
+desativa e relê `UTUN_FLAGS_NO_INPUT | UTUN_FLAGS_NO_OUTPUT`. Usa um endereço
+aleatório privado ULA IPv6 `/128` ou link-local IPv4 `/32`, exclusivo da família
+ausente. Até 32 candidatos são conferidos contra endereços existentes e rotas
+de host em qualquer escopo; uma colisão posterior invalida o recurso.
+
+Os pedidos de alias só recebem o nome retornado pelo próprio controle. Não há
+alteração de interface descoberta por log/IPC. A intenção de atribuir endereço
+é registrada antes do ioctl: até uma falha parcial fecha só o FD próprio e
+conserva metadados para observar o cleanup. O fechamento não equivale a remoção
+observada; são conferidos nome/índice, qualquer rota referindo o índice e o
+endereço/rota de host, incluindo uma rota local que reste em `lo0`.
+
+Os seis testes interceptam a criação, conexão, opções e alias; o único FD real
+é de um socket Unix descartável. Cobrem ordem, duas famílias, CLOEXEC,
+falhas/races/cancelamento, nome/índice preexistente, seleção limitada e cleanup.
+Um consumidor C independente lê os bytes por stdin, com estruturas/macros do
+SDK, e confere unidade automática, sockaddr_ctl, flags, ifaliasreq/in6_aliasreq,
+máscaras, peer, escopo, NODAD e lifetimes. O C não abre sockets nem usa ioctl.
+O gate de UID é executado como usuário comum sem abrir controle nativo.
+
+A estratégia segue o [controle UTUN do XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/if_utun.c)
+e a seleção de endereço da [camada de rotas](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c).
+O endereço da mesma família é necessário para o plano de ADD; usar somente um
+gateway AF_LINK não elimina essa exigência. Leitura de fonte e ABI não provam
+criação, descarte de pacotes ou detach na versão instalada. Nenhuma UTUN,
+endereço ou rota foi criada pelos testes; esses gates continuam pendentes.
 
 ## Backend de leases e cleanup por interface
 
@@ -362,19 +399,25 @@ indisponibilidade; não permite que `Error::Changed` do adaptador seja confundid
 com recurso substituído e descartável pelo coordenador.
 
 O ciclo de encerramento preparado é: parar o cliente, marcar a geração em
-cleanup, aguardar ambos os watches de saída, fechar apenas a referência PPP
-própria, repetir o cleanup das leases e conferir todos os destinos do plano.
+cleanup, aguardar ambos os watches de saída, fechar apenas as referências PPP
+e UTUN próprias, repetir o cleanup das leases e conferir os destinos do plano
+e recursos implícitos. A liberação final exige ausência dos índices, de qualquer
+rota que ainda os referencie e de rotas locais dos endereços. Um endereço PPP
+compartilhado por outro vínculo preserva sua rota; não se exige removê-la.
 Fechar a referência não significa que as rotas sumiram. Rotas emprestadas
 também entram na conferência final. Mesma interface ainda presente, mesmo com
 atributos diferentes ou possível reutilização do índice, mantém pendência.
 Uma rota observada em interface estrangeira é preservada; uma movida para
 outro destino próprio continua pendente. Não há DELETE/CHANGE por chave.
 
-Os dez testes do registro exercitam o consumidor `Coordinator` com tabela e
+Os onze testes do registro exercitam o consumidor `Coordinator` com tabela e
 ciclo de vida de interface simulados. Cobrem autorização, redes não registradas,
 ACK perdido, ACK sem rota, falha de leitura após ADD, bloqueio de nova geração
 durante cleanup, fechamento único, empréstimos, substituição/reuso, tokens de
-outro backend, dois destinos próprios e migração entre eles. Isso não executa
+outro backend, dois destinos próprios, migração entre eles e cleanup implícito
+pendente após as quatro leases de full tunnel desaparecerem. Dois testes
+adicionais verificam a fila de aposentadoria de falhas, erros de leitura,
+nova admissão bloqueada e rotas implícitas/endereços compartilhados. Isso não executa
 o adaptador privilegiado e não prova retenção PPP, ADD ou purge de rotas reais.
 
 O teste de saída usa quatro processos próprios ao todo, em duas ordens de
@@ -385,10 +428,13 @@ chave exata no snapshot; um teste puro recusa prefixo mais amplo, escopo
 diferente e duplicidade.
 
 O plano aceita ausência de sink somente quando ele não é necessário. A fábrica
-PPP atual fornece `None`: full tunnel com família sem origem no vínculo é recusado
-antes do vínculo/escrita. O recurso nativo próprio de bloqueio continua como
-próxima entrega; o fixture de dois destinos não o substitui. Releitura e leases
-também não substituem o probe pelo túnel para promover a sessão a Connected.
+PPP prepara a UTUN apenas para full tunnel com uma família sem origem; redes
+split explícitas sem suporte continuam inválidas. Cadastro que falha conserva
+uma guarda de aposentadoria, inclusive após configurar um alias. A fila impede
+nova admissão até a remoção observada. O futuro helper precisa parar seus filhos
+e consumir `reap_retired`/`has_resources`, além das leases, antes de encerrar.
+Fixtures não executam a fábrica privilegiada. Releitura e leases também não
+substituem o probe pelo túnel para promover a sessão a Connected.
 
 ## Política de rotas e leitura nativa
 
@@ -428,7 +474,7 @@ compilação não contam como mutações detectadas. A mutação de opcode GET e
 C/AF_UNIX. Nenhuma envia o opcode alterado a um socket de rotas.
 As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 45 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+São 57 mutações, incluindo remoção do vínculo de perfil da saída SSL,
 aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
 de inode, ACL ou checagem de hardlink do controlador. As dez novas de ADD/PPP
 retiram opcode correto, índice, zona da origem, PID/seq, comparação de origem,
@@ -437,6 +483,12 @@ final do dono. As 15 novas do backend retiram autorização, plano de redes,
 releitura exata, confirmação, retenção de recibos, tratamento de erro, varredura
 de destinos, espera de saída, vínculo ao backend/geração ou checagem de destinos
 próprios. Também alteram a busca exata e a conjunção dos watches.
+As 12 novas retiram bloqueio dos dois sentidos, recusa de interface anterior,
+intenção de alias parcial, validação posterior, recusa de colisão de host,
+máscara IPv6 host, NODAD, unidade automática, gate de cleanup implícito,
+retenção de aposentadoria, observação da rota local PPP e bloqueio de admissão
+pendente. Executam somente fixtures de chamadas/AF_UNIX e o consumidor stdin;
+nenhuma dessas mutações cria uma UTUN ou endereço real.
 As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo
@@ -444,7 +496,7 @@ Python independente detecta a mutação que omite o flock; bookkeeping interno
 não basta para satisfazer o teste.
 O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
 
-Confirmação/cleanup de recursos reais, sink nativo e integração helper/UI
+Confirmação/cleanup de recursos reais, bloqueio de tráfego na UTUN e integração helper/UI
 continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
 seleciona a chave destino/máscara/escopo, sem comparação atômica dos atributos
 observados antes. O backend deverá lidar com alterações concorrentes e identidade

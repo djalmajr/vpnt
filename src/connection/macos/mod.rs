@@ -6,6 +6,7 @@ pub mod probe;
 mod process;
 mod resolve;
 pub mod routing;
+mod sink;
 mod store;
 mod tcp;
 pub use interfaces::Interfaces;

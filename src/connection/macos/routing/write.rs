@@ -1,6 +1,6 @@
 use super::{Address, Error, Key, Network, NextHop, Reader, Route, add_codec, codec};
 use crate::{
-    connection::macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, tcp},
+    connection::macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink, tcp},
     helper::controller_lock::ControllerLock,
 };
 use std::{
@@ -81,6 +81,37 @@ impl<'a> AddWriter<'a> {
         };
         let mut receipt = exchange(&self.fd, route, source, timeout, canceled)?;
         if attachment.validate().is_err() || !ppp.is_current().unwrap_or(false) {
+            receipt.confirmation = Err(Error::Changed);
+        }
+        Ok(receipt)
+    }
+    pub(super) fn add_sink(
+        &mut self,
+        sink: &OwnedSink<'_>,
+        network: Network,
+        timeout: Duration,
+        canceled: &AtomicBool,
+    ) -> Result<AddReceipt, Error> {
+        if !std::ptr::eq(self.controller, sink.controller()) {
+            return Err(Error::Invalid);
+        }
+        sink.validate()?;
+        let source = sink
+            .source(network.address().is_ipv4())
+            .ok_or(Error::Invalid)?;
+        let route = Route {
+            key: Key { network, scope: 0 },
+            interface: sink.index(),
+            next_hop: NextHop::Blackhole,
+        };
+        let mut receipt = exchange(
+            &self.fd,
+            route,
+            Address::unscoped(source),
+            timeout,
+            canceled,
+        )?;
+        if sink.validate().is_err() {
             receipt.confirmation = Err(Error::Changed);
         }
         Ok(receipt)

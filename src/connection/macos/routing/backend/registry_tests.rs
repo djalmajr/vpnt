@@ -13,6 +13,7 @@ struct Kernel {
     fail_after_add: bool,
     read_error: Option<Error>,
     auto_purge: bool,
+    implicit_pending: bool,
 }
 type Shared = Rc<RefCell<Kernel>>;
 struct FixtureTable(Shared);
@@ -82,6 +83,9 @@ impl Scope for FixtureScope {
                 .retain(|_, route| !self.targets.contains(&route.interface));
         }
         Ok(true)
+    }
+    fn cleanup_complete(&mut self) -> Result<bool, Error> {
+        Ok(!self.kernel.borrow().implicit_pending)
     }
 }
 type TestRegistry = Registry<FixtureScope, FixtureTable>;
@@ -163,6 +167,34 @@ fn confirmed_routes_stay_pending_until_both_reference_release_and_absence() {
     coordinator.backend_mut().finish_cleanup(&token).unwrap();
     assert!(coordinator.backend_mut().is_empty());
     assert_eq!(kernel.borrow_mut().routes.get(&foreign.key), Some(&foreign));
+}
+#[test]
+fn implicit_cleanup_keeps_full_tunnel_generation_reserved_after_all_leases_are_absent() {
+    let (mut registry, kernel) = backend();
+    let plan = ppp_networks(&[], 3, true, false, Some(4)).unwrap();
+    let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    coordinator.validate(&lease).unwrap();
+    assert_eq!(kernel.borrow().writes, 4);
+    assert_eq!(coordinator.release(lease).unwrap().pending, 4);
+    {
+        let mut state = kernel.borrow_mut();
+        state.live.insert(3, false);
+        state.auto_purge = true;
+        state.implicit_pending = true;
+    }
+    assert!(coordinator.backend_mut().begin_cleanup(&token).unwrap());
+    assert_eq!(coordinator.retry_cleanup().absent, 4);
+    assert_eq!(
+        coordinator.backend_mut().finish_cleanup(&token),
+        Err(Error::Busy)
+    );
+    assert!(!coordinator.backend_mut().is_empty());
+    kernel.borrow_mut().implicit_pending = false;
+    coordinator.backend_mut().finish_cleanup(&token).unwrap();
+    assert!(coordinator.backend_mut().is_empty());
+    assert_eq!(kernel.borrow().closes, BTreeMap::from([(3, 1), (4, 1)]));
 }
 #[test]
 fn lost_ack_or_postflight_read_failure_never_discards_a_possible_add() {

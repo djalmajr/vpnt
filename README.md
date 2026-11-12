@@ -119,10 +119,15 @@ da ABI Darwin em sockets Unix privados: nenhuma retenção PPP ou escrita real
 de rota foi executada. O backend SSL já liga esses componentes ao coordenador,
 autoriza UID/perfil/geração, relê a chave exata da rota e retém recibos incertos.
 Só fecha sua referência após os dois processos saírem e só termina o cleanup
-após conferir todas as redes planejadas, incluindo empréstimos. Os fluxos do
-backend usam tabela e ciclo de vida simulados; os watches de processos e a
-leitura nativa têm evidência separada. Execução privilegiada, bloqueio nativo
-da família IP não suportada e ligação ao helper/UI continuam pendentes;
+após conferir redes planejadas, empréstimos e rotas implícitas dos endereços.
+O backend prepara uma UTUN própria para a família IP ausente no túnel completo,
+desativa entrada/saída antes de atribuir um endereço privado e usa rotas blackhole.
+Falhas parciais conservam metadados de cleanup e impedem nova admissão até a
+remoção observada. A liberação fecha só os descritores próprios.
+Os fluxos do backend usam tabela e ciclo de vida simulados; os pedidos UTUN e
+de endereço têm fixtures e consumidor C independente do SDK. Watches de
+processos e leitura nativa têm evidência separada. Execução privilegiada,
+bloqueio de tráfego real e ligação ao helper/UI continuam pendentes;
 detalhes em `VALIDATION.md`.
 
 O runtime inclui uma cópia dos certificados públicos de

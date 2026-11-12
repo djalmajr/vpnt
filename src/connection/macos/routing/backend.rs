@@ -1,19 +1,21 @@
 //! SSL route backend. No per-key delete exists: after both owned processes
-//! exit, close only our PPP reference and observe every planned route.
+//! exit, close only our PPP/UTUN references and observe explicit/implicit routes.
 mod registry;
+mod retirement;
 use super::{AddWriter, Error, Key, Route, Snapshot};
 use crate::{
     connection::{
-        macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment},
-        routes::{Backend, Owner, Presence, ppp_networks},
+        macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink},
+        routes::{Backend, NextHop, Owner, Presence, ppp_networks},
     },
     helper::controller_lock::ControllerLock,
 };
 use registry::{Attempt, Registry, Scope, Table};
 pub use registry::{InterfaceToken, NativeReceipt};
+use retirement::Guard;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -22,6 +24,7 @@ use std::{
 pub struct NativeBackend<'a> {
     controller: &'a ControllerLock,
     registry: Registry<NativeScope<'a>, NativeTable<'a>>,
+    retired: retirement::Queue,
 }
 impl<'a> NativeBackend<'a> {
     pub fn new(controller: &'a ControllerLock) -> Result<Self, Error> {
@@ -33,12 +36,13 @@ impl<'a> NativeBackend<'a> {
         Ok(Self {
             controller,
             registry: Registry::new(NativeTable(controller))?,
+            retired: Arc::new(Mutex::new(Vec::new())),
         })
     }
     /// Called with the root-stored profile's networks. The caller retains its
     /// Arc even on registration failure so it can still observe PPP shutdown.
-    /// Unsupported-family full tunnel requires the forthcoming owned sink;
-    /// this method fails instead of silently creating an incomplete full tunnel.
+    /// A full tunnel with one family creates its own disabled-packet UTUN for
+    /// the missing family. Explicit unsupported split networks remain invalid.
     pub fn register_ppp(
         &mut self,
         ppp: &Arc<OwnedPpp>,
@@ -50,18 +54,57 @@ impl<'a> NativeBackend<'a> {
         if canceled.load(Ordering::Acquire) {
             return Err(Error::Canceled);
         }
+        self.reap_retired()?;
+        // A failed registration has no public token. Its original processes
+        // and any partial aliases must retire before admitting another scope.
+        retirement::admit(&self.retired)?;
+        if self.registry.len() >= 64 {
+            return Err(Error::Limit);
+        }
         let index = u16::try_from(ppp.index()).map_err(|_| Error::Invalid)?;
         let ipv4 = ppp.addresses().any(|ip| ip.is_ipv4());
         let ipv6 = ppp.addresses().any(|ip| ip.is_ipv6());
-        let plan = ppp_networks(networks, index, ipv4, ipv6, None)?;
+        let needs_sink = networks.is_empty() && ipv4 != ipv6;
+        // Validate split inputs before native allocation. Full/missing family
+        // is planned only after its actual, owned sink index is known.
+        let plan = if needs_sink {
+            None
+        } else {
+            Some(ppp_networks(networks, index, ipv4, ipv6, None)?)
+        };
+        let writer = AddWriter::open(self.controller)?;
         let attachment =
             PppAttachment::retain(ppp, self.controller).map_err(|_| Error::Unavailable)?;
-        let scope = NativeScope {
+        let mut scope = NativeScope {
             ppp: ppp.clone(),
             attachment: Some(attachment),
             index,
-            writer: AddWriter::open(self.controller)?,
+            writer,
             canceled: canceled.clone(),
+            sink: None,
+            retirement: Guard::new(ppp.clone(), self.retired.clone()),
+        };
+        if needs_sink {
+            match OwnedSink::create(!ipv4, self.controller) {
+                Ok(sink) => {
+                    scope.retirement.set_sink(Some(sink.identity()));
+                    scope.sink = Some(sink);
+                }
+                Err(failure) => {
+                    scope.retirement.set_sink(failure.retired);
+                    return Err(failure.error); // Scope Drop preserves retirement
+                }
+            }
+        }
+        let plan = match plan {
+            Some(plan) => plan,
+            None => ppp_networks(
+                networks,
+                index,
+                ipv4,
+                ipv6,
+                scope.retirement.sink().map(|sink| sink.index),
+            )?,
         };
         let token = self.registry.register(scope, owner, plan.clone())?;
         Ok((token, plan))
@@ -78,7 +121,14 @@ impl<'a> NativeBackend<'a> {
         self.registry.finish_cleanup(token)
     }
     pub fn has_resources(&self) -> bool {
-        !self.registry.is_empty()
+        !self.registry.is_empty() || self.retired.lock().map_or(true, |queue| !queue.is_empty())
+    }
+    /// Failed registration may have configured an alias before failing. Keep
+    /// its passive retirement record until the original processes/ifnets and
+    /// implicit routes are gone. This method never mutates machine resources.
+    pub fn reap_retired(&mut self) -> Result<(), Error> {
+        self.controller.validate().map_err(|_| Error::Unavailable)?;
+        retirement::reap(&self.retired)
     }
 }
 impl Backend for NativeBackend<'_> {
@@ -116,10 +166,20 @@ struct NativeScope<'a> {
     index: u16,
     writer: AddWriter<'a>,
     canceled: Arc<AtomicBool>,
+    sink: Option<OwnedSink<'a>>,
+    // Last: descriptors above close before pending metadata enters the queue.
+    retirement: Guard,
 }
 impl Scope for NativeScope<'_> {
     fn index(&self) -> u16 {
         self.index
+    }
+    fn owns(&self, index: u16) -> bool {
+        self.index == index
+            || self
+                .retirement
+                .sink()
+                .is_some_and(|sink| sink.index == index)
     }
     fn active(&self) -> Result<(), Error> {
         if self.canceled.load(Ordering::Acquire) {
@@ -133,21 +193,34 @@ impl Scope for NativeScope<'_> {
         if !self.ppp.is_current().map_err(|_| Error::Unavailable)? {
             return Err(Error::Unavailable);
         }
+        if let Some(sink) = &self.sink {
+            sink.validate()?;
+        }
         Ok(())
     }
     fn add(&mut self, route: Route) -> Result<Attempt, Error> {
-        if route.interface != self.index
-            || route.next_hop != crate::connection::routes::NextHop::Interface
-        {
-            return Err(Error::Invalid);
-        }
-        let receipt = self.writer.add(
-            &self.ppp,
-            self.attachment.as_ref().ok_or(Error::Busy)?,
-            route.key.network,
-            Duration::from_secs(2),
-            &self.canceled,
-        )?;
+        let receipt = match route.next_hop {
+            NextHop::Interface if route.interface == self.index => self.writer.add(
+                &self.ppp,
+                self.attachment.as_ref().ok_or(Error::Busy)?,
+                route.key.network,
+                Duration::from_secs(2),
+                &self.canceled,
+            )?,
+            NextHop::Blackhole => {
+                let sink = self.sink.as_ref().ok_or(Error::Invalid)?;
+                if sink.index() != route.interface {
+                    return Err(Error::Invalid);
+                }
+                self.writer.add_sink(
+                    sink,
+                    route.key.network,
+                    Duration::from_secs(2),
+                    &self.canceled,
+                )?
+            }
+            _ => return Err(Error::Invalid),
+        };
         Ok(Attempt {
             confirmation: receipt.confirmation(),
         })
@@ -162,6 +235,15 @@ impl Scope for NativeScope<'_> {
         }
         // Drop only the FD we created; no PID signal, unit ioctl or route delete.
         drop(self.attachment.take());
+        if let Some(sink) = self.sink.take() {
+            self.retirement.set_sink(Some(sink.retire()));
+        }
         Ok(true)
+    }
+    fn cleanup_complete(&mut self) -> Result<bool, Error> {
+        if self.attachment.is_some() || self.sink.is_some() {
+            return Ok(false);
+        }
+        self.retirement.complete()
     }
 }
