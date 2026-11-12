@@ -19,6 +19,19 @@ replace = shared.replace
 run = shared.run
 
 
+def operation(source, name, before, after):
+    start = source.index(f'    fn {name}(')
+    end = source.index('\n    fn ', start + 1)
+    return source[:start] + replace(source[start:end], before, after) + source[end:]
+
+
+def exposed_ipsec_directory(source):
+    before = 'payload::files::directory(&path, tree.owner, true)?;'
+    if source.count(before) != 2:
+        raise RuntimeError('Changed private-directory admission anchors')
+    return source.replace(before, 'payload::files::directory(&path, tree.owner, false)?;')
+
+
 def mutations():
     base = 'src/install/engine'
     prefix = 'install::engine::tests::'
@@ -34,9 +47,22 @@ def mutations():
     recovery = prefix + 'recovery::recovery_restores_interrupted_updates_but_never_overwrites_an_unrecognized_image'
     crashes = prefix + 'crash::abrupt_process_exit_is_recovered_under_the_persistent_lock'
     channel = prefix + 'channel::removal_channel_uses_kernel_identity_and_refuses_an_extra_uid_or_second_document'
+    pending = prefix + 'pending::claims_without_a_controller_block_activation_removal_and_journal_recovery_in_every_phase'
+    untrusted = prefix + 'pending::untrusted_ipsec_roots_are_refused_and_opaque_entries_cannot_be_interpreted_as_empty'
+    admission = 'let _guard = self.tree.bootstrap()?;\n        pending::clear(&self.tree, &_guard)?;'
+    gate = '        pending::clear(&self.tree, &_guard)?;\n'
+    recovery_order = gate + '        Journal::recover(&self.tree)?;\n'
     cases = [
-        ('activation-lock-released-early', base + '.rs', lambda s: replace(s, 'let _guard = self.tree.bootstrap()?;\n        Journal::recover(&self.tree)?;\n        self.checks.installed(&[])?;\n        let old = Receipt::load(&self.tree)?;', 'drop(self.tree.bootstrap()?);\n        Journal::recover(&self.tree)?;\n        self.checks.installed(&[])?;\n        let old = Receipt::load(&self.tree)?;'), crashes),
-        ('activation-lock-skipped', base + '.rs', lambda s: s.replace('let _guard = self.tree.bootstrap()?;', 'let _guard = ();', 1), active),
+        ('activation-lock-released-early', base + '.rs', lambda s: operation(s, 'activate', admission, admission + '\n        drop(_guard);'), crashes),
+        ('activation-lock-skipped', base + '.rs', lambda s: operation(s, 'activate', admission, 'let _guard = ();'), active),
+        ('activation-ignores-pending-ipsec', base + '.rs', lambda s: operation(s, 'activate', gate, ''), pending),
+        ('removal-ignores-pending-ipsec', base + '.rs', lambda s: operation(s, 'remove', gate, ''), pending),
+        ('activation-recovers-before-ipsec-admission', base + '.rs', lambda s: operation(s, 'activate', recovery_order, '        Journal::recover(&self.tree)?;\n' + gate), pending),
+        ('removal-recovers-before-ipsec-admission', base + '.rs', lambda s: operation(s, 'remove', recovery_order, '        Journal::recover(&self.tree)?;\n' + gate), pending),
+        ('ipsec-state-exposed', base + '/pending.rs', exposed_ipsec_directory, untrusted),
+        ('nonregular-ipsec-entry-ignored', base + '/pending.rs', lambda s: replace(s, '        entry.map_err(|_| Error::Io)?;\n        return Err(Error::Busy);', '        let entry = entry.map_err(|_| Error::Io)?;\n        if entry.file_type().map_err(|_| Error::Io)?.is_file() { return Err(Error::Busy); }\n        return Ok(());'), untrusted),
+        ('missing-ipsec-tree-blocks-installation', base + '/pending.rs', lambda s: replace(s, '=> return validate(),', '=> return Err(Error::Busy),'), pending),
+        ('empty-ipsec-tree-blocks-installation', base + '/pending.rs', lambda s: replace(s, '    unchanged()\n}', '    Err(Error::Busy)\n}'), pending),
         ('unchanged-policy-replaced', base + '/plan.rs', lambda s: replace(s, 'if !changed {', 'if false {'), persistence),
         ('foreign-destination-adopted', base + '/plan.rs', lambda s: replace(s, 'return Err(Error::Conflict);', '{}'), active),
         ('installed-digest-not-checked', base + '/receipt.rs', lambda s: replace(s, 'if !image::same(image::snapshot(tree, &key)?.as_ref(), Some(&stamp)) {', 'if false {'), foreign),

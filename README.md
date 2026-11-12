@@ -193,6 +193,11 @@ configuração gerada, sem executar charon. Ainda faltam observador SA/SPD,
 recuperação de claims, endereço virtual, tráfego e cleanup integrados ao driver.
 O helper continua recusando conexão IPsec até completar essa integração.
 
+O executor de instalação e remoção também exige ausência de admissões IPsec
+pendentes antes de recuperar o journal ou modificar componentes. Um lock livre
+ou uma fase Stopped não comprovam cleanup. O executor preserva a admissão e
+recusa a operação; sua reconciliação pertence à camada de VPN.
+
 O patch [`openfortivpn-no-routes.patch`](scripts/macos/patches/openfortivpn-no-routes.patch)
 impede a remoção corretiva de uma rota quando `--no-routes` está ativo. O driver
 SSL usa rotas e DNS desativados no cliente para que o controlador cuide dos

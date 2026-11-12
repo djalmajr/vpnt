@@ -76,7 +76,51 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## IPsec: produtor nativo e admissão durável (B1)
+## IPsec: veto de componentes com admissões pendentes
+
+```bash
+cargo test --locked --no-default-features --lib install::engine::tests::pending
+python3 scripts/macos/check-installation-engine.py
+```
+
+[PASS, native filesystem/process fixture] Dois testes atravessam activate/remove
+do executor produtivo, em árvores privadas de usuário comum. Qualquer entrada
+em state/ipsec bloqueia as operações antes de recuperar/coletar o journal,
+mesmo com ControllerLock disponível. Prepared/Starting/Running/Stopped e dados
+desconhecidos preservam componentes, recibos, políticas e journal; Stopped não
+significa cleanup comprovado. Diretório ausente ou privado/admitido vazio
+permite a operação. Não há leitura de PID, conteúdo ou alvo da entrada.
+
+Arquivo/symlink no lugar do diretório, modo inseguro e ACL com grant são
+recusados. FIFO dentro da árvore é presença pendente, sem abrir o nó. Os testes
+comparam bytes/modos/inodes instalados e comprovam que a coleta do journal só
+prossegue após remover a admissão fictícia por limpeza explícita do fixture.
+Nenhuma limpeza de claim foi adicionada ao instalador.
+
+[PASS, local] 267 testes Rust com desktop e 263 sem desktop, em sequência;
+dois ignored (runtime opcional e harness de crash exercitado pelo pai). Fmt,
+clippy all-targets/all-features -D warnings, build dos binários e sintaxe
+Python/YAML passaram.
+A matriz do executor detectou 32 mutações, incluindo oito oráculos do veto,
+com quatro baselines/restaurações e 232 hashes de entrada conferidos. Dois
+oráculos antigos do lock foram adaptados ao guard obrigatório; falha de
+compilação não conta como detecção. Logs em output/fixtures/ipsec-pending-*;
+recibo em output/fixtures/installation-engine-oracles/. O recibo anterior
+foi preservado antes da reexecução. Sem benchmark de performance.
+
+Parser strongSwan, consumidores C/PPP e matrizes de produtor/VICI mantêm o
+checkpoint 28eb90a nos caminhos inalterados; não foram reexecutados nesta
+mudança do executor. Os oito casos nativos do produtor também passaram nas
+suítes Rust completas. O workflow já executa a matriz ampliada; CI remoto
+continua sem execução.
+
+[NOT RUN] Instalação/remoção elevadas, caminho root/PackageKit/PAM e VPN real.
+Observador SAD/SPD, recuperação de claims, leases de VIP/rotas e integração
+IPsec/SSL continuam necessários. Veto de componente não prova ausência de
+recursos no kernel e não habilita IPsec. UI/catálogos/dependências/patches
+inalterados; .app/payload preservados no checkpoint 692489d.
+
+## IPsec: produtor nativo e admissão durável (B1, 28eb90a)
 
 ```bash
 cargo test --locked --no-default-features --lib connection::ipsec

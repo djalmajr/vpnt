@@ -81,6 +81,7 @@ mod channel;
 mod crash;
 mod invariants;
 mod journal;
+mod pending;
 mod recovery;
 
 #[test]

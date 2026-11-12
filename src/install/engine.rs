@@ -7,6 +7,7 @@ use std::{
 mod checks;
 mod image;
 mod journal;
+mod pending;
 mod plan;
 mod receipt;
 mod tree;
@@ -37,6 +38,7 @@ impl Executor {
             return Err(Error::PermissionDenied);
         }
         let _guard = self.tree.bootstrap()?;
+        pending::clear(&self.tree, &_guard)?;
         Journal::recover(&self.tree)?;
         self.checks.installed(&[])?;
         let old = Receipt::load(&self.tree)?;
@@ -50,6 +52,7 @@ impl Executor {
     fn remove(&mut self, uid: u32) -> Result<Outcome, Error> {
         policy::account(uid)?;
         let _guard = self.tree.bootstrap()?;
+        pending::clear(&self.tree, &_guard)?;
         Journal::recover(&self.tree)?;
         self.checks.installed(&[])?;
         let old = Receipt::load(&self.tree)?.ok_or(Error::Conflict)?;
