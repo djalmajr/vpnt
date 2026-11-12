@@ -49,6 +49,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-pinentry-consumer.py
+      - name: Verify route policy negative oracles
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-route-policy.py
 
   core:
     runs-on: ubuntu-24.04

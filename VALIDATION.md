@@ -230,6 +230,51 @@ Os testes não criam interfaces, rotas, SAs ou registros no `configd`. O comando
 pode precisar sair do sandbox para sockets, ICMP e o serviço nativo. Isso é
 execução como usuário comum; não instala componentes nem se torna root.
 
+## Política de rotas e leitura nativa
+
+```bash
+cargo test --locked --no-default-features --test route_leases --test route_flow
+cargo test --locked --no-default-features --lib connection::macos::routing
+python3 scripts/macos/check-route-policy.py
+```
+
+O primeiro comando é portável. Usa um kernel de fixture com identidades de
+recursos e falhas observáveis. Verificar empréstimo sem remoção, compartilhamento
+até o último usuário, sobreposição de prefixos distintos, conflito exato,
+UID/perfil/geração, handles de coordenadores diferentes e rollback em ordem
+inversa. O pin do gateway pode ser adquirido antes do cliente e estendido com
+as redes após a descoberta PPP. Uma extensão incompleta com rollback pendente
+não pode validar como pronta. Falha ao remover uma rede retém o pin anterior,
+os recibos e o perfil ocupado até o retry; não basta apagar a sessão da lista.
+
+Rede vazia significa túnel completo: pares `/1` preservam os defaults `/0`.
+O plano prevê blackhole para a família IP não suportada, em vez de deixá-la
+usar silenciosamente a conexão física. Redes explícitas sem suporte são
+recusadas. Isso valida o plano; não comprova que o kernel aplicou o bloqueio.
+
+O segundo comando, no macOS, lê `NET_RT_DUMP2` e consulta somente `RTM_GET`.
+As respostas de loopback são conferidas contra o índice de `lo0` obtido por
+uma API independente. O codec trata alinhamento de quatro bytes, máscaras
+compactas, escopo IPv6/KAME, limites e truncamento. O consumidor GET também é
+exercitado por datagramas privados: PID/seq incorretos não podem satisfazer
+outra consulta. Nenhum dado pessoal da tabela é impresso. São evidências de
+leitura nativa e protocolo; não são provas de ADD/DELETE ou de tráfego VPN.
+
+O terceiro comando exige macOS e usuário comum. Em cópia descartável de fonte
+e build, executa baseline, mutações nomeadas e baseline restaurada; falhas de
+compilação não contam como mutações detectadas. A mutação de opcode executa
+**somente o teste puro do codec**, sem enviar o opcode alterado a um socket de
+rotas. As outras consultas nativas permanecem GET. Cópia/build são removidos;
+logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
+O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
+
+Backend privilegiado de escrita, lock global entre helpers, recibos de criação
+reais e integração helper/UI continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
+seleciona a chave destino/máscara/escopo, sem comparação atômica dos atributos
+observados antes. O backend deverá lidar com alterações concorrentes e identidade
+perdida; a identidade monotônica do fixture não fornece essa prova no macOS.
+Não usar igualdade de atributos ou um pidfile para declarar ownership nativo.
+
 ## Fluxos de demonstração
 
 Use `cargo run -- --demo-server 4178` e abra o endereço local do README.
