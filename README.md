@@ -112,8 +112,12 @@ nativa consulta a tabela e faz somente `RTM_GET`; os testes de aplicação e
 remoção usam um kernel simulado. O lock global do controlador tem testes de
 exclusão real entre processos e validação de inode/permissões/ACL; a fábrica
 produtiva exige root e um arquivo persistente preparado pela instalação.
-Ainda falta consumi-lo no controlador/helper. Backend de escrita e confirmação
-de recursos nativos continuam pendentes.
+Ainda falta consumi-lo no controlador/helper. Há um vínculo PPP por descritor
+e um escritor separado de `ADD`, ambos preparados para exigir root, o lock e
+a interface comprovada. Seus testes usam ioctls simulados e um consumidor C
+da ABI Darwin em sockets Unix privados: nenhuma retenção PPP ou escrita real
+de rota foi executada. Backend de leases/cleanup nativo, bloqueio da família
+IP não suportada e integração continuam pendentes; detalhes em `VALIDATION.md`.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação

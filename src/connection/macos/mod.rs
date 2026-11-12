@@ -1,6 +1,7 @@
 pub mod egress;
 mod interfaces;
 pub mod ppp;
+pub mod ppp_attachment;
 pub mod probe;
 mod process;
 mod resolve;

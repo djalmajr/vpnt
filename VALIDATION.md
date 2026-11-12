@@ -281,6 +281,65 @@ Os testes não criam interfaces, rotas, SAs ou registros no `configd`. O comando
 pode precisar sair do sandbox para sockets, ICMP e o serviço nativo. Isso é
 execução como usuário comum; não instala componentes nem se torna root.
 
+## Retenção PPP e protocolo de ADD
+
+```bash
+cargo test --locked --no-default-features --lib connection::macos::ppp_attachment
+cargo test --locked --no-default-features --lib connection::macos::routing::write
+```
+
+`PppAttachment` exige root, um `ControllerLock` ainda vivo e `OwnedPpp` válido
+antes/depois do vínculo. Abre seu próprio socket de controle `PF_PPP`, emite
+somente `PPPIOCATTACH` para a unidade comprovada e confere `PPPIOCGUNIT`.
+O descritor CLOEXEC mantém essa referência até sair do escopo. A API não expõe
+o FD, não cria unidades e não emite `PPPIOCDETACH` ou destruição por nome.
+Nome, unidade e índice são distintos: o fixture usa ppp42 com índice 234.
+Validar a referência não significa que pppd ou a conexão estejam ativos.
+
+A [camada de controle PPP da Apple](https://github.com/apple-oss-distributions/ppp/blob/main/Family/ppp_domain.c)
+associa o socket à unidade e solta seu cliente no fechamento. O
+[driver de interface](https://github.com/apple-oss-distributions/ppp/blob/main/Family/ppp_if.c)
+conta os clientes e chama o detach quando sai o último. Essa leitura fundamenta
+a estratégia de ciclo de vida; **não prova** comportamento ou cleanup na máquina
+atual. A integração deverá observar a ausência das rotas após desligar o cliente
+e fechar apenas sua própria referência, mantendo cleanup pendente na incerteza.
+
+Os três testes de retenção usam um socket Unix real para observar fechamento,
+mas interceptam abertura/ioctls PPP. Conferem ordem, unidade, CLOEXEC, mudança
+de ownership durante o vínculo, erro de attach e descarte da referência em
+falha. O EOF pode aguardar o exec de outro fixture que tenha acabado de fazer
+fork; não depende de fechamento instantâneo. O gate de UID é exercitado sem root.
+Isso é fixture de controle/lifecycle, não uma retenção PPP nativa executada.
+
+`AddWriter` é separado de `Reader`. Sua fábrica exige root e lock; o método
+produtivo aceita somente uma PPP comprovada e sua referência retida, derivando
+índice e origem. Revalida antes/depois do envio e emite somente `RTM_ADD`, sem
+substituir ou apagar rotas. Famílias sem origem no vínculo são recusadas.
+O codec suporta IPv4/IPv6, origem link-local com escopo, máscaras, host e
+blackhole. **O blackhole deste teste é apenas ABI**: o recurso nativo próprio
+para bloquear uma família não negociada ainda precisa ser entregue.
+
+Os dois testes de ADD usam somente `AF_UNIX`. Um processo C independente,
+compilado contra `net/route.h` e `net/if_dl.h` do SDK, decodifica o pacote real
+e verifica endereços/máscara, flags, índice e origem. O C também confere a
+codificação dos dois ioctls PPP com as macros do SDK, usando os números do
+[header PPP publicado](https://github.com/apple-oss-distributions/ppp/blob/main/Family/if_ppp.h).
+São 11 cenários de mensagens: IPv4, IPv6, origem link-local com zona, host,
+blackhole, PID/seq estrangeiros, EEXIST, origem alterada, truncamento, peer
+encerrado e peer silencioso. Casos separados verificam cancelamento antes e
+depois do envio, sem depender de sleeps para sincronizar o cancelamento.
+
+Depois de tentar enviar, timeout/cancelamento/erro retornam um recibo não
+confirmado com a rota tentada; não se presume que nada foi criado. Antes do
+envio, cancelar não produz pacote. A confirmação exige ACK com PID/seq/opcode,
+rota e origem esperados, mas é somente prova de protocolo: o controlador deverá
+reler a tabela e executar o probe antes de Connected. Nem ACK nem igualdade de
+atributos fornece identidade para DELETE. Não há API de DELETE/CHANGE.
+
+Nenhum teste chama a fábrica privilegiada de ADD, anexa um socket PPP real,
+cria interface ou escreve no kernel de rotas. A aplicação/remoção nativa,
+integração ao coordenador de leases e helper/controlador seguem pendentes.
+
 ## Política de rotas e leitura nativa
 
 ```bash
@@ -303,7 +362,8 @@ O plano prevê blackhole para a família IP não suportada, em vez de deixá-la
 usar silenciosamente a conexão física. Redes explícitas sem suporte são
 recusadas. Isso valida o plano; não comprova que o kernel aplicou o bloqueio.
 
-O segundo comando, no macOS, lê `NET_RT_DUMP2` e consulta somente `RTM_GET`.
+O segundo comando, no macOS, lê `NET_RT_DUMP2` e consulta somente `RTM_GET`
+no kernel real; os testes de ADD usam apenas os datagramas privados acima.
 As respostas de loopback são conferidas contra o índice de `lo0` obtido por
 uma API independente. O codec trata alinhamento de quatro bytes, máscaras
 compactas, escopo IPv6/KAME, limites e truncamento. O consumidor GET também é
@@ -313,20 +373,24 @@ leitura nativa e protocolo; não são provas de ADD/DELETE ou de tráfego VPN.
 
 O terceiro comando exige macOS e usuário comum. Em cópia descartável de fonte
 e build, executa baseline, mutações nomeadas e baseline restaurada; falhas de
-compilação não contam como mutações detectadas. A mutação de opcode executa
-**somente o teste puro do codec**, sem enviar o opcode alterado a um socket de
-rotas. As outras consultas nativas permanecem GET. Cópia/build são removidos;
+compilação não contam como mutações detectadas. A mutação de opcode GET executa
+**somente o teste puro do codec**; a de opcode ADD executa somente o consumidor
+C/AF_UNIX. Nenhuma envia o opcode alterado a um socket de rotas.
+As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 20 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+São 30 mutações, incluindo remoção do vínculo de perfil da saída SSL,
 aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
-de inode, ACL ou checagem de hardlink do controlador. As baselines nativas incluem
+de inode, ACL ou checagem de hardlink do controlador. As dez novas de ADD/PPP
+retiram opcode correto, índice, zona da origem, PID/seq, comparação de origem,
+recusa de ACK perdido, recibo após cancelamento, leitura da unidade ou validação
+final do dono. As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo
 Python independente detecta a mutação que omite o flock; bookkeeping interno
 não basta para satisfazer o teste.
 O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
 
-Backend privilegiado de escrita, consumo do lock global, recibos de criação
+Consumo do escritor/lock no backend de leases, confirmação/cleanup de recursos
 reais e integração helper/UI continuam pendentes. O [delete de rotas no XNU](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c)
 seleciona a chave destino/máscara/escopo, sem comparação atômica dos atributos
 observados antes. O backend deverá lidar com alterações concorrentes e identidade

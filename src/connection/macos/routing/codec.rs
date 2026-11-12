@@ -29,13 +29,13 @@ fn u32_at(bytes: &[u8], at: usize) -> Result<u32, Error> {
 pub(super) fn signed(bytes: &[u8], at: usize) -> Result<i32, Error> {
     Ok(u32_at(bytes, at)? as i32)
 }
-fn put16(bytes: &mut [u8], at: usize, value: u16) {
+pub(super) fn put16(bytes: &mut [u8], at: usize, value: u16) {
     bytes[at..at + 2].copy_from_slice(&value.to_ne_bytes());
 }
-fn put32(bytes: &mut [u8], at: usize, value: u32) {
+pub(super) fn put32(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_ne_bytes());
 }
-fn rounded(length: usize) -> usize {
+pub(super) fn rounded(length: usize) -> usize {
     length.max(1).div_ceil(4) * 4
 }
 pub(super) fn frame(bytes: &[u8]) -> Result<&[u8], Error> {

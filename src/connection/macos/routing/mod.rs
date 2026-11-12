@@ -1,8 +1,12 @@
-//! Native read-only routing evidence. This module cannot add/delete routes.
+//! Native routing. Reader stays GET-only; the separate privileged writer can
+//! only ADD to a retained, verified PPP interface. No DELETE/CHANGE API exists.
+mod add_codec;
 mod codec;
 mod read;
+mod write;
 use crate::connection::routes::{Address, Error, Key, Network, NextHop, Route};
 pub use read::{Reader, Snapshot};
+pub use write::{AddReceipt, AddWriter};
 
 #[derive(Clone, Debug)]
 pub struct Record {

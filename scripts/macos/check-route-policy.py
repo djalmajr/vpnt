@@ -122,6 +122,38 @@ def main():
         ("controller-hardlink-accepted", "src/helper/controller_lock.rs",
          lambda s: replace_once(s, "        || metadata.nlink() != 1\n", ""),
          ["--lib", "absent_special_linked_or_exposed_lock"]),
+        # ADD mutations execute only the C/private-AF_UNIX consumer. They never
+        # call AddWriter::open or send any opcode to an actual PF_ROUTE socket.
+        ("add-opcode-changed", "src/connection/macos/routing/add_codec.rs",
+         lambda s: replace_once(s, "bytes[3] = libc::RTM_ADD as u8;", "bytes[3] = libc::RTM_DELETE as u8;"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-interface-corrupted", "src/connection/macos/routing/add_codec.rs",
+         lambda s: replace_once(s, "put16(&mut link, 2, route.interface);", "put16(&mut link, 2, route.interface + 1);"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-source-zone-omitted", "src/connection/macos/routing/add_codec.rs",
+         lambda s: replace_once(s, "put32(&mut bytes, 24, address.zone);", "put32(&mut bytes, 24, 0);"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-foreign-pid-accepted", "src/connection/macos/routing/write.rs",
+         lambda s: replace_once(s, "codec::signed(frame, offset_of!(libc::rt_msghdr, rtm_pid))? != pid", "false"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-foreign-sequence-accepted", "src/connection/macos/routing/write.rs",
+         lambda s: replace_once(s, "codec::signed(frame, offset_of!(libc::rt_msghdr, rtm_seq))? != sequence", "false"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-source-mismatch-ignored", "src/connection/macos/routing/write.rs",
+         lambda s: replace_once(s, " || actual.source != Some(source)", ""),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-lost-ack-accepted", "src/connection/macos/routing/write.rs",
+         lambda s: replace_once(s, "        confirm(fd, route, source, pid, sequence, deadline, canceled)", "        match confirm(fd, route, source, pid, sequence, deadline, canceled) { Err(Error::TimedOut) => Ok(()), result => result }"),
+         ["--lib", "add_consumer_uses_sdk_abi"]),
+        ("add-canceled-attempt-forgotten", "src/connection/macos/routing/write.rs",
+         lambda s: replace_once(s, "    Ok(AddReceipt {\n        route,\n        confirmation,\n    })", "    confirmation?;\n    Ok(AddReceipt { route, confirmation })"),
+         ["--lib", "cancellation_after_dispatch"]),
+        ("ppp-attachment-readback-omitted", "src/connection/macos/ppp_attachment.rs",
+         lambda s: replace_once(s, "    socket.verify(api)?;\n", ""),
+         ["--lib", "a_raced_or_mismatched_attachment"]),
+        ("ppp-attachment-final-owner-check-omitted", "src/connection/macos/ppp_attachment.rs",
+         lambda s: replace_once(s, "    socket.verify(api)?;\n    if !current()? {", "    socket.verify(api)?;\n    if false && !current()? {"),
+         ["--lib", "a_raced_or_mismatched_attachment"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -139,7 +171,7 @@ def main():
             native = ["--lib", "connection::macos"]
             lock = ["--lib", "helper::controller_lock"]
             receipt["baseline-policy"] = run(copy, "baseline-policy", tests, 0)
-            receipt["baseline-native-read"] = run(copy, "baseline-native-read", native, 0)
+            receipt["baseline-native-consumers"] = run(copy, "baseline-native-consumers", native, 0)
             receipt["baseline-controller-lock"] = run(copy, "baseline-controller-lock", lock, 0)
             for name, path, mutation, arguments in mutations:
                 file = copy / path
@@ -150,7 +182,7 @@ def main():
                 finally:
                     file.write_text(original)
             receipt["restored-policy"] = run(copy, "restored-policy", tests, 0)
-            receipt["restored-native-read"] = run(copy, "restored-native-read", native, 0)
+            receipt["restored-native-consumers"] = run(copy, "restored-native-consumers", native, 0)
             receipt["restored-controller-lock"] = run(copy, "restored-controller-lock", lock, 0)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")

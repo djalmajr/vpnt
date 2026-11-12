@@ -92,7 +92,7 @@ impl Snapshot {
     }
 }
 pub struct Reader {
-    fd: OwnedFd,
+    pub(super) fd: OwnedFd,
 }
 impl Reader {
     pub fn open() -> Result<Self, Error> {
