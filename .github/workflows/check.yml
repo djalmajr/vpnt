@@ -49,6 +49,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-pinentry-consumer.py
+      - name: Verify helper channel negative oracles
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-helper-channel.py
       - name: Verify route policy negative oracles
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

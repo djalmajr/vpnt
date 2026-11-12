@@ -42,6 +42,11 @@ impl ControllerLock {
         Self::at(Path::new(super::paths::STATE), 0)
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fixture(directory: &Path, owner: u32) -> Result<Self, LockError> {
+        Self::at(directory, owner)
+    }
+
     fn at(directory: &Path, owner: u32) -> Result<Self, LockError> {
         check_directory(directory, owner)?;
         let file = OpenOptions::new()

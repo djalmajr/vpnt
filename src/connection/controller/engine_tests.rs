@@ -81,6 +81,7 @@ impl Backend for Table {
     }
 }
 struct Fixture {
+    uid: u32,
     kernel: Shared,
     routes: Arc<Mutex<Coordinator<Table>>>,
 }
@@ -94,7 +95,7 @@ impl Factory for Fixture {
         credentials: Credentials,
         canceled: Arc<AtomicBool>,
     ) -> Self::Attempt {
-        assert_eq!(uid, 501);
+        assert_eq!(uid, self.uid);
         assert!(generation > 0);
         let mut kernel = self.kernel.lock().unwrap();
         let index = 3 + kernel.attempts.len() as u16;
@@ -261,6 +262,7 @@ impl Harness {
         let kernel = Arc::new(Mutex::new(Kernel::default()));
         let routes = Arc::new(Mutex::new(Coordinator::new(Table(kernel.clone())).unwrap()));
         let fixture = Fixture {
+            uid: 501,
             kernel: kernel.clone(),
             routes,
         };
@@ -653,4 +655,105 @@ fn unread_output_does_not_block_cancel_and_bounded_overflow_shuts_down_safely() 
     }
     assert!(h.kernel.lock().unwrap().attempts[&("one".into(), 1)].stopped);
     assert!(h.worker.take().unwrap().join().unwrap().is_ok());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_eof() {
+    use std::{net::Shutdown, os::unix::net::UnixStream};
+    let (client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let kernel = Arc::new(Mutex::new(Kernel::default()));
+    let routes = Arc::new(Mutex::new(Coordinator::new(Table(kernel.clone())).unwrap()));
+    let uid = unsafe { libc::geteuid() };
+    let fixture = Fixture {
+        uid,
+        kernel: kernel.clone(),
+        routes,
+    };
+    let worker = thread::spawn(move || {
+        crate::helper::server::runtime_fixture(server, |actual, requests, output| {
+            assert_eq!(actual, uid);
+            run(
+                fixture,
+                actual,
+                vec![profile("one")],
+                requests,
+                output,
+                Timing {
+                    connect: Duration::from_secs(5),
+                    probe: Duration::from_secs(1),
+                    interval: Duration::from_secs(60),
+                    poll: Duration::from_millis(2),
+                },
+            )
+        })
+    });
+    let (_, output) = mpsc::sync_channel(1);
+    let mut h = Harness {
+        input: None,
+        output,
+        kernel,
+        worker: Some(worker),
+        seen: vec![],
+        next_request: 0,
+    };
+    // Declared after the guard: on assertion failure the socket closes before
+    // Harness releases its simulated cleanup barriers and joins the controller.
+    let mut client = BufReader::new(client);
+    crate::helper::protocol::write_request(
+        client.get_mut(),
+        &Request {
+            id: "socket-connect".into(),
+            command: Command::Connect {
+                id: "one".into(),
+                generation: 1,
+                credentials: Credentials {
+                    password: "fixture-password".into(),
+                    psk: "".into(),
+                },
+            },
+        },
+    )
+    .unwrap();
+    h.started("one", 1);
+    h.control("one", 1, |c| {
+        c.ready = true;
+        c.responsive = true;
+    });
+    loop {
+        let message = read_message(&mut client).unwrap().unwrap();
+        if matches!(
+            message,
+            Message::Changed {
+                state: ConnectionState::Connected,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    h.kernel.lock().unwrap().retired_pending = true;
+    client.get_mut().shutdown(Shutdown::Write).unwrap();
+    h.control("one", 1, |c| c.cleanup_allowed = true);
+    h.wait(|h| {
+        h.kernel
+            .lock()
+            .unwrap()
+            .attempts
+            .values()
+            .all(|c| c.finished)
+    });
+    h.wait(|h| {
+        h.kernel.lock().unwrap().retirement_observed || h.worker.as_ref().unwrap().is_finished()
+    });
+    assert!(
+        !h.worker.as_ref().unwrap().is_finished(),
+        "socket EOF cannot release pending retirement"
+    );
+    h.kernel.lock().unwrap().retired_pending = false;
+    h.finish();
+    assert!(read_message(&mut client).unwrap().is_none());
 }

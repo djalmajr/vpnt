@@ -3,7 +3,7 @@
 //! Only this parent holds/signals/reaps Child; the controller observes identity
 //! and exit, never signals a PID from a log or configuration record.
 mod raw;
-mod signals;
+pub(crate) mod signals;
 use super::{local_socket::peer_uid, process::ManagedChild};
 use std::{
     io,

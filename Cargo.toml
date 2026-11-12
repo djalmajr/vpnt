@@ -45,3 +45,7 @@ path = "src/bin/vpnt-pinentry.rs"
 [[bin]]
 name = "vpnt-pppd"
 path = "src/bin/vpnt-pppd.rs"
+
+[[bin]]
+name = "vpnt-helper"
+path = "src/bin/vpnt-helper.rs"

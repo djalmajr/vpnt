@@ -17,3 +17,6 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(unix)]
 pub mod vici;
+
+#[cfg(target_os = "macos")]
+pub mod server;

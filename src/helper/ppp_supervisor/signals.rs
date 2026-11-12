@@ -2,11 +2,11 @@ use std::{
     io,
     sync::atomic::{AtomicBool, Ordering},
 };
-pub(super) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+pub(crate) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn interrupt(_: i32) {
     INTERRUPTED.store(true, Ordering::Release);
 }
-pub(super) struct Guard {
+pub(crate) struct Guard {
     previous: Vec<(i32, libc::sigaction)>,
 }
 impl Guard {
