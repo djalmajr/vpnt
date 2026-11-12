@@ -9,6 +9,11 @@ fn main() {
         eprintln!("vpnt pinentry requires its privileged parent");
         std::process::exit(77);
     }
+    // SAFETY: this fixed one-shot adapter only needs FD 3. FD 4 belongs to
+    // PPP supervision in the parent and must not keep that capability alive.
+    unsafe {
+        libc::close(4);
+    }
     if pinentry::serve(
         &mut BufReader::new(io::stdin().lock()),
         &mut io::stdout().lock(),

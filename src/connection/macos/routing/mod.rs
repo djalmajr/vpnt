@@ -10,7 +10,7 @@ pub use backend::{InterfaceToken, NativeBackend, NativeReceipt};
 pub use read::{Reader, Snapshot};
 pub use write::{AddReceipt, AddWriter};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Record {
     pub key: Key,
     pub interface: u16,
@@ -18,7 +18,7 @@ pub struct Record {
     pub gateway: Option<Gateway>,
     pub source: Option<Address>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Gateway {
     Address(Address),
     Link(u16),

@@ -266,6 +266,12 @@ def main():
         ("controller-queued-reconnect-survives-disconnect", "src/connection/controller/engine/dispatch.rs",
          lambda s: replace_once(s, "            slot.pending = None;\n", ""),
          ["--lib", "cancel_before_discovery_does_not_forget"]),
+        ("early-unattributed-ppp-forgotten", "src/connection/macos/ppp_early_cleanup.rs",
+         lambda s: replace_once(s, "before.entries.get(&interface.name) != Some(interface)", "false"),
+         ["--lib", "early_cleanup_preserves_before"]),
+        ("early-unknown-route-forgotten", "src/connection/macos/ppp_early_cleanup.rs",
+         lambda s: replace_once(s, "        return false;\n    }\n    true\n}", "        return true;\n    }\n    true\n}"),
+         ["--lib", "early_cleanup_requires_implicit"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()

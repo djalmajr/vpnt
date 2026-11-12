@@ -6,7 +6,7 @@ use std::{
     ptr,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Interface {
     pub name: String,
     pub index: u32,

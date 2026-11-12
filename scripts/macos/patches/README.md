@@ -38,3 +38,18 @@ O build executa o consumidor TCP C real com um listener em loopback. O script
 cópia descartável da fonte verificada; DNS é interceptado para que a mutação
 não faça lookup externo. O mesmo licenciamento do openfortivpn se aplica.
 O hash deste patch também é obrigatório na admissão do runtime.
+
+`openfortivpn-ppp-supervisor.patch` modifica o `pppd_run` Apple em `tunnel.c`
+da mesma versão: executa somente o caminho fixo
+`/Library/PrivilegedHelperTools/dev.vpnt.pppd`, sem fallback para pppd direto.
+Registra PID/PTY próprios antes de uma possível falha de fcntl. O supervisor
+recebe o FD 4 herdado; seu receptor e o canal de senha FD 3 são preparados
+juntos pelo driver. O hash deste terceiro patch do openfortivpn é obrigatório
+no manifest e na admissão Rust. O mesmo licenciamento GPL-3.0-or-later se aplica.
+
+`../check-ppp-supervisor.py` aplica o patch ao tarball verificado e troca apenas
+o caminho do executável por um supervisor de fixture. Exercita o forkpty/argv
+C real, um payload PPP fictício e tanto o receptor independente quanto o
+produtivo. O runtime nativo foi recompilado e admitido com esse patch; não foi
+instalado e nenhum pppd do sistema foi executado. A auditoria de configuração
+global e scripts do pppd continua sendo requisito antes de execução real.

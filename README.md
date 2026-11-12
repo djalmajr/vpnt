@@ -137,9 +137,11 @@ de cadastros que falharam. Estados de worker são mantidos em memória de forma
 limitada; saída lenta não bloqueia o cancelamento. Os testes passam pelo codec
 real, coordenador e processos de teste próprios, com rede e PPP simuladas.
 O adaptador root está compilado, mas não foi executado nem exposto na UI.
-Ainda falta observar criação/saída de pppd desde o início do cliente: sem essa
-prova, cancelamento ou falha antes de descobrir a PPP mantém cleanup pendente,
-sem presumir que a saída do cliente removeu todos os recursos.
+O canal herdado já observa o cliente, o supervisor e o filho PPP desde as
+barreiras anteriores ao exec, conservando os três watches originais. Falhas
+após spawn mantêm o driver e seus recibos. Se houve permissão antes de descobrir
+a interface, o cleanup compara interfaces/rotas com a observação anterior:
+recursos novos sem atribuição segura mantêm pendência, sem remoção por palpite.
 
 O runtime inclui uma cópia dos certificados públicos de
 `SystemRootCertificates.keychain`, conferida e incluída no inventário. A exportação
@@ -157,10 +159,13 @@ somente a lista fixa de argumentos, exige root e um canal herdado em FD 4,
 autoriza supervisor e filho antes do exec, conserva o PTY e espera o filho
 próprio antes de emitir seu recibo final. Não encaminha os canais de senha e
 controle ao programa PPP. Os testes executam forks, sinais e watches reais,
-com um payload fictício no lugar de `/usr/sbin/pppd`. Esse componente ainda
-não está instalado nem ligado ao runtime/controlador; o caso de cleanup
-precoce acima permanece pendente até essa integração e a prova de recursos
-de rede. Não foi executado o pppd do sistema.
+com um payload fictício no lugar de `/usr/sbin/pppd`. Esse componente
+já está ligado ao runtime e ao controlador preparados, mas não está instalado.
+O receptor autentica UID, programa, pai e identidade nativa antes de conceder
+cada permissão; EOF ou recibo final não substituem os watches de saída.
+O runtime recompilado exige o patch e o hash desse caminho fixo. A auditoria
+das opções/scripts globais, a execução privilegiada e a prova de remoção dos
+recursos reais continuam pendentes. Não foi executado o pppd do sistema.
 
 ## Proposta visual
 

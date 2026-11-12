@@ -16,13 +16,14 @@ fn main() {
         .strip_prefix("adapter-")
         .unwrap();
     let directory = executable.parent().unwrap();
-    let mut command = Command::new(if mode == "exec-failure" {
+    let payload_mode = mode.strip_prefix("host-").unwrap_or(mode);
+    let mut command = Command::new(if payload_mode == "exec-failure" {
         directory.join("absent-child")
     } else {
         directory.join("child")
     });
     command
-        .arg(mode)
+        .arg(payload_mode)
         .arg(directory.join(format!("marker-{mode}")))
         .env("VPNT_MUST_NOT_REACH_PPP", "fixture");
     // SAFETY: this fixture is a one-shot supervisor; the C parent reserved

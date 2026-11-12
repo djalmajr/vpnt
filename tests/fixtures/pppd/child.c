@@ -15,9 +15,11 @@ int main(int argc,char **argv) {
     assert(getenv("VPNT_MUST_NOT_REACH_PPP")==NULL);
     assert(strcmp(getenv("LANG"),"C")==0);
     if(strcmp(argv[1],"ignore-term")==0) signal(SIGTERM,SIG_IGN);
+    if(strcmp(argv[1],"orphan")==0) { signal(SIGHUP,SIG_IGN);signal(SIGTERM,SIG_IGN); }
     FILE *marker=fopen(argv[2],"w");assert(marker);
     fprintf(marker,"%d\n",getpid());assert(fclose(marker)==0);
     puts("fixture PPP payload ready");fflush(stdout);
     if(strcmp(argv[1],"normal")==0) return 0;
+    if(strcmp(argv[1],"orphan")==0) { usleep(1000000);return 0; }
     while(1) pause();
 }

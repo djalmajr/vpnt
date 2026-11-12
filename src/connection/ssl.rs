@@ -5,7 +5,10 @@ use super::ssl_output::Output;
 use crate::helper::{pinentry_channel::PinentryChild, process::StopOutcome};
 #[cfg(target_os = "macos")]
 use crate::{
-    connection::macos::egress::Egress,
+    connection::macos::{
+        egress::Egress,
+        ppp_control::{Control, Policy, Proof},
+    },
     helper::{
         paths,
         runtime::{Program, Runtime, RuntimeError},
@@ -17,7 +20,9 @@ use std::{io, time::Duration};
 #[cfg(target_os = "macos")]
 use std::{
     net::{IpAddr, Ipv4Addr},
+    os::unix::net::UnixStream,
     process::Command,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 #[cfg(target_os = "macos")]
@@ -62,18 +67,18 @@ pub struct Update {
     pub candidate: Option<InterfaceName>,
     pub failure: Option<SslFailure>,
     pub exited: bool,
+    pub start_error: Option<StartError>,
 }
 
 pub struct SslDriver {
     child: PinentryChild,
     output: Output,
+    #[cfg(target_os = "macos")]
+    supervision: Control,
+    start_error: Option<StartError>,
 }
 
 impl SslDriver {
-    #[cfg(target_os = "macos")]
-    pub(super) fn id(&self) -> u32 {
-        self.child.id()
-    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     #[cfg(target_os = "macos")]
@@ -81,6 +86,7 @@ impl SslDriver {
         profile: &Profile,
         credentials: Credentials,
         egress: &Egress,
+        canceled: &Arc<AtomicBool>,
     ) -> Result<Self, StartError> {
         // SAFETY: UID queries have no memory preconditions.
         if !cfg!(target_os = "macos") || unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {
@@ -88,13 +94,14 @@ impl SslDriver {
         }
         let runtime = Runtime::installed().map_err(map_runtime)?;
         Runtime::verify_pinentry().map_err(map_runtime)?;
+        Runtime::verify_ppp_supervisor().map_err(map_runtime)?;
         let binding = egress
             .binding(profile)
             .map_err(|_| StartError::Unavailable)?;
-        let mut driver = Self::start_using(&runtime, profile, credentials, &binding)?;
+        let mut driver =
+            Self::start_using(&runtime, profile, credentials, &binding, canceled.clone())?;
         if !egress.is_current(profile).unwrap_or(false) {
-            let _ = driver.stop();
-            return Err(StartError::Unavailable);
+            driver.start_error = Some(StartError::Unavailable);
         }
         Ok(driver)
     }
@@ -104,31 +111,65 @@ impl SslDriver {
         profile: &Profile,
         credentials: Credentials,
         binding: &Binding,
+        canceled: Arc<AtomicBool>,
     ) -> Result<Self, StartError> {
         let command = command(runtime, profile, binding)?;
         credentials
             .validate(VpnKind::Ssl)
             .map_err(|_| StartError::InvalidSecret)?;
         runtime.verify().map_err(map_runtime)?;
-        let child = PinentryChild::spawn_private_runtime(command, credentials.password)
-            .map_err(|_| StartError::Unavailable)?;
+        let (server, supervisor) = UnixStream::pair().map_err(|_| StartError::Unavailable)?;
+        let child =
+            PinentryChild::spawn_private_runtime(command, credentials.password, supervisor.into())
+                .map_err(|_| StartError::Unavailable)?;
+        // No permission has been issued before this control object exists.
+        // Construction failure closes the capability and the owned client;
+        // admitted runtime code cannot bypass the supervisor gate.
+        let supervision = Control::new(
+            server,
+            child.id(),
+            Policy {
+                owner: runtime.owner(),
+                client: runtime.program(Program::Fortinet),
+                supervisor: paths::PPP_SUPERVISOR.into(),
+                ppp: crate::helper::ppp_supervisor::SYSTEM_PPP.into(),
+            },
+            canceled,
+        )
+        .map_err(|_| StartError::Unavailable)?;
         let mut driver = Self {
             child,
             output: Output::default(),
+            supervision,
+            start_error: None,
         };
-        let stdout = driver.child.take_stdout().ok_or(StartError::Unavailable)?;
-        driver
-            .output
-            .attach(stdout)
-            .map_err(|_| StartError::Unavailable)?;
-        let stderr = driver.child.take_stderr().ok_or(StartError::Unavailable)?;
-        driver
-            .output
-            .attach(stderr)
-            .map_err(|_| StartError::Unavailable)?;
+        let setup = (|| {
+            let stdout = driver.child.take_stdout().ok_or(StartError::Unavailable)?;
+            driver
+                .output
+                .attach(stdout)
+                .map_err(|_| StartError::Unavailable)?;
+            let stderr = driver.child.take_stderr().ok_or(StartError::Unavailable)?;
+            driver
+                .output
+                .attach(stderr)
+                .map_err(|_| StartError::Unavailable)
+        })();
+        // After spawn, retain the driver/receipts even when setup fails.
+        driver.start_error = setup.err();
         Ok(driver)
     }
     pub fn poll(&mut self) -> io::Result<Update> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.start_error.is_some() {
+                self.supervision.cancel();
+            }
+            self.supervision.poll()?;
+            if self.supervision.failed() {
+                self.start_error = Some(StartError::Unavailable);
+            }
+        }
         let exited = self.child.poll()?.is_some();
         if exited {
             self.output.finish();
@@ -138,14 +179,30 @@ impl SslDriver {
             candidate: observed.candidate,
             failure: observed.failure,
             exited,
+            start_error: self.start_error,
         })
     }
     /// This confirms exit of the direct client only. The controller must also
     /// verify PPP and its leased routes are gone, including after escalation.
     pub fn stop(&mut self) -> io::Result<StopOutcome> {
+        #[cfg(target_os = "macos")]
+        self.supervision.cancel();
         let result = self.child.stop(Duration::from_secs(3));
         self.output.finish();
         result
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn supervised_ppp(&self) -> Option<Arc<Proof>> {
+        self.supervision.proof()
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ppp_may_have_run(&self) -> bool {
+        self.supervision.may_have_run()
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn children_complete(&mut self) -> io::Result<bool> {
+        let exited = self.child.poll()?.is_some();
+        self.supervision.complete(exited)
     }
 }
 impl Drop for SslDriver {

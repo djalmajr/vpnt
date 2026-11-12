@@ -445,11 +445,11 @@ python3 scripts/macos/check-ppp-supervisor-mutations.py
 
 Os comandos exigem macOS, usuário comum e o tarball do openfortivpn 1.24.1
 preparado pelo build de runtime/consumidor de pinentry. O SHA-256 é conferido
-antes de extrair somente `pppd_run` e seu construtor de argv. O programa C
-executa esse código original em fixture de configuração, sem rede. O próprio
-forkpty, PTY e exec são reais; `/usr/sbin/pppd` é substituído por um programa C
-fictício. Ele confere stdio no PTY, ambiente limpo, ausência de FD 3/4 e grava
-somente um marcador local para provar que chegou ao exec.
+antes de aplicar o patch obrigatório e extrair `pppd_run` e seu construtor de
+argv. A fixture troca somente o caminho fixo do supervisor para o executável
+de teste. Forkpty, PTY e exec são reais; `/usr/sbin/pppd` é substituído por um
+programa C fictício. Ele confere stdio no PTY, ambiente limpo, ausência de FD 3/4
+e grava somente um marcador local para provar que chegou ao exec.
 
 O supervisor preparado aceita a lista completa e exata de argumentos; não
 aceita call, file, plugin, caminhos ou opções adicionais. O entrypoint produtivo
@@ -463,36 +463,53 @@ exec. I/O de cada handshake tem prazo monotônico de cinco segundos.
 EOF, dados de controle inesperados e HUP/INT/TERM revogam a execução. O
 supervisor sinaliza apenas seu Child não reaped, espera término e pode escalar
 para KILL desse mesmo handle após um segundo. O recibo final vem após wait;
-falha de protocolo/exec não é transformada em sucesso. O controlador futuro
-deverá autenticar o programa, pai, UID e início com observação nativa antes de
-conceder cada permissão, e manter os watches originais até a saída.
+falha de protocolo/exec não é transformada em sucesso.
 
-O consumidor de teste implementa o outro lado do wire sem usar o codec do
-supervisor. Confere identidades nativas antes do exec e mantém três ExitWatch
-reais. Os 14 cenários cobrem término normal, EOF, TERM ignorado/escalation,
-saída do cliente, fechamento real do PTY/HUP, dado extra, PID incorreto nas duas
-permissões, revogação durante o pre_exec, peer errado, exec ausente, call e
-opções adicionais e rejeição do binário produtivo como usuário comum. Um
-marcador não pode existir antes das permissões. No recibo final o filho
-original não pode continuar executando; todos os watches e EOF são conferidos.
+O receptor produtivo autentica UID real/efetivo, executável, pai e identidade
+PID/início via APIs nativas antes de cada permissão. Mantém três ExitWatch
+originais e registra a possível autorização antes de escrever o ACK. Cancelar
+fecha a escrita, conservando a leitura de recibos/EOF. A saída do cliente e
+EOF não encerram cleanup após uma possível autorização: todos os três watches
+precisam indicar saída, mesmo que o recibo final tenha sido perdido.
+O driver passa senha em FD 3 e controle em FD 4 no mesmo pre_exec; pinentry
+fecha FD 4, e o filho PPP não recebe nenhum dos dois canais após exec.
+
+Os 14 cenários de wire usam um receptor independente. Cobrem término normal,
+EOF, TERM ignorado/escalation, saída do cliente, fechamento real do PTY/HUP,
+dado extra, PID incorreto nas duas permissões, revogação durante pre_exec,
+peer errado, exec ausente, call/opções adicionais e rejeição do binário
+produtivo como usuário comum. Um marcador não pode existir antes das permissões.
+Nove cenários adicionais usam o receptor produtivo e a passagem real de FD 3/4,
+com proprietário/caminhos próprios de fixture: normal, revogação, TERM ignorado,
+saída do pai, programa errado, pai estrangeiro, falha de exec, cancelamento
+prévio e órfão. No último, o cliente de teste mata somente seu supervisor filho;
+o payload ignora HUP/TERM e termina sozinho. O receptor precisa manter cleanup
+pendente depois do EOF/saída dos pais até o watch do PPP original indicar saída.
 Os prazos estão implementados, mas silêncio por cinco segundos ainda não é
 um cenário separado dessa suíte.
 
-A matriz usa cópia descartável com source/build próprios: baseline de 14 casos,
-nove mutações e restauração de 14 casos. Compilação/formatação não contam como
-falha discriminante: exige assertion executada do consumidor. As mutações
-removem as duas permissões, comparação de PID, CLOEXEC, fechamento da senha,
-tratamento de HUP/wait, ordem do recibo, preservação do PTY e limite de argv.
-Comandos, exits e hashes de src/tests ficam em `output/fixtures/ppp-supervisor/`
-e `output/fixtures/ppp-supervisor-oracles/`; fonte/build descartáveis são removidos.
+A matriz usa cópia descartável com source/build próprios: baseline de 14 casos
+wire e nove do receptor, 11 mutações e restauração dos mesmos 23 casos.
+Compilação/formatação não contam como falha discriminante: exige assertion
+executada do consumidor. As mutações removem as duas permissões, comparação de
+PID, CLOEXEC, fechamento da senha, tratamento de HUP/wait, ordem do recibo,
+preservação do PTY, limite de argv, verificação de pai no receptor e espera do
+PPP órfão. Comandos, exits e hashes de src/tests ficam em
+`output/fixtures/ppp-supervisor/` e `output/fixtures/ppp-supervisor-oracles/`;
+fonte/build descartáveis são removidos.
 
-**Limites:** código do receptor/recibos no controlador, passagem isolada de FD 4
-com FD 3, admissão do binário, patch do runtime, nova cadeia cliente/supervisor/
-pppd na prova de propriedade e cleanup de interfaces/rotas ainda precisam ser
-integrados. O supervisor não está no .app ou instalado. Validar options/scripts
-efetivos do pppd antes de habilitar a execução real; argv fechado não elimina
-automaticamente sua configuração global. Nenhum teste chamou system pppd,
-criou interface, alterou rotas ou usou credenciais de VPN.
+O runtime nativo foi recompilado com os três patches do openfortivpn; a admissão
+Rust do artefato preparado passou. O manifest exige o hash do patch de supervisão,
+e o teste de política recusa sua ausência ou hash divergente. A fixture TCP
+executada com esses mesmos patches passou os seis casos e três mutações;
+o consumidor nativo de senha passou 12 casos. Isso não instala o runtime.
+
+**Limites:** o receptor, o driver e o backend estão integrados em código, sem
+helper/UI instalado. Validar options/scripts efetivos do pppd antes de habilitar
+a execução real; argv fechado não elimina sua configuração global. A checagem
+de cleanup precoce descrita abaixo tem evidência de fixture, não de recursos PPP
+reais. Nenhum teste chamou system pppd, criou interface, alterou rotas ou usou
+credenciais de VPN.
 
 ## Controlador SSL por geração
 
@@ -535,14 +552,19 @@ EOF espera uma observação real da barreira de aposentadoria ou um término
 indevido do controlador; uma consulta instantânea a `is_finished` sozinha
 não prova que o loop já chegou a essa barreira.
 
-**Limite obrigatório antes da integração instalada:** o adaptador nativo mantém
-cleanup pendente se houve tentativa de spawn e não foi possível comprovar a PPP,
-inclusive em erro de setup após possível criação do cliente. Não há timeout que
-transforme essa incerteza em Off ou libere uma nova geração. Falta o canal de
-criação/saída dos filhos desde o início do cliente, para fechar esse caso de
-cancelamento/falha precoce. Auditar também options/scripts efetivos de pppd antes
-de executar conexão privilegiada. A descoberta posterior pelo configd e o exit
-do cliente, sozinhos, não fornecem essa prova. A ligação ao helper/broker/UI,
+Se o setup falha depois do spawn, o driver conserva processo e recibos até
+cleanup. Antes de qualquer permissão PPP, EOF após saída do cliente prova que
+nenhum holder pode obter uma permissão futura. Se houve possível permissão,
+o controlador espera os três processos originais. Quando ainda não descobriu
+OwnedPpp, usa a observação anterior de interfaces/rotas e uma releitura de configd:
+uma PPP nova/alterada sem dono estrangeiro comprovado ou uma rota nova sem
+explicação segura conserva a pendência. Preserva observações anteriores e PPPs
+estrangeiras comprovadas; não apaga interface/rota por nome, PID ou chave.
+Dois testes puros e duas mutações discriminantes exercitam esse fallback,
+incluindo PPP anterior inativa que aparece ativa, rota local residual,
+neighbor cache físico e rota cujo índice já desapareceu. Não houve execução
+privilegiada desse caminho ou prova de purge real. Não há timeout que transforme
+incerteza em Off. A ligação ao helper/broker/UI, auditoria de opções/scripts,
 instalação e conexão real continuam pendentes.
 
 ## Política de rotas e leitura nativa
@@ -583,7 +605,7 @@ compilação não contam como mutações detectadas. A mutação de opcode GET e
 C/AF_UNIX. Nenhuma envia o opcode alterado a um socket de rotas.
 As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
-São 65 mutações, incluindo remoção do vínculo de perfil da saída SSL,
+São 67 mutações, incluindo remoção do vínculo de perfil da saída SSL,
 aceitação indevida de DNS sem escopo para probe e retirada do flock, vínculo
 de inode, ACL ou checagem de hardlink do controlador. As dez novas de ADD/PPP
 retiram opcode correto, índice, zona da origem, PID/seq, comparação de origem,
@@ -601,7 +623,9 @@ nenhuma dessas mutações cria uma UTUN ou endereço real.
 Oito novas do controlador aceitam estado/operador antigo, iniciam substituto
 antes de cleanup, omitem a espera de cleanup/aposentadoria, promovem conexão
 sem teste, aceitam probe sem resposta ou preservam uma reconexão após desligar.
-Baseline e restauração também executam os sete cenários do controlador.
+Duas adicionais retiram a espera por PPP nova/alterada sem atribuição e por
+rotas residuais no cleanup precoce. Baseline e restauração também executam os
+sete cenários do controlador e os dois testes desse fallback.
 As baselines nativas incluem
 seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 Baseline e restauração também executam os cinco testes do lock. O processo

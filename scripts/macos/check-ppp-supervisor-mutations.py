@@ -39,6 +39,8 @@ def run(copy, label, expected):
         receipt = json.loads((copy / "output/fixtures/ppp-supervisor/receipt.json").read_text())
         if len(receipt["cases"]) != 14 or any(case["exit"] for case in receipt["cases"].values()):
             raise RuntimeError(f"{label}: incomplete baseline")
+        if len(receipt.get("hostCases", {})) != 9 or any(case["exit"] for case in receipt["hostCases"].values()):
+            raise RuntimeError(f"{label}: incomplete production-host baseline")
     shutil.copytree(copy / "output/fixtures/ppp-supervisor", REPORTS / label, dirs_exist_ok=True)
     print(f"{label}: script exit {result.returncode}, failed consumers {list(failed)}", flush=True)
     return {"exit": result.returncode, "failedConsumers": list(failed)}
@@ -59,6 +61,8 @@ def main():
         ("final-receipt-before-child-wait", supervisor, early_receipt),
         ("ppp-stdio-replaced-with-pipes", "src/helper/process.rs", lambda s: replace_once(s, "Self::spawn_configured(command, Environment::System, true)", "Self::spawn_configured(command, Environment::System, false)")),
         ("extra-ppp-options-accepted", supervisor, lambda s: replace_once(s, "arguments.len() == ARGUMENTS.len()", "arguments.len() >= ARGUMENTS.len()")),
+        ("host-foreign-parent-accepted", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "(parent != 0 && value.parent != parent)", "false")),
+        ("host-eof-substitutes-child-exit", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "self.proof.as_ref().map_or(Ok(true), |proof| proof.exited())", "Ok(true)")),
     ]
     receipt = {"sourceSha256": {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for prefix in ["src", "tests"] for path in sorted((ROOT / prefix).rglob("*")) if path.is_file()}}
     try:
@@ -84,7 +88,7 @@ def main():
             receipt["restored"] = run(copy, "restored", 0)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    print(f"Killed {len(mutations)} supervisor mutations; both 14-case baselines passed; copy removed")
+    print(f"Killed {len(mutations)} supervision mutations; both 14-wire/9-host baselines passed; copy removed")
 
 
 if __name__ == "__main__":

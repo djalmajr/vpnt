@@ -2,6 +2,7 @@
  * inherited secret channel, then emits deliberately untrusted client output. */
 #include <arpa/inet.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ int main(int argc,char **argv) {
     assert(strcmp(getenv("OPENSSL_MODULES"),RUNTIME_PREFIX "/lib/ossl-modules")==0);
     assert(strcmp(getenv("SSL_CERT_FILE"),RUNTIME_PREFIX "/certs/ca-bundle.pem")==0);
     assert(getenv("DYLD_LIBRARY_PATH")==NULL && getenv("DYLD_INSERT_LIBRARIES")==NULL);
+    assert(fcntl(4,F_GETFD)>=0); /* independent supervision capability */
     unsigned char request[8]={'V','P','T','1'};
     uint32_t pid=htonl((uint32_t)getpid());memcpy(request+4,&pid,4);
     assert(write(3,request,8)==8 && shutdown(3,SHUT_WR)==0);

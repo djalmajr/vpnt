@@ -71,6 +71,9 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub(crate) fn owner(&self) -> u32 {
+        self.owner
+    }
     pub fn installed() -> Result<Self, RuntimeError> {
         Self::inspect(paths::runtime_directory(), 0)
     }
@@ -120,6 +123,15 @@ impl Runtime {
                             ))
                         ),
                     ),
+                    (
+                        "openfortivpn-ppp-supervisor.patch".into(),
+                        format!(
+                            "{:x}",
+                            Sha256::digest(include_bytes!(
+                                "../../scripts/macos/patches/openfortivpn-ppp-supervisor.patch"
+                            ))
+                        ),
+                    ),
                 ])
             || manifest.files.len() > 64
             || !valid_version(&manifest.minimum_macos)
@@ -152,7 +164,12 @@ impl Runtime {
     /// Only the fixed auxiliary executable is admitted in production. Root
     /// ownership and all ancestors are checked independently from the C runtime.
     pub fn verify_pinentry() -> Result<(), RuntimeError> {
-        let path = Path::new(paths::PINENTRY);
+        Self::verify_adapter(Path::new(paths::PINENTRY))
+    }
+    pub fn verify_ppp_supervisor() -> Result<(), RuntimeError> {
+        Self::verify_adapter(Path::new(paths::PPP_SUPERVISOR))
+    }
+    fn verify_adapter(path: &Path) -> Result<(), RuntimeError> {
         check_directory(path.parent().ok_or(RuntimeError::Untrusted)?, 0)?;
         let bytes = read_file(path, 0, true, MAX_FILE)?;
         check_macho(&bytes, &BTreeMap::new(), true)

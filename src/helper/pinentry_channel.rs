@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     net::Shutdown,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{ChildStderr, ChildStdout, Command, ExitStatus},
@@ -36,17 +36,31 @@ pub struct PinentryChild {
 
 impl PinentryChild {
     pub fn spawn(command: Command, password: Secret) -> io::Result<Self> {
-        Self::spawn_in(command, password, Environment::System)
+        Self::spawn_in(command, password, Environment::System, None)
+    }
+    /// Owned secondary capability, never a descriptor number supplied by IPC.
+    /// Both target slots are installed by the same remapping operation.
+    pub fn spawn_with_supervisor(
+        command: Command,
+        password: Secret,
+        supervisor: OwnedFd,
+    ) -> io::Result<Self> {
+        Self::spawn_in(command, password, Environment::System, Some(supervisor))
     }
 
-    pub(crate) fn spawn_private_runtime(command: Command, password: Secret) -> io::Result<Self> {
-        Self::spawn_in(command, password, Environment::PrivateVpn)
+    pub(crate) fn spawn_private_runtime(
+        command: Command,
+        password: Secret,
+        supervisor: OwnedFd,
+    ) -> io::Result<Self> {
+        Self::spawn_in(command, password, Environment::PrivateVpn, Some(supervisor))
     }
 
     fn spawn_in(
         mut command: Command,
         password: Secret,
         environment: Environment,
+        supervisor: Option<OwnedFd>,
     ) -> io::Result<Self> {
         let credentials = Credentials {
             password,
@@ -56,7 +70,15 @@ impl PinentryChild {
             .validate(VpnKind::Ssl)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let (server, child_socket) = UnixStream::pair()?;
-        let descriptor = child_socket.as_raw_fd();
+        // Both source descriptors stay above the fixed targets. Assigning
+        // FD 3 must never overwrite the source for FD 4 (or the reverse).
+        let password_fd = high(child_socket.as_raw_fd())?;
+        let supervisor_fd = supervisor
+            .as_ref()
+            .map(|fd| high(fd.as_raw_fd()))
+            .transpose()?;
+        let descriptor = password_fd.as_raw_fd();
+        let extra = supervisor_fd.as_ref().map(AsRawFd::as_raw_fd);
         // SAFETY: only async-signal-safe descriptor operations run after fork.
         // child_socket stays owned/live through spawn. All stdio descriptors
         // have already been set by Command before this hook runs. Command is
@@ -67,6 +89,11 @@ impl PinentryChild {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::fcntl(INHERITED_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(extra) = extra
+                    && (libc::dup2(extra, 4) < 0 || libc::fcntl(4, libc::F_SETFD, 0) < 0)
+                {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -102,6 +129,15 @@ impl PinentryChild {
         self.lease.revoke();
         self.child.stop(grace)
     }
+}
+fn high(fd: i32) -> io::Result<OwnedFd> {
+    // SAFETY: duplicate a live borrowed descriptor, with close-on-exec, away
+    // from both protocol targets. The caller retains every source through spawn.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 impl Drop for PinentryChild {
     fn drop(&mut self) {

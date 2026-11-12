@@ -43,7 +43,7 @@ def main():
     openssl = Path(subprocess.check_output(["brew", "--prefix", "openssl@4"], text=True).strip())
     fixture = ROOT / "tests/fixtures/fortinet_transport.c"
     patches = [ROOT / "scripts/macos/patches" / name for name in [
-        "openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch"]]
+        "openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch"]]
     receipt = {"archiveSha256": FORTI_SHA, "sourceSha256": {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in [fixture, *patches]

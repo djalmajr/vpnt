@@ -5,8 +5,8 @@ use crate::{
             Interfaces,
             egress::Egress,
             ppp::{OwnedPpp, OwnershipError},
-            probe,
-            routing::{InterfaceToken, NativeBackend},
+            ppp_early_cleanup, probe,
+            routing::{InterfaceToken, NativeBackend, Snapshot},
         },
         routes::{Coordinator, Lease, Owner},
         ssl::{SslDriver, SslFailure, StartError},
@@ -88,6 +88,7 @@ impl<'a> Factory for NativeFactory<'a> {
             routes: self.routes.clone(),
             canceled,
             before: None,
+            before_routes: None,
             client: None,
             link: None,
             token: None,
@@ -114,6 +115,7 @@ struct NativeAttempt<'a> {
     routes: Routes<'a>,
     canceled: Arc<AtomicBool>,
     before: Option<Interfaces>,
+    before_routes: Option<Snapshot>,
     client: Option<SslDriver>,
     link: Option<Arc<OwnedPpp>>,
     token: Option<InterfaceToken>,
@@ -130,6 +132,9 @@ impl NativeAttempt<'_> {
             .ok_or_else(Failure::unavailable)?
             .poll()
             .map_err(|_| Failure::unavailable())?;
+        if update.start_error.is_some() {
+            return Err(Failure::unavailable());
+        }
         if let Some(failure) = update.failure {
             return Err(Failure {
                 state: match failure {
@@ -166,6 +171,7 @@ impl Attempt for NativeAttempt<'_> {
         // uncertainty must survive even if setup returns an error.
         Runtime::installed()
             .and_then(|_| Runtime::verify_pinentry())
+            .and_then(|_| Runtime::verify_ppp_supervisor())
             .map_err(|error| Failure {
                 state: if error == RuntimeError::Missing {
                     ConnectionState::MissingProgram
@@ -181,21 +187,24 @@ impl Attempt for NativeAttempt<'_> {
         let egress = Egress::select(&self.profile, canceled, Duration::from_secs(3))
             .map_err(|_| Failure::unavailable())?;
         self.before = Some(Interfaces::read().map_err(|_| Failure::unavailable())?);
+        self.before_routes = Some(Snapshot::read().map_err(|_| Failure::unavailable())?);
         if canceled.load(Ordering::Acquire) {
             return Err(Failure::unavailable());
         }
         let credentials = self.credentials.take().ok_or_else(Failure::unavailable)?;
-        self.spawn_attempted = true;
         self.client = Some(
-            SslDriver::start(&self.profile, credentials, &egress).map_err(|error| Failure {
-                state: if error == StartError::MissingProgram {
-                    ConnectionState::MissingProgram
-                } else {
-                    ConnectionState::Dropped
+            SslDriver::start(&self.profile, credentials, &egress, &self.canceled).map_err(
+                |error| Failure {
+                    state: if error == StartError::MissingProgram {
+                        ConnectionState::MissingProgram
+                    } else {
+                        ConnectionState::Dropped
+                    },
+                    error: ErrorCode::BackendFailure,
                 },
-                error: ErrorCode::BackendFailure,
-            })?,
+            )?,
         );
+        self.spawn_attempted = true;
         Ok(())
     }
     fn ready(&mut self) -> Result<bool, Failure> {
@@ -266,11 +275,24 @@ impl Attempt for NativeAttempt<'_> {
         if !self.spawn_attempted {
             return true;
         }
-        // Absence of discovery is not proof that a spawned client never forked
-        // pppd. Keep this attempt pending; the client birth/exit handshake is a
-        // required remaining integration before the installed helper is usable.
-        let Some(link) = &self.link else {
+        let Some(client) = &mut self.client else {
             return false;
+        };
+        if !client.children_complete().unwrap_or(false) {
+            return false;
+        }
+        // A birth grant predates configd/address discovery. Process receipts
+        // alone cannot prove that implicit network resources were removed.
+        let Some(link) = &self.link else {
+            if !client.ppp_may_have_run() {
+                return true;
+            }
+            let (Some(before), Some(routes), Some(proof)) =
+                (&self.before, &self.before_routes, client.supervised_ppp())
+            else {
+                return false;
+            };
+            return ppp_early_cleanup::complete(before, routes, proof.child()).unwrap_or(false);
         };
         let Ok(mut routes) = self.routes.lock() else {
             return false;

@@ -9,12 +9,12 @@ use std::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct Identity {
+pub(crate) struct Identity {
     pub pid: u32,
     pub start: (u64, u64),
 }
 #[derive(Debug)]
-pub(super) struct Process {
+pub(crate) struct Process {
     pub identity: Identity,
     pub parent: u32,
     pub uid: u32,
@@ -81,7 +81,7 @@ impl Process {
     }
 }
 
-pub(super) struct ExitWatch {
+pub(crate) struct ExitWatch {
     fd: OwnedFd,
     pid: u32,
     exited: bool,

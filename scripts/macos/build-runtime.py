@@ -26,6 +26,7 @@ MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"
 PID_PATCH = ROOT / "scripts/macos/patches/charon-private-pid.patch"
 FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
+SUPERVISOR_PATCH = ROOT / "scripts/macos/patches/openfortivpn-ppp-supervisor.patch"
 
 
 def digest(path):
@@ -170,7 +171,7 @@ def verify_runtime(root):
         raise RuntimeError("Runtime manifest does not match this app")
     if manifest["strongswan"]["patches"] != {PID_PATCH.name: digest(PID_PATCH)}:
         raise RuntimeError("Runtime does not include the expected private PID patch")
-    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH]}:
+    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH]}:
         raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
@@ -364,7 +365,7 @@ def main():
                 "version": FORTI_VERSION,
                 "source": FORTI_URL,
                 "sha256": FORTI_SHA,
-                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH]},
+                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH]},
             },
             "files": files,
         }

@@ -174,6 +174,7 @@ fn owned_ppp_exit_requires_both_original_process_watches() {
             owner: parent.owner,
             parent_program: PathBuf::from("/bin/sleep"),
             ppp_program: PathBuf::from("/bin/sleep"),
+            supervision: None,
         };
         assert!(!proof.processes_exited().unwrap());
         if parent_first {

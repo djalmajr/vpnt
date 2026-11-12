@@ -2,13 +2,14 @@
 //! configd records supply candidate PIDs only; this module never signals one.
 use super::{
     interfaces::{Interface, Interfaces},
+    ppp_control::Proof,
     process::{ExitWatch, Identity, Process},
     store::{self, Record},
 };
 use crate::{connection::ssl::SslDriver, helper::paths};
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,7 @@ pub struct OwnedPpp {
     owner: u32,
     parent_program: PathBuf,
     ppp_program: PathBuf,
+    supervision: Option<Arc<Proof>>,
 }
 struct Policy<'a> {
     owner: u32,
@@ -37,23 +39,35 @@ struct Policy<'a> {
 impl OwnedPpp {
     pub fn discover(driver: &mut SslDriver, before: &Interfaces) -> Result<Self, OwnershipError> {
         let update = driver.poll().map_err(|_| OwnershipError::Unavailable)?;
-        if update.exited || update.failure.is_some() {
+        if update.exited || update.failure.is_some() || update.start_error.is_some() {
             return Err(OwnershipError::NotReady);
         }
         let now = Interfaces::read().map_err(|_| OwnershipError::Unavailable)?;
         let records = store::read().map_err(|_| OwnershipError::Unavailable)?;
-        let parent_program = paths::runtime_directory().join("bin/openfortivpn");
-        discover(
-            driver.id(),
+        let supervision = driver.supervised_ppp().ok_or(OwnershipError::NotReady)?;
+        if !supervision
+            .current()
+            .map_err(|_| OwnershipError::Unavailable)?
+        {
+            return Err(OwnershipError::NotReady);
+        }
+        let parent_program = Path::new(paths::PPP_SUPERVISOR);
+        let mut proof = discover(
+            supervision.supervisor().pid,
             before,
             &now,
             &records,
             Policy {
                 owner: 0,
-                parent_program: &parent_program,
+                parent_program,
                 ppp_program: Path::new("/usr/sbin/pppd"),
             },
-        )
+        )?;
+        if proof.parent != *supervision.supervisor() || proof.ppp != *supervision.child() {
+            return Err(OwnershipError::ForeignLink);
+        }
+        proof.supervision = Some(supervision);
+        Ok(proof)
     }
     pub fn name(&self) -> &str {
         &self.interface.name
@@ -68,6 +82,11 @@ impl OwnedPpp {
     /// Revalidate before and after every probe/route operation. Kernel exit
     /// watches retain identity even after a PID is reaped and later reused.
     pub fn is_current(&self) -> Result<bool, OwnershipError> {
+        if let Some(proof) = &self.supervision
+            && !proof.current().map_err(|_| OwnershipError::Unavailable)?
+        {
+            return Ok(false);
+        }
         if self.exited()? {
             return Ok(false);
         }
@@ -119,6 +138,11 @@ impl OwnedPpp {
             && watches
                 .1
                 .exited()
+                .map_err(|_| OwnershipError::Unavailable)?
+            && self
+                .supervision
+                .as_ref()
+                .map_or(Ok(true), |proof| proof.exited())
                 .map_err(|_| OwnershipError::Unavailable)?)
     }
     /// PPP only, not route cleanup. A still-up interface without a new verified
@@ -252,6 +276,7 @@ fn discover(
         owner: policy.owner,
         parent_program: policy.parent_program.into(),
         ppp_program: policy.ppp_program.into(),
+        supervision: None,
     })
 }
 fn related(

@@ -1,0 +1,34 @@
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -181,7 +181,11 @@
+ 	};
+ #endif
+ 
++#ifdef __APPLE__
++	static const char ppp_path[] = "/Library/PrivilegedHelperTools/dev.vpnt.pppd";
++#else
+ 	static const char ppp_path[] = PPP_PATH;
++#endif
+ 
+ 	if (access(ppp_path, F_OK) != 0) {
+ 		log_error("%s: %s.\n", ppp_path, strerror(errno));
+@@ -415,6 +419,9 @@
+ 		}
+ 	}
+ 
++	tunnel->pppd_pid = pid;
++	tunnel->pppd_pty = amaster;
++
+ 	// Set non-blocking
+ 	int flags = fcntl(amaster, F_GETFL, 0);
+ 
+@@ -424,8 +431,5 @@
+ 		return 1;
+ 	}
+ 
+-	tunnel->pppd_pid = pid;
+-	tunnel->pppd_pty = amaster;
+-
+ 	return 0;
+ }
+ 
