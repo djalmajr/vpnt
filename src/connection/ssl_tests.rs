@@ -15,6 +15,16 @@ struct Fixture {
     runtime: Runtime,
 }
 impl Fixture {
+    fn binding() -> Binding {
+        let name = std::ffi::CString::new("lo0").unwrap();
+        // SAFETY: name is a live native NUL-terminated interface name.
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        Binding {
+            interface: "lo0".into(),
+            index,
+            gateway: Ipv4Addr::LOCALHOST,
+        }
+    }
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let directory = root.join("output/fixtures").join(format!(
@@ -59,7 +69,7 @@ impl Fixture {
         }
         let manifest = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
             "strongswan":{"version":"6.1.0","source":"fixture","sha256":"fixture","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/charon-private-pid.patch")))}},
-            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-no-routes.patch")))}},"files":files});
+            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-no-routes.patch"))),"openfortivpn-bound-transport.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-bound-transport.patch")))}},"files":files});
         fs::write(
             directory.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
@@ -80,6 +90,7 @@ impl Fixture {
                 password: Secret::from("fixture-driver-password"),
                 psk: Secret::from(""),
             },
+            &Self::binding(),
         )
         .unwrap()
     }
@@ -143,7 +154,7 @@ fn profile_options_and_fingerprints_cannot_add_commands_or_paths() {
     let fixture = Fixture::new();
     let mut profile = Fixture::profile("ready.fixture.invalid");
     profile.certificate = "A1".repeat(32);
-    let configured = command(&fixture.runtime, &profile).unwrap();
+    let configured = command(&fixture.runtime, &profile, &Fixture::binding()).unwrap();
     assert!(
         configured
             .get_args()
@@ -155,9 +166,9 @@ fn profile_options_and_fingerprints_cannot_add_commands_or_paths() {
         "user\n--pppd-plugin=/tmp/file".into(),
     ] {
         profile.username = username;
-        assert!(command(&fixture.runtime, &profile).is_err());
+        assert!(command(&fixture.runtime, &profile, &Fixture::binding()).is_err());
     }
     profile.username = "fixture-user".into();
     profile.gateway = "::1".into();
-    assert!(command(&fixture.runtime, &profile).is_err());
+    assert!(command(&fixture.runtime, &profile, &Fixture::binding()).is_err());
 }

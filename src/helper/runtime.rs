@@ -101,15 +101,26 @@ impl Runtime {
             || manifest.openfortivpn.sha256
                 != "c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465"
             || manifest.openfortivpn.patches
-                != BTreeMap::from([(
-                    "openfortivpn-no-routes.patch".into(),
-                    format!(
-                        "{:x}",
-                        Sha256::digest(include_bytes!(
-                            "../../scripts/macos/patches/openfortivpn-no-routes.patch"
-                        ))
+                != BTreeMap::from([
+                    (
+                        "openfortivpn-no-routes.patch".into(),
+                        format!(
+                            "{:x}",
+                            Sha256::digest(include_bytes!(
+                                "../../scripts/macos/patches/openfortivpn-no-routes.patch"
+                            ))
+                        ),
                     ),
-                )])
+                    (
+                        "openfortivpn-bound-transport.patch".into(),
+                        format!(
+                            "{:x}",
+                            Sha256::digest(include_bytes!(
+                                "../../scripts/macos/patches/openfortivpn-bound-transport.patch"
+                            ))
+                        ),
+                    ),
+                ])
             || manifest.files.len() > 64
             || !valid_version(&manifest.minimum_macos)
             || !manifest.files.contains_key("bin/charon")

@@ -25,6 +25,7 @@ PKGCONF_SHA = "9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de"
 MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
 PID_PATCH = ROOT / "scripts/macos/patches/charon-private-pid.patch"
 FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
+TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
 
 
 def digest(path):
@@ -169,8 +170,8 @@ def verify_runtime(root):
         raise RuntimeError("Runtime manifest does not match this app")
     if manifest["strongswan"]["patches"] != {PID_PATCH.name: digest(PID_PATCH)}:
         raise RuntimeError("Runtime does not include the expected private PID patch")
-    if manifest["openfortivpn"]["patches"] != {FORTI_PATCH.name: digest(FORTI_PATCH)}:
-        raise RuntimeError("Runtime does not include the expected route isolation patch")
+    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH]}:
+        raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
     actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
@@ -213,10 +214,20 @@ def verify_runtime(root):
             if program == "openfortivpn":
                 # Parse the driver's fixed options in the real client, then
                 # exit via --version before config, credentials or networking.
-                arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", "--pinentry=/Library/PrivilegedHelperTools/dev.vpnt.pinentry", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--trusted-cert=" + "a1" * 32]
+                arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", "--pinentry=/Library/PrivilegedHelperTools/dev.vpnt.pinentry", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--ifname=lo0", "--vpnt-ifindex=1", "--vpnt-gateway-ip=127.0.0.1", "--trusted-cert=" + "a1" * 32]
             result = subprocess.run(arguments + ["--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
             if result.returncode or result.stdout.strip() != expected:
                 raise RuntimeError(f"Private {program} startup/version check failed")
+        # Invalid metadata must fail during parsing, before --version can exit
+        # successfully. No invocation proceeds to config loading or networking.
+        for option, diagnostic, values in [
+            ("vpnt-ifindex", "Invalid vpnt interface index", ["", "0", "-1", "+1", " 1", "1x", "4294967296"]),
+            ("vpnt-gateway-ip", "Invalid vpnt gateway address", ["", "0.0.0.0", "255.255.255.255", "224.0.0.1", "::1", "fixture.invalid"]),
+        ]:
+            for value in values:
+                result = subprocess.run([str(root / "bin/openfortivpn"), f"--{option}={value}", "--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
+                if result.returncode != 1 or diagnostic not in result.stdout + result.stderr:
+                    raise RuntimeError(f"Private openfortivpn did not reject invalid {option} during parsing")
     print(f"Verified {len(manifest['files'])} runtime files; minimum macOS {minimum}; versions OK", flush=True)
 
 
@@ -353,7 +364,7 @@ def main():
                 "version": FORTI_VERSION,
                 "source": FORTI_URL,
                 "sha256": FORTI_SHA,
-                "patches": {FORTI_PATCH.name: digest(FORTI_PATCH)},
+                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH]},
             },
             "files": files,
         }

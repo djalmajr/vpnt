@@ -63,7 +63,8 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     build.mkdir(parents=True, exist_ok=True)
     log = build.with_suffix(".log")
     env.update(PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"), ACLOCAL_PATH=str(prefix / "share/aclocal"), CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib -Wl,-headerpad_max_install_names")
-    run(["/usr/bin/patch", "-t", "-p1", "-i", root / "scripts/macos/patches/openfortivpn-no-routes.patch"], source, env, log)
+    for patch in ["openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch"]:
+        run(["/usr/bin/patch", "-t", "-p1", "-i", root / "scripts/macos/patches" / patch], source, env, log)
     run(["/bin/sh", source / "autogen.sh"], source, env, log)
     run([source / "configure", f"--prefix={runtime_prefix}", "--with-pppd=/usr/sbin/pppd", "--with-netstat=/usr/sbin/netstat", "--with-resolvconf=DISABLED", "--with-systemdsystemunitdir=no", "--enable-legacy-pppd"], build, env, log)
     run(["/usr/bin/make", f"-j{jobs}"], build, env, log)
@@ -71,5 +72,8 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     # intercepted. It can run without privilege and never creates an interface.
     checker = build / "check-routes"
     run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_routes.c", "-o", checker], build, env, log)
+    run([checker], build, env, log)
+    checker = build / "check-transport"
+    run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_transport.c", "-o", checker], build, env, log)
     run([checker], build, env, log)
     return build / "openfortivpn", source

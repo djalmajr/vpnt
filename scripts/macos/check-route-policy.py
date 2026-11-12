@@ -104,6 +104,12 @@ def main():
         ("foreign-query-pid-accepted", "src/connection/macos/routing/read.rs",
          lambda s: replace_once(s, "codec::signed(frame, offset_of!(libc::rt_msghdr, rtm_pid))? != pid", "false"),
          ["--lib", "get_consumer_filters_foreign"]),
+        ("egress-profile-binding-omitted", "src/connection/macos/egress.rs",
+         lambda s: replace_once(s, "        if profile.kind != VpnKind::Ssl\n            || profile.id != self.profile\n            || profile.gateway != self.host\n            || profile.port != self.port\n        {\n            return Ok(false);\n        }\n", ""),
+         ["--lib", "native_route_selection_is_read_only"]),
+        ("probe-dns-unscoped", "src/connection/macos/resolve.rs",
+         lambda s: replace_once(s, "    if index == 0 {\n        return Err(Error::Invalid);\n    }\n", ""),
+         ["--lib", "native_localhost_queries"]),
     ]
     receipt = {"sourceSha256": {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -118,7 +124,7 @@ def main():
             for path in ["src", "tests", "ui/dist", "scripts/macos/patches"]:
                 shutil.copytree(ROOT / path, copy / path)
             tests = ["--test", "route_flow", "--test", "route_leases"]
-            native = ["--lib", "connection::macos::routing"]
+            native = ["--lib", "connection::macos"]
             receipt["baseline-policy"] = run(copy, "baseline-policy", tests, 0)
             receipt["baseline-native-read"] = run(copy, "baseline-native-read", native, 0)
             for name, path, mutation, arguments in mutations:

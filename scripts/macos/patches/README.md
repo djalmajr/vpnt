@@ -23,3 +23,18 @@ Fonte: <https://github.com/adrienverge/openfortivpn/archive/refs/tags/v1.24.1.ta
 SHA-256 `c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465`.
 O patch segue a GPL-3.0-or-later de `tunnel.c`. `LICENSE` e a exceção OpenSSL
 originais acompanham o runtime. A admissão Rust exige seu hash no manifest.
+
+`openfortivpn-bound-transport.patch` modifica `config.h`, `config.c`, `main.c`
+e `tunnel.c` da mesma versão. Acrescenta os metadados privados `--vpnt-ifindex`
+e `--vpnt-gateway-ip`. O IP já resolvido fixa o destino TCP; o hostname continua
+intacto para validação TLS/SNI. No Darwin, `--ifname` passa a exigir
+`IP_BOUND_IF`, além do bind da origem. Um índice divergente, erro de vínculo
+ou mudança de índice/origem após o connect fecha o socket sem fallback.
+O driver não permite que o peer de IPC forneça esses metadados: recebe um
+token de saída produzido por consultas nativas de rota/interface.
+
+O build executa o consumidor TCP C real com um listener em loopback. O script
+`../check-transport-consumer.py` repete os seis cenários e três mutações numa
+cópia descartável da fonte verificada; DNS é interceptado para que a mutação
+não faça lookup externo. O mesmo licenciamento do openfortivpn se aplica.
+O hash deste patch também é obrigatório na admissão do runtime.

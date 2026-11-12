@@ -87,22 +87,29 @@ SHA-256. O strongSwan é compilado com os plugins necessários incorporados; seu
 PID padrão fica em um prefixo próprio. O patch versionado permite ao futuro
 driver indicar um PID diferente por perfil em configuração privada. A fonte
 é extraída novamente do arquivo verificado antes de cada build. O openfortivpn
-também é compilado da fonte restaurada, com o patch de `--no-routes` e suporte
-ao pppd legado do macOS. Nenhum comando instala em `/Library` ou inicia túneis.
+também é compilado da fonte restaurada, com os patches de `--no-routes`,
+vínculo de transporte e suporte ao pppd legado do macOS. Nenhum comando instala
+em `/Library` ou inicia túneis.
 
 A verificação confere inventário/hashes, dependências Mach-O com prefixos
 privados ou do sistema, assinaturas ad hoc e a versão mínima real do macOS.
 Executa apenas `--version` sem privilégios, com bibliotecas da cópia de staging
 e um arquivo de configuração fictício regular. O manifest não pode presumir
 compatibilidade com um macOS anterior ao mínimo dos componentes.
+O cliente real deve aceitar os argumentos fixos do driver e recusar 13 formas
+inválidas dos novos metadados antes de chegar a `--version`; o check exige o
+diagnóstico de parser esperado, não apenas um código de erro.
 
 O bundle de CAs contém somente certificados públicos exportados do chaveiro de
 raízes do sistema. Exportação vazia ou inválida interrompe o build; o sandbox
 pode retornar uma lista vazia sem erro. O bundle e o patch de PID integram a
-verificação do manifest. O patch de rotas do openfortivpn também é exigido.
+verificação do manifest. Os patches de rotas e transporte do openfortivpn
+também são exigidos.
 O build executa o callback C original de interface pronta, com chamadas de
 rota/DNS interceptadas: nenhuma com `--no-routes`, chamadas preservadas ao
 habilitar rotas. Esse fixture não faz escritas reais de rede.
+Também executa o consumidor TCP original com o patch aplicado, usando somente
+loopback para conferir vínculo ao índice, origem, descritor CLOEXEC e rejeições.
 
 Esses checks não provam carregamento dos plugins privilegiados, criação de SAs,
 PPP, tráfego pelo túnel ou cleanup de rotas. O controle de filhos tem testes de
@@ -172,7 +179,27 @@ Timeout inclui o texto real do Darwin (Operation timed out). O entrypoint
 produtivo exige root, runtime instalado verificado e pinentry fixo com dono e
 dependências confiáveis. O fixture usa explicitamente uma árvore do usuário e
 não substitui essa prova privilegiada. Gateway SSL literal IPv6 é rejeitado;
-o transporte do cliente usa IPv4/DNS.
+o transporte do cliente usa IPv4/DNS. A seleção da saída resolve o gateway por
+DNS-SD do sistema antes do túnel e consulta `RTM_GET`. O token é ligado ao
+perfil, hostname, porta, interface, índice, endereços e próximo salto; a consulta
+com escopo revalida a saída antes/depois do spawn. A entrada de DNS para probe
+continua recusando índice zero.
+
+```bash
+python3 scripts/macos/check-transport-consumer.py
+```
+
+Este comando exige macOS, usuário comum e OpenSSL 4 já disponível no Homebrew.
+Em cópia descartável da fonte com SHA-256 fixado, aplica os patches, compila
+o consumidor TCP C e executa seis cenários em loopback. Resolve o IP fixo sem
+consultar DNS e preserva o hostname. Confere `IP_BOUND_IF`, origem, CLOEXEC e
+recusa de índice incorreto, opção de vínculo recusada, interface vazia/ausente.
+Três mutações removem vínculo, comparação do índice e destino fixo; cada uma
+deve compilar e falhar numa asserção executada. DNS é interceptado e proxies
+são apagados; nem as mutações podem contactar um destino externo. A baseline
+restaurada passa novamente. Logs/hashes ficam em
+`output/fixtures/transport-oracles/`. O workflow prepara esse check no macOS;
+preparo local não prova execução remota. Não cria PPP, rotas, DNS ou VPN.
 
 Interface citada no log é somente candidata. Esses testes não provam propriedade
 de PPP, leases/cleanup de rotas, probe pelo túnel ou estado conectado. Isso
@@ -266,6 +293,9 @@ compilação não contam como mutações detectadas. A mutação de opcode execu
 **somente o teste puro do codec**, sem enviar o opcode alterado a um socket de
 rotas. As outras consultas nativas permanecem GET. Cópia/build são removidos;
 logs, comandos e hashes de fonte ficam em `output/fixtures/route-oracles/`.
+São 16 mutações, incluindo remoção do vínculo de perfil da saída SSL e
+aceitação indevida de DNS sem escopo para probe. As baselines nativas incluem
+seleção de saída por `RTM_GET` de TEST-NET, sem abrir conexão para esse endereço.
 O workflow macOS prepara essa mesma execução; CI remoto ainda precisa rodar.
 
 Backend privilegiado de escrita, lock global entre helpers, recibos de criação

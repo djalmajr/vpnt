@@ -1,4 +1,5 @@
-//! Bounded DNS-SD lookups with an explicit interface. Separate A/AAAA queries
+//! Bounded DNS-SD lookups. Tunnel probes require an explicit interface; gateway
+//! discovery has a separate system-resolver entry point. Separate A/AAAA queries
 //! prevent the first completed batch from discarding the other address family.
 //! Services are deallocated on this thread before callback contexts are freed.
 use super::{
@@ -127,7 +128,7 @@ unsafe extern "C" fn answer(
     }
     // LocalOnly records include /etc/hosts. They are addresses to test, not
     // proof of tunnel traffic; the probe separately rejects all local targets.
-    if index == 0 || index == u32::MAX || index == answers.index {
+    if answers.index == 0 || index == 0 || index == u32::MAX || index == answers.index {
         // SAFETY: DNS-SD supplies a sockaddr valid for this callback. The native
         // parser checks family/length before reading the corresponding fields.
         if let Some(value) = unsafe { address(value) }
@@ -151,13 +152,36 @@ pub(super) fn resolve(
     deadline: Instant,
     canceled: &AtomicBool,
 ) -> Result<Vec<IpAddr>, Error> {
+    if index == 0 {
+        return Err(Error::Invalid);
+    }
+    lookup(host, index, protocol, deadline, canceled)
+}
+
+/// Gateway discovery uses the system resolver before a tunnel exists. This
+/// separate entry point never supplies unscoped DNS to a tunnel probe.
+pub(super) fn gateway_ipv4(
+    host: &str,
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Result<Vec<IpAddr>, Error> {
+    lookup(host, 0, 1, deadline, canceled)
+}
+
+fn lookup(
+    host: &str,
+    index: u32,
+    protocol: u32,
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Result<Vec<IpAddr>, Error> {
     if canceled.load(Ordering::Acquire) {
         return Err(Error::Canceled);
     }
     if deadline <= Instant::now() {
         return Err(Error::TimedOut);
     }
-    if index == 0 || protocol == 0 || protocol & !3 != 0 || host.is_empty() || host.len() > 253 {
+    if protocol == 0 || protocol & !3 != 0 || host.is_empty() || host.len() > 253 {
         return Err(Error::Invalid);
     }
     if let Ok(value) = host.parse::<IpAddr>() {
@@ -235,6 +259,13 @@ mod tests {
         let values = resolve("localhost", index, 3, deadline, &canceled).unwrap();
         assert!(values.contains(&"127.0.0.1".parse().unwrap()));
         assert!(values.contains(&"::1".parse().unwrap()));
+        let gateway = gateway_ipv4("localhost", deadline, &canceled).unwrap();
+        assert!(gateway.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(gateway.iter().all(IpAddr::is_ipv4));
+        assert_eq!(
+            resolve("127.0.0.1", 0, 1, deadline, &canceled),
+            Err(Error::Invalid)
+        );
         assert_eq!(
             resolve("::1", index, 1, deadline, &canceled),
             Err(Error::Invalid)

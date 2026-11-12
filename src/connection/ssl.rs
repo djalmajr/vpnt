@@ -2,17 +2,30 @@
 //! is only a candidate; the controller must prove ownership, install its leased
 //! routes and run a tunnel-bound probe before reporting Connected.
 use super::ssl_output::Output;
+use crate::helper::{pinentry_channel::PinentryChild, process::StopOutcome};
+#[cfg(target_os = "macos")]
 use crate::{
+    connection::macos::egress::Egress,
     helper::{
         paths,
-        pinentry_channel::PinentryChild,
-        process::StopOutcome,
         runtime::{Program, Runtime, RuntimeError},
     },
     model::{Profile, VpnKind},
     secrets::Credentials,
 };
-use std::{io, net::IpAddr, process::Command, time::Duration};
+use std::{io, time::Duration};
+#[cfg(target_os = "macos")]
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    process::Command,
+};
+
+#[cfg(target_os = "macos")]
+pub(crate) struct Binding {
+    pub(crate) interface: String,
+    pub(crate) index: u32,
+    pub(crate) gateway: Ipv4Addr,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceName(String);
@@ -63,21 +76,36 @@ impl SslDriver {
     }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
-    pub fn start(profile: &Profile, credentials: Credentials) -> Result<Self, StartError> {
+    #[cfg(target_os = "macos")]
+    pub fn start(
+        profile: &Profile,
+        credentials: Credentials,
+        egress: &Egress,
+    ) -> Result<Self, StartError> {
         // SAFETY: UID queries have no memory preconditions.
         if !cfg!(target_os = "macos") || unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {
             return Err(StartError::PermissionDenied);
         }
         let runtime = Runtime::installed().map_err(map_runtime)?;
         Runtime::verify_pinentry().map_err(map_runtime)?;
-        Self::start_using(&runtime, profile, credentials)
+        let binding = egress
+            .binding(profile)
+            .map_err(|_| StartError::Unavailable)?;
+        let mut driver = Self::start_using(&runtime, profile, credentials, &binding)?;
+        if !egress.is_current(profile).unwrap_or(false) {
+            let _ = driver.stop();
+            return Err(StartError::Unavailable);
+        }
+        Ok(driver)
     }
+    #[cfg(target_os = "macos")]
     fn start_using(
         runtime: &Runtime,
         profile: &Profile,
         credentials: Credentials,
+        binding: &Binding,
     ) -> Result<Self, StartError> {
-        let command = command(runtime, profile)?;
+        let command = command(runtime, profile, binding)?;
         credentials
             .validate(VpnKind::Ssl)
             .map_err(|_| StartError::InvalidSecret)?;
@@ -126,11 +154,22 @@ impl Drop for SslDriver {
     }
 }
 
-fn command(runtime: &Runtime, profile: &Profile) -> Result<Command, StartError> {
+#[cfg(target_os = "macos")]
+fn command(runtime: &Runtime, profile: &Profile, binding: &Binding) -> Result<Command, StartError> {
     profile.validate().map_err(|_| StartError::InvalidProfile)?;
     if profile.kind != VpnKind::Ssl
         || profile.username.is_empty()
         || matches!(profile.gateway.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
+        || binding.index == 0
+        || binding.interface.is_empty()
+        || binding.interface.len() >= libc::IFNAMSIZ
+        || !binding
+            .interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        || binding.gateway.is_unspecified()
+        || binding.gateway.is_multicast()
+        || binding.gateway == Ipv4Addr::BROADCAST
     {
         return Err(StartError::InvalidProfile);
     }
@@ -146,7 +185,10 @@ fn command(runtime: &Runtime, profile: &Profile) -> Result<Command, StartError> 
         ])
         .arg(format!("--username={}", profile.username))
         .arg(format!("--pinentry={}", paths::PINENTRY))
-        .arg(format!("--ca-file={}", runtime.ca_bundle().display()));
+        .arg(format!("--ca-file={}", runtime.ca_bundle().display()))
+        .arg(format!("--ifname={}", binding.interface))
+        .arg(format!("--vpnt-ifindex={}", binding.index))
+        .arg(format!("--vpnt-gateway-ip={}", binding.gateway));
     if !profile.certificate.is_empty() {
         command.arg(format!(
             "--trusted-cert={}",
@@ -159,6 +201,7 @@ fn command(runtime: &Runtime, profile: &Profile) -> Result<Command, StartError> 
     Ok(command)
 }
 
+#[cfg(target_os = "macos")]
 fn map_runtime(error: RuntimeError) -> StartError {
     match error {
         RuntimeError::Missing => StartError::MissingProgram,

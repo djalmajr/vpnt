@@ -1,3 +1,4 @@
+pub mod egress;
 mod interfaces;
 pub mod ppp;
 pub mod probe;

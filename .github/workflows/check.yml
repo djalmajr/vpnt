@@ -53,6 +53,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-route-policy.py
+      - name: Verify bound SSL transport consumer
+        run: |
+          brew install openssl@4
+          python3 scripts/macos/check-transport-consumer.py
 
   core:
     runs-on: ubuntu-24.04

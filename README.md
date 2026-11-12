@@ -97,6 +97,14 @@ explícitas, com ping e fallback TCP. Os fixtures usam loopback e interfaces
 sintéticas; não provam PPP ou tráfego VPN. Leases/cleanup de rotas, helper e
 integração real da UI continuam pendentes.
 
+O transporte SSL recebe um vínculo de saída selecionado por leitura nativa da
+rota, ligado ao ID, hostname e porta do perfil. O patch
+[`openfortivpn-bound-transport.patch`](scripts/macos/patches/openfortivpn-bound-transport.patch)
+fixa o IP escolhido, preserva o hostname de TLS e exige `IP_BOUND_IF` junto ao
+bind da origem no macOS. Não há fallback sem vínculo. A prova atual usa o
+consumidor C real em loopback e consultas somente de leitura; não demonstra
+tráfego Fortinet nem coexistência com rotas de um túnel real.
+
 O controle de rotas tem um coordenador de leases por UID, perfil e geração,
 com compartilhamento, conflitos exatos, extensão após PPP e rollback. O plano
 de túnel completo usa pares `/1` e bloqueia a família IP sem suporte. A leitura
