@@ -76,7 +76,57 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## IPsec: veto de componentes com admissões pendentes
+## IPsec: metadados PF_KEY Darwin
+
+```bash
+cargo test --locked --no-default-features --lib connection::ipsec::pfkey
+python3 scripts/macos/check-pfkey.py
+```
+
+[PASS, SDK/process fixture] Seis testes usam datagramas binários produzidos por
+C independente compilado contra o SDK Darwin. Conferem ABI, SA/SA2/lifetime,
+políticas e cadeias de requests, IPv4/IPv6, escopo KAME e seletores normais/range.
+SPI e portas sockaddr são de rede; reqid SA2 conserva 32 bits nativos, sem
+truncar para a faixa do allocator. O request de política tem tamanho em bytes,
+enquanto frame/extensões usam unidades de oito. reserved/refcount não exige zero.
+
+Frames completos passam por versão/tipo/satype/tamanho, duplicação e limites
+de 64 extensões/requests; padding, prefixos, famílias, ranges e modos/protocolos
+ambíguos são recusados. Extensões não interpretadas são marcadas por tipo.
+Errno continua resposta explícita e não vira snapshot vazio. Chaves/identidades
+e payloads desconhecidos não integram o DTO/Debug retornado. O codec apenas
+empresta o input; o futuro leitor deve possuir e limpar o buffer bruto.
+
+[PASS, original consumer] Declaração sadb_sa_2 e atribuição de porta extraídas
+do strongSwan 6.1.0 com SHA fixado são compiladas com um host fictício. Dois
+casos IPv4/IPv6 atravessam o codec produtivo e confirmam que a porta privada
+NAT-T é nativa, diferente de sockaddr. O getter original retorna ntohs; isso
+foi inspecionado, sem executar daemon. Entrada do consumidor Rust fica em
+Zeroizing; o runner conserva assertions/logs, sem persistir datagramas brutos.
+
+[PASS, negative oracles] Quarenta mutações detectadas por assertions nos seis
+testes previstos e duas por assertions do consumidor original NAT-T, ambas
+em IPv4/IPv6. Baselines/restaurações SDK e original passaram; 241 hashes de
+entrada conferidos. Recibos/logs em output/fixtures/pfkey-codec-oracles/.
+O workflow inclui esse gate, sem execução remota.
+
+[PASS, local] 273 testes Rust com desktop e 269 sem desktop, em sequência;
+dois ignored (runtime opcional e harness de crash exercitado pelo pai). Fmt,
+clippy all-targets/all-features -D warnings, build dos binários e sintaxe
+Python/YAML passaram.
+Logs em output/fixtures/pfkey-codec-*. UI/catálogos/dependências/patches não
+mudaram; provas visuais e consumidores existentes mantêm os checkpoints
+anteriores. Matrizes de VICI/produtor/componente/C/PPP não foram repetidas nesta
+mudança de codec. Sem benchmark de performance.
+
+[NOT RUN] Nenhum socket PF_KEY aberto, dump/table do kernel lido, charon/plugin,
+claim reconciliado, VIP/rota/probe, instalação ou VPN executados. Pacote validado
+não é lote completo, ausência observada, propriedade ou autorização de cleanup.
+Leitor/transporte, completude SAD/SPD, recuperação e integração B2/C continuam
+necessários. UI/catálogos/dependências/patches e consumidores existentes não
+mudaram; .app/payload preservados no checkpoint 692489d.
+
+## IPsec: veto de componentes com admissões pendentes (f69a772)
 
 ```bash
 cargo test --locked --no-default-features --lib install::engine::tests::pending

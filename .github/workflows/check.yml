@@ -107,6 +107,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-ipsec-producer.py
+      - name: Verify Darwin PF_KEY metadata with SDK and original NAT-T consumer
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-pfkey.py
       - name: Verify PPP subprocess supervision
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

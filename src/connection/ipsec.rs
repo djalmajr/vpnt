@@ -4,6 +4,8 @@ mod config;
 mod control;
 mod namespace;
 #[cfg(target_os = "macos")]
+pub mod pfkey;
+#[cfg(target_os = "macos")]
 mod producer;
 mod snapshot;
 pub use config::Config;

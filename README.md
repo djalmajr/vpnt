@@ -193,6 +193,11 @@ configuração gerada, sem executar charon. Ainda faltam observador SA/SPD,
 recuperação de claims, endereço virtual, tráfego e cleanup integrados ao driver.
 O helper continua recusando conexão IPsec até completar essa integração.
 
+O codec PF_KEY Darwin já interpreta metadados de SA/política produzidos pelo
+SDK, com saída sem payloads de chaves. O consumidor da extensão NAT-T também
+é conferido contra fonte fixada do strongSwan. São testes de datagramas
+fictícios; ainda não leem tabelas do kernel nem comprovam ausência de recursos.
+
 O executor de instalação e remoção também exige ausência de admissões IPsec
 pendentes antes de recuperar o journal ou modificar componentes. Um lock livre
 ou uma fase Stopped não comprovam cleanup. O executor preserva a admissão e
