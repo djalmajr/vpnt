@@ -80,7 +80,7 @@ def main():
         if mutate(source) == source: raise RuntimeError(f'{label}: unchanged mutation')
     files = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     files += [Path(__file__), Path(__file__).with_name('check-broker.py')]
-    receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}, 'limits': 'Pure injected namespace observations and VICI codec/schema assertions. No native SA/SPD observer, charon, VICI command transport, authorization, privileged installation or VPN. No kernel mutation/deletion.'}
+    receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}, 'limits': 'Namespace and VICI schema mutations with injected observations. The full IPsec baseline also includes independent owned VICI fixture peers. No native SA/SPD observer, charon, authorization, privileged installation or VPN. No kernel mutation/deletion.'}
     try:
         with tempfile.TemporaryDirectory(prefix='vpnt-copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)

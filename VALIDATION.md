@@ -76,7 +76,70 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## VICI: prazo absoluto e cancelamento
+## IPsec: controle VICI e snapshots
+
+```bash
+cargo test --locked --no-default-features --lib connection::ipsec
+python3 scripts/macos/check-ipsec-control.py
+```
+
+[PASS, process/socket fixture] Dez testes novos exercitam Control pelo cliente
+VICI produtivo contra um processo Python independente. O daemon de teste valida
+quadros/comandos/alvos e credenciais fictícias. Observações SA/SPD e confirmação
+do produtor no Registry são injetadas: não são leituras de kernel ou de charon.
+
+Config conserva um selo privado da autoridade/serial da reserva. O construtor
+recusa configuração de outra admissão e devolve a reserva ao chamador. Versão
+charon/6.1.0 precede qualquer segredo no canal; load-conn e os dois load-shared
+precedem uma nova observação do namespace e initiate. A tentativa é consumida
+mesmo após erro/cancelamento/prazo. Erros não repassam errmsg do peer. O registro
+não fica bloqueado durante IO VICI. Initiated não é Connected nem prova de tráfego.
+
+Cleanup usa um prazo novo, tenta terminate/unload apenas nos nomes fechados e
+marca incerteza antes da primeira carga. Uma falha antes de initiate também
+recebe terminate direcionado, pois a ausência de resposta não desfaz efeitos
+remotos. Comandos de cleanup não são repetidos. O produtor original recebe
+retirement mesmo se o registro falhar; só saída observada e ausência no
+observador liberam a reserva. Erro/Drop não liberam automaticamente o namespace.
+
+list-sas é consultado sem noblock; só uma resposta final vazia completa o lote.
+O conjunto inteiro passa por nomes, IKEv2, endpoints, IDs únicos/canônicos,
+reqid, modo TUNNEL/ESP, SPIs não zero/únicos, VIPs e seletores locais/remotos.
+Há limite de 256 filhos; redes remotas devem caber nas solicitadas e seletores
+locais devem ser hosts VIP. Lote malformado não publica prefixo válido. Rekey
+com duas IKE_SAs é aceito; filhos transitórios sem SPIs não são instalados.
+Os campos instalados e o modo em maiúsculas seguem vici_query.c/ipsec_types.c
+fixados em strongSwan 6.1.0. Campo active é relato do daemon, sem autoridade
+para alterar recursos nativos. Consulta vazia não prova conexão ou cleanup.
+
+Red/Green executados para selo de admissão, candidatos de rekey e retirement
+após falha do registro. Os casos incluem seis prefixos de erro, prazo e
+cancelamento com produtor vivo, cleanup sem replay, presença/ausência injetada,
+rekey/transição, IPv4/IPv6/vazio e 30 formas inválidas de snapshot.
+
+[PASS, negative oracles] 46 mutações detectadas por assertions executadas nos
+testes previstos, com baseline/restauração em cópia descartável. Recibo/logs em
+output/fixtures/ipsec-control-oracles/; os 216 hashes de entrada conferem.
+O CI inclui o gate, sem execução remota. Matrizes A1 e de transporte conservam
+seus checkpoints; não foram reexecutadas nesta fase. O runner A1 agora explicita
+que sua baseline também inclui os peers de controle, sem alterar as 42 mutações.
+
+[PASS, local] 256 testes Rust com desktop e 252 sem desktop; dois ignored
+(runtime opcional e harness de crash exercitado pelo pai). Fmt, clippy
+all-targets/all-features -D warnings e sintaxe Python passaram. Logs em
+output/fixtures/ipsec-control-{desktop,core,clippy,cases}.log e recibo do
+commit em output/fixtures/ipsec-control-commit-evidence.json. A validação
+do transporte e dos consumidores C/PPP é reaproveitada de f241d39 nos caminhos
+inalterados; não é uma nova execução dessas matrizes ou de VPN real.
+
+[NOT RUN] Não há Peer nativo, charon executado, claims duráveis após falha do
+helper, observador SA/SPD, prova de origem/probe, Factory/dispatch IPsec ou VPN
+real nesta etapa. Esses itens continuam necessários antes de habilitar IPsec.
+Nenhuma instalação, elevação, configuração de VPN ou publicação foi feita.
+.app/payload conservado pertence a 692489d. UI/catálogos/dependências/patches
+não mudaram; validação visual e consumidores C/PPP mantêm seus checkpoints.
+
+## VICI: prazo absoluto e cancelamento (checkpoint f241d39)
 
 ```bash
 cargo test --locked --no-default-features --test vici --test vici_deadlines

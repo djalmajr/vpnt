@@ -67,6 +67,12 @@ impl Message {
     pub fn new() -> Self {
         Self::default()
     }
+    pub fn len(&self) -> usize {
+        self.elements.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
     pub fn value(&mut self, key: &str, value: &[u8]) -> &mut Self {
         self.insert(key, Element::Value(Zeroizing::new(value.to_vec())));
         self

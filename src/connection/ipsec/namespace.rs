@@ -18,13 +18,29 @@ pub trait Observer {
     fn producer_stopped(&mut self, owner: &Owner) -> Result<bool, Error>;
 }
 /// No Clone/Deserialize/Drop release: an uncertain producer retains its slot.
+#[derive(Debug)]
 pub struct Reservation {
     owner: Owner,
     reqid: u16,
     serial: u64,
     authority: Arc<()>,
 }
+pub(super) struct Binding {
+    authority: Arc<()>,
+    serial: u64,
+}
+impl Binding {
+    pub(super) fn matches(&self, reservation: &Reservation) -> bool {
+        Arc::ptr_eq(&self.authority, &reservation.authority) && self.serial == reservation.serial
+    }
+}
 impl Reservation {
+    pub(super) fn binding(&self) -> Binding {
+        Binding {
+            authority: self.authority.clone(),
+            serial: self.serial,
+        }
+    }
     pub fn owner(&self) -> &Owner {
         &self.owner
     }

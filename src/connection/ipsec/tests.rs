@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+mod control;
+mod control_peer;
 mod identity;
 mod namespace;
 #[cfg(target_os = "macos")]

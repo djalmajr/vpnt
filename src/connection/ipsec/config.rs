@@ -9,15 +9,16 @@ use std::{collections::BTreeSet, fmt::Write, net::IpAddr, time::Duration};
 /// Request metadata only. Every transport operation must revalidate its
 /// reservation; a built config is neither a live lease nor tunnel evidence.
 pub struct Config {
+    binding: super::namespace::Binding,
     name: String,
     child: String,
-    reqid: u16,
+    pub(super) reqid: u16,
     gateway: String,
     identity: String,
     port: u16,
-    local: IpAddr,
-    remote: IpAddr,
-    networks: Vec<String>,
+    pub(super) local: IpAddr,
+    pub(super) remote: IpAddr,
+    pub(super) networks: Vec<String>,
 }
 impl Config {
     pub fn new<N: Observer>(
@@ -60,6 +61,7 @@ impl Config {
                 .collect()
         };
         Ok(Self {
+            binding: reservation.binding(),
             child: format!("{name}-child"),
             name,
             reqid: reservation.reqid(),
@@ -73,6 +75,9 @@ impl Config {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    pub(super) fn matches(&self, reservation: &Reservation) -> bool {
+        self.binding.matches(reservation) && self.reqid == reservation.reqid()
     }
     pub fn child_name(&self) -> &str {
         &self.child
