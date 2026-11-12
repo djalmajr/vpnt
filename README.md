@@ -146,6 +146,22 @@ Execução positiva como root, efeito do Installer no sistema e ligação de
 instalação/remoção ao app continuam pendentes. Veja os limites e os comandos de
 reprodução em `VALIDATION.md`.
 
+Para incluir esse componente no próprio `.app`, use o payload admitido:
+
+```bash
+python3 scripts/macos/package-app.py --replace --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
+target/vpnt.app/Contents/MacOS/vpnt --inspect-component
+```
+
+O empacotador audita o `.pkg` antes de copiá-lo e vincula seus hashes à versão,
+ao usuário atual e aos bytes do host. O comando de inspeção deriva a localização
+do executável atual e só lê os arquivos; não aceita path/UID alternativo nem
+abre o Installer. Um pacote ausente, alterado ou de outro usuário é recusado.
+O mínimo do `.app` passa a considerar o componente incluído, atualmente macOS
+26.0 no runtime local preparado. Sem essa opção, o pacote simples para demo
+continua disponível. A ligação dos botões de instalar/remover ao fluxo nativo
+ainda está em desenvolvimento.
+
 O build aplica [`charon-private-pid.patch`](scripts/macos/patches/charon-private-pid.patch)
 à fonte verificada do strongSwan. Ele acrescenta `charon.vpnt_pid_file` para que
 o helper possa usar um PID privado por perfil. O manifest registra o hash do

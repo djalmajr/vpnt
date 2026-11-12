@@ -230,7 +230,86 @@ SaveProfile/RemoveProfile nem refresh correlacionado. O avanço atual está abai
 publicado. Não houve system pppd, interface/rota nova ou VPN. Instalação/remoção,
 sudoers/IO/PTY e prova nativa de credenciais/cleanup continuam pendentes.
 
-## Pacote local do componente privilegiado
+## Componente incluído no app e admissão sem Installer
+
+```bash
+cargo test --locked --no-default-features --lib install::bundle::tests
+cargo test --locked --no-default-features --test app_component
+python3 scripts/macos/check-app-component.py
+cargo build --locked --bins
+python3 scripts/macos/build-askpass.py
+python3 scripts/macos/prepare-installation.py
+python3 scripts/macos/package-app.py --replace --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
+target/vpnt.app/Contents/MacOS/vpnt --inspect-component
+```
+
+[executed, filesystem/byte binding] Sete testes do leitor Rust vinculam versão,
+UID real, build, hashes e host ao caminho fixo Contents/Resources/Component
+derivado do executável. Metadados têm schema fechado, hashes/versão numérica
+válidos e limites de leitura; troca de host, pacote ou metadados invalida a
+admissão original. O principal para ler arquivos vem do UID obtido pelo processo,
+não do UID alegado no JSON. O entrypoint não aceita flags de path/UID nem usa
+SUDO_UID como autoridade. Seus gates de root/UID efetivo diferente estão no
+código, sem execução desses ramos privilegiados nesta fase.
+
+[executed, native filesystem + own ACL fixtures] Recusa links em arquivo ou
+ancestrais, hardlinks, FIFO, permissões/ACL de escrita alheia e pacote excessivo.
+Diretórios/arquivos devem pertencer a root ou ao usuário atual. A exceção de
+ancestral só admite o /Applications padrão root:admin 0775, ou seu caminho de
+volume de dados, com essas propriedades exatas; o app, descendentes e arquivos
+continuam sob as checagens estritas. O diretório real foi apenas lido; nenhum
+app ou configuração foi criado em Applications. Isso não demonstra um bundle
+executado naquele diretório nem admissão de arquivo pertencente a outro UID.
+
+[executed, native headless host + package tools] Dois testes atravessam os
+empacotadores reais com runtime/roles fictícios, incluem o .pkg auditado no .app
+e executam o host nativo copiado com --inspect-component. O programa confere os
+bytes reais do próprio executável e pacote e devolve metadados correspondentes.
+Checksum alterado é recusado; argv extra, ambiente ou cwd não selecionam outro
+componente. Pacote simples sem componente falha na inspeção sem abrir GUI.
+Se a fonte do componente estiver corrompida, a tentativa de --replace falha
+antes de apagar o app anterior; seus bytes e sua admissão permanecem válidos.
+O plist do .app precisa corresponder ao mínimo declarado, considerando o maior
+entre macOS 13.0 e o mínimo do componente.
+
+[executed, regression/oracles] A assertion inicial de admissão falhou no método
+produtivo antes da implementação. A matriz detectou 17 mutações, com quatro
+baselines/restaurações: UID/versão/schema/digests, selo de metadados, hashes de
+host/pacote, links/modos/ACL, nome do executável, preservação do app anterior,
+mínimo incoerente e exceção do Applications. Esta última só roda quando a
+máquina tem root:admin 0775, como no ambiente local verificado. O runner valida
+todas as âncoras primeiro e exige falha executada da assertion esperada. Logs e
+187 hashes conferidos ficam em output/fixtures/app-component-oracles/.
+
+[executed, local] Passaram 219 testes Rust com desktop e 216 sem desktop,
+com dois ignored: admissão opcional do runtime e harness de crash exercitado
+pelo pai. Fmt, clippy all-targets/all-features com -D warnings, sintaxe Python e
+build dos binários/askpass passaram. UI/catálogos/layout, dependências e patches
+não mudaram, sem novo browser/aceite visual. As 15 mutações do .pkg permanecem
+no checkpoint 64fe499; as 48 de payload/executor, em e8f4b7e; as demais 157,
+em seus checkpoints anteriores. Esses oráculos não foram reexecutados nesta
+fase. As suítes completas incluem os testes positivos dessas camadas. O CI
+inclui a matriz nova, ainda sem execução no serviço remoto.
+
+[executed, prepared native artifact] O .app final incluiu o runtime/adapters
+locais já admitidos no payload 6f4596d2684eb8feb0966a41e1e44276b0df6b61abc568f8ceeaa10b6ee2d234.
+O host real foi executado apenas com --inspect-component, cwd / e ambiente
+mínimo; devolveu UID 502, mínimo macOS 26.0 e os hashes esperados. Bytes do host
+coincidem com target/debug/vpnt; o pacote incluído tem SHA256
+8a2b54192a8ccfd8edc3b386898fe17b32bce5f1ae824ac608db3aab39cda0a3.
+Recebimento nativo de metadados e leitura de arquivos não são execução do
+Installer, instalação, abertura do tray ou prova de VPN.
+
+[partial] Esta fase prepara o artefato e sua admissão; não aciona os botões
+InstallHelper/RemoveHelper nem abre o Installer. Ainda faltam o cliente/ator
+assíncronos, quiescência do runtime e exclusão de operações incertas, confirmação
+bilíngue, prova de recibo/sessão após instalação e os gates positivos root/
+PackageKit/PAM. Hashes são integridade do build de desenvolvimento e não
+substituem assinatura nem cercam alteração arbitrária pelo próprio usuário.
+CLI sem GUI não prova tray/WKWebView; VPN/tráfego/cleanup e IPsec continuam
+pendentes. Nenhuma elevação, instalação ou VPN foi executada.
+
+## Pacote local do componente privilegiado — checkpoint 64fe499
 
 ```bash
 cargo test --locked --no-default-features --test install_package --test install_preparation

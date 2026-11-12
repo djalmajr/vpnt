@@ -12,6 +12,27 @@ fn main() {
     match options {
         Options::Help => println!("{USAGE}"),
         Options::Version => println!("vpnt {}", env!("CARGO_PKG_VERSION")),
+        Options::InspectComponent => {
+            #[cfg(target_os = "macos")]
+            match vpnt::install::bundle::Component::current() {
+                Ok(component) => {
+                    println!("{}", serde_json::to_string(component.metadata()).unwrap())
+                }
+                Err(error) => {
+                    eprintln!("{}", serde_json::to_string(&error).unwrap());
+                    std::process::exit(if error == vpnt::install::Error::PermissionDenied {
+                        77
+                    } else {
+                        1
+                    });
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                eprintln!("Component admission requires macOS.");
+                std::process::exit(1);
+            }
+        }
         #[cfg(feature = "desktop")]
         Options::DemoServer { port } => {
             if let Err(error) = vpnt::preview::serve(port) {

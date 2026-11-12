@@ -7,6 +7,7 @@ import plistlib
 import shutil
 import tempfile
 import tomllib
+from app_component import include as include_component
 
 root = Path(__file__).resolve().parents[2]
 version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
@@ -15,6 +16,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path, default=Path("target/debug/vpnt"))
 parser.add_argument("--output", type=Path, default=Path("target/vpnt.app"))
 parser.add_argument("--replace", action="store_true")
+parser.add_argument("--component-payload", type=Path, help="Include the audited local component from this admitted payload")
 args = parser.parse_args()
 if not args.binary.is_file():
     parser.error("Build the binary first.")
@@ -35,8 +37,11 @@ with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent)
     resources = bundle / "Contents/Resources"
     resources.mkdir()
     shutil.copy2(root / "LICENSE", resources / "LICENSE")
+    minimum = "13.0"
+    if args.component_payload:
+        minimum = include_component(args.component_payload.resolve(), resources, executable)
     with (bundle / "Contents/Info.plist").open("wb") as handle:
-        plistlib.dump({"CFBundleIdentifier": "dev.vpnt.app", "CFBundleName": "vpnt", "CFBundleDisplayName": "vpnt", "CFBundleExecutable": "vpnt", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": "13.0", "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
+        plistlib.dump({"CFBundleIdentifier": "dev.vpnt.app", "CFBundleName": "vpnt", "CFBundleDisplayName": "vpnt", "CFBundleExecutable": "vpnt", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": minimum, "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
     if args.output.exists():
         shutil.rmtree(args.output)
     shutil.move(str(bundle), str(args.output))

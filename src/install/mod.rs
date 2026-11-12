@@ -1,6 +1,8 @@
 //! Closed installation payloads. Admission alone never grants access or writes
 //! to the machine; privileged activation must retain its own controller lock.
 #[cfg(target_os = "macos")]
+pub mod bundle;
+#[cfg(target_os = "macos")]
 pub mod engine;
 pub mod payload;
 pub mod policy;

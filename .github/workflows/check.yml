@@ -59,6 +59,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-installation-package.py
+      - name: Verify packaged host and component binding without Installer
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-app-component.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

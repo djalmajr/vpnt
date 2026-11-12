@@ -2,12 +2,12 @@
 pub enum Options {
     Help,
     Version,
+    InspectComponent,
     App { demo: bool, show: bool },
     DemoServer { port: u16 },
 }
 
-pub const USAGE: &str =
-    "vpnt [--demo] [--show]\nvpnt --demo-server <port>\nvpnt --help\nvpnt --version";
+pub const USAGE: &str = "vpnt [--demo] [--show]\nvpnt --demo-server <port>\nvpnt --inspect-component\nvpnt --help\nvpnt --version";
 
 pub fn parse(args: &[String]) -> Result<Options, &'static str> {
     if args == ["--help"] || args == ["-h"] {
@@ -15,6 +15,9 @@ pub fn parse(args: &[String]) -> Result<Options, &'static str> {
     }
     if args == ["--version"] {
         return Ok(Options::Version);
+    }
+    if args == ["--inspect-component"] {
+        return Ok(Options::InspectComponent);
     }
     if args.first().map(String::as_str) == Some("--demo-server") {
         if args.len() != 2 {
