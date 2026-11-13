@@ -2177,3 +2177,24 @@ python3 scripts/macos/check-charon-config.py
   de coexistência. O Driver IPsec, o ledger real e a proteção do transporte UDP
   permanecem pendentes. Nenhuma VPN real pode ser declarada conectada com esta
   evidência.
+
+### Fixture VICI ociosa (correção posterior ao checkpoint)
+
+- [PASS, fixture nativa] Removido o timeout de leitura de 200 ms da fixture
+  do produtor. Um cliente válido pode ficar ocioso por 350 ms e ainda receber
+  a resposta `version`; o listener e a observação de EOF são multiplexados.
+  O comportamento antigo falhou nessa regressão na cópia diagnóstica.
+- [PASS, escopo afetado] Formatação, clippy de todos os targets/features com
+  `-D warnings`, 27 testes do produtor e as 32 mutações passaram no estado
+  final. Recibo: `output/fixtures/fixture-idle-scope-receipt.json`, quatro
+  passos verdes com fonte estável. Revisão independente da delta concluída.
+- [PASS, evidência reutilizada] Somente a fixture C e o teste de regressão
+  mudaram desde `6acbad9`. Código de produção, runtime, UI, controle, parser e
+  pacote conservaram seus insumos; os 14 passos do checkpoint são reutilizados.
+  As suítes completas anteriores continuam sendo 352 desktop e 336 core,
+  com dois ignorados em cada; não foram reexecutadas nesta correção.
+- [Limite da fixture] Há um cliente por vez; uma mensagem parcial pode bloquear
+  a leitura. Os testes cobertos enviam a mensagem completa. Isso não altera o
+  protocolo ou os prazos do produtor real.
+- [NOT RUN, VPN real] Esta correção não executa túnel, instalação privilegiada,
+  política IPsec, configuração de VIP/rotas ou tráfego real.

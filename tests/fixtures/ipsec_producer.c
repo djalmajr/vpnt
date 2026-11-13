@@ -42,37 +42,43 @@ static void audit_closed(const char *directory) {
     int fd=open(path,O_WRONLY|O_APPEND|O_CREAT,0600);if(fd<0)return;
     (void)write(fd,"closed\n",7);close(fd);
 }
+static int handle(int client) {
+    unsigned char header[4],body[32];
+    if(!read_all(client,header,4))return 0;
+    size_t len=((size_t)header[0]<<24)|((size_t)header[1]<<16)|((size_t)header[2]<<8)|header[3];
+    if(len>sizeof(body) || !read_all(client,body,len))return 0;
+    if(len!=9 || memcmp(body,"\0\7version",9)!=0)return 0;
+    static const unsigned char reply[]="\1\3\6daemon\0\6charon\3\7version\0\5" "6.1.0";
+    const unsigned char prefix[]={0,0,0,sizeof(reply)-1};
+    if(write(client,prefix,sizeof(prefix))!=(ssize_t)sizeof(prefix))return 0;
+    return write(client,reply,sizeof(reply)-1)==(ssize_t)(sizeof(reply)-1);
+}
 static void serve(const char *path,int watch,const char *directory) {
     int fd=socket(AF_UNIX,SOCK_STREAM,0);demand(fd>=0);
     struct sockaddr_un address;memset(&address,0,sizeof(address));address.sun_family=AF_UNIX;
     demand(strlen(path)<sizeof(address.sun_path));strcpy(address.sun_path,path);
     mode_t old=umask(0117);int bound=bind(fd,(struct sockaddr*)&address,sizeof(address));umask(old);demand(bound==0 && listen(fd,4)==0);
+    /* One idle client is multiplexed, never closed by a read timeout: a valid
+     * caller may be scheduled long after it connected. */
+    int client=-1;
     while(!stopping) {
-        int widest=watch>fd?watch:fd;
-        fd_set ready;FD_ZERO(&ready);FD_SET(fd,&ready);if(watch>=0)FD_SET(watch,&ready);
+        int widest=fd;if(watch>widest)widest=watch;if(client>widest)widest=client;
+        fd_set ready;FD_ZERO(&ready);FD_SET(fd,&ready);
+        if(watch>=0)FD_SET(watch,&ready);
+        if(client>=0)FD_SET(client,&ready);
         struct timeval timeout={0,50000};
         int rc=select(widest+1,&ready,NULL,NULL,&timeout);if(rc<=0)continue;
         if(watch>=0 && FD_ISSET(watch,&ready)) {
             unsigned char byte;ssize_t got=read(watch,&byte,1);
             if(got==0 || (got<0 && errno!=EINTR)) {audit_closed(directory);close(watch);watch=-1;}
         }
-        if(!FD_ISSET(fd,&ready))continue;
-        int client=accept(fd,NULL,NULL);if(client<0)continue;
-        /* A client that never speaks must not stall the watch loop. */
-        struct timeval wait={0,200000};
-        (void)setsockopt(client,SOL_SOCKET,SO_RCVTIMEO,&wait,sizeof(wait));
-        unsigned char header[4],body[32];
-        if(read_all(client,header,4)) {
-            size_t len=((size_t)header[0]<<24)|((size_t)header[1]<<16)|((size_t)header[2]<<8)|header[3];
-            if(len<=sizeof(body) && read_all(client,body,len)) {
-                demand(len==9 && memcmp(body,"\0\7version",9)==0);
-                static const unsigned char reply[]="\1\3\6daemon\0\6charon\3\7version\0\5" "6.1.0";
-                const unsigned char prefix[]={0,0,0,sizeof(reply)-1};
-                (void)write(client,prefix,sizeof(prefix));(void)write(client,reply,sizeof(reply)-1);
-            }
+        if(client>=0 && FD_ISSET(client,&ready) && !handle(client)) {close(client);client=-1;}
+        if(FD_ISSET(fd,&ready)) {
+            int accepted=accept(fd,NULL,NULL);
+            if(accepted>=0) {if(client>=0)close(client);client=accepted;}
         }
-        close(client);
     }
+    if(client>=0)close(client);
     close(fd);
 }
 int main(int argc,char **argv) {

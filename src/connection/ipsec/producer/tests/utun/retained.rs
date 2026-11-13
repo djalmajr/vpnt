@@ -257,3 +257,20 @@ fn take_interface_is_bounded_while_the_active_map_is_held() {
     assert_eq!(peer.retire(reservation.owner()), Ok(true));
     registry.release(&reservation).unwrap();
 }
+
+// Regression: a valid VICI client that idles past the old 200 ms read
+// window must still answer; the fixture must not close it on a scheduler delay.
+#[test]
+fn idle_client_stays_open_past_the_old_read_window_and_still_answers() {
+    use crate::helper::vici::Message;
+    let fixture = Fixture::new();
+    let context = fixture.context();
+    let (mut registry, reservation, mut peer) = prepared(&context, "normal", 1);
+    let client = peer.open(reservation.owner(), until(), token()).unwrap();
+    thread::sleep(Duration::from_millis(350));
+    client
+        .command("version", Message::new(), &[])
+        .expect("a valid idle client was closed before it could issue a command");
+    assert_eq!(peer.retire(reservation.owner()), Ok(true));
+    registry.release(&reservation).unwrap();
+}
