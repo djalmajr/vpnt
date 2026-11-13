@@ -51,8 +51,8 @@ jobs:
           cargo +1.99.0 build --locked
       - name: Package unsigned development app
         run: python3 scripts/macos/package-app.py
-      - name: Build graphical askpass adapter without elevation
-        run: python3 scripts/macos/build-askpass.py
+      - name: Validate graphical askpass adapter without elevation
+        run: python3 scripts/macos/check-askpass.py
       - name: Verify installation payload and preparation oracles
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

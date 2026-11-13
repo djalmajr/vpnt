@@ -75,7 +75,14 @@ O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
 `--replace` para substituir um pacote anterior do vpnt nesse destino. Isso não
 instala programas de VPN, componentes privilegiados ou regras do sudoers.
 O askpass é produzido separadamente em `target/debug/vpnt-askpass`, sem instalar
-ou executar sudo. O build só verifica sua recusa a um pai não autorizado.
+ou executar sudo. O build verifica sua recusa a um pai não autorizado. O gate adicional
+`python3 scripts/macos/check-askpass.py` compila esse adaptador e exercita a
+identidade do pai com syscalls injetados e mutações em cópia temporária, sem
+abrir diálogo nem executar sudo. O askpass consulta o início exato do pai por
+`sysctl(KERN_PROC_PID)` e conserva os checks de pai direto e caminho de sudo;
+isso evita depender da consulta `proc_pidinfo` que foi recusada para o processo
+root no ensaio local. O salvamento nativo e o fluxo de senha com esse adaptador
+ainda precisam de validação no componente instalado.
 Novos perfis usam porta remota 500 para IPsec e 443 para SSL; o campo é editável
 nos dois tipos. Abrir um perfil existente ou trocar seu tipo conserva a porta
 escolhida. Nenhuma configuração existente é migrada automaticamente.

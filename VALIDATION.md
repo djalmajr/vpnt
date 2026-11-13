@@ -22,7 +22,7 @@ cargo test --locked --all-targets --all-features
 cargo test --locked --no-default-features
 cargo build --locked
 python3 scripts/macos/package-app.py --replace
-python3 scripts/macos/build-askpass.py
+python3 scripts/macos/check-askpass.py
 ```
 
 O gate de tokens compara as 94 entradas mapeadas em `DESIGN.md` com o CSS.
@@ -254,7 +254,28 @@ novo pedido. A admissão dos dois adaptadores passou. Uma sonda de leitura nativ
 encontrou `EPERM` em `proc_pidinfo` para o sudo root pertencente ao app, enquanto
 `proc_pidpath` e `sysctl(KERN_PROC_PID)` responderam. Isso identifica um guard
 incompatível no askpass; a execução original não tem trace que prove ter parado
-exatamente nesse ramo. A correção e seu aceite nativo permanecem pendentes.
+exatamente nesse ramo. A correção foi integrada após revisão de segurança independente; o aceite do
+adaptador instalado e o salvamento real continuam pendentes.
+
+[PASS local, identidade do pai no askpass] A observação usa agora o layout SDK
+de `sysctl(KERN_PROC_PID)`, exigindo sucesso, tamanho exato, PID, estado vivo e
+início em segundos/microssegundos. Timer e aceitação repetem a correlação com o
+pai direto e o caminho exato de sudo. Os guards de usuário, FIFO, idioma, prazo
+e destino da senha foram conservados. O gate `check-askpass.py` compila o
+adaptador e verifica sua recusa sem UI quando chamado diretamente. O fixture
+inclui a implementação real, com syscalls/topologia injetados: 26 casos e dois
+mutantes discriminantes passaram, com baseline restaurado. As mutações ocorrem
+somente em uma cópia temporária; fontes canônicas são conferidas antes/depois.
+A prova de falha de compilação e limpeza foi fornecida pelo implementador; o
+integrador repetiu o gate completo aprovado. Isso não comprova um diálogo de
+senha bem-sucedido nem zeroização do buffer mantido pelo sistema.
+
+[PASS, novo pacote local] Após essa correção foram executados build de todos os
+binários, verificação do runtime sem rebuild, preparação do payload, pacote do
+app e inspeção do vínculo host/componente. Licenças e inputs foram conferidos.
+A saída separada `target/vpnt-askpass-parent.app` contém o adaptador corrigido;
+ainda não substitui a prova do componente instalado anteriormente. Nenhum
+Installer, senha ou conexão foi executado nessa preparação.
 
 [NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
 coexistência operacional, abertura após logout/login, entrega de notificações e

@@ -1,6 +1,6 @@
 #import <AppKit/AppKit.h>
 #include <libproc.h>
-#include <sys/proc_info.h>
+#include <sys/sysctl.h>
 #include <sys/proc.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -14,12 +14,26 @@ static uint64_t monotonic_ns(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
 }
-static BOOL parent_matches(pid_t pid, const struct proc_bsdinfo *original) {
-    struct proc_bsdinfo info;
-    char path[PROC_PIDPATHINFO_MAXSIZE];
-    if (getppid() != pid || proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) return NO;
-    if (info.pbi_start_tvsec != original->pbi_start_tvsec || info.pbi_start_tvusec != original->pbi_start_tvusec || info.pbi_status == SZOMB) return NO;
-    return proc_pidpath(pid, path, sizeof(path)) > 0 && strcmp(path, "/usr/bin/sudo") == 0;
+// Fail closed on missing/truncated observations, including a process that exits
+// or is reparented while its identity is being read. Use the public SDK layout.
+static BOOL parent_snapshot(pid_t pid, struct kinfo_proc *info) {
+    int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PID,pid};
+    size_t length=sizeof(*info);
+    memset(info,0,sizeof(*info));
+    if (pid<=0 || getppid()!=pid || sysctl(mib,4,info,&length,NULL,0)!=0 || getppid()!=pid) return NO;
+    return length==sizeof(*info) && info->kp_proc.p_pid==pid && info->kp_proc.p_stat>=SIDL && info->kp_proc.p_stat<SZOMB &&
+        info->kp_proc.p_starttime.tv_sec>0 && info->kp_proc.p_starttime.tv_usec>=0 && info->kp_proc.p_starttime.tv_usec<1000000;
+}
+static BOOL parent_matches(pid_t pid, const struct kinfo_proc *original) {
+    struct kinfo_proc info;
+    char path[PROC_PIDPATHINFO_MAXSIZE]={0};
+    if (!parent_snapshot(pid,&info)) return NO;
+    if (info.kp_proc.p_starttime.tv_sec!=original->kp_proc.p_starttime.tv_sec ||
+        info.kp_proc.p_starttime.tv_usec!=original->kp_proc.p_starttime.tv_usec) return NO;
+    // The snapshot and path lookup are not atomic. Recheck direct parentage
+    // after the path read; timer and accept both repeat the full identity gate.
+    return proc_pidpath(pid,path,sizeof(path))>0 && memchr(path,0,sizeof(path))!=NULL &&
+        strcmp(path,"/usr/bin/sudo")==0 && getppid()==pid;
 }
 static BOOL write_all(const void *bytes, size_t length) {
     const char *at=bytes;
@@ -36,10 +50,10 @@ int main(int argc, const char *argv[]) {
     // The only stdout consumer is sudo's private askpass pipe. Refuse direct
     // invocation before creating NSApplication or displaying a password field.
     struct stat output;
-    struct proc_bsdinfo parent;
+    struct kinfo_proc parent;
     pid_t pid=getppid();
     if (argc!=2 || getuid()==0 || geteuid()!=getuid() || fstat(STDOUT_FILENO,&output)!=0 || !S_ISFIFO(output.st_mode)) return 1;
-    if (proc_pidinfo(pid,PROC_PIDTBSDINFO,0,&parent,sizeof(parent))!=sizeof(parent) || !parent_matches(pid,&parent)) return 1;
+    if (!parent_snapshot(pid,&parent) || !parent_matches(pid,&parent)) return 1;
     const char *raw=getenv("VPNT_AUTH_UNTIL_NS"),*locale=getenv("VPNT_AUTH_LOCALE");
     if (!raw || !*raw || !locale || (strcmp(locale,"pt-BR")!=0 && strcmp(locale,"en-US")!=0)) return 1;
     for (const char *p=raw;*p;p++) if (*p<'0'||*p>'9') return 1;
