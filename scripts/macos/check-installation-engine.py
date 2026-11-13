@@ -17,6 +17,9 @@ spec.loader.exec_module(shared)
 shared.REPORTS = REPORTS
 replace = shared.replace
 run = shared.run
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def operation(source, name, before, after):
@@ -101,6 +104,14 @@ def main():
             raise RuntimeError(f'{label}: mutation changed nothing')
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [ROOT / 'scripts/macos' / name for name in ['check-installation-engine.py', 'check-installation.py', 'prepare-installation.py']]
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}, 'limits': 'Same executor and native visudo, ordinary-user private filesystem/socket fixtures, owned child crash and recovery. No root activation, effective sudo policy, installation or VPN.'}
     baselines = [('engine', ['--lib', 'install::engine::tests']), ('preparation', ['--test', 'install_preparation'])]
     try:
@@ -109,6 +120,7 @@ def main():
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
             shutil.copy2(ROOT / 'scripts/macos/prepare-installation.py', copy / 'scripts/macos/prepare-installation.py')
+            build_inputs.copy_into(ROOT, copy)
             for label, selector in baselines: receipt['baseline-' + label] = run(copy, 'baseline-' + label, selector)
             for label, file, mutate, selector, expected in mutants:
                 source = copy / file

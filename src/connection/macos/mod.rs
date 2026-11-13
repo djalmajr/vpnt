@@ -11,4 +11,6 @@ pub mod routing;
 mod sink;
 mod store;
 mod tcp;
+pub(crate) mod utun_observer;
+pub(crate) mod utun_socket;
 pub use interfaces::Interfaces;

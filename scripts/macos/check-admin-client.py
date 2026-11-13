@@ -16,6 +16,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 def without_eof(source):
     a = source.index('    if read(channel, &mut input, deadline, state)?.is_some() {')
@@ -54,12 +57,18 @@ def main():
         ('keychain-cleanup-failure-hidden', 'src/broker/admin.rs', lambda s: replace(s, 'result = Err("secret_cleanup_failed");', 'result = Ok(());'), broker + 'a_partial_keychain_cleanup_reports_failure_after_the_profile_was_removed', False),
         ('administration-blocks-native-actor', 'src/desktop/worker.rs', lambda s: replace(s, '                                            administrative.insert(token, work.request.id);', '                                            administrative.insert(token, work.request.id);\n                                            loop {\n                                                normal.poll();\n                                                if let Some((_, result)) = normal.take_admin_result() {\n                                                    reply(response(administrative.remove(&token).unwrap(), result)); break;\n                                                }\n                                                std::thread::sleep(Duration::from_millis(5));\n                                            }'), actor, True),
     ]
-    receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for folder in ['src', 'tests', 'ui/src'] for p in sorted((ROOT/folder).rglob('*')) if p.is_file()}, 'limits': 'No sudo/PAM/native authorization window; fixed command assertion is static. Peer IO and actor use ordinary-user processes and an isolated Keychain.'}
+    source = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for folder in ['src', 'tests', 'ui/src'] for p in sorted((ROOT/folder).rglob('*')) if p.is_file()}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key] != digest:
+            raise RuntimeError(f'conflicting build input hash: {key}')
+        source[key] = digest
+    receipt = {'sourceSha256': dict(sorted(source.items())), 'limits': 'No sudo/PAM/native authorization window; fixed command assertion is static. Peer IO and actor use ordinary-user processes and an isolated Keychain.'}
     try:
         with tempfile.TemporaryDirectory(prefix='copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT/name, copy/name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/dist', 'ui/src']: shutil.copytree(ROOT/name, copy/name)
+            build_inputs.copy_into(ROOT, copy)
             baselines = [('client', 'helper::admin_client', False), ('broker', 'broker::admin', False), ('actor', actor, True)]
             for label, selector, desktop in baselines: receipt['baseline-'+label] = base.run(copy, 'baseline-'+label, selector, desktop=desktop)
             for label, file, mutate, expected, desktop in mutants:

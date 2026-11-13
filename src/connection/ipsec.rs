@@ -12,7 +12,7 @@ pub use config::Config;
 pub use control::{Control, Peer, Phase};
 pub use namespace::{Observer, Registry, Reservation};
 #[cfg(target_os = "macos")]
-pub use producer::{KernelClaims, NativeContext, NativeObserver, NativePeer};
+pub use producer::{InterfaceObservation, KernelClaims, NativeContext, NativeObserver, NativePeer};
 pub use snapshot::Candidate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

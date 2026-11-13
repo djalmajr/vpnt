@@ -99,7 +99,7 @@ impl Fixture {
                 .collect::<std::collections::BTreeMap<_, _>>()
         };
         let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
-            "strongswan":{"version":"6.1.0","source":"fixture","sha256":"fixture","pidDirectory":paths::runtime_directory().join("run"),"patches":hashes(&["charon-private-pid.patch"])},
+            "strongswan":{"version":"6.1.0","source":"fixture","sha256":"fixture","backend":"kernel-libipsec","pidDirectory":paths::runtime_directory().join("run"),"patches":hashes(&["charon-private-pid.patch","strongswan-utun-framing.patch","strongswan-libipsec-no-routes.patch","charon-parent-eof.patch"])},
             "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":hashes(&["openfortivpn-no-routes.patch","openfortivpn-bound-transport.patch","openfortivpn-ppp-supervisor.patch"])},"files":files});
         fs::write(
             path.join("manifest.json"),

@@ -39,6 +39,10 @@ jobs:
         run: |
           bun scripts/design/check-tokens.ts
           bun scripts/design/check-classes.ts
+      - name: Test the Rust build-input helper without Cargo
+        run: python3 scripts/macos/tests/test_rust_build_inputs.py
+      - name: Test build-runtime configure recovery without a build
+        run: python3 scripts/macos/tests/test_runtime_configure_recovery.py
       - name: Validate native code and demo API
         run: |
           cargo +1.99.0 fmt --check

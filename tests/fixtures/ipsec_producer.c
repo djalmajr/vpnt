@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #ifndef RUNTIME_PREFIX
 #error RUNTIME_PREFIX required
 #endif
@@ -53,7 +54,10 @@ static void serve(const char *path) {
 }
 int main(int argc,char **argv) {
     struct stat null_device,descriptor;demand(stat("/dev/null",&null_device)==0);
-    for(int fd=0;fd<3;fd++) demand(fstat(fd,&descriptor)==0 && S_ISCHR(descriptor.st_mode) && descriptor.st_rdev==null_device.st_rdev);
+    /* fd0 is the private parent-liveness read end: anonymous, read-only. */
+    demand(fstat(0,&descriptor)==0 && S_ISFIFO(descriptor.st_mode) && descriptor.st_nlink==0);
+    int stdin_flags=fcntl(0,F_GETFL);demand(stdin_flags!=-1 && (stdin_flags&O_ACCMODE)==O_RDONLY);
+    for(int fd=1;fd<3;fd++) demand(fstat(fd,&descriptor)==0 && S_ISCHR(descriptor.st_mode) && descriptor.st_rdev==null_device.st_rdev);
     char cwd[1024];demand(getcwd(cwd,sizeof(cwd)) && strcmp(cwd,"/")==0);
     const char *groups[]={"dmn","mgr","ike","chd","job","cfg","knl","net","asn","enc","tnc","imc","imv","pts","tls","esp","lib"};
     demand(argc==35);
@@ -69,6 +73,8 @@ int main(int argc,char **argv) {
     char config[8192],claim[8192],directory[1024],pid[1024],socket_path[104],record[1024];
     read_file(filename,config,sizeof(config));
     demand(strstr(config,"install_routes = no") && strstr(config,"install_virtual_ip = no") && strstr(config,"port = 0") && strstr(config,"port_nat_t = 0"));
+    demand(strstr(config,"kernel-libipsec") && strstr(config,"kernel-pfroute") && !strstr(config,"kernel-pfkey"));
+    demand(strstr(config,"vpnt_parent_eof = yes"));
     strcpy(directory,filename);char *slash=strrchr(directory,'/');demand(slash!=NULL);*slash=0;
     struct stat st;demand(lstat(directory,&st)==0 && S_ISDIR(st.st_mode) && (st.st_mode&07777)==0700);
     snprintf(record,sizeof(record),"%s/claim.json",directory);read_file(record,claim,sizeof(claim));

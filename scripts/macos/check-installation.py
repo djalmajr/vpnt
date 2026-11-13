@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Payload/policy/preparer oracles in a disposable copy; never elevate/install."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / 'output/fixtures/installation-oracles'
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def replace(source, before, after):
@@ -85,13 +89,18 @@ def main():
             raise RuntimeError(f'{label}: mutation changed nothing')
     hashes = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()}
     hashes['scripts/macos/prepare-installation.py'] = hashlib.sha256((ROOT / 'scripts/macos/prepare-installation.py').read_bytes()).hexdigest()
-    receipt = {'sourceSha256': hashes, 'limits': 'Read-only inspector; source/layout and policy assertions, native visudo syntax and fictional preparation. No effective sudo privileges, root activation or VPN.'}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in hashes and hashes[key] != digest:
+            raise RuntimeError(f'conflicting build input hash: {key}')
+        hashes[key] = digest
+    receipt = {'sourceSha256': dict(sorted(hashes.items())), 'limits': 'Read-only inspector; source/layout and policy assertions, native visudo syntax and fictional preparation. No effective sudo privileges, root activation or VPN.'}
     try:
         with tempfile.TemporaryDirectory(prefix='vpnt-copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
             shutil.copy2(ROOT / 'scripts/macos/prepare-installation.py', copy / 'scripts/macos/prepare-installation.py')
+            build_inputs.copy_into(ROOT, copy)
             baselines = [('admission', ['--lib', 'install::']), ('preparation', ['--test', 'install_preparation'])]
             for label, selector in baselines: receipt['baseline-' + label] = run(copy, 'baseline-' + label, selector)
             for label, file, mutate, selector, expected in mutants:

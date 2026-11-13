@@ -16,6 +16,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def without_eof(source):
@@ -87,6 +90,14 @@ def main():
             raise RuntimeError(f'{label}: unchanged mutation')
     inputs = [p for folder in ['src', 'tests', 'ui/src'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [Path(__file__), Path(__file__).with_name('check-broker.py')]
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}, 'limits': 'Ordinary-user processes/socketpairs, synthetic component admission. No root ownership positive gate, sudo/PAM/Installer/PackageKit, installed helper, real VPN, signals to a discovered PID or native GUI proof.'}
     baselines = [('client', 'install::client::tests', False), ('broker', 'broker::component::tests', False), ('actor', actor, True)]
     if selected:
@@ -96,6 +107,7 @@ def main():
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/dist', 'ui/src']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             for label, test, desktop in baselines: receipt['baseline-' + label] = base.run(copy, 'baseline-' + label, test, desktop=desktop)
             for label, file, mutate, test, desktop in mutants:
                 path = copy / file

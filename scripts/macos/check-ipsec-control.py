@@ -15,6 +15,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def main():
@@ -32,7 +35,10 @@ def main():
     cancel = prefix + 'io::cancellation_during_initiate_keeps_the_live_producer_reserved_and_does_not_replay'
     deadline = prefix + 'io::deadline_during_initiate_returns_while_the_producer_is_alive_and_cleanup_has_its_own_budget'
     retire = prefix + 'io::registry_failure_still_requests_producer_retirement_and_retains_the_claim'
+    backend = prefix + 'backend::backend_admission_rejects_missing_foreign_or_malformed_lists_before_any_load'
+    backend_positive = prefix + 'backend::accepted_backend_order_keeps_stats_before_any_credential_serialization'
     control = 'src/connection/ipsec/control.rs'
+    backend_rs = 'src/connection/ipsec/control/backend.rs'
     io = 'src/connection/ipsec/control/io.rs'
     registry = 'src/connection/ipsec/namespace.rs'
     snapshot = 'src/connection/ipsec/snapshot.rs'
@@ -84,12 +90,35 @@ def main():
         ('unspecified-vip-admitted', fields, lambda s: replace(s, '!Address::unscoped(ip).valid_gateway()', 'false'), invalid),
         ('empty-query-rejected', snapshot, lambda s: replace(s, '    let mut ike_ids', '    if result.events.is_empty() { return Err(Error::Invalid); }\n    let mut ike_ids'), positive),
         ('ipv6-selector-rejected', fields, lambda s: replace(s, "    if value.contains('/') {", "    if value.contains(':') { return Err(Error::Invalid); }\n    if value.contains('/') {"), positive),
+        ('backend-admission-omitted', control, lambda s: replace(s, '        let stats = self.exchange(&call, "stats", Message::new(), &[])?.response;\n        backend::admit(&stats)?;\n', ''), backend),
+        ('pfkey-backend-admitted', backend_rs, lambda s: replace(s, 'if name.starts_with("kernel-") && !REQUIRED.contains(&name) {', 'if name.starts_with("kernel-") && !REQUIRED.contains(&name) && name != "kernel-pfkey" {'), backend),
+        ('libipsec-plugin-omitted', backend_rs, lambda s: replace(s, 'const REQUIRED: [&str; 4] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "socket-default",\n    "vici",\n];', 'const REQUIRED: [&str; 3] = [\n    "kernel-pfroute",\n    "socket-default",\n    "vici",\n];'), backend),
+        ('pfroute-plugin-omitted', backend_rs, lambda s: replace(s, 'const REQUIRED: [&str; 4] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "socket-default",\n    "vici",\n];', 'const REQUIRED: [&str; 3] = [\n    "kernel-libipsec",\n    "socket-default",\n    "vici",\n];'), backend),
+        ('socket-default-plugin-omitted', backend_rs, lambda s: replace(s, 'const REQUIRED: [&str; 4] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "socket-default",\n    "vici",\n];', 'const REQUIRED: [&str; 3] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "vici",\n];'), backend),
+        ('vici-plugin-omitted', backend_rs, lambda s: replace(s, 'const REQUIRED: [&str; 4] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "socket-default",\n    "vici",\n];', 'const REQUIRED: [&str; 3] = [\n    "kernel-libipsec",\n    "kernel-pfroute",\n    "socket-default",\n];'), backend),
+        ('duplicate-plugin-admitted', backend_rs, lambda s: replace(s, '        if !seen.insert(name) {\n            return Err(Error::Incompatible);\n        }\n', '        seen.insert(name);\n'), backend),
+        ('non-list-plugins-admitted', backend_rs, lambda s: replace(s, '    let plugins = response.get_list("plugins").ok_or(Error::Incompatible)?;\n', '    let Some(plugins) = response.get_list("plugins") else {\n        return Ok(());\n    };\n'), backend),
+        ('plugin-list-unbounded', backend_rs, lambda s: replace(s, '    if plugins.is_empty() || plugins.len() > MAX_ENTRIES {', '    if plugins.is_empty() {'), backend),
+        ('empty-plugin-admitted', backend_rs, lambda s: replace(s, '        if name.is_empty()\n            || name.len() > MAX_NAME\n', '        if name.len() > MAX_NAME\n'), backend),
+        ('invalid-utf8-plugin-admitted', backend_rs, lambda s: replace(s, '        let name = std::str::from_utf8(item.as_slice()).map_err(|_| Error::Incompatible)?;', '        let name = std::str::from_utf8(item.as_slice()).unwrap_or("replacement");'), backend),
+        ('plugin-list-boundary-off-by-one', backend_rs, lambda s: replace(s, 'plugins.len() > MAX_ENTRIES', 'plugins.len() >= MAX_ENTRIES'), backend_positive),
+        ('plugin-name-boundary-off-by-one', backend_rs, lambda s: replace(s, 'name.len() > MAX_NAME', 'name.len() >= MAX_NAME'), backend_positive),
+        ('malformed-plugin-admitted', backend_rs, lambda s: replace(s, "            || !name\n                .bytes()\n                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')\n", ''), backend),
+        ('credentials-before-stats', control, lambda s: replace(s, '        let stats = self.exchange(&call, "stats", Message::new(), &[])?.response;\n        backend::admit(&stats)?;\n        let shared = self.config.shared(credentials)?;\n        // Mark uncertainty before sending: a lost reply does not undo a load.\n        self.loaded = true;\n        self.ack(&call, "load-conn", self.config.connection())?;\n        for message in shared {\n            self.ack(&call, "load-shared", message)?;\n        }\n', '        let shared = self.config.shared(credentials)?;\n        // Mark uncertainty before sending: a lost reply does not undo a load.\n        self.loaded = true;\n        self.ack(&call, "load-conn", self.config.connection())?;\n        for message in shared {\n            self.ack(&call, "load-shared", message)?;\n        }\n        let stats = self.exchange(&call, "stats", Message::new(), &[])?.response;\n        backend::admit(&stats)?;\n'), backend),
     ]
     for label, file, mutate, _ in mutations:
         source = (ROOT / file).read_text()
         if mutate(source) == source: raise RuntimeError(f'{label}: unchanged mutation')
     files = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     files += [Path(__file__), Path(__file__).with_name('check-broker.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
+    files += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(files, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    files = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
                'limits': 'Public Control lifecycle and complete VICI candidates over owned independent Python processes/sockets. Namespace observations injected. No charon/native PID admission/PF_KEY/probe, privileged installation or VPN.'}
     try:
@@ -97,6 +126,7 @@ def main():
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             receipt['baseline'] = base.run(copy, 'baseline', prefix)
             for label, file, mutate, expected in mutations:
                 target = copy / file

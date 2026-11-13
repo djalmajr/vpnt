@@ -26,6 +26,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def mutations():
@@ -164,6 +167,14 @@ def main():
             raise RuntimeError(f'{label}: unchanged mutation')
     inputs = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [Path(__file__), Path(__file__).with_name('check-broker.py'), Path(__file__).with_name('build-runtime.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     receipt = {'archiveSha256': runtime.SWAN_SHA, 'headerSha256': hashlib.sha256(header.encode()).hexdigest(),
                'originalNattCases': 2, 'pfkeySocketOpened': False, 'vpnStarted': False,
                'sourceSha256': {str(p.relative_to(ROOT)): runtime.digest(p) for p in inputs},
@@ -173,6 +184,7 @@ def main():
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             directory = copy / 'native-fixture'
             directory.mkdir()
             (directory / 'original-natt.h').write_text(header)

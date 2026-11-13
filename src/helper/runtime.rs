@@ -50,8 +50,35 @@ struct Swan {
     _source: String,
     #[serde(rename = "sha256")]
     _sha256: String,
+    backend: String,
     pid_directory: String,
     patches: BTreeMap<String, String>,
+}
+
+/// Exact strongSwan patch set compiled into the private runtime, in apply order.
+fn swan_patches() -> BTreeMap<String, String> {
+    [
+        (
+            "charon-private-pid.patch",
+            include_bytes!("../../scripts/macos/patches/charon-private-pid.patch").as_slice(),
+        ),
+        (
+            "strongswan-utun-framing.patch",
+            include_bytes!("../../scripts/macos/patches/strongswan-utun-framing.patch").as_slice(),
+        ),
+        (
+            "strongswan-libipsec-no-routes.patch",
+            include_bytes!("../../scripts/macos/patches/strongswan-libipsec-no-routes.patch")
+                .as_slice(),
+        ),
+        (
+            "charon-parent-eof.patch",
+            include_bytes!("../../scripts/macos/patches/charon-parent-eof.patch").as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, bytes)| (name.into(), format!("{:x}", Sha256::digest(bytes))))
+    .collect()
 }
 
 #[derive(Deserialize)]
@@ -90,16 +117,8 @@ impl Runtime {
             || Path::new(&manifest.strongswan.pid_directory)
                 != paths::runtime_directory().join("run")
             || manifest.strongswan.version != "6.1.0"
-            || manifest.strongswan.patches
-                != BTreeMap::from([(
-                    "charon-private-pid.patch".into(),
-                    format!(
-                        "{:x}",
-                        Sha256::digest(include_bytes!(
-                            "../../scripts/macos/patches/charon-private-pid.patch"
-                        ))
-                    ),
-                )])
+            || manifest.strongswan.backend != "kernel-libipsec"
+            || manifest.strongswan.patches != swan_patches()
             || manifest.openfortivpn.version != "1.24.1"
             || manifest.openfortivpn.sha256
                 != "c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465"

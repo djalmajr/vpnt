@@ -1,6 +1,7 @@
 //! Native producer admission. Still not dispatched by the application. Kernel
 //! and VIP/route observers must supply complete absence before finalization.
 use super::{Config, Error, Observer, Peer, Registry, Reservation};
+pub use crate::connection::macos::utun_observer::InterfaceObservation;
 use crate::{
     connection::{
         macos::process::{Identity, Process},
@@ -106,6 +107,29 @@ impl<'a> NativeContext<'a> {
             context: self.clone(),
             kernel,
         }
+    }
+    /// Observe the utun control socket of the active producer for `owner`.
+    ///
+    /// Read-only and bounded: it never spawns or reopens a producer, exposes no
+    /// PID/FD, and confers no route, cleanup or ownership authority.
+    pub fn observe_interface(
+        &self,
+        owner: &Owner,
+        expires: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<InterfaceObservation, Error> {
+        self.validate()?;
+        let observation = self.observe_active(owner, expires, &cancel)?;
+        self.validate()?;
+        Ok(observation)
+    }
+    fn observe_active(
+        &self,
+        owner: &Owner,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<InterfaceObservation, Error> {
+        child::observe_active(self, owner, expires, cancel)
     }
     fn lookup(&self, owner: &Owner) -> Result<Option<SharedProducer<'a>>, Error> {
         let live: Vec<_> = self

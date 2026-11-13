@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Instant,
 };
+mod backend;
 mod io;
 use io::Call;
 
@@ -99,6 +100,10 @@ impl<N: Observer, P: Peer> Control<N, P> {
             return Err(Error::Incompatible);
         }
         self.version_verified = true;
+        // Real constructor evidence before any connection or shared secret is
+        // serialized: a stale or foreign backend is refused here.
+        let stats = self.exchange(&call, "stats", Message::new(), &[])?.response;
+        backend::admit(&stats)?;
         let shared = self.config.shared(credentials)?;
         // Mark uncertainty before sending: a lost reply does not undo a load.
         self.loaded = true;

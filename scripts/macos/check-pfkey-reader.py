@@ -19,6 +19,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def collector_preflight(source):
@@ -115,6 +118,14 @@ def receipt_inputs():
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales', 'scripts/macos/patches']
               for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [Path(__file__), Path(__file__).with_name('check-broker.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     if len({str(p.relative_to(ROOT)) for p in inputs}) != len(inputs):
         raise RuntimeError('Duplicate input path in receipt')
     return inputs
@@ -137,6 +148,7 @@ def main():
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             receipt['baseline'] = base.run(copy, 'baseline', 'connection::ipsec::pfkey::read')
             for label, file, mutate, expected in cases:
                 target = copy / file

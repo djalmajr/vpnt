@@ -16,6 +16,9 @@ shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
 shared.REPORTS = REPORTS
 replace, run = shared.replace, shared.run
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def omit_guard(source, token):
@@ -59,6 +62,14 @@ def main():
     scripts = ['check-installation.py', 'check-installation-package.py', 'prepare-installation.py', 'package-installation.py', 'installation_package.py']
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts]
     inputs += [ROOT / 'scripts/macos' / name for name in scripts]
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}, 'limits': 'Native package build/extraction/BOM and ordinary-user script rejection. No positive root script, Installer, policy/PAM, install or VPN proof.'}
     baselines = [('package', ['--test', 'install_package']), ('preparation', ['--test', 'install_preparation'])]
     try:
@@ -67,6 +78,7 @@ def main():
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name, ignore=shutil.ignore_patterns('__pycache__'))
             for name in scripts: shutil.copy2(ROOT / 'scripts/macos' / name, copy / 'scripts/macos' / name)
+            build_inputs.copy_into(ROOT, copy)
             for label, selector in baselines: receipt['baseline-' + label] = run(copy, 'baseline-' + label, selector)
             for label, file, mutate, test in mutants:
                 source = copy / file

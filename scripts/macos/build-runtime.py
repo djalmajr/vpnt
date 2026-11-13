@@ -23,7 +23,14 @@ SWAN_SHA = "fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4"
 PKGCONF_VERSION = "3.0.10"
 PKGCONF_SHA = "9371b2f6372da574d4c6dc96fe9b1463037bcf6afcb6671c1555afde7b17e2de"
 MACH_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
-PID_PATCH = ROOT / "scripts/macos/patches/charon-private-pid.patch"
+SWAN_BACKEND = "kernel-libipsec"
+# Exact order matters; the admission and the manifest require this set.
+SWAN_PATCHES = [
+    ROOT / "scripts/macos/patches/charon-private-pid.patch",
+    ROOT / "scripts/macos/patches/strongswan-utun-framing.patch",
+    ROOT / "scripts/macos/patches/strongswan-libipsec-no-routes.patch",
+    ROOT / "scripts/macos/patches/charon-parent-eof.patch",
+]
 FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
 SUPERVISOR_PATCH = ROOT / "scripts/macos/patches/openfortivpn-ppp-supervisor.patch"
@@ -36,6 +43,21 @@ def digest(path):
 
 def capture(args):
     return subprocess.check_output([str(arg) for arg in args], text=True).strip()
+
+
+def expected_swan_patches():
+    return {patch.name: digest(patch) for patch in SWAN_PATCHES}
+
+
+def verify_backend(binary):
+    """Prove the compiled backend from symbols, not from configure or metadata."""
+    names = {line.split()[-1] for line in capture(["/usr/bin/nm", "-gU", binary]).splitlines() if line.strip()}
+    if not any("_kernel_libipsec_" in name for name in names):
+        raise RuntimeError("charon does not contain the kernel-libipsec backend")
+    if any("_kernel_pfkey" in name for name in names):
+        raise RuntimeError("charon still contains the kernel-pfkey backend")
+    if not any("_kernel_pfroute_" in name for name in names):
+        raise RuntimeError("charon lost the kernel-pfroute backend")
 
 
 def run(args, cwd, env, log):
@@ -169,8 +191,10 @@ def verify_runtime(root):
     manifest = json.loads((root / "manifest.json").read_text())
     if manifest["format"] != 1 or manifest["appVersion"] != VERSION or manifest["prefix"] != str(PREFIX):
         raise RuntimeError("Runtime manifest does not match this app")
-    if manifest["strongswan"]["patches"] != {PID_PATCH.name: digest(PID_PATCH)}:
-        raise RuntimeError("Runtime does not include the expected private PID patch")
+    if manifest["strongswan"].get("backend") != SWAN_BACKEND:
+        raise RuntimeError("Runtime manifest does not declare the kernel-libipsec backend")
+    if manifest["strongswan"]["patches"] != expected_swan_patches():
+        raise RuntimeError("Runtime does not include the exact strongSwan patch set")
     if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH]}:
         raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
     if any(path.is_symlink() for path in root.rglob("*")):
@@ -199,6 +223,9 @@ def verify_runtime(root):
         raise RuntimeError("charon does not use its private PID directory")
     if b"charon.vpnt_pid_file" not in (root / "bin/charon").read_bytes():
         raise RuntimeError("charon does not support a private PID per profile")
+    if b"charon.vpnt_parent_eof" not in (root / "bin/charon").read_bytes():
+        raise RuntimeError("charon does not support the private parent EOF capability")
+    verify_backend(root / "bin/charon")
     ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(root / "certs/ca-bundle.pem")
     # Test actual loading in the staging directory. These overrides are for this
     # unprivileged --version check; installed clients use their fixed private paths.
@@ -230,6 +257,59 @@ def verify_runtime(root):
                 if result.returncode != 1 or diagnostic not in result.stdout + result.stderr:
                     raise RuntimeError(f"Private openfortivpn did not reject invalid {option} during parsing")
     print(f"Verified {len(manifest['files'])} runtime files; minimum macOS {minimum}; versions OK", flush=True)
+
+
+CONFIGURE_STARTED = ".vpnt-configure-started.json"
+
+
+def _configure_started(path):
+    """True only for the exact in-progress sentinel shape this script writes."""
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(document, dict)
+        and set(document) == {"format", "signature"}
+        and type(document["format"]) is int
+        and document["format"] == 1
+        and isinstance(document["signature"], str)
+    )
+
+
+def configure_build(build, signature, configure, env, log, run):
+    """Reuse a completed configure or safely reconfigure an interrupted one.
+
+    The final marker is written only after configure succeeds; the started
+    sentinel is written before it, so a failed or interrupted configure is
+    recognized as this script's own tree and retried on the next invocation.
+    An unrecognized nonempty directory and a symlinked/non-directory path are
+    preserved, never deleted.
+    """
+    marker = build / ".vpnt-build.json"
+    started = build / CONFIGURE_STARTED
+    if build.is_symlink() or (build.exists() and not build.is_dir()):
+        raise RuntimeError("Refusing to replace a non-directory strongSwan build path")
+    stale = marker.read_text() != signature if marker.is_file() else True
+    if stale and build.exists():
+        # Generated plugin_constructors.c is backend-specific; a build tree from
+        # another backend or patch set must never be reused.
+        recognized = (
+            (build / ".vpnt-configure.json").is_file()
+            or marker.is_file()
+            or _configure_started(started)
+        )
+        if not recognized and any(build.iterdir()):
+            raise RuntimeError("Refusing to replace unrecognized strongSwan build directory")
+        shutil.rmtree(build)
+    build.mkdir(parents=True, exist_ok=True)
+    if not stale:
+        started.unlink(missing_ok=True)
+        return
+    started.write_text(json.dumps({"format": 1, "signature": signature}, sort_keys=True))
+    run(configure, build, env, log)
+    marker.write_text(signature)
+    started.unlink(missing_ok=True)
 
 
 def main():
@@ -273,7 +353,8 @@ def main():
     build = ROOT / "target/runtime-build/strongswan"
     build.mkdir(parents=True, exist_ok=True)
     log = ROOT / "target/runtime-build/strongswan.log"
-    run(["/usr/bin/patch", "-t", "-p1", "-i", PID_PATCH], source, os.environ.copy(), log)
+    for patch in SWAN_PATCHES:
+        run(["/usr/bin/patch", "-t", "-p1", "--fuzz=0", "-i", patch], source, os.environ.copy(), log)
     env = {key: value for key, value in os.environ.items() if not key.startswith(("DYLD_", "LD_"))}
     env.update(CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib", PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"))
     configure = [
@@ -287,7 +368,9 @@ def main():
         "--enable-charon",
         "--enable-ikev2",
         "--enable-vici",
-        "--enable-kernel-pfkey",
+        "--enable-libipsec",
+        "--enable-kernel-libipsec",
+        "--disable-kernel-pfkey",
         "--enable-kernel-pfroute",
         "--enable-socket-default",
         "--enable-eap-identity",
@@ -303,11 +386,16 @@ def main():
         "--enable-sha2",
         "--enable-hmac",
     ]
-    marker = build / ".vpnt-configure.json"
-    signature = json.dumps([str(value) for value in configure] + [str(openssl)])
-    if not marker.exists() or marker.read_text() != signature:
-        run(configure, build, env, log)
-        marker.write_text(signature)
+    signature = json.dumps(
+        {
+            "configure": [str(value) for value in configure],
+            "openssl": str(openssl),
+            "backend": SWAN_BACKEND,
+            "patches": expected_swan_patches(),
+        },
+        sort_keys=True,
+    )
+    configure_build(build, signature, configure, env, log, run)
     run(["/usr/bin/make", f"-j{args.jobs}"], build, env, log)
     staging_parent = ROOT / "target/runtime-build"
     with tempfile.TemporaryDirectory(prefix="vpnt-stage-", dir=staging_parent) as temporary:
@@ -358,8 +446,9 @@ def main():
                 "version": SWAN_VERSION,
                 "source": SWAN_URL,
                 "sha256": SWAN_SHA,
+                "backend": SWAN_BACKEND,
                 "pidDirectory": str(PREFIX / "run"),
-                "patches": {PID_PATCH.name: digest(PID_PATCH)},
+                "patches": expected_swan_patches(),
             },
             "openfortivpn": {
                 "version": FORTI_VERSION,

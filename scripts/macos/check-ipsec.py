@@ -15,6 +15,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def main():
@@ -80,12 +83,21 @@ def main():
         if mutate(source) == source: raise RuntimeError(f'{label}: unchanged mutation')
     files = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     files += [Path(__file__), Path(__file__).with_name('check-broker.py')]
+    files += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(files, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    files = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}, 'limits': 'Namespace and VICI schema mutations with injected observations. The full IPsec baseline also includes independent owned VICI fixture peers. No native SA/SPD observer, charon, authorization, privileged installation or VPN. No kernel mutation/deletion.'}
     try:
         with tempfile.TemporaryDirectory(prefix='vpnt-copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             receipt['baseline'] = base.run(copy, 'baseline', prefix)
             for label, file, mutate, expected in mutations:
                 path = copy / file

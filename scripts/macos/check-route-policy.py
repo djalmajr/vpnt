@@ -2,6 +2,7 @@
 """Run focused route-policy mutations in a disposable source/build copy."""
 import json
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -12,6 +13,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / "output/fixtures/route-oracles"
+spec = importlib.util.spec_from_file_location("rust_build_inputs", Path(__file__).with_name("rust_build_inputs.py"))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def replace_once(source, before, after):
@@ -273,11 +277,16 @@ def main():
          lambda s: replace_once(s, "        return false;\n    }\n    true\n}", "        return true;\n    }\n    true\n}"),
          ["--lib", "early_cleanup_requires_implicit"]),
     ]
-    receipt = {"sourceSha256": {
+    source = {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for prefix in ["src", "tests", "ui/src/locales"] for path in sorted((ROOT / prefix).rglob("*"))
         if path.is_file()
-    }}
+    }
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key] != digest:
+            raise RuntimeError(f"conflicting build input hash: {key}")
+        source[key] = digest
+    receipt = {"sourceSha256": dict(sorted(source.items()))}
     try:
         with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
             copy = Path(temporary)
@@ -285,6 +294,7 @@ def main():
                 shutil.copy2(ROOT / path, copy / path)
             for path in ["src", "tests", "ui/dist", "scripts/macos/patches", "ui/src/locales"]:
                 shutil.copytree(ROOT / path, copy / path)
+            build_inputs.copy_into(ROOT, copy)
             tests = ["--test", "route_flow", "--test", "route_leases"]
             native = ["--lib", "connection::macos"]
             lock = ["--lib", "helper::controller_lock"]

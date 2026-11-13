@@ -84,7 +84,7 @@ impl Fixture {
             );
         }
         let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
-            "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/charon-private-pid.patch")))}},
+            "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","backend":"kernel-libipsec","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/charon-private-pid.patch"))),"strongswan-utun-framing.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/strongswan-utun-framing.patch"))),"strongswan-libipsec-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/strongswan-libipsec-no-routes.patch"))),"charon-parent-eof.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/charon-parent-eof.patch")))}},
             "openfortivpn":{"version":"1.24.1","source":"https://github.com/adrienverge/openfortivpn/archive/refs/tags/v1.24.1.tar.gz","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/openfortivpn-no-routes.patch"))),"openfortivpn-bound-transport.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/openfortivpn-bound-transport.patch"))),"openfortivpn-ppp-supervisor.patch":format!("{:x}",Sha256::digest(include_bytes!("../scripts/macos/patches/openfortivpn-ppp-supervisor.patch")))}},"files":files});
         fs::write(
             self.directory.join("manifest.json"),
@@ -173,11 +173,11 @@ fn prepared_native_runtime_passes_the_same_admission_code() {
 }
 
 #[test]
-fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
+fn missing_or_changed_runtime_backend_patch_and_ca_inventory_are_rejected() {
     let fixture = Fixture::new();
     let path = fixture.directory.join("manifest.json");
     let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    for change in 0..9 {
+    for change in 0..16 {
         let mut document = original.clone();
         match change {
             0 => {
@@ -218,13 +218,45 @@ fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
                     .unwrap()
                     .remove("openfortivpn-ppp-supervisor.patch");
             }
-            _ => {
+            8 => {
                 document["openfortivpn"]["patches"]["openfortivpn-ppp-supervisor.patch"] =
                     "0".repeat(64).into();
             }
+            9 => {
+                document["strongswan"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("backend");
+            }
+            10 => document["strongswan"]["backend"] = "kernel-pfkey".into(),
+            11 => {
+                document["strongswan"]["patches"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("strongswan-utun-framing.patch");
+            }
+            12 => {
+                document["strongswan"]["patches"]["strongswan-libipsec-no-routes.patch"] =
+                    "0".repeat(64).into()
+            }
+            13 => {
+                document["strongswan"]["patches"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("charon-parent-eof.patch");
+            }
+            14 => {
+                document["strongswan"]["patches"]["charon-parent-eof.patch"] = "0".repeat(64).into()
+            }
+            _ => {
+                document["strongswan"]["patches"]["charon-extra.patch"] = "0".repeat(64).into();
+            }
         }
         fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-        assert!(Runtime::inspect(&fixture.directory, fixture.uid).is_err());
+        assert!(
+            Runtime::inspect(&fixture.directory, fixture.uid).is_err(),
+            "{change}"
+        );
         if change == 2 {
             fs::write(
                 fixture.directory.join("certs/ca-bundle.pem"),
@@ -233,6 +265,38 @@ fn missing_or_changed_runtime_patch_and_ca_inventory_are_rejected() {
             .unwrap();
         }
     }
+}
+
+// Mutation: compare only the patch count, accept another backend name, or drop
+// one required patch from the expected map.
+#[test]
+fn runtime_compiled_for_another_backend_or_patch_set_is_rejected() {
+    let fixture = Fixture::new();
+    let path = fixture.directory.join("manifest.json");
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (label, mutate) in [("backend", 0), ("missing-patch", 1), ("altered-hash", 2)] {
+        let mut document = original.clone();
+        match mutate {
+            0 => document["strongswan"]["backend"] = "kernel-pfkey".into(),
+            1 => {
+                document["strongswan"]["patches"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("strongswan-utun-framing.patch");
+            }
+            _ => {
+                document["strongswan"]["patches"]["strongswan-libipsec-no-routes.patch"] =
+                    "0".repeat(64).into();
+            }
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(
+            Runtime::inspect(&fixture.directory, fixture.uid).is_err(),
+            "{label}"
+        );
+    }
+    fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+    assert!(Runtime::inspect(&fixture.directory, fixture.uid).is_ok());
 }
 
 #[cfg(target_os = "macos")]

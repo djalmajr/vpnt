@@ -1997,3 +1997,94 @@ e os critérios afetados em conjunto.
 
 Renderização, lint e propagação de componentes não provam conexões de VPN ou
 transições funcionais; os controles de `vpnt.fig` são estáticos.
+
+## Backend de usuário: kernel-libipsec, observação e admissão VICI
+
+Estado desta integração, sem instalação de runtime e sem VPN real. Comandos na
+raiz do repositório, como usuário comum:
+
+```bash
+cargo test --locked --no-default-features --lib connection::macos::utun_socket::tests
+cargo test --locked --no-default-features --lib connection::macos::utun_observer::tests
+cargo test --locked --no-default-features --lib connection::ipsec::producer::tests::utun
+RUST_TEST_THREADS=4 cargo test --locked --no-default-features --lib helper::process::tests
+RUST_TEST_THREADS=4 cargo test --locked --no-default-features --lib connection::ipsec::tests::control
+cargo test --locked --no-default-features --test runtime_policy -- --ignored
+python3 scripts/macos/build-runtime.py --verify-only
+python3 scripts/macos/tests/test_rust_build_inputs.py
+python3 scripts/macos/tests/test_runtime_configure_recovery.py
+```
+
+- [PASS, local] `helper::process::tests`: 1 teste. O filho de fixture confere
+  stdin como FIFO anônimo somente leitura, stdout/stderr em `/dev/null`; o pai
+  mantém a única escrita com `FD_CLOEXEC` e o filho sai normalmente após o EOF.
+  O fixture é um filho comum, não o watcher do charon; a composição com o
+  watcher original está provada em fixture separado, sem daemon real.
+- [PASS, local] `connection::ipsec::tests::control`: 12 testes, com peer VICI
+  independente. Inclui a admissão de `stats`/plugins antes de qualquer load ou
+  envio de credencial, a recusa de backend ausente/PF_KEY/duplicado/malformado e
+  a ordem `version`, `stats`, `load-conn`, `load-shared`, `initiate`. O audit do
+  peer prova os comandos enviados e sua ordem; a posição de `Config::shared` é
+  verificada por inspeção do código, não pelo audit.
+- [PASS, SDK/fixture] `connection::macos::utun_socket::tests`: quatro testes;
+  `connection::macos::utun_observer::tests`: nove. O positivo de utun é
+  sintético; os negativos usam descritores de um filho comum próprio. Nove
+  mutações do observador foram detectadas, com baseline e restauração.
+- [PASS, consumidor nativo de fixture]
+  `connection::ipsec::producer::tests::utun`: cinco testes pelo método público
+  `NativeContext::observe_interface`, incluindo tentativa não iniciada, owner
+  alheio, scanner sem utun, aposentadoria e mutex ocupado com prazo/cancelamento.
+  Cinco mutações foram detectadas por assertions. Nenhuma observação concede
+  autoridade de lease, rota ou cleanup.
+- [PASS, runtime privado preparado] O teste ignorado
+  `prepared_native_runtime_passes_the_same_admission_code` foi executado:
+  um teste passou. Ele admite os arquivos preparados para o usuário comum;
+  não exerce a instalação root-owned.
+- [PASS, sem privilégio] `python3 scripts/macos/build-runtime.py --verify-only`
+  terminou com exit 0; `output/fixtures/libipsec-final-runtime.log` registra
+  `Verified 10 runtime files; minimum macOS 26.0; versions OK`. O mínimo 26.0 é
+  metadado derivado desta máquina, não um novo mínimo suportado; host e
+  fixtures miram 13.
+- [PASS, local] `test_rust_build_inputs.py` e
+  `test_runtime_configure_recovery.py`: 7 testes cada, sem Cargo, rede,
+  privilégio ou build. Eles também rodam no job macOS do CI, antes dos gates
+  caros.
+- O shim C do SDK (`native/utun_socket.c`) só é compilado quando o alvo é
+  macOS: `build.rs` retorna antes em outros alvos, e `cc` está fixado em
+  `=1.11.1`. A nova borda de build reutiliza a versão já existente no lockfile,
+  sem mudar versões de dependências; nenhum serviço ou action foi acrescentado.
+
+[PASS, integração local] Fmt, clippy com `-D warnings`, build, 330 testes
+desktop e 314 core passaram com `RUST_TEST_THREADS=4`, dois ignored em cada
+suíte. As 32 mutações do produtor passaram com controles verdes do pipe antes
+e depois da matriz; as 59 mutações iniciais de controle também passaram.
+`output/fixtures/libipsec-integration-receipt.json` registra fontes estáveis,
+sem VPN ou instalação real. A primeira falha de lint e seu recibo permanecem
+em `libipsec-initial-*`; a correção equivalente de `is_multiple_of` entrou antes
+da execução verde.
+
+[PASS, escopo final afetado] Depois dessa integração, mudaram somente os casos
+de limite do peer/checker VICI e a exatidão JSON da recuperação de configure.
+Fmt e clippy foram repetidos; os 12 testes de controle, a matriz completa de
+61 mutações, os dois testes Python de sete casos cada e a verificação do
+runtime passaram. Os limites aceitos 128/64 e recusados 129/65 estão cobertos;
+os mutantes `>` para `>=` falham por assertion. O recibo
+`output/fixtures/libipsec-final-scope-receipt.json` registra as cinco entradas
+alteradas e sua estabilidade. A evidência das suítes não afetadas e da matriz
+do produtor foi reutilizada; os caminhos de produção Rust/C e os patches não
+mudaram entre essas duas execuções.
+
+[PASS, empacotamento local] `target/vpnt-libipsec-checkpoint.app` foi produzido
+com o binário do build integrado, conferido byte a byte. É um host local sem
+instalação do componente. A UI não mudou desde o checkpoint anterior: seus
+26 hashes registrados coincidem, assim como o diff de `ui`, `scripts/design`
+e `DESIGN.md`; foram reutilizados os oito testes/114 assertions e os 81 tokens.
+O gate de classes continua sem regras. Isso não prova um túnel real.
+
+Recibos históricos: o runtime preparado atual foi gerado com o script no hash
+`1163454a…`; a recuperação de configure mudou `scripts/macos/build-runtime.py`
+para `23edb1fc…`, e o guard JSON estrito para `37e14397…`. O recibo do build não
+foi refeito nesta etapa; o novo
+`--verify-only` não prova paridade de fonte entre revisões do script. Nenhuma
+instalação privilegiada, VPN real, tráfego, utun real, efeito de login ou CI
+verde é afirmado aqui.

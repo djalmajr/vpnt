@@ -349,6 +349,36 @@ altera. O comando interno desativa ACSP/DHCP, proxy ARP e persistência.
 A execução privilegiada e a prova de remoção dos recursos reais continuam
 pendentes. Não foi executado o pppd do sistema.
 
+### Integração atual: kernel-libipsec, observação e admissão
+
+O runtime privado preparado compila strongSwan 6.1.0 com o backend de usuário
+`kernel-libipsec` e `kernel-pfroute`, sem `kernel-pfkey`, e aplica quatro
+patches fixos: PID privado, enquadramento do utun, respeito a `install_routes`
+no kernel-libipsec e o pipe de vida do pai (`vpnt_parent_eof`). O manifest
+declara `strongswan.backend = "kernel-libipsec"` e o hash dos quatro patches; a
+admissão recusa backend diferente, patch faltante ou hash alterado, e a
+verificação do build confere pelos símbolos do binário que libipsec e pfroute
+existem e que PF_KEY não foi compilado. O mínimo de macOS gravado no manifest é
+metadado derivado da máquina que preparou o runtime, não um novo mínimo do
+projeto; o host Rust e os fixtures continuam exigindo 13.
+
+O helper ainda **recusa despacho IPsec real** até o driver de rotas, VIP e
+cleanup estar integrado. Nada nesta etapa prova túnel conectado ou tráfego. O
+codec e o leitor PF_KEY continuam preparados, somente leitura e históricos: o
+backend de usuário não os exige e não há alegação de tabela vazia forjada. O
+contrato `KernelClaims` segue inalterado, à espera de um adaptador explícito de
+recursos de usuário.
+
+A observação de utun usa um contexto público somente leitura sobre o filho
+original, com nome e índice opacos e sem autoridade de lease ou rota; a prova
+positiva de utun é sintética e apenas o caso negativo de UDP com filho próprio é
+nativo. Antes de qualquer conexão ou envio de credencial compartilhada, o
+controle consulta `stats` e exige a lista de plugins efetivamente carregada
+(`kernel-libipsec`, `kernel-pfroute`, `socket-default`, `vici`), recusando
+PF_KEY, listas ausentes, duplicadas ou malformadas. O pipe do pai é uma
+capacidade Rust de filho comum, composta com o fixture do watcher original do
+charon; não há prova com morte real de daemon pai.
+
 ## Proposta visual
 
 O arquivo [`vpnt.fig`](vpnt.fig), na raiz do projeto, abre no OpenPencil.

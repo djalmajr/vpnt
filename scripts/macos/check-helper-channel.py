@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify helper admission/transport in a disposable unprivileged source copy."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / "output/fixtures/helper-channel-oracles"
+spec = importlib.util.spec_from_file_location("rust_build_inputs", Path(__file__).with_name("rust_build_inputs.py"))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def replace(source, before, after, count=1):
@@ -60,7 +64,12 @@ def main():
         ("admin-silence-deadline-extended", io, lambda s: replace(s, "const DEADLINE: Duration = Duration::from_secs(5)", "const DEADLINE: Duration = Duration::from_secs(30)"), tests + "an_admin_channel_kept_open_in_silence_expires_without_applying_an_operation"),
         ("consumed-password-bytes-retained", io, lambda s: replace(s, "self.buffer[self.head..end].zeroize();", "let _ = &self.buffer[self.head..end];"), "helper::server::io::tests::consumed_secret_bytes_are_erased_without_corrupting_the_next_buffered_frame"),
     ]
-    receipt = {"sourceSha256": {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests", "ui/src/locales"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}}
+    source = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests", "ui/src/locales"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key] != digest:
+            raise RuntimeError(f"conflicting build input hash: {key}")
+        source[key] = digest
+    receipt = {"sourceSha256": dict(sorted(source.items()))}
     try:
         with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
             copy = Path(temporary)
@@ -68,6 +77,7 @@ def main():
                 shutil.copy2(ROOT / file, copy / file)
             for folder in ["src", "tests", "scripts/macos/patches", "ui/src/locales"]:
                 shutil.copytree(ROOT / folder, copy / folder)
+            build_inputs.copy_into(ROOT, copy)
             baselines = [("transport", ["--lib", "helper::server"]), ("controller", ["--lib", "inherited_helper_channel"]), ("entrypoint", ["--test", "helper_entrypoint"])]
             for label, selector in baselines:
                 receipt["baseline-" + label] = run(copy, "baseline-" + label, selector)

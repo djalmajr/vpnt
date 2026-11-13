@@ -162,7 +162,7 @@ impl Peer for TestPeer {
         );
         assert_eq!(current, &owner("Case", 7));
         self.opens += 1;
-        if self.collide && self.opens == 4 {
+        if self.collide && self.opens == 5 {
             self.observation.0.lock().unwrap().occupied.insert(16383);
         }
         // SAFETY: geteuid has no memory preconditions.

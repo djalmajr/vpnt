@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Profile admission/admin isolation oracles, without root or VPN resources."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / 'output/fixtures/profile-admin-oracles'
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 def replace(source, before, after):
     if source.count(before) != 1:
@@ -85,12 +89,18 @@ def main():
         ('failed-refresh-partially-mutates-idle-slot',metadata,partial_refresh,['--lib',atomic],atomic),
         ('ipsec-dispatched-to-ssl','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if slot.profile.kind != VpnKind::Ssl {','if false {'),['--lib','connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'],'connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'),
     ]
-    receipt={'sourceSha256':{str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['src','tests','ui/src/locales'] for p in sorted((ROOT/base).rglob('*')) if p.is_file()}}
+    source={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['src','tests','ui/src/locales'] for p in sorted((ROOT/base).rglob('*')) if p.is_file()}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key]!=digest:
+            raise RuntimeError(f'conflicting build input hash: {key}')
+        source[key]=digest
+    receipt={'sourceSha256':dict(sorted(source.items()))}
     try:
         with tempfile.TemporaryDirectory(prefix='copy-',dir=REPORTS) as temporary:
             copy=Path(temporary)
             for name in ['Cargo.toml','Cargo.lock']:shutil.copy2(ROOT/name,copy/name)
             for name in ['src','tests','scripts/macos/patches','ui/src/locales']:shutil.copytree(ROOT/name,copy/name)
+            build_inputs.copy_into(ROOT, copy)
             baselines=[('release',['--lib','storage::reservation']),('filesystem',['--test','profile_reservations','--test','storage']),('custody',['--lib','connection::controller::profiles']),('metadata',['--lib','connection::controller::engine::metadata']),('admin-wire',['--lib','helper::server::tests::profiles'])]
             for label,args in baselines:receipt['baseline-'+label]=run(copy,'baseline-'+label,args)
             for label,file,mutate,args,expected in mutants:

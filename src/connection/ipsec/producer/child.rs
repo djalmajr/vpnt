@@ -1,5 +1,8 @@
 use super::*;
-use crate::helper::{process::ManagedChild, runtime::Program};
+use crate::{
+    connection::macos::utun_observer::{self, InterfaceObservation},
+    helper::{process::ManagedChild, runtime::Program},
+};
 use std::{fs, process::Command, sync::atomic::Ordering, time::Duration};
 pub(super) struct Producer<'a> {
     context: Arc<NativeContext<'a>>,
@@ -98,6 +101,30 @@ impl<'a> Producer<'a> {
         }
         Ok(())
     }
+    /// Observe the original child's utun control socket. Read-only and bounded:
+    /// this never spawns, reopens or reaps another producer.
+    pub(super) fn observe_interface(
+        &mut self,
+        owner: &Owner,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<InterfaceObservation, Error> {
+        if self.lease.record.owner() != *owner || self.retired || self.released || !self.attempted {
+            return Err(Error::Changed);
+        }
+        self.current()?;
+        let identity = self.identity.as_ref().ok_or(Error::Changed)?.clone();
+        let executable = self.context.runtime.program(Program::Charon);
+        let expected = utun_observer::Expected {
+            identity,
+            parent: self.context.identity.pid,
+            uid: self.context.runtime.owner(),
+            executable: &executable,
+        };
+        let child = self.child.as_mut().ok_or(Error::Changed)?;
+        utun_observer::observe(self.context.controller, child, &expected, expires, cancel)
+            .map_err(map_observe)
+    }
     pub fn open(
         &mut self,
         owner: &Owner,
@@ -186,5 +213,85 @@ impl<'a> Producer<'a> {
 impl Drop for Producer<'_> {
     fn drop(&mut self) {
         let _ = self.retire();
+    }
+}
+
+pub(super) fn observe_active<'a>(
+    context: &NativeContext<'a>,
+    owner: &Owner,
+    expires: Instant,
+    cancel: &AtomicBool,
+) -> Result<InterfaceObservation, Error> {
+    loop {
+        utun_observer::check(expires, cancel).map_err(map_check)?;
+        let live: Vec<SharedProducer<'a>> = context
+            .active
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut matching: Option<SharedProducer<'a>> = None;
+        let mut busy = false;
+        for producer in live {
+            let matches = match producer.try_lock() {
+                Ok(guard) => {
+                    let matches = guard.lease.record.owner() == *owner;
+                    drop(guard);
+                    matches
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Unavailable),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    busy = true;
+                    false
+                }
+            };
+            if matches {
+                if matching.is_some() {
+                    return Err(Error::Changed);
+                }
+                matching = Some(producer);
+            }
+        }
+        if busy {
+            utun_observer::check(expires, cancel).map_err(map_check)?;
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+        let Some(producer) = matching else {
+            return Err(Error::Unavailable);
+        };
+        loop {
+            utun_observer::check(expires, cancel).map_err(map_check)?;
+            match producer.try_lock() {
+                Ok(mut producer) => return producer.observe_interface(owner, expires, cancel),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Unavailable),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    utun_observer::check(expires, cancel).map_err(map_check)?;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+}
+
+fn map_check(error: utun_observer::Error) -> Error {
+    match error {
+        utun_observer::Error::Canceled => Error::Canceled,
+        utun_observer::Error::Timeout => Error::Timeout,
+        _ => Error::Unavailable,
+    }
+}
+
+fn map_observe(error: utun_observer::Error) -> Error {
+    match error {
+        utun_observer::Error::NotFound => Error::Unavailable,
+        utun_observer::Error::Ambiguous | utun_observer::Error::Changed => Error::Changed,
+        utun_observer::Error::Canceled => Error::Canceled,
+        utun_observer::Error::Timeout => Error::Timeout,
+        utun_observer::Error::Unavailable => Error::Unavailable,
+        utun_observer::Error::Exhausted => Error::Exhausted,
+        utun_observer::Error::Permission => Error::PermissionDenied,
+        utun_observer::Error::Invalid => Error::Invalid,
     }
 }

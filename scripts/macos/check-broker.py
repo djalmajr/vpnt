@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Discriminating broker/client mutations with an unprivileged fictional peer."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / "output/fixtures/broker-oracles"
+spec = importlib.util.spec_from_file_location("rust_build_inputs", Path(__file__).with_name("rust_build_inputs.py"))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 def replace(source, before, after):
     if source.count(before) != 1:
@@ -97,14 +101,20 @@ def main():
         ("disposed-poll-publishes-snapshot",ui,lambda s:replace(s,"if (live() && started === revision) receive(snapshot);","if (started === revision) receive(snapshot);"),"disposed polling cannot affect the active page"),
         ("disposed-poll-publishes-error",ui,lambda s:replace(s,'if (live() && started === revision) fail("backend_unavailable");','if (started === revision) fail("backend_unavailable");'),"disposed polling cannot affect the active page"),
     ]
-    receipt={"sourceSha256":{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src","tests","ui/src"] for p in sorted((ROOT/base).rglob("*")) if p.is_file()}}
+    source = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests", "ui/src"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key] != digest:
+            raise RuntimeError(f"conflicting build input hash: {key}")
+        source[key] = digest
+    receipt = {"sourceSha256": dict(sorted(source.items()))}
     try:
-        with tempfile.TemporaryDirectory(prefix="copy-",dir=REPORTS) as temporary:
-            copy=Path(temporary)
-            for name in ["Cargo.toml","Cargo.lock"]:shutil.copy2(ROOT/name,copy/name)
-            for name in ["src","tests","scripts/macos/patches","ui/dist","ui/src"]:shutil.copytree(ROOT/name,copy/name)
-            shutil.copy2(ROOT/"ui/package.json",copy/"ui/package.json")
-            baselines=[("broker","broker::tests",False),("client","helper::client",False),("actor",actor,True)]
+        with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
+            copy = Path(temporary)
+            for name in ["Cargo.toml", "Cargo.lock"]: shutil.copy2(ROOT / name, copy / name)
+            for name in ["src", "tests", "scripts/macos/patches", "ui/dist", "ui/src"]: shutil.copytree(ROOT / name, copy / name)
+            shutil.copy2(ROOT / "ui/package.json", copy / "ui/package.json")
+            build_inputs.copy_into(ROOT, copy)
+            baselines = [("broker", "broker::tests", False), ("client", "helper::client", False), ("actor", actor, True)]
             for label,filter,desktop in baselines:receipt["baseline-"+label]=run(copy,"baseline-"+label,filter,desktop=desktop)
             for label,file,mutate,expected,desktop in mutations:
                 path=copy/file;original=path.read_text()

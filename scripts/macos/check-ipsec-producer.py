@@ -16,6 +16,9 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 base.REPORTS = REPORTS
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def main():
@@ -23,6 +26,8 @@ def main():
         raise SystemExit('Run as an ordinary macOS user; no charon/PF_KEY/installation/VPN')
     REPORTS.mkdir(parents=True, exist_ok=True)
     prefix = 'connection::ipsec::producer::tests::'
+    parent_pipe = ('helper::process::tests::'
+                   'charon_stdin_is_the_private_parent_pipe_and_eof_stops_the_child')
     lifecycle = prefix + 'owned_native_child_is_bound_to_a_durable_attempt_and_completion_waits_for_absence'
     foreign = prefix + 'foreign_peer_process_and_exited_children_are_refused_without_respawn'
     altered = prefix + 'altered_configuration_denies_io_but_still_retires_only_the_owned_child'
@@ -85,9 +90,11 @@ def main():
         ('producer-deadline-extended', child, lambda s: replace(s, 'Instant::now() >= expires', 'Instant::now() >= expires + Duration::from_secs(1)'), budgets),
         ('preexisting-runtime-socket-admitted', child, lambda s: replace(s, 'for name in ["v", "pid"] {', 'for name in ["pid"] {'), socket),
         ('inherited-environment-admitted', process, lambda s: replace(s, '            .env_clear()\n', ''), lifecycle),
-        ('charon-stdin-piped', process, lambda s: replace(s, '.stdin(Stdio::null())', '.stdin(Stdio::piped())'), lifecycle),
+        ('charon-stdin-null', process, lambda s: replace(s, '.env("STRONGSWAN_CONF", configuration)\n                .stdin(Stdio::piped())', '.env("STRONGSWAN_CONF", configuration)\n                .stdin(Stdio::null())'), parent_pipe),
         ('charon-stdout-piped', process, lambda s: replace(s, '.stdout(Stdio::null())', '.stdout(Stdio::piped())'), lifecycle),
         ('charon-stderr-piped', process, lambda s: replace(s, '.stderr(Stdio::null())', '.stderr(Stdio::piped())'), lifecycle),
+        ('charon-parent-eof-disabled', config, lambda s: replace(s, 'vpnt_parent_eof = yes', 'vpnt_parent_eof = no'), lifecycle),
+        ('charon-wrong-backend', config, lambda s: replace(s, 'kernel-libipsec', 'kernel-pfkey'), lifecycle),
         ('charon-shared-ike-port', config, lambda s: replace(s, 'port = 0', 'port = 500'), lifecycle),
         ('charon-automatic-routes', config, lambda s: replace(s, 'install_routes = no', 'install_routes = yes'), lifecycle),
         ('charon-automatic-virtual-ip', config, lambda s: replace(s, 'install_virtual_ip = no', 'install_virtual_ip = yes'), lifecycle),
@@ -98,6 +105,14 @@ def main():
             raise RuntimeError(f'{label}: unchanged mutation')
     inputs = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [Path(__file__), Path(__file__).with_name('check-broker.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
+    inputs += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    inputs = unique
     receipt = {'sourceSha256': {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs},
                'limits': 'Owned unprivileged Mach-O C producer; original process/UDS identity and filesystem admission. Kernel absence injected; no charon/PF_KEY/privilege/VPN.'}
     try:
@@ -107,7 +122,10 @@ def main():
                 shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']:
                 shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             receipt['baseline'] = base.run(copy, 'baseline', 'connection::ipsec::')
+            # Green control for the parent-pipe test before any mutant.
+            receipt['baseline-parent-pipe'] = base.run(copy, 'baseline-parent-pipe', parent_pipe)
             for label, file, mutate, expected in mutations:
                 target = copy / file
                 original = target.read_text()
@@ -117,6 +135,7 @@ def main():
                 finally:
                     target.write_text(original)
             receipt['restored'] = base.run(copy, 'restored', 'connection::ipsec::')
+            receipt['restored-parent-pipe'] = base.run(copy, 'restored-parent-pipe', parent_pipe)
     finally:
         (REPORTS / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(f'Killed {len(mutations)} native producer mutations; baseline/restoration passed; temporary copy removed')

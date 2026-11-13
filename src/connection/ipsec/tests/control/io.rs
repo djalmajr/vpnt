@@ -18,7 +18,7 @@ fn cancellation_during_initiate_keeps_the_live_producer_reserved_and_does_not_re
         control.start(creds(), until(), token()),
         Err(Error::Changed)
     );
-    assert_eq!(harness.audit().len(), 5);
+    assert_eq!(harness.audit().len(), 6);
     assert_eq!(control.cleanup(until()), Ok(false));
     settle(&mut control, &harness, &observation, &registry);
 }
@@ -61,7 +61,7 @@ fn deadline_during_initiate_returns_while_the_producer_is_alive_and_cleanup_has_
         "lifecycle deadline was extended"
     );
     assert!(!harness.process.lock().unwrap().exited());
-    assert_eq!(harness.audit().len(), 5);
+    assert_eq!(harness.audit().len(), 6);
     assert_eq!(control.cleanup(until()), Ok(false));
     assert!(harness.audit().iter().any(|s| s == "terminate"));
     settle(&mut control, &harness, &observation, &registry);

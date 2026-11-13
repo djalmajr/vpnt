@@ -1,0 +1,97 @@
+--- a/src/charon/charon.c
++++ b/src/charon/charon.c
+@@ -294,7 +294,79 @@
+ 		ignore_result(ftruncate(fileno(pidfile), 0));
+ 		fclose(pidfile);
+ 		unlink(vpnt_pid_file);
++	}
++}
++
++/**
++ * vpnt: end this process when the private parent capability is lost.
++ *
++ * This bypasses initialization, signal handling and deinitialization on
++ * purpose: it must not depend on plugins, the IKE run loop or a graceful
++ * shutdown that may itself be blocked.
++ */
++static void vpnt_parent_lost()
++{
++	_exit(SS_RC_INITIALIZATION_FAILED);
++}
++
++/**
++ * vpnt: read the inherited capability until the helper closes its only writer.
++ */
++static void *vpnt_parent_watch(void *arg)
++{
++	char byte;
++	ssize_t n;
++
++	(void)arg;
++	for (;;)
++	{
++		n = read(STDIN_FILENO, &byte, 1);
++		if (n == 0)
++		{
++			vpnt_parent_lost();
++		}
++		if (n < 0 && errno == EINTR)
++		{
++			continue;
++		}
++		/* Read error or payload: not a live silent parent. */
++		vpnt_parent_lost();
++	}
++	return NULL;
++}
++
++/**
++ * vpnt: admit an anonymous, read-only pipe that only the helper can write,
++ * then start a detached watcher. Any failure is fatal before plugins exist.
++ */
++static bool vpnt_start_parent_watch()
++{
++	struct stat stb;
++	pthread_attr_t attr;
++	pthread_t thread;
++	int flags, rc;
++
++	if (fstat(STDIN_FILENO, &stb) != 0 || !S_ISFIFO(stb.st_mode) ||
++		stb.st_nlink != 0)
++	{
++		return FALSE;
+ 	}
++	flags = fcntl(STDIN_FILENO, F_GETFL);
++	if (flags == -1 || (flags & O_ACCMODE) != O_RDONLY)
++	{
++		return FALSE;
++	}
++	if (pthread_attr_init(&attr) != 0)
++	{
++		return FALSE;
++	}
++	rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++	if (rc == 0)
++	{
++		rc = pthread_create(&thread, &attr, vpnt_parent_watch, NULL);
++	}
++	pthread_attr_destroy(&attr);
++	return rc == 0;
+ }
+ 
+ /**
+@@ -441,6 +513,14 @@
+ 	vpnt_pid_file = lib->settings->get_str(lib->settings,
+ 										 "charon.vpnt_pid_file", PID_FILE);
+ 
++	if (lib->settings->get_bool(lib->settings, "charon.vpnt_parent_eof", FALSE))
++	{
++		if (!vpnt_start_parent_watch())
++		{
++			vpnt_parent_lost();
++		}
++	}
++
+ 	/* initialize daemon */
+ 	if (!charon->initialize(charon,
+ 				lib->settings->get_str(lib->settings, "charon.load", PLUGINS)))

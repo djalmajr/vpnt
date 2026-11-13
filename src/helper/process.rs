@@ -80,9 +80,12 @@ impl ManagedChild {
                 .env("SSL_CERT_FILE", runtime.join("certs/ca-bundle.pem"));
         }
         if let Environment::Charon(configuration) = environment {
+            // The inherited read end is the private parent-liveness capability:
+            // charon's opt-in watcher exits when this process drops its only
+            // write end. Nothing is written; stdout/stderr stay discarded.
             command
                 .env("STRONGSWAN_CONF", configuration)
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
         } else if terminal {
@@ -182,3 +185,6 @@ impl Drop for ManagedChild {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests;

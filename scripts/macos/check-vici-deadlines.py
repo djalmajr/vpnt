@@ -15,6 +15,9 @@ spec = importlib.util.spec_from_file_location('broker_oracles', Path(__file__).w
 base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 replace = base.replace
+spec = importlib.util.spec_from_file_location('rust_build_inputs', Path(__file__).with_name('rust_build_inputs.py'))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def run(copy, label, test='', failure=False):
@@ -58,6 +61,14 @@ def main():
             raise RuntimeError(f'{label}: unchanged mutation')
     files = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     files += [Path(__file__), Path(__file__).with_name('check-broker.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
+    files += build_inputs.source_files(ROOT)
+    unique, seen = [], set()
+    for path in sorted(files, key=lambda p: str(p.relative_to(ROOT))):
+        key = str(path.relative_to(ROOT))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    files = unique
     receipt = {'sourceSha256': {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
                'limits': 'Public VICI client with own Unix sockets and independent Python peers. No charon, native peer PID/socket admission, PF_KEY, privileged installation or VPN.'}
     try:
@@ -65,6 +76,7 @@ def main():
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
+            build_inputs.copy_into(ROOT, copy)
             receipt['baseline'] = run(copy, 'baseline')
             for label, file, mutate, test in mutations:
                 target = copy / file

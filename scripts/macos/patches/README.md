@@ -1,5 +1,16 @@
 # Patches do runtime
 
+O runtime privado compila strongSwan 6.1.0 com o backend `kernel-libipsec`
+(`--enable-libipsec --enable-kernel-libipsec`, `--disable-kernel-pfkey`) e
+aplica exatamente quatro patches, nesta ordem:
+`charon-private-pid.patch`, `strongswan-utun-framing.patch`,
+`strongswan-libipsec-no-routes.patch`, `charon-parent-eof.patch`. A fonte é
+sempre reextraída do tarball verificado; o build não reutiliza árvore de build
+gerada para outro backend ou outro conjunto de patches. O manifest declara
+`strongswan.backend = "kernel-libipsec"` e o hash exato dos quatro patches, e a
+admissão Rust recusa backend ausente/divergente, patch faltante ou hash
+alterado.
+
 `charon-private-pid.patch` modifica apenas `src/charon/charon.c` do strongSwan
 6.1.0. Acrescenta `charon.vpnt_pid_file` e preserva o caminho compilado como
 padrão. O futuro driver deve produzir essa configuração em diretório privado
@@ -54,3 +65,36 @@ produtivo. O runtime nativo foi recompilado e admitido com esse patch; não foi
 instalado e nenhum pppd do sistema foi executado. A auditoria de configuração
 global e scripts resultou num gate de recusa de arquivos ambientes no supervisor;
 sua validação instalada/root com pppd real continua pendente.
+
+`strongswan-utun-framing.patch` modifica `src/libstrongswan/networking/tun_device.c`
+do mesmo 6.1.0. No Darwin, o frame do utun leva um prefixo de 4 bytes com a
+família do protocolo; o código original assumia IPv4. O patch passa a escolher
+`AF_INET`/`AF_INET6` pelo nibble de versão do pacote, recusa pacote vazio ou de
+versão desconhecida e lê no máximo MTU + prefixo + 1 byte, recusando datagrama
+maior em vez de truncá-lo em silêncio. O parser do pacote IP continua sendo o
+do chamador. Limite: este patch não é exercitado por tráfego real nem cria
+utun neste repositório; o fixture alimenta os bytes e confere o prefixo.
+
+`strongswan-libipsec-no-routes.patch` modifica
+`src/libcharon/plugins/kernel_libipsec/kernel_libipsec_ipsec.c` do mesmo 6.1.0.
+O backend instalava rotas para políticas de saída ignorando
+`charon.install_routes`; o patch faz `install_route` retornar sem escrever
+quando a opção é falsa (o padrão continua verdadeiro, preservando o
+comportamento upstream para quem não desativa). Com o runtime vpnt, o helper
+instala e remove as rotas que autorizou. Limite: nenhuma rota real é escrita ou
+verificada aqui; a alternativa de pré-adicionar a rota para obter
+`ALREADY_DONE` continua sendo uma decisão de integração.
+
+`charon-parent-eof.patch` modifica apenas `src/charon/charon.c`. Acrescenta a
+opção privada `charon.vpnt_parent_eof` (padrão `false`), lida depois do parsing
+de CLI e da admissão de settings, antes de `charon->initialize` — portanto antes
+de plugins, utun ou SAs. Quando ligada, o FD 0 precisa ser um pipe anônimo,
+somente leitura (`S_ISFIFO`, `st_nlink == 0`, `O_RDONLY`); o helper mantém a
+única ponta de escrita, com `CLOEXEC`. Nenhum dado trafega: EOF, qualquer byte
+ou erro de leitura encerram o processo com `_exit(não zero)`, sem init, sinais
+ou `deinit`. Falha de admissão ou de criação da thread também encerra antes dos
+plugins. A parada normal continua sendo VICI + o stop gracioso/forçado do
+`ManagedChild`; este caminho abrupto existe só para a perda da capacidade
+privada, e deixa PID/journal privados para a recuperação do helper. Limite: não
+há teste com charon real, login item ou morte de processo pai neste repositório;
+as provas atuais são de fixture, com filhos próprios e pipes anônimos.

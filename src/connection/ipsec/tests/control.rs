@@ -95,6 +95,7 @@ fn lifecycle_retains_uncertainty_and_requires_both_producer_and_kernel_absence_w
     assert_eq!(control.phase(), Phase::Initiated);
     let initial = vec![
         "version",
+        "stats",
         "load-conn",
         "load-shared",
         "load-shared",
@@ -112,7 +113,7 @@ fn lifecycle_retains_uncertainty_and_requires_both_producer_and_kernel_absence_w
     assert!(registry.lock().unwrap().has_reservations());
     let cleanup = harness.audit();
     assert_eq!(
-        &cleanup[5..],
+        &cleanup[6..],
         &["terminate", "unload-conn", "unload-shared", "unload-shared"]
     );
     assert_eq!(control.cleanup(until()), Ok(false));
@@ -143,10 +144,10 @@ fn every_failed_start_prefix_is_redacted_consumed_and_targeted_for_cleanup() {
     for (mode, length, error) in [
         ("incompatible", 1, Error::Incompatible),
         ("incompatible-daemon", 1, Error::Incompatible),
-        ("load-conn:1", 2, Error::Rejected),
-        ("load-shared:1", 3, Error::Rejected),
-        ("load-shared:2", 4, Error::Rejected),
-        ("initiate:1", 5, Error::Rejected),
+        ("load-conn:1", 3, Error::Rejected),
+        ("load-shared:1", 4, Error::Rejected),
+        ("load-shared:2", 5, Error::Rejected),
+        ("initiate:1", 6, Error::Rejected),
     ] {
         let (mut control, harness, observation, registry) = setup(mode, false);
         let result = control.start(creds(), until(), token());
@@ -185,7 +186,13 @@ fn namespace_conflict_and_preflight_cancellation_cannot_reach_initiate() {
     assert_eq!(control.start(creds(), until(), token()), Err(Error::Busy));
     assert_eq!(
         harness.audit(),
-        vec!["version", "load-conn", "load-shared", "load-shared"]
+        vec![
+            "version",
+            "stats",
+            "load-conn",
+            "load-shared",
+            "load-shared"
+        ]
     );
     assert_eq!(control.cleanup(Instant::now()), Ok(false));
     settle(&mut control, &harness, &observation, &registry);
@@ -209,5 +216,6 @@ fn namespace_conflict_and_preflight_cancellation_cannot_reach_initiate() {
     }
 }
 
+mod backend;
 mod io;
 mod snapshots;

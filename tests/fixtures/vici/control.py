@@ -70,11 +70,11 @@ def encode(message):
         elif isinstance(value, list):
             result += b'\x04' + key
             for item in value:
-                item = item.encode('ascii')
+                item = item if isinstance(item, bytes) else item.encode('ascii')
                 result += b'\x05' + len(item).to_bytes(2, 'big') + item
             result += b'\x06'
         else:
-            value = value.encode('ascii')
+            value = value if isinstance(value, bytes) else value.encode('ascii')
             result += b'\x03' + key + len(value).to_bytes(2, 'big') + value
     return result
 
@@ -169,6 +169,58 @@ def sas():
     return [{name: ike}]
 
 
+PLUGINS = [
+    'kernel-libipsec', 'kernel-pfroute', 'socket-default', 'vici',
+    'aes', 'des', 'sha1', 'sha2', 'hmac', 'kdf', 'random', 'nonce',
+    'openssl', 'eap-identity', 'eap-mschapv2',
+]
+
+
+def stats():
+    plugins = list(PLUGINS)
+    if mode == 'stats-missing':
+        return {'uptime': '1'}
+    if mode == 'stats-scalar':
+        return {'plugins': 'kernel-libipsec', 'uptime': '1'}
+    if mode == 'stats-section':
+        return {'plugins': {'kernel-libipsec': {}}, 'uptime': '1'}
+    if mode == 'stats-empty':
+        return {'plugins': [], 'uptime': '1'}
+    if mode == 'stats-duplicate':
+        plugins.append('vici')
+    elif mode == 'stats-uppercase':
+        plugins[0] = 'Kernel-Libipsec'
+    elif mode == 'stats-underscore':
+        plugins.append('bad_name')
+    elif mode == 'stats-long':
+        plugins.append('a' * 65)
+    elif mode == 'stats-pfkey':
+        plugins.append('kernel-pfkey')
+    elif mode == 'stats-netlink':
+        plugins.append('kernel-netlink')
+    elif mode == 'stats-no-libipsec':
+        plugins.remove('kernel-libipsec')
+    elif mode == 'stats-no-pfroute':
+        plugins.remove('kernel-pfroute')
+    elif mode == 'stats-no-socket':
+        plugins.remove('socket-default')
+    elif mode == 'stats-no-vici':
+        plugins.remove('vici')
+    elif mode == 'stats-128':
+        plugins = plugins + [f'x{number}' for number in range(128 - len(PLUGINS))]
+    elif mode == 'stats-129':
+        plugins = plugins + [f'x{number}' for number in range(129 - len(PLUGINS))]
+    elif mode == 'stats-name64':
+        plugins.append('n' * 64)
+    elif mode == 'stats-empty-item':
+        plugins.append('')
+    elif mode == 'stats-invalid-utf8':
+        plugins.append(b'bad\xffname')
+    elif mode == 'stats-extra':
+        plugins = list(reversed(plugins)) + ['pem', 'x509']
+    return {'plugins': plugins, 'uptime': '1'}
+
+
 server = socket.socket(socket.AF_UNIX)
 server.bind(path)
 server.listen(4)
@@ -199,6 +251,8 @@ while time.monotonic() < expires:
         output.write(command + '\n')
     if command == 'version':
         send(wire, {'daemon': 'foreign' if mode == 'incompatible-daemon' else 'charon', 'version': '9.0' if mode == 'incompatible' else '6.1.0'})
+    elif command == 'stats':
+        send(wire, stats())
     elif command == 'list-sas':
         assert request == {'ike': name}
         for item in sas():

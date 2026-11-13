@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mutate supervisor guards only in a disposable build/source copy."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REPORTS = ROOT / "output/fixtures/ppp-supervisor-oracles"
+spec = importlib.util.spec_from_file_location("rust_build_inputs", Path(__file__).with_name("rust_build_inputs.py"))
+build_inputs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(build_inputs)
 
 
 def replace_once(source, before, after):
@@ -91,7 +95,12 @@ def main():
         ("host-foreign-parent-accepted", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "(parent != 0 && value.parent != parent)", "false")),
         ("host-eof-substitutes-child-exit", "src/connection/macos/ppp_control.rs", lambda s: replace_once(s, "self.proof.as_ref().map_or(Ok(true), |proof| proof.exited())", "Ok(true)")),
     ]
-    receipt = {"sourceSha256": {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for prefix in ["src", "tests", "ui/src/locales"] for path in sorted((ROOT / prefix).rglob("*")) if path.is_file()}}
+    source = {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for prefix in ["src", "tests", "ui/src/locales"] for path in sorted((ROOT / prefix).rglob("*")) if path.is_file()}
+    for key, digest in build_inputs.source_hashes(ROOT).items():
+        if key in source and source[key] != digest:
+            raise RuntimeError(f"conflicting build input hash: {key}")
+        source[key] = digest
+    receipt = {"sourceSha256": dict(sorted(source.items()))}
     try:
         with tempfile.TemporaryDirectory(prefix="copy-", dir=REPORTS) as temporary:
             copy = Path(temporary)
@@ -103,6 +112,7 @@ def main():
             cache = copy / "target/runtime-sources"
             cache.mkdir(parents=True)
             shutil.copy2(ROOT / "target/runtime-sources/openfortivpn-1.24.1.tar.gz", cache / "openfortivpn-1.24.1.tar.gz")
+            build_inputs.copy_into(ROOT, copy)
             receipt["baseline"] = run(copy, "baseline", 0)
             for label, file, mutate in mutations:
                 path = copy / file
