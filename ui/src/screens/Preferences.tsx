@@ -42,7 +42,7 @@ export function Preferences({
           <Toggle
             label={t("startAtLogin")}
             checked={settings.startup}
-            disabled={pending}
+            busy={pending}
             onChange={(value) => set("startup", value)}
           />
         </Row>
@@ -79,7 +79,7 @@ export function Preferences({
           <Select
             aria-label={t("testEvery")}
             value={settings.interval}
-            disabled={pending}
+            busy={pending}
             onChange={(event) =>
               set(
                 "interval",
@@ -98,7 +98,7 @@ export function Preferences({
           <Toggle
             label={t("notifyStale")}
             checked={settings.notify}
-            disabled={pending}
+            busy={pending}
             onChange={(value) => set("notify", value)}
           />
         </Row>
@@ -106,7 +106,7 @@ export function Preferences({
           <Toggle
             label={t("autoReconnect")}
             checked={settings.reconnect}
-            disabled={pending}
+            busy={pending}
             onChange={(value) => set("reconnect", value)}
           />
         </Row>

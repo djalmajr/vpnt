@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { commandFlow } from "./commandFlow";
-import { Toggle } from "./components/common";
+import { Select, type T, Toggle } from "./components/common";
 import { translate } from "./i18n";
 import type { Command, NativePreferences, Snapshot } from "./model";
 import { createPreferencesFlow } from "./preferencesFlow";
+import { Preferences } from "./screens/Preferences";
 import {
   defaultPreferences,
   loadSettings,
@@ -373,24 +374,113 @@ describe("preferências nativas da UI", () => {
     }
   });
 
-  // Mutation captured: a pending write leaves the switch visually enabled, so a second click repeats the write.
-  test("o interruptor nativo fica desabilitado e atenuado enquanto a escrita está pendente", () => {
-    const markup = (disabled?: boolean) =>
+  // Mutation captured: a pending native write dimmed every switch, so the whole
+  // row blinked 100→45→100% while the host answered. Busy keeps native
+  // blocking and the authoritative checked state without the disabled paint.
+  test("interruptor pendente bloqueia sem atenuar; desabilitado permanente mantém o dim", () => {
+    const markup = (props: { disabled?: boolean; busy?: boolean }) =>
       renderToStaticMarkup(
         createElement(Toggle, {
           label: "notify",
           checked: true,
-          disabled,
           onChange: () => {},
+          ...props,
         }),
       );
-    const busy = markup(true);
+    const busy = markup({ busy: true });
     expect(busy).toContain("disabled");
-    expect(busy).toContain("dim");
+    expect(busy).toContain('aria-busy="true"');
     expect(busy).toContain('aria-checked="true"');
-    const idle = markup(false);
+    expect(busy).not.toContain("dim");
+    expect(busy).not.toMatch(/\sbusy=/);
+    const permanent = markup({ disabled: true });
+    expect(permanent).toContain("disabled");
+    expect(permanent).toContain("dim");
+    expect(permanent).not.toContain("aria-busy");
+    // The permanent reason wins: a disabled+busy control stays unavailable.
+    const both = markup({ disabled: true, busy: true });
+    expect(both).toContain("disabled");
+    expect(both).toContain('aria-busy="true"');
+    expect(both).toContain("dim");
+    const idle = markup({});
     expect(idle).not.toContain("disabled");
     expect(idle).not.toContain("dim");
+    expect(idle).not.toContain("aria-busy");
+    expect(idle).toContain('aria-checked="true"');
+  });
+
+  // Mutation captured: a pending interval write grayed the native select and
+  // dimmed its wrapper, so the control flashed unavailable on every write.
+  test("select pendente bloqueia sem trocar a pintura; permanente mantém o contrato", () => {
+    const markup = (props: {
+      disabled?: boolean;
+      busy?: boolean;
+      "aria-busy"?: boolean;
+    }) =>
+      renderToStaticMarkup(
+        createElement(
+          Select,
+          { "aria-label": "interval", ...props },
+          createElement("option", { value: 30 }, "30 s"),
+        ),
+      );
+    const busy = markup({ busy: true });
+    expect(busy).toContain('aria-busy="true"');
+    expect(busy).toContain("select-control busy");
+    expect(busy).toContain("disabled");
+    expect(busy).not.toMatch(/\sbusy=/);
+    const permanent = markup({ disabled: true });
+    expect(permanent).toContain("disabled");
+    expect(permanent).not.toContain("select-control busy");
+    expect(permanent).not.toContain("aria-busy");
+    // The permanent reason wins over the transient one.
+    const both = markup({ disabled: true, busy: true });
+    expect(both).toContain('aria-busy="true"');
+    expect(both).not.toContain("select-control busy");
+    // A caller-provided aria-busy survives when the control is idle.
+    const callerBusy = markup({ "aria-busy": true });
+    expect(callerBusy).toContain('aria-busy="true"');
+    expect(callerBusy).not.toContain("disabled");
+    const idle = markup({});
+    expect(idle).toContain('aria-label="interval"');
+    expect(idle).toContain('<option value="30">30 s</option>');
+    expect(idle).not.toContain("disabled");
+    expect(idle).not.toContain("aria-busy");
+    expect(idle).not.toContain("busy");
+  });
+
+  // Mutation captured: Preferences passed `disabled` for a pending write, so
+  // the whole preference form blinked instead of only blocking the controls.
+  test("a tela de preferências usa busy pendente e mantém idioma/tema locais ativos", () => {
+    const t: T = (key, values) => translate("pt-BR", key, values);
+    const screen = (preferencesPending: boolean) =>
+      renderToStaticMarkup(
+        createElement(Preferences, {
+          snapshot: {
+            version: "snapshot",
+            demo: true,
+            helper: "installed",
+            preferences: defaultPreferences,
+            vpns: [],
+          },
+          settings: { ...settingsWith(defaultPreferences), preferencesPending },
+          update: () => {},
+          navigate: () => {},
+          removeComponent: () => {},
+          t,
+        }),
+      );
+    const busy = screen(true);
+    // Three switches plus the interval select wait on the host; the locale and
+    // theme selects stay local and enabled.
+    expect(busy.match(/aria-busy="true"/g)).toHaveLength(4);
+    expect(busy.match(/ disabled/g)).toHaveLength(4);
+    expect(busy).toContain("select-control busy");
+    expect(busy).not.toContain("dim");
+    const idle = screen(false);
+    expect(idle).not.toContain("aria-busy");
+    expect(idle).not.toContain(" disabled");
+    expect(idle).not.toContain("busy");
   });
 
   // Mutation captured: a disposed flow still starts the queued second write.

@@ -32,8 +32,8 @@ variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
 ## Checkpoint atual — 13/11/2026
 
-[PASS, execução local] A UI passou lint, typecheck, build e 34 testes
-(272 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
+[PASS, execução local] A UI passou lint, typecheck, build e 36 testes
+(305 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
 janela e na WebView, menu compartilhado Radix e os símbolos nativos da bandeja.
 O gate de classes segue sem regras e não representa cobertura visual.
 
@@ -57,6 +57,20 @@ também passaram. A integração canônica repetiu os gates UI; os assets gerado
 coincidem byte a byte com os do renderer privado. No app normal atualizado,
 a geometria de acessibilidade confirmou botões e seletores com 24 px e switches
 de 24 × 14 px. Essas medidas nativas não são captura visual nem VPN real.
+
+[PASS, espera de preferências sem pulso] O estado transitório de salvamento
+mantém o bloqueio HTML e `aria-busy`, mas conserva opacidade e cor; o estado
+permanentemente indisponível continua atenuado. Antes da correção, o renderer
+mediu os três switches em 45% enquanto aguardavam o host. Com resposta
+sintética retida, oito casos de idioma/tema/sucesso/falha mediram dez amostras
+sucessivas com opacidade 100%, mesmo tamanho e um único pedido após clique
+repetido. O valor só muda após confirmação; a recusa mantém o valor anterior
+e exibe o erro. Reintroduzir a atenuação e remover o bloqueio HTML fizeram as
+assertions correspondentes falharem; a fonte foi restaurada e passou novamente.
+Os assets canônicos coincidem com os testados. O app normal foi atualizado
+preservando as escolhas e a chave de preferências do usuário, sem alterar essas
+preferências para o ensaio. São amostras de CSS e entradas DOM, sem captura de
+pixels nem execução de uma nova operação nativa de preferência nessa prova.
 
 [PASS, testes com fixtures] As suítes completas passaram com 627 testes desktop
 e 568 core, sem falhas e com dois ignorados em cada suíte. Depois delas, somente

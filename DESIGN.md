@@ -344,6 +344,19 @@ próprio. O ícone `down` compartilhado é `aria-hidden` e não captura ponteiro
 então clique, foco, teclado e o rótulo implícito de `field` continuam no
 elemento nativo.
 
+Por correção do Djalma em 2026-11-13, uma espera do Host não pode parecer
+indisponibilidade permanente: `Toggle` e `Select` aceitam `busy`, que mantém o
+bloqueio nativo (o elemento continua desabilitado de verdade e expõe
+`aria-busy` enquanto durar) sem aplicar `dim-opacity` nem trocar a cor para
+`secondary`. Só o `disabled` explícito e permanente usa a atenuação;
+`disabled` junto com `busy` mantém a aparência permanente. Durante o `busy`, o
+seletor conserva `control-height`, `control-x`, `font-control`, o raio de
+controle e o ícone `down`; o interruptor conserva `switch-width`,
+`switch-height`, `switch-knob`, `switch-inset` e o raio derivado. O único sinal
+adicional é o cursor de progresso — sem texto novo no catálogo, spinner ou
+mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
+vindo do snapshot autoritativo.
+
 ### Ícone da barra de menus
 
 Usar SF Symbols nativos como imagens de template, acompanhando a aparência da

@@ -51,14 +51,28 @@ export function Icon({
   );
 }
 /* A real native <select>: the platform popup and keyboard semantics stay with
-   the element, the wrapper only hosts the shared chevron. */
+   the element, the wrapper only hosts the shared chevron. `busy` blocks the
+   control like `disabled` but keeps the idle paint: a transient wait must not
+   look permanently unavailable. The `busy` class is only for that state, so a
+   permanent `disabled` keeps its dim/secondary appearance. */
 export function Select({
   children,
+  busy = false,
+  disabled = false,
+  "aria-busy": ariaBusy,
   ...props
-}: SelectHTMLAttributes<HTMLSelectElement>) {
+}: SelectHTMLAttributes<HTMLSelectElement> & { busy?: boolean }) {
   return (
-    <span className="select-control">
-      <select {...props}>{children}</select>
+    <span
+      className={busy && !disabled ? "select-control busy" : "select-control"}
+    >
+      <select
+        {...props}
+        aria-busy={busy ? true : ariaBusy}
+        disabled={disabled || busy}
+      >
+        {children}
+      </select>
       <Icon name="down" />
     </span>
   );
@@ -98,11 +112,13 @@ export function Toggle({
   label,
   checked,
   disabled = false,
+  busy = false,
   onChange,
 }: {
   label: string;
   checked: boolean;
   disabled?: boolean;
+  busy?: boolean;
   onChange: (checked: boolean) => void;
 }) {
   return (
@@ -111,8 +127,9 @@ export function Toggle({
       role="switch"
       aria-label={label}
       aria-checked={checked}
-      disabled={disabled}
-      className={`switch ${checked ? "on" : ""} ${disabled ? "dim" : ""}`}
+      aria-busy={busy ? true : undefined}
+      disabled={disabled || busy}
+      className={`switch ${checked ? "on" : ""} ${disabled ? "dim" : ""} ${busy && !disabled ? "busy" : ""}`}
       onClick={() => onChange(!checked)}
     >
       <span />

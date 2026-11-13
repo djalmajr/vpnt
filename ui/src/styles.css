@@ -357,6 +357,16 @@ h2 {
 .dim {
   opacity: var(--dim-opacity);
 }
+/* Busy is transient: the native control stays blocked but keeps the idle paint
+   and radius, so a host round-trip never reads as permanently unavailable.
+   Permanent `disabled` keeps the dim/secondary treatment. */
+.switch.busy:disabled,
+.select-control.busy > select:disabled {
+  cursor: progress;
+}
+.select-control.busy > select:disabled {
+  color: inherit;
+}
 .primary {
   background: var(--action);
   color: var(--white);
