@@ -16,6 +16,8 @@ jobs:
   macos:
     runs-on: macos-15
     timeout-minutes: 30
+    env:
+      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -111,6 +113,10 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-pfkey.py
+      - name: Verify PF_KEY read transport with independent datagram peers
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-pfkey-reader.py
       - name: Verify PPP subprocess supervision
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

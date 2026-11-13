@@ -48,15 +48,19 @@ pub(super) struct Header {
     pub sequence: u32,
     pub pid: u32,
 }
+pub(super) fn check_datagram(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() < 16
+        || bytes.len() > 524_280
+        || bytes[0] != 2
+        || usize::from(u16_at(bytes, 4)?) * 8 != bytes.len()
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
 impl Header {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() < 16
-            || bytes.len() > 524_280
-            || bytes[0] != 2
-            || usize::from(u16_at(bytes, 4)?) * 8 != bytes.len()
-        {
-            return Err(Error::Invalid);
-        }
+        check_datagram(bytes)?;
         let kind = match bytes[1] {
             10 => Kind::Sad,
             18 => Kind::Spd,

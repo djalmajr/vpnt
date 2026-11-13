@@ -5,6 +5,7 @@ use crate::connection::routes::{Address, Network};
 use std::collections::BTreeSet;
 mod address;
 mod entry;
+pub mod read;
 mod wire;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
