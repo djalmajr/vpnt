@@ -198,6 +198,25 @@ SDK, com saída sem payloads de chaves. O consumidor da extensão NAT-T também
 é conferido contra fonte fixada do strongSwan. São testes de datagramas
 fictícios; ainda não leem tabelas do kernel nem comprovam ausência de recursos.
 
+O leitor preparado limita pedidos a SADB_DUMP/SPDDUMP, com socket por consulta,
+prazo absoluto e cancelamento. O coletor confere sequência e respostas extras,
+limpa o buffer bruto e só devolve metadados após o término do protocolo.
+Seus testes usam o mesmo send/recvmsg em sockets Unix com um peer C do SDK.
+Quarenta e uma mutações nomeadas e um recibo de 261 hashes acompanham esse
+caminho; a prova nativa de MSG_CTRUNC e a atomicidade entre a criação do
+descritor e o spawn de filhos, antes do uso em runtime, continuam pendentes.
+O término observado não garante completude das tabelas ou autoriza liberar
+recursos; o observador e a recuperação IPsec ainda precisam dessa integração.
+
+Preferências nativas têm um valor validado (intervalo 10/30/60, notificação,
+reconexão e abrir no login) e um intake preparado: a ponte aceita o comando, o
+app de demonstração e o broker guardam e devolvem a escolha no snapshot, e o
+broker recusa abrir no login até o adaptador correspondente ser ligado. O
+adaptador de login item (ServiceManagement, macOS 13+) está compilado e testado
+com lógica fictícia, mas não é chamado pela interface nem registra nada.
+Intervalo efetivo de probe, notificações, reconexão automática, persistência e
+abertura real no login continuam sem efeito e sem prova.
+
 O executor de instalação e remoção também exige ausência de admissões IPsec
 pendentes antes de recuperar o journal ou modificar componentes. Um lock livre
 ou uma fase Stopped não comprovam cleanup. O executor preserva a admissão e

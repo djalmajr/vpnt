@@ -30,6 +30,14 @@ O gate de classes ainda não tem classes proibidas configuradas; sua execução
 não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
 variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
+O checkpoint integrado final (`5222128`) passou fmt, clippy com `-D warnings`, build,
+308 testes desktop e 292 core (dois ignored por suíte) e a matriz de 42
+mutações do codec PF_KEY. Na UI, lint, typecheck, oito testes (114 assertions),
+build e 81 tokens passaram; o gate de classes segue sem regras. O recibo em
+`output/fixtures/final-checkpoint-receipt.json` registra `sourceUnchanged=true`,
+`realVpn=false` e `privilegedInstall=false`; os logs `final-checkpoint-*` e
+`final-ui-*` acompanham cada etapa e limite.
+
 O teste de HTTP executa um processo filho do servidor de demonstração e usa
 somente loopback. Precisa de permissão de socket. Ele verifica origem/Host,
 rejeição de JSON ambíguo, sobrevivência a UTF-8 inválido e uma resposta posterior
@@ -76,7 +84,115 @@ fragmentadas, limites, versões incompatíveis, ações/campos desconhecidos e
 tentativas de cruzar os canais. Esses testes de codec não provam elevação,
 processos de VPN ou instalação de sudoers.
 
-## IPsec: metadados PF_KEY Darwin
+## Preferências nativas e abertura no login (em integração)
+
+```bash
+cargo test --locked --no-default-features --test preferences --test bridge --test application
+cargo test --locked --no-default-features --lib broker::preferences_tests
+cargo test --locked --offline --all-features --lib broker::component::tests::lifecycle::preferences
+cargo test --locked --offline --all-features --lib desktop::login_item
+```
+
+[PASS, portable contract] Sete testes públicos verificam os defaults da UI,
+os intervalos inteiros 10/30/60, conversão e rejeição de campos desconhecidos,
+ausentes ou mal tipados. Seis mutações foram detectadas em cópia isolada, com
+baseline e restauração; o manifesto fica em
+`output/fixtures/preferences-contract-commit-evidence.json` e os logs/drivers
+em `output/fixtures/preferences-contract/`. Esse valor entrou no checkpoint
+`cc2e837`; o intake, em `8e7b769`.
+
+[PASS, bridge e broker] A ponte aceita o comando com o tipo validado e exige
+objeto no campo de preferências: a forma posicional que o serde do valor também
+aceita é recusada por um decodificador próprio da ponte, sem segundo schema. O
+`Snapshot` sempre ecoa a escolha. O app de demonstração guarda os quatro valores
+em memória, sem chaveiro, helper ou OS, e o app normal continua recusando
+mutações não-demo. O broker guarda e ecoa a escolha depois dos gates de
+expiração e de componente ocupado, e recusa `startup=true` com
+`startup_unavailable` até o adaptador de login ser ligado, preservando os quatro
+valores anteriores. Provas: dois testes de ponte, quatro privados do broker e um
+no fixture real de componente (operação viva, `component_busy` sem alterar
+escolhas, filho próprio concluído). Sete mutações nomeadas do intake e a que
+isenta o comando do gate de componente falham no teste previsto; logs em
+`output/fixtures/preferences-intake/` e
+`output/fixtures/preferences-component-gate/`.
+
+[PASS, adaptador de login preparado] O adaptador nativo usa somente
+`SMAppService` (ServiceManagement, macOS 13+) e compila/liga no desktop, com
+doze testes de lógica — inclusive a recusa do binário de teste sem bundle — e
+doze mutações nomeadas na fonte final (checkpoint `5222128`), reproduzíveis com
+`cargo test --locked --offline --all-features --lib desktop::login_item`; logs e
+recibo em `output/fixtures/login-item-final/`. Ele não é chamado pela UI nem
+pelo broker: nada registra, desregistra ou abre System Settings.
+
+[NOT RUN, efeitos e serviço real] Helper, UI e persistência ainda não consomem
+o comando; intervalo efetivo de probe, notificações, reconexão automática e
+abertura no login não têm efeito ligado. `register`, `unregister`, `status`,
+aprovação em System Settings e falha de assinatura de um login item real não
+foram executados. O ramo macOS < 13 de `available!` continua NOT RUN: o guard
+está presente e é a primeira instrução da admissão, sem seam artificial.
+
+## IPsec: transporte de leitura PF_KEY (em integração)
+
+```bash
+cargo test --locked --no-default-features --lib connection::ipsec::pfkey::read
+python3 scripts/macos/check-pfkey-reader.py
+```
+
+[PASS, native process/socket + memory fixtures] Nove testes exercitam o coletor
+e send/recvmsg produtivos em AF_UNIX com peer C independente do SDK. O peer
+valida o pedido fechado e permanece vivo até liberação explícita. SAD/SPD,
+PID/tipo alheios, vazio/errno, prefixo incompleto, duplicação/lacuna, extra após
+término, prazo, cancelamento e rebase de deadline depois do envio são cobertos.
+Fixtures de memória verificam os limites de 4096 datagramas/16 MiB e a limpeza
+do buffer antes de seu reuso. Gate UID negativo, flags CLOEXEC/NONBLOCK e
+truncamento de payload são nativos; o formato de endereço AF_KEY positivo é
+sintético. Nenhum PF_KEY real é aberto.
+
+[PASS, negative oracles] Baseline e restauração 9/9; quarenta e uma mutações
+detectadas por assertions previstas, cada uma no teste nomeado, e 261 hashes de
+entrada conferidos. Recibo e logs em output/fixtures/pfkey-reader-oracles/.
+O workflow inclui o comando, ainda sem execução remota. O buffer Zeroizing
+também cobre descarte por erro; não há payload de chave no DTO. A proteção
+MSG_CTRUNC não foi exercitada nativamente: o recvmsg sem buffer ancillary usado
+aqui não reproduziu essa flag no macOS. A matriz anterior de 40 casos permanece
+arquivada em output/fixtures/pfkey-reader-initial-40/, sem alteração.
+
+[PASS, temp e admissão] Sob um TMPDIR 0755 do próprio usuário, o caso de
+admissão (ordinary_uid_cannot_admit_a_reader...) prova o parent aceito e a
+folha 0700; o caso de recvmsg apenas confirma que o caminho nativo não depende
+de TMPDIR. Log em output/fixtures/pfkey-reader-tmp0755.log.
+
+[PASS, checkpoint integrado] O leitor entrou no checkpoint a046191. A suíte
+final passou 308 testes desktop e 292 core, dois ignored por suíte, com fmt,
+clippy -D warnings e build; a matriz do codec PF_KEY de 42 mutações passou
+baseline/restauração. O recibo integrado registra sourceUnchanged=true,
+realVpn=false e privilegedInstall=false. A reescrita de lint equivalente
+(matches!) no adaptador de login é posterior somente à matriz de 41 casos do
+leitor — drift contextual registrado nessa reconciliação — e anterior aos gates
+integrados finais, que já rodaram com a fonte final; as fontes do leitor seguem
+idênticas.
+
+[FAIL, historical] A primeira rodada core falhou em quatro fixtures existentes:
+IPsec persistent_phase, dois casos de prazo SSL e pending claim Busy. O log
+original foi preservado. Os quatro passaram isolados e no rerun limitado com
+quatro threads; contenção é hipótese e as causas originais de Unavailable/Busy
+não foram demonstradas. Nenhum teste, assertion ou deadline foi alterado; o job
+macOS limita RUST_TEST_THREADS a 4 para reduzir a concorrência entre fixtures,
+e testes de concorrência continuam criando seus próprios processos/threads.
+A execução local anterior do leitor (281 testes) e a integração preliminar
+(288/284) ficam registradas apenas como histórico, substituídas pelo checkpoint
+integrado acima.
+
+[NOT RUN, privileged/real] Abertura PF_KEY, origem real do kernel, tamanho do
+buffer do socket e dump SAD/SPD reais não foram exercitados. Collection e
+ProtocolEnd registram término observado; seq0 ou ENOENT não concedem completude,
+propriedade, KernelClaims ou autoridade de cleanup. Antes do uso em runtime,
+permanece pendente a atomicidade entre a criação do descritor PF_KEY e o spawn
+de filhos. Recuperação, leases VIP/rotas, probe e dispatch IPsec continuam em
+integração. Nenhum componente foi instalado, elevado, conectado ou publicado.
+O .app preservado ainda é do checkpoint 692489d.
+
+## IPsec: metadados PF_KEY Darwin (checkpoint 3bf9738)
 
 ```bash
 cargo test --locked --no-default-features --lib connection::ipsec::pfkey
