@@ -50,7 +50,7 @@ impl Factory for Catalog {
     }
 }
 impl Attempt for Connection {
-    fn start(&mut self, _: &AtomicBool) -> Result<(), Failure> {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
         self.reservation = Some(
             self.profiles
                 .begin(&self.profile, self.generation)

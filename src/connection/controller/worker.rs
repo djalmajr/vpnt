@@ -14,6 +14,12 @@ pub(super) struct Signals {
     pub probe: Arc<AtomicBool>,
     pub state: Arc<Mutex<Option<ConnectionState>>>,
 }
+fn timeout() -> Failure {
+    Failure {
+        state: ConnectionState::GatewayTimeout,
+        error: ErrorCode::BackendFailure,
+    }
+}
 pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -> Finished {
     let send = |state| {
         // One coalesced status per worker. A slow pipe reader never blocks
@@ -28,20 +34,33 @@ pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -
         if canceled() {
             return Ok(());
         }
-        attempt.start(&signals.canceled)?;
-        let deadline = Instant::now() + timing.connect;
+        // One connection deadline covers start and readiness; it is never
+        // rebased after start or a ready poll. Traffic probes use their own budget.
+        let expires = Instant::now() + timing.connect;
+        let start = attempt.start(&signals.canceled, expires);
+        if canceled() {
+            return Ok(());
+        }
+        if Instant::now() >= expires {
+            return Err(timeout());
+        }
+        start?;
         loop {
             if canceled() {
                 return Ok(());
             }
-            if attempt.ready()? {
-                break;
+            if Instant::now() >= expires {
+                return Err(timeout());
             }
-            if Instant::now() >= deadline {
-                return Err(Failure {
-                    state: ConnectionState::GatewayTimeout,
-                    error: ErrorCode::BackendFailure,
-                });
+            let ready = attempt.ready();
+            if canceled() {
+                return Ok(());
+            }
+            if Instant::now() >= expires {
+                return Err(timeout());
+            }
+            if ready? {
+                break;
             }
             thread::sleep(timing.poll);
         }
@@ -93,3 +112,7 @@ pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -
         },
     }
 }
+
+#[cfg(test)]
+#[path = "worker/tests.rs"]
+mod tests;

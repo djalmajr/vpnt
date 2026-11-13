@@ -440,6 +440,12 @@ partir do mesmo pin validado antes e depois do snapshot. Ela observa apenas o
 UTUN conhecido, sem bloquear por uma nova rota PPP alheia. A origem desses
 metadados no UTUN configurado ainda tem prova estática, sem positivo nativo.
 
+O prazo de conexão já inclui a inicialização e toda a espera pela interface,
+sem reiniciar após start. Cancelamento tem precedência sobre prazo vencido;
+um ready tardio não chega à sonda. O timeout continua repetindo a limpeza até
+sua confirmação. A sonda de tráfego possui orçamento próprio; chamadas
+síncronas já em voo são conferidas ao retornar, sem promessa de interrupção.
+
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,

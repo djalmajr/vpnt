@@ -184,14 +184,33 @@ impl NativeAttempt<'_> {
         }
     }
 }
+fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
+    if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
+        return Err(Failure::unavailable());
+    }
+    Ok(())
+}
+
+fn bounded(expires: Instant, canceled: &AtomicBool) -> Result<Duration, Failure> {
+    check(expires, canceled)?;
+    let remaining = expires
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(3));
+    if remaining.is_zero() {
+        return Err(Failure::unavailable());
+    }
+    Ok(remaining)
+}
+
 impl Attempt for NativeAttempt<'_> {
-    fn start(&mut self, canceled: &AtomicBool) -> Result<(), Failure> {
+    fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure> {
         if self.profile.kind != VpnKind::Ssl {
             return Err(Failure {
                 state: ConnectionState::MissingProgram,
                 error: ErrorCode::MissingProgram,
             });
         }
+        check(expires, canceled)?;
         self.profile_use = Some(
             self.profiles
                 .begin(&self.profile, self.owner.generation)
@@ -206,6 +225,7 @@ impl Attempt for NativeAttempt<'_> {
         );
         // Preflight failures have no spawned child. After attempting spawn,
         // uncertainty must survive even if setup returns an error.
+        check(expires, canceled)?;
         Runtime::installed()
             .and_then(|_| Runtime::verify_pinentry())
             .and_then(|_| Runtime::verify_ppp_supervisor())
@@ -221,13 +241,13 @@ impl Attempt for NativeAttempt<'_> {
                     ErrorCode::UntrustedConfiguration
                 },
             })?;
-        let egress = Egress::select(&self.profile, canceled, Duration::from_secs(3))
+        check(expires, canceled)?;
+        let egress = Egress::select(&self.profile, canceled, bounded(expires, canceled)?)
             .map_err(|_| Failure::unavailable())?;
+        check(expires, canceled)?;
         self.before = Some(Interfaces::read().map_err(|_| Failure::unavailable())?);
         self.before_routes = Some(Snapshot::read().map_err(|_| Failure::unavailable())?);
-        if canceled.load(Ordering::Acquire) {
-            return Err(Failure::unavailable());
-        }
+        check(expires, canceled)?;
         let credentials = self.credentials.take().ok_or_else(Failure::unavailable)?;
         self.client = Some(
             SslDriver::start(&self.profile, credentials, &egress, &self.canceled).map_err(

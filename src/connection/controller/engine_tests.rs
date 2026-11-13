@@ -163,7 +163,7 @@ impl FixtureAttempt {
     }
 }
 impl Attempt for FixtureAttempt {
-    fn start(&mut self, _: &AtomicBool) -> Result<(), Failure> {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
         let credentials = self.credentials.take().unwrap();
         assert_eq!(credentials.password.expose(), "fixture-password");
         self.child =

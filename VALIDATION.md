@@ -2462,3 +2462,38 @@ python3 scripts/macos/check-charon-config.py
   UTUN/VIP/RTM_ADD/BYPASS real, tráfego de VPN, coexistência com túnel pessoal,
   instalação privilegiada, publicação ou CI remoto. O pacote é preparação
   local; não comprova conexão ou limpeza de recursos no kernel.
+
+
+### Prazo de conexão inclui inicialização e ready
+
+- [PASS, worker real com adaptador privado] Um único Instant é criado antes
+  de start e passado à tentativa. O worker confere cancelamento e prazo depois
+  de start e antes/depois de ready, mesmo quando ready retorna true. Os quatro
+  testes novos verificam timeout após start lento, ready lento sem healthy ou
+  probe, cancelamento simultâneo com timeout resultando em Off e repetição de
+  cleanup até sucesso. A sonda inicial possui orçamento separado.
+- [PASS, preparação SSL estática] Os checks nativos conferem o mesmo prazo
+  antes/depois de preflight, seleção de saída e snapshots, antes de consumir
+  credenciais e iniciar o cliente. A seleção recebe o restante limitado a três
+  segundos. SDK/syscalls já em voo não são interrompíveis. Os fixtures do
+  controlador mudaram somente a assinatura de start.
+- [PASS, revisão e execução] A revisão independente aprovou o código; o
+  comentário sobre a abrangência do prazo foi corrigido pelo integrador.
+  Fmt, clippy all-targets/all-features com -D warnings, 477 testes desktop,
+  461 core (dois ignorados em cada), os 67 mutantes de política de rotas,
+  build e pacote local passaram. Os quatro mutantes específicos do prazo
+  permanecem evidência fornecida pelo worker, não reexecutada pelo integrador.
+- [RESOLVIDO, inventário de fonte] A rodada terminou com erro de inventário
+  porque seu snapshot final incluiu 23 arquivos temporários .vpnt-* de fixtures
+  concorrentes. Os hashes de todos os 413 arquivos de fonte permaneceram iguais
+  no término e numa nova leitura. A falha original foi preservada em
+  output/fixtures/worker-budget-integration-receipt.json; a classificação dos
+  caminhos gerados e a verificação do manifesto completo estão em
+  output/fixtures/worker-budget-source-inventory-resolution.json. Nenhuma fonte
+  foi excluída da comparação nem houve alteração no .gitignore. Não foi
+  necessário repetir suítes que já passaram para resolver esse inventário.
+- [PASS, pacote e limites] Pacote local:
+  target/vpnt-worker-budget-checkpoint.app. UI/design e runtime permanecem
+  inalterados. Esse lote não integra ledger ou Driver IPsec. O helper nativo
+  segue somente SSL; conexão/cleanup de VPN real, UTUN/VIP/rotas/BYPASS reais,
+  instalação privilegiada e CI remoto continuam NOT RUN.

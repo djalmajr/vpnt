@@ -17,7 +17,7 @@ use crate::{
 pub use native::run_ssl;
 use std::{
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Failure {
@@ -33,7 +33,7 @@ impl Failure {
     }
 }
 trait Attempt {
-    fn start(&mut self, canceled: &AtomicBool) -> Result<(), Failure>;
+    fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure>;
     /// true only after owned interface discovery and complete route leases.
     fn ready(&mut self) -> Result<bool, Failure>;
     fn healthy(&mut self) -> Result<(), Failure>;
