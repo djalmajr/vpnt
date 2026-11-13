@@ -390,6 +390,13 @@ e intercepta as chamadas de política para conferir o ABI e as falhas. Isso não
 prova a eficácia da política no kernel. A opção permanece desligada por padrão;
 a configuração do produtor ainda precisa consumir a seleção de saída validada.
 
+A seleção de saída IPsec já possui um tipo não serializável que captura a
+interface existente, o endereço de origem e a rota específica do gateway.
+A revalidação consulta o escopo da interface capturada, sem refazer DNS nem
+seguir as novas rotas globais do túnel. O seletor nativo usa UDP somente para
+consultar a origem, sem enviar datagramas. Esse tipo guarda metadados; ainda
+precisa ser ligado ao produtor protegido e não concede autoridade de rota.
+
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,

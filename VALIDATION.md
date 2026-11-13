@@ -2233,3 +2233,36 @@ python3 scripts/macos/check-charon-config.py
   o build do runtime, mas não foi executado remotamente. A prova real de
   BYPASS, charon/utun, instalação, tráfego, cleanup e coexistência continua
   pendente; não há túnel real declarado conectado.
+
+### Seleção de saída IPsec e rota específica do gateway
+
+- [PASS, escopo afetado] Seis arquivos de seleção/resolução foram integrados.
+  Formatação, clippy de todos os targets/features com `-D warnings`, oito testes
+  de egress, um do resolver, build e pacote local passaram com insumos estáveis.
+  Recibo: `output/fixtures/egress-scope-receipt.json`. O primeiro lint encontrou
+  duas ocorrências mecânicas, corrigidas sem desabilitar warnings; a falha foi
+  preservada em `egress-scope-initial-*`.
+- [PASS, consumidor nativo somente leitura] Um perfil sintético com destino
+  literal `192.0.2.200` seleciona a saída com prazo de 3 s e revalida com 5 s.
+  O consumidor confere rota host, origem, índice e escopo capturados. Usa RTM_GET
+  e UDP connect/getsockname, sem send, mudança de rota ou túnel. Requer uma rota
+  do host para esse destino, como o teste SSL existente. O seletor privado de
+  origem também foi exercitado em lo0 para IPv4 e IPv6.
+- [PASS, simulado] Os demais casos cobrem origem exata entre vários endereços,
+  famílias, perfis, cancelamento, prazo compartilhado, rota blackhole, escopo
+  próprio/estrangeiro e revalidação de prefixos equivalentes com o mesmo host
+  pin. As mutações direcionadas foram executadas nas cópias privadas; as provas
+  de prazo nativo e de pin corrigido constam nos relatórios da revisão.
+- [Limite de prazo] O saldo do prazo é propagado e conferido antes/depois das
+  operações. Chamadas síncronas do sistema, como getifaddrs e abertura de socket,
+  não são interrompíveis; não há garantia absoluta contra syscall travada.
+- [PASS, reutilização] Runtime de seis patches, 33 insumos de UI/design,
+  produtor/controle, parser e gates C permanecem os mesmos do checkpoint
+  `984d149`, cujos 15 passos são reutilizados. Não houve nova execução das
+  suítes completas; as últimas contagens completas continuam 353 desktop e
+  337 core, com dois ignorados em cada. O host empacotado desta etapa está em
+  `target/vpnt-egress-checkpoint.app`, sem instalar componentes.
+- [NOT RUN, produto real] A seleção validada ainda precisa ser consumida pelo
+  produtor/Driver; não há autorização de rota, tráfego de túnel ou Connected
+  decorrente desse token. VIP/rotas, ledger, despacho, políticas reais, instalação,
+  coexistência e CI remoto continuam pendentes.

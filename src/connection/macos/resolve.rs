@@ -158,6 +158,16 @@ pub(super) fn resolve(
     lookup(host, index, protocol, deadline, canceled)
 }
 
+/// Dual-family gateway discovery before a tunnel exists; never supplies DNS
+/// to a tunnel probe.
+pub(super) fn gateway(
+    host: &str,
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Result<Vec<IpAddr>, Error> {
+    lookup(host, 0, 3, deadline, canceled)
+}
+
 /// Gateway discovery uses the system resolver before a tunnel exists. This
 /// separate entry point never supplies unscoped DNS to a tunnel probe.
 pub(super) fn gateway_ipv4(
@@ -259,9 +269,12 @@ mod tests {
         let values = resolve("localhost", index, 3, deadline, &canceled).unwrap();
         assert!(values.contains(&"127.0.0.1".parse().unwrap()));
         assert!(values.contains(&"::1".parse().unwrap()));
-        let gateway = gateway_ipv4("localhost", deadline, &canceled).unwrap();
-        assert!(gateway.contains(&"127.0.0.1".parse().unwrap()));
-        assert!(gateway.iter().all(IpAddr::is_ipv4));
+        let gateway_v4 = gateway_ipv4("localhost", deadline, &canceled).unwrap();
+        assert!(gateway_v4.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(gateway_v4.iter().all(IpAddr::is_ipv4));
+        let dual = super::gateway("localhost", deadline, &canceled).unwrap();
+        assert!(dual.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(dual.contains(&"::1".parse().unwrap()));
         assert_eq!(
             resolve("127.0.0.1", 0, 1, deadline, &canceled),
             Err(Error::Invalid)
