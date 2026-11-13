@@ -1,4 +1,5 @@
 mod icon;
+mod login_item;
 mod worker;
 
 use crate::{

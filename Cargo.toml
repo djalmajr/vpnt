@@ -10,7 +10,14 @@ default-run = "vpnt"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:tao", "dep:wry", "dep:tray-icon"]
+desktop = [
+    "dep:tao",
+    "dep:wry",
+    "dep:tray-icon",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-service-management",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -29,6 +36,19 @@ tray-icon = { version = "0.26.1", optional = true }
 security-framework = "3.7"
 security-framework-sys = "2.17"
 core-foundation = "0.10"
+# Login item (SMAppService). Locked versions only: objc2 0.6.5, objc2-foundation 0.3.2.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSString",
+] }
+objc2-service-management = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "SMAppService",
+    "objc2",
+    "objc2-foundation",
+] }
 
 [profile.release]
 lto = "thin"
