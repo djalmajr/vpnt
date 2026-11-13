@@ -235,8 +235,16 @@ impl<'a> Producer<'a> {
                         return Err(error);
                     }
                     Self::call(expires, &cancel)?;
+                    // Pin the observed socket even while it is not listening:
+                    // a later retry must not admit a replacement endpoint.
                     self.socket = Some(stamp);
-                    return Ok(client);
+                    match client {
+                        Some(client) => return Ok(client),
+                        None => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                    }
                 }
             }
         }

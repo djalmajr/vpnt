@@ -1,15 +1,16 @@
 ---
 name: vpnt
-description: Visual contract derived from the approved vpnt.fig prototype.
+description: Visual contract derived from the approved vpnt.fig flow and the classic ai-usagebar theme.
 colors:
   surface: "#ffffff"
   card: "#f2f2f2"
   menu: "#ffffff"
-  separator: "#e3e3e3"
-  text: "#262626"
-  secondary: "#636363"
-  control: "#e3e3e3"
-  control-surface: "#f0f0f0"
+  separator: "rgba(0, 0, 0, 0.1)"
+  text: "rgba(0, 0, 0, 0.85)"
+  secondary: "rgba(0, 0, 0, 0.5)"
+  control: "rgba(0, 0, 0, 0.06)"
+  control-hover: "rgba(0, 0, 0, 0.1)"
+  menu-hover: "rgba(0, 0, 0, 0.06)"
   field: "#ffffff"
   switch-off: "#d9d9d9"
   blue: "#007aff"
@@ -31,9 +32,10 @@ colors:
   white: "#ffffff"
   scrim: "rgb(0 0 0 / 24%)"
 typography:
-  font-family: "Inter, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif"
-  font-body: "12px"
+  font-family: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
+  font-body: "13px"
   font-label: "13px"
+  font-control: "12px"
   line-height: "16px"
 spacing:
   xs: "4px"
@@ -43,36 +45,47 @@ spacing:
 rounded:
   sm: "4px"
   control: "6px"
-  card: "8px"
+  card: "10px"
   panel: "12px"
+  popover: "13px"
+shadows:
+  menu: "0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1)"
 x-layout:
   panel-width: "320px"
   control-height: "24px"
-  switch-width: "32px"
-  switch-height: "20px"
+  control-x: "10px"
+  switch-width: "28px"
+  switch-height: "16px"
+  switch-knob: "12px"
+  switch-inset: "1px"
   panel-max-height: "720px"
   field-label-width: "92px"
   dialog-width: "280px"
   dialog-inset: "24px"
   log-max-height: "480px"
-  menu-width: "196px"
-  menu-row-height: "28px"
+  menu-min-width: "184px"
+  menu-pad: "5px"
+  menu-item-x: "8px"
+  menu-item-y: "5px"
+  icon-menu: "15px"
+  icon-inline: "13px"
   border-width: "1px"
   focus-width: "2px"
 x-opacity:
   dim-opacity: "0.45"
-  hover-brightness: "0.96"
+  hover-brightness: "1.08"
 x-motion:
   spinner-duration: "1s"
 darkColors:
   surface: "#1e1e1e"
   card: "#292929"
   menu: "#2b2b2b"
-  separator: "#3a3a3a"
-  text: "#dedede"
-  secondary: "#ababab"
-  control: "#3b3b3b"
-  control-surface: "#303030"
+  separator: "rgba(255, 255, 255, 0.1)"
+  text: "rgba(255, 255, 255, 0.85)"
+  secondary: "rgba(255, 255, 255, 0.55)"
+  control: "rgba(255, 255, 255, 0.08)"
+  control-hover: "rgba(255, 255, 255, 0.14)"
+  menu-hover: "rgba(255, 255, 255, 0.1)"
   field: "#1e1e1e"
   switch-off: "#454545"
   blue: "#0a84ff"
@@ -90,6 +103,8 @@ darkColors:
   error-fg: "#ff9a91"
   info-bg: "#14283d"
   info-fg: "#7cbcff"
+darkShadows:
+  menu: "0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -4px rgba(0, 0, 0, 0.3)"
 x-parity:
   include: ["ui/src"]
   exclude: []
@@ -104,7 +119,8 @@ x-parity:
     colors.text: { selector: ":root", var: "--text" }
     colors.secondary: { selector: ":root", var: "--secondary" }
     colors.control: { selector: ":root", var: "--control" }
-    colors.control-surface: { selector: ":root", var: "--control-surface" }
+    colors.control-hover: { selector: ":root", var: "--control-hover" }
+    colors.menu-hover: { selector: ":root", var: "--menu-hover" }
     colors.field: { selector: ":root", var: "--field" }
     colors.switch-off: { selector: ":root", var: "--switch-off" }
     colors.blue: { selector: ":root", var: "--blue" }
@@ -124,9 +140,11 @@ x-parity:
     colors.info-bg: { selector: ":root", var: "--info-bg" }
     colors.info-fg: { selector: ":root", var: "--info-fg" }
     colors.white: { selector: ":root", var: "--white" }
+    colors.scrim: { selector: ":root", var: "--scrim" }
     typography.font-family: { selector: ":root", var: "--font-family" }
     typography.font-body: { selector: ":root", var: "--font-body" }
     typography.font-label: { selector: ":root", var: "--font-label" }
+    typography.font-control: { selector: ":root", var: "--font-control" }
     typography.line-height: { selector: ":root", var: "--line-height" }
     spacing.xs: { selector: ":root", var: "--space-xs" }
     spacing.sm: { selector: ":root", var: "--space-sm" }
@@ -136,22 +154,30 @@ x-parity:
     rounded.control: { selector: ":root", var: "--radius-control" }
     rounded.card: { selector: ":root", var: "--radius-card" }
     rounded.panel: { selector: ":root", var: "--radius-panel" }
+    rounded.popover: { selector: ":root", var: "--radius-popover" }
+    shadows.menu: { selector: ":root", var: "--shadow-menu" }
     x-layout.panel-width: { selector: ":root", var: "--panel-width" }
     x-layout.control-height: { selector: ":root", var: "--control-height" }
+    x-layout.control-x: { selector: ":root", var: "--control-x" }
     x-layout.switch-width: { selector: ":root", var: "--switch-width" }
     x-layout.switch-height: { selector: ":root", var: "--switch-height" }
-    x-opacity.dim-opacity: { selector: ":root", var: "--dim-opacity" }
+    x-layout.switch-knob: { selector: ":root", var: "--switch-knob" }
+    x-layout.switch-inset: { selector: ":root", var: "--switch-inset" }
     x-layout.panel-max-height: { selector: ":root", var: "--panel-max-height" }
     x-layout.field-label-width: { selector: ":root", var: "--field-label-width" }
     x-layout.dialog-width: { selector: ":root", var: "--dialog-width" }
     x-layout.dialog-inset: { selector: ":root", var: "--dialog-inset" }
     x-layout.log-max-height: { selector: ":root", var: "--log-max-height" }
-    x-layout.menu-width: { selector: ":root", var: "--menu-width" }
-    x-layout.menu-row-height: { selector: ":root", var: "--menu-row-height" }
+    x-layout.menu-min-width: { selector: ":root", var: "--menu-min-width" }
+    x-layout.menu-pad: { selector: ":root", var: "--menu-pad" }
+    x-layout.menu-item-x: { selector: ":root", var: "--menu-item-x" }
+    x-layout.menu-item-y: { selector: ":root", var: "--menu-item-y" }
+    x-layout.icon-menu: { selector: ":root", var: "--icon-menu" }
+    x-layout.icon-inline: { selector: ":root", var: "--icon-inline" }
     x-layout.border-width: { selector: ":root", var: "--border-width" }
     x-layout.focus-width: { selector: ":root", var: "--focus-width" }
+    x-opacity.dim-opacity: { selector: ":root", var: "--dim-opacity" }
     x-opacity.hover-brightness: { selector: ":root", var: "--hover-brightness" }
-    colors.scrim: { selector: ":root", var: "--scrim" }
     x-motion.spinner-duration: { selector: ":root", var: "--spinner-duration" }
     darkColors.surface: { selector: ".dark", var: "--surface" }
     darkColors.card: { selector: ".dark", var: "--card" }
@@ -160,7 +186,8 @@ x-parity:
     darkColors.text: { selector: ".dark", var: "--text" }
     darkColors.secondary: { selector: ".dark", var: "--secondary" }
     darkColors.control: { selector: ".dark", var: "--control" }
-    darkColors.control-surface: { selector: ".dark", var: "--control-surface" }
+    darkColors.control-hover: { selector: ".dark", var: "--control-hover" }
+    darkColors.menu-hover: { selector: ".dark", var: "--menu-hover" }
     darkColors.field: { selector: ".dark", var: "--field" }
     darkColors.switch-off: { selector: ".dark", var: "--switch-off" }
     darkColors.blue: { selector: ".dark", var: "--blue" }
@@ -178,49 +205,91 @@ x-parity:
     darkColors.error-fg: { selector: ".dark", var: "--error-fg" }
     darkColors.info-bg: { selector: ".dark", var: "--info-bg" }
     darkColors.info-fg: { selector: ".dark", var: "--info-fg" }
+    darkShadows.menu: { selector: ".dark", var: "--shadow-menu" }
 ---
 
 ## Overview
 
-O vpnt usa o tema clássico aprovado em `vpnt.fig`: superfície opaca, cartões
-preenchidos e controles compactos. O painel tem 320 px e segue o tema do sistema
-por padrão; claro e escuro são igualmente suportados.
+O vpnt usa o tema clássico do ai-usagebar, aplicado por indicação explícita do
+Djalma em 2026-11-13: superfícies opacas, cartões preenchidos, menu branco com
+linha destacada em cinza e controles compactos. O fluxo continua sendo o de
+`vpnt.fig` (referência aprovada); os valores de tema e espaçamento abaixo são os
+do ai-usagebar (commit `4f9d73f2`, MIT/copyright 2026 AkitaOnRails) e
+prevalecem sobre os valores antigos da figura onde houver conflito. O painel tem
+320 px e segue o tema do sistema por padrão; claro e escuro são igualmente
+suportados.
 
 ## Colors
 
-As cores de superfície, cartão, controle, estado e aviso vêm do protótipo.
+Superfície, cartão, menu, controle e estado vêm do tema clássico. Rótulos usam
+`text` (85% de opacidade) e `secondary` (50% no claro, 55% no escuro);
+separadores usam 10% da cor oposta. `control` é o fundo padrão de botões e
+seletores; `control-hover` é o realce de qualquer controle clicável; `menu-hover`
+é o realce de linha de menu e de linha clicável dentro de cartão. Não há filtro
+global de brilho no hover: cada controle declara o próprio preenchimento, e
+linhas desabilitadas não realçam.
+
 Azul indica ação; verde só indica túnel verificado; laranja indica atenção ou
 tráfego sem resposta; vermelho indica falha. Ícones e texto acompanham o estado,
 sem depender apenas da cor. Botões com texto branco usam `action` ou `red-fill`.
+As cores semânticas de VPN sem papel equivalente no tema clássico (`switch-off`,
+`field`, `link`, `orange-text`, `red-text`, avisos) permanecem para manter
+contraste de erro e ação.
 
 ## Typography
 
-Texto de corpo tem 12 px; nomes e títulos usam 13 px; altura de linha de 16 px.
-Os pesos permitidos são 400, 500 e 600. Inter é a referência do protótipo; as
-fontes do sistema são fallback local. Nomes de perfis e rótulos podem quebrar
+Texto de corpo, nomes e rótulos de cartão usam 13 px, com altura de linha de
+16 px. Controles — botões, gatilho do menu, campos e seletores — usam o texto de
+controle de 12 px; linhas de menu continuam em 13 px, como as linhas de cartão.
+A família é a pilha do sistema macOS (`-apple-system`, `BlinkMacSystemFont`,
+`Segoe UI`); Inter saiu por indicação de 2026-11-13, junto com o tema clássico.
+Os pesos permitidos são 400, 500 e 600. Nomes de perfis e rótulos podem quebrar
 linha; traduções não devem ser cortadas para conservar uma altura fixa.
 
 ## Layout
 
-Espaçamento de 4, 8, 12 e 16 px. Painel com 8 px de margem interna e 8 px entre
-peças; cartões com 12 px de margem interna; controles com 24 px de altura.
-O painel cresce com o conteúdo e rola até o limite da tela. Campos e seletores
-encolhem dentro da largura disponível. Nenhum fluxo depende de hover.
+Espaçamento de 4, 8, 12 e 16 px. Painel e cartões usam 8 px de margem interna e
+8 px entre peças; controles têm 24 px de altura e 10 px de recuo horizontal
+(`control-x`). O menu usa 184 px de largura mínima, 5 px de recuo, 8 px
+horizontais e 5 px verticais por linha, ícone de 15 px e 8 px entre ícone e
+texto. O painel cresce com o conteúdo e rola até o limite da tela. Campos e
+seletores encolhem dentro da largura disponível. Nenhum fluxo depende de hover.
+
+O menu é ancorado ao próprio gatilho pelo primitivo Radix: abre acima dele
+(`side="top"`), alinhado à borda final (`align="end"`), com 6 px entre gatilho e
+menu e 8 px de margem de colisão em cada lado (`collisionPadding`). O primitivo
+reposiciona em resize e rolagem, inverte o lado quando falta espaço acima e
+nunca usa coordenadas fixas de tela. A altura máxima vem de
+`--radix-dropdown-menu-content-available-height` e a largura é limitada ao
+viewport menos 16 px (2 × `space-sm`); quando o conteúdo não cabe, o menu rola
+dentro de si mesmo em vez de esconder as primeiras ações. O `sideOffset` de 6 px
+da referência é uma exceção documentada: o deslocamento é calculado em JS, então
+o valor fica no componente e não vira token CSS. O interruptor clássico mede 28
+por 16 px, com botão de 12 px e 1 px de recuo.
 
 ### Conflicting visual priorities
 
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
-320 px quando há espaço; em viewport menor, ocupa a largura disponível.
+320 px quando há espaço; em viewport menor, ocupa a largura disponível. Em
+viewport baixo, o menu rola e continua alcançável; nenhuma ação é cortada.
 
 ## Elevation & Depth
 
-Superfícies preenchidas e separadores discretos. O app não usa vidro, gradientes
-ou sombras de destaque. O scrim serve somente para o diálogo modal.
+Superfícies cheias e separadores discretos: o app não usa vidro nem gradientes
+de fundo. A camada flutuante (menu de opções e diálogo) usa a sombra compartilhada
+`shadows.menu`, conforme a correção de 2026-11-13; o scrim continua reservado ao
+diálogo modal.
 
 ## Shapes
 
-Raios de 4, 6, 8 e 12 px, conforme os tokens. Cartão usa 8 px; painel e diálogo,
-12 px; controles, 6 px. O interruptor mantém 32 por 20 px.
+Raios de 4, 6, 10, 12 e 13 px, conforme os tokens. O popover externo usa 13 px
+(`rounded.popover` → `--radius-popover`), o mesmo `window-radius` de 13 px da
+referência ai-usagebar; cartões e menus usam 10 px; o diálogo continua em 12 px
+(`rounded.panel`); controles e linhas de menu, 6 px. O recorte externo é do host
+nativo: a janela é transparente e a camada AppKit é recortada em 13 pt contínuos,
+então no CSS basta o raio do próprio painel sobre a raiz transparente — não há
+`height: 100%`/`overflow: hidden` em `html`/`body`, que cortaria o portal do menu
+no `body`. O interruptor mantém 28 por 16 px, com botão de 12 px e 1 px de recuo.
 
 ## Components
 
@@ -230,11 +299,47 @@ Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles t�
 nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
 nativo `dialog`, com foco contido e Escape para cancelar.
 
+O menu de opções é um componente compartilhado (`Menu`, `MenuItem`,
+`MenuSeparator`) sobre o mesmo primitivo Radix da referência
+(`@radix-ui/react-dropdown-menu` 2.1.24, MIT): `Root` não modal, `Trigger` como
+botão real com o rótulo traduzido e o ícone `down`, `Content` dentro de
+`Portal`. O primitivo cuida de ancoragem viva, Escape e clique fora, navegação
+por teclado, itens desabilitados, retorno de foco ao gatilho (exceto quando a
+saída foi um clique fora) e limpeza; não há ARIA menu feito à mão, medição de
+DOM nem listeners globais. As linhas são `div` emitidas pelo primitivo e
+estilizadas por `data-highlighted` (realce cinza no ponteiro e no teclado) e
+`data-disabled` (não interativo, sem realce); o separador é a `div`
+`role="separator"` do primitivo. Cada ação atual tem ícone do vocabulário
+existente; nenhuma ação nova é criada.
+
+Controles compartilhados seguem os papéis do ai-usagebar: texto de controle de
+12 px, recuo horizontal de 10 px e preenchimento explícito no hover; o botão
+primário e o de perigo preenchido recebem brilho 1.08 no hover
+(`hover-brightness`), um token e não um valor solto.
+
+### Ícone da barra de menus
+
+Usar SF Symbols nativos como imagens de template, acompanhando a aparência da
+barra: `lock.shield.fill` para IPsec conectado, `lock.fill` para SSL conectado,
+`lock.square.stack.fill` para ambos e `lock.open` quando nenhum está conectado.
+`exclamationmark.triangle.fill` indica estado incerto, transitório ou com erro.
+Somente o snapshot autoritativo do helper instalado pode fechar o cadeado;
+demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de altura.
+
 ## Do's and Don'ts
 
-- Preservar a estrutura e os estados do protótipo aprovado.
+- Preservar a estrutura e os estados do fluxo aprovado em `vpnt.fig`.
 - Usar os catálogos pt-BR/en-US para todo texto funcional da interface.
 - Manter o modo de demonstração explicitamente identificado.
 - Usar tokens do contrato; registrar novas indicações visuais neste arquivo.
+- Menu e controles seguem o tema clássico do ai-usagebar: superfície opaca, realce
+  de linha por preenchimento e sombra compartilhada na camada flutuante.
+- Não trocar realce por filtro de brilho global, nem deixar linha de menu com
+  fundo transparente no hover ou no foco por teclado.
+- Não deixar o menu crescer além do viewport: largura e altura vêm do espaço
+  disponível, com rolagem interna e 8 px de borda.
+- Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
+  `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
+  do host nativo, não do CSS.
 - Não simular conexão real por haver processo ou rota: exigir teste de tráfego.
 - Percentuais e medidas de `sr-only` são estrutura de acessibilidade, não novos tokens visuais.

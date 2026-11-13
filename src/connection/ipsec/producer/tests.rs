@@ -12,6 +12,7 @@ mod bound_budget;
 mod fixture;
 mod lease_budget;
 mod ledger;
+mod startup;
 mod userspace;
 mod utun;
 use fixture::Fixture;

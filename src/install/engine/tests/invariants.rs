@@ -203,7 +203,7 @@ fn installed_receipts_require_a_complete_canonical_inventory_and_matching_modes(
 
 #[test]
 fn destination_links_and_unsafe_permissions_are_rejected_before_mutation() {
-    for case in ["hardlink", "symlink", "permissions"] {
+    for case in ["hardlink", "symlink", "permissions", "setuid"] {
         let mut f = Fixture::new();
         f.activate().unwrap();
         let helper = f.executor.tree.resolve("adapters/helper").unwrap();
@@ -214,6 +214,7 @@ fn destination_links_and_unsafe_permissions_are_rejected_before_mutation() {
                 fs::rename(&helper, &target).unwrap();
                 std::os::unix::fs::symlink(target, &helper).unwrap();
             }
+            "setuid" => fs::set_permissions(&helper, fs::Permissions::from_mode(0o4755)).unwrap(),
             _ => fs::set_permissions(&helper, fs::Permissions::from_mode(0o577)).unwrap(),
         }
         let before = files(&f.root);
@@ -224,4 +225,61 @@ fn destination_links_and_unsafe_permissions_are_rejected_before_mutation() {
         );
         assert_eq!(files(&f.root), before, "{case}");
     }
+}
+
+#[test]
+fn a_sticky_public_tools_directory_traverses_install_update_rollback_and_remove_unchanged() {
+    let mut f = Fixture::new();
+    let tools = f.executor.tree.tools.clone();
+    fs::create_dir(&tools).unwrap();
+    fs::set_permissions(&tools, fs::Permissions::from_mode(0o1755)).unwrap();
+    let mode = || fs::metadata(&tools).unwrap().mode() & 0o7777;
+    assert_eq!(mode(), 0o1755);
+
+    // Rollback: a write fault after the first payload image must restore the tree
+    // and must not rewrite the existing directory's permissions.
+    f.executor.fault = Some(Fault {
+        remaining: 1,
+        crash: false,
+    });
+    let before = files(&f.root);
+    assert_eq!(f.activate().unwrap_err(), Error::Io);
+    assert_eq!(files(&f.root), before);
+    assert!(!Journal::pending(&f.executor.tree).unwrap());
+    assert_eq!(mode(), 0o1755);
+    f.executor.fault = None;
+
+    // Install through the real executor, not a mask check.
+    assert_eq!(f.activate().unwrap().files, 9);
+    assert_eq!(mode(), 0o1755);
+    Receipt::load(&f.executor.tree)
+        .unwrap()
+        .unwrap()
+        .verify(&f.executor.tree)
+        .unwrap();
+    access::admit(&f.executor.tree, 601).unwrap();
+    assert!(f.policy(601).exists());
+    assert!(f.executor.tree.state.join("users/601").is_dir());
+
+    // Update keeps the receipt, policy and directory mode coherent.
+    let policy = fs::read(f.policy(601)).unwrap();
+    f.revise();
+    assert_eq!(f.activate().unwrap().users, vec![601]);
+    assert_ne!(fs::read(f.policy(601)).unwrap(), policy);
+    assert_eq!(mode(), 0o1755);
+    Receipt::load(&f.executor.tree)
+        .unwrap()
+        .unwrap()
+        .verify(&f.executor.tree)
+        .unwrap();
+    access::admit(&f.executor.tree, 601).unwrap();
+
+    // Remove releases every declared target and leaves the directory as found.
+    let removed = f.executor.remove(601).unwrap();
+    assert!(removed.users.is_empty());
+    assert_eq!(removed.files, 0);
+    assert!(!f.policy(601).exists());
+    assert!(!f.executor.tree.resolve("adapters/helper").unwrap().exists());
+    assert_eq!(mode(), 0o1755);
+    assert!(tools.is_dir());
 }

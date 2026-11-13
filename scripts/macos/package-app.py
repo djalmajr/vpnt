@@ -37,6 +37,9 @@ with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent)
     resources = bundle / "Contents/Resources"
     resources.mkdir()
     shutil.copy2(root / "LICENSE", resources / "LICENSE")
+    notices = root / "LICENSES"
+    if notices.is_dir():
+        shutil.copytree(notices, resources / "LICENSES")
     minimum = "13.0"
     if args.component_payload:
         minimum = include_component(args.component_payload.resolve(), resources, executable)

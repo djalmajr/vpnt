@@ -1,7 +1,12 @@
 use super::*;
 use crate::install::{policy, valid_hash};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::PathBuf,
+};
 mod runtime;
 use runtime::{RuntimeFixture, macho};
 
@@ -291,4 +296,99 @@ fn extended_acl_write_grants_are_rejected_before_any_payload_is_trusted() {
         );
         assert!(f.inspect().is_err());
     }
+}
+
+fn directory_scratch(label: &str) -> PathBuf {
+    let path = std::env::current_dir()
+        .unwrap()
+        .join("output/fixtures")
+        .join(format!("directory-{}-{label}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[test]
+fn a_payload_under_a_sticky_public_parent_is_admitted_and_stays_private() {
+    let f = Fixture::new();
+    let base = directory_scratch("payload");
+    let sticky = base.join("sticky");
+    fs::create_dir(&sticky).unwrap();
+    fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1755)).unwrap();
+    let moved = sticky.join(f.root.file_name().unwrap());
+    fs::rename(&f.root, &moved).unwrap();
+    let uid = fs::metadata(&sticky).unwrap().uid();
+    Payload::inspect(&moved, uid).expect("a sticky parent must not block payload admission");
+    assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o700);
+    assert_eq!(fs::metadata(&sticky).unwrap().mode() & 0o7777, 0o1755);
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn sticky_is_admitted_only_on_a_trusted_public_directory_and_never_on_a_private_one() {
+    let base = directory_scratch("modes");
+    let uid = fs::metadata(&base).unwrap().uid();
+    let target = base.join("target");
+    fs::create_dir(&target).unwrap();
+    let set = |mode: u32| {
+        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, mode);
+    };
+    // The system helper directory is 01755; sticky alone restricts, never grants.
+    for mode in [0o755, 0o700, 0o1755] {
+        set(mode);
+        files::directory(&target, uid, false)
+            .unwrap_or_else(|_| panic!("{mode:o} must stay admissible"));
+    }
+    for mode in [0o1777, 0o1775, 0o1757, 0o777, 0o4755] {
+        set(mode);
+        assert_eq!(
+            files::directory(&target, uid, false),
+            Err(Error::UntrustedPath),
+            "{mode:o} grants write or escalates privilege"
+        );
+    }
+    // macOS keeps setuid on an owned directory (04755 above). Setgid is not
+    // reliably storable by an ordinary owner, so assert the kernel's own outcome
+    // and that admission follows the stored bits instead of assuming one.
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o2755)).unwrap();
+    let stored = fs::metadata(&target).unwrap().mode() & 0o7777;
+    assert!(stored == 0o2755 || stored == 0o755, "{stored:o}");
+    assert_eq!(
+        files::directory(&target, uid, false),
+        if stored & 0o6022 == 0 {
+            Ok(())
+        } else {
+            Err(Error::UntrustedPath)
+        },
+        "{stored:o}"
+    );
+    // A private directory keeps exactly 0700; sticky is not a private mode.
+    for mode in [0o1700, 0o1755, 0o755] {
+        set(mode);
+        assert_eq!(
+            files::directory(&target, uid, true),
+            Err(Error::UntrustedPath),
+            "private {mode:o}"
+        );
+    }
+    set(0o700);
+    files::directory(&target, uid, true).unwrap();
+    // A foreign owner and a symlinked directory stay rejected.
+    set(0o755);
+    assert_eq!(
+        files::directory(&target, uid + 1, false),
+        Err(Error::UntrustedPath),
+        "foreign owner"
+    );
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_eq!(
+        files::directory(&link, uid, false),
+        Err(Error::UntrustedPath),
+        "symlinked directory"
+    );
+    let _ = fs::remove_dir_all(&base);
 }

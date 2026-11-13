@@ -17,12 +17,17 @@ const paths = {
   loader: "M21 12a9 9 0 1 1-6.219-8.56",
   refresh:
     "M3 12a9 9 0 0 1 15-6.7L21 8 M21 3v5h-5 M21 12a9 9 0 0 1-15 6.7L3 16 M3 21v-5h5",
+  log: "M4 17l6-5-6-5 M12 19h8",
+  info: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z M12 11v5 M12 7.5v.01",
+  power: "M12 3v9 M18.36 6.64a9 9 0 1 1-12.73 0",
+  quit: "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4 M10 17l5-5-5-5 M15 12H3",
 };
+export type IconName = keyof typeof paths;
 export function Icon({
   name,
   large = false,
 }: {
-  name: keyof typeof paths;
+  name: IconName;
   large?: boolean;
 }) {
   return (

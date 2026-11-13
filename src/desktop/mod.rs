@@ -1,12 +1,14 @@
 mod icon;
 mod login_item;
 mod notifications;
+mod popover;
 mod preferences;
 mod worker;
 
 use crate::{
     assets::{CONTENT_SECURITY_POLICY, asset},
     bridge::{Command, Reply, parse_request, trusted_origin},
+    model::Snapshot,
 };
 use tao::{
     dpi::{LogicalPosition, LogicalSize},
@@ -37,11 +39,13 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         .with_title("vpnt")
         .with_inner_size(LogicalSize::new(320.0, 360.0))
         .with_visible(false)
+        .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top(true)
         .with_resizable(false)
         .build(&event_loop)?;
     let webview = WebViewBuilder::new()
+        .with_transparent(true)
         .with_custom_protocol("vpnt".into(), |_id, request| {
             let (mime, body, status) =
                 if request.uri().host() == Some("localhost") && request.method() == "GET" {
@@ -69,32 +73,20 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         .with_navigation_handler(|url| trusted_origin(&url))
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .build(&window)?;
+    popover::round_corners(&window, &webview)?;
     let reply_proxy = event_loop.create_proxy();
     let application = worker::Worker::new(demo, move |reply| {
         let _ = reply_proxy.send_event(UserEvent::Reply(reply));
     })?;
-    let mut tray = None;
+    let mut icons = None;
     let mut open = false;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) => {
-                match icon::shield()
-                    .map_err(|error| error.to_string())
-                    .and_then(|icon| {
-                        TrayIconBuilder::new()
-                            .with_icon_templated(icon)
-                            .with_tooltip("vpnt")
-                            .with_menu_on_left_click(false)
-                            .with_menu_on_right_click(false)
-                            .build()
-                            .map_err(|error| error.to_string())
-                    }) {
-                    Ok(icon) => tray = Some(icon),
-                    Err(error) => {
-                        eprintln!("Could not create tray icon: {error}");
-                        *control_flow = ControlFlow::Exit;
-                    }
+                if let Err(error) = create_tray(&mut icons) {
+                    eprintln!("Could not create tray icon: {error}");
+                    *control_flow = ControlFlow::Exit;
                 }
                 if show {
                     window.set_visible(true);
@@ -148,6 +140,8 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                             snapshot: None,
                             error: Some("backend_unavailable".into()),
                         };
+                        // A failed request is never a verified tunnel.
+                        show_icon(&mut icons, reply.snapshot.as_ref(), reply.error.is_some());
                         if let Ok(json) = serde_json::to_string(&reply) {
                             let _ =
                                 webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
@@ -156,6 +150,9 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::Reply(reply)) => {
+                // The tray follows the same reply the webview receives, before
+                // it is serialized.
+                show_icon(&mut icons, reply.snapshot.as_ref(), reply.error.is_some());
                 if let Ok(json) = serde_json::to_string(&reply) {
                     let _ = webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
                 }
@@ -170,6 +167,31 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
-        let _ = &tray;
     });
+}
+
+/// Builds the status item at menu-bar size and puts the open lock on it, before
+/// the item first draws and before any snapshot proves otherwise.
+fn create_tray(icons: &mut Option<icon::Controller>) -> Result<(), String> {
+    let placeholder = icon::placeholder().map_err(|error| error.to_string())?;
+    let tray = TrayIconBuilder::new()
+        .with_icon_templated(placeholder)
+        .with_tooltip(icon::TOOLTIP)
+        .with_menu_on_left_click(false)
+        .with_menu_on_right_click(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+    *icons = Some(icon::Controller::new(tray).map_err(|error| error.to_string())?);
+    Ok(())
+}
+
+/// Applies the reply's icon, reporting a symbol AppKit cannot resolve instead of
+/// keeping a stale reading silently.
+fn show_icon(icons: &mut Option<icon::Controller>, snapshot: Option<&Snapshot>, error: bool) {
+    let Some(controller) = icons else {
+        return;
+    };
+    if let Err(error) = controller.show(snapshot, error) {
+        eprintln!("Could not update tray icon: {error}");
+    }
 }

@@ -60,11 +60,28 @@ static int handle(int client) {
     if(write(client,prefix,sizeof(prefix))!=(ssize_t)sizeof(prefix))return 0;
     return write(client,reply,sizeof(reply)-1)==(ssize_t)(sizeof(reply)-1);
 }
-static void serve(const char *path,int watch,const char *directory) {
+/* Test-only control channel: the real producer socket is bound, but cannot
+ * listen until the test explicitly releases it. No delay chooses the race. */
+static void before_listen(const char *directory) {
+    char parent[1100],root[1024];
+    snprintf(parent,sizeof(parent),"%s/../..",directory);
+    demand(realpath(parent,root)!=NULL);
+    int gate=socket(AF_UNIX,SOCK_STREAM,0);demand(gate>=0);
+    struct sockaddr_un address;memset(&address,0,sizeof(address));
+    address.sun_family=AF_UNIX;
+    demand(snprintf(address.sun_path,sizeof(address.sun_path),"%s/startup.sock",root)<(int)sizeof(address.sun_path));
+    demand(connect(gate,(struct sockaddr*)&address,sizeof(address))==0);
+    demand(write(gate,"B",1)==1);
+    char release;int released=read_all(gate,&release,1);close(gate);
+    if(!released || release!='L')_exit(0);
+}
+static void serve(const char *path,int watch,const char *directory,int hold) {
     int fd=socket(AF_UNIX,SOCK_STREAM,0);demand(fd>=0);
     struct sockaddr_un address;memset(&address,0,sizeof(address));address.sun_family=AF_UNIX;
     demand(strlen(path)<sizeof(address.sun_path));strcpy(address.sun_path,path);
-    mode_t old=umask(0117);int bound=bind(fd,(struct sockaddr*)&address,sizeof(address));umask(old);demand(bound==0 && listen(fd,4)==0);
+    mode_t old=umask(0117);int bound=bind(fd,(struct sockaddr*)&address,sizeof(address));umask(old);demand(bound==0);
+    if(hold)before_listen(directory);
+    demand(listen(fd,4)==0);
     /* One idle client is multiplexed, never closed by a read timeout: a valid
      * caller may be scheduled long after it connected. */
     int client=-1;
@@ -181,11 +198,11 @@ int main(int argc,char **argv) {
     if(strstr(claim,"\"profile\":\"silence\"")) {while(!stopping)usleep(1000);}
     else if(strstr(claim,"\"profile\":\"fork\"")) {
         pid_t child=fork();demand(child>=0);
-        if(child==0) {serve(socket_path,retained[1],directory);_exit(0);}
+        if(child==0) {serve(socket_path,retained[1],directory,0);_exit(0);}
         int status;
         while(!stopping && waitpid(child,&status,WNOHANG)==0)usleep(1000);
         if(stopping) {kill(child,SIGTERM);while(waitpid(child,&status,0)<0 && errno==EINTR){}}
-    } else serve(socket_path,retained[1],directory);
+    } else serve(socket_path,retained[1],directory,strstr(claim,"\"profile\":\"startup-")!=NULL);
     unlink(pid);
     return 0;
 }

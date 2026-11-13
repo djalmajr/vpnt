@@ -69,7 +69,12 @@ impl Tree {
     pub fn directory(&self, path: &Path, mode: u32) -> Result<(), Error> {
         match fs::symlink_metadata(path) {
             Ok(m) => {
-                if !m.is_dir() || m.mode() & 0o7777 != mode {
+                // The system helper directory is root:wheel 01755. A sticky bit on
+                // an otherwise public directory only restricts deletion, so an
+                // existing 01755 satisfies a 0755 expectation and is left untouched.
+                // Private directories still require exactly 0700 without sticky.
+                let existing = m.mode() & 0o7777;
+                if !m.is_dir() || (existing != mode && !(mode == 0o755 && existing == 0o1755)) {
                     return Err(Error::UntrustedPath);
                 }
             }

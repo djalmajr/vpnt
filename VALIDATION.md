@@ -25,10 +25,92 @@ python3 scripts/macos/package-app.py --replace
 python3 scripts/macos/build-askpass.py
 ```
 
-O gate de tokens compara as 81 entradas mapeadas em `DESIGN.md` com o CSS.
+O gate de tokens compara as 94 entradas mapeadas em `DESIGN.md` com o CSS.
 O gate de classes ainda não tem classes proibidas configuradas; sua execução
 não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
 variáveis, que podem anular medidas mesmo quando os nomes coincidem.
+
+## Checkpoint atual — 13/11/2026
+
+[PASS, execução local] A UI passou lint, typecheck, build e 28 testes
+(247 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
+janela e na WebView, menu compartilhado Radix e os símbolos nativos da bandeja.
+O gate de classes segue sem regras e não representa cobertura visual.
+
+[PASS, testes com fixtures] As suítes completas passaram com 627 testes desktop
+e 568 core, sem falhas e com dois ignorados em cada suíte. Depois delas, somente
+os pré-requisitos temporais de um teste novo de startup foram corrigidos;
+o código Rust de produção e as dependências permaneceram idênticos. A correção
+posterior de navegação alterou somente o hook da UI e seu teste, validados
+separadamente abaixo. Após a correção de startup passaram fmt, clippy
+all-targets/all-features com `-D warnings`, os dois
+testes de startup, baseline e restauração dos 126 testes IPsec e a campanha de
+32 mutações do produtor. O build de todos os binários também passou. As duas
+suítes completas são evidência reaproveitada por essa paridade, não uma nova
+execução após a correção exclusiva do teste.
+
+O retry de startup trata somente `ConnectionRefused` entre bind e listen do
+socket VICI, conservando o prazo absoluto, cancelamento e verificações de
+identidade. Um fixture C com barreira bind/listen reproduziu o defeito; remover
+o retry fez a asserção funcional falhar e restaurá-lo passou. Isso não prova a
+causa das falhas históricas sem trace. A primeira campanha posterior parou no
+baseline porque o teste de cancelamento consumiu seu orçamento antes de enviar
+a flag. O teste passou a separar esse preparo do cenário de deadline; nenhum
+prazo de produção mudou. A falha original foi preservada antes da reexecução.
+
+[PASS, renderer isolado] A WKWebView real, em janela privada não exibida e com
+`App::demo`, passou 24 combinações: pt-BR/en-US, claro/escuro e seis dimensões,
+de 280×180 a 1406×1090. Entradas DOM sintéticas verificaram posicionamento do
+menu, margem, rolagem, destaque, itens desabilitados, Escape e foco, sem violação
+da CSP. Um probe do SDK conferiu camadas com raio 13 pt, curva contínua e recorte
+em três alturas; desabilitar o recorte no probe fez sua asserção falhar e a
+restauração passou. Essas provas não são captura visual nem mouse real no app.
+
+[PASS, artefato preparado] O host e o componente atuais foram preparados e
+inspecionados novamente após a correção VICI: askpass, dez arquivos do runtime,
+payload de 17 arquivos, vínculo de hashes e licenças. O runtime local requer
+macOS 26.0. As 59 mutações de instalação passaram num checkpoint anterior; não
+foram repetidas localmente após as novas arestas opcionais de dependências
+nativas e não são apresentadas como campanha fresca desse grafo Cargo.
+
+[PASS, instalação e admissão nativas] O Installer real concluiu a instalação
+após a autenticação do usuário. Helper e instalador em
+`/Library/PrivilegedHelperTools` conferem com os hashes do pacote, proprietário
+root e modo `0555`. Após fechar o Installer, o app retomou o helper: o painel
+não apresentou aviso de componente ausente e Preferências exibiu “Componente
+instalado”, versão 0.1.0 e ação de remoção. Isso confirma admissão e snapshot
+inicial, sem provar uma VPN. Os processos de VPN já existentes foram
+preservados; nenhuma conexão foi solicitada pelo vpnt.
+
+[PASS, regressão no consumidor isolado] A chamada do app expirou durante a
+interação humana e a tela de primeiro uso permaneceu aberta até voltar
+manualmente ao painel. A correção reconcilia somente essa rota quando chega
+snapshot não-demo com helper instalado. O hook original falhou na asserção de
+navegação da WKWebView real; a versão corrigida passou seis casos com snapshots
+sintéticos: confirmação tardia, erro de expiração seguido de confirmação,
+Preferences, rascunho de perfil, demo e helper desatualizado. O alerta de
+expiração e o rascunho foram preservados, sem pedido repetido de instalação.
+A mesma versão passou novamente as 24 combinações de layout e os gates UI.
+Não houve segunda instalação real para repetir o timeout com o novo host.
+
+[BLOCKED, VPN real] A consulta de rota, sem envio de pacotes, encontrou o destino
+de teste já servido por um túnel existente. A validação de VPN foi interrompida
+nesse pré-requisito, conforme a autorização de preservar conexões e configurações.
+
+[NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
+coexistência operacional, efeitos nativos positivos de login/notificações,
+aceite visual por captura do popover e CI remoto. A instalação parcial acima
+não altera o estado desses itens.
+
+Os recibos locais não versionados em `output/fixtures/` são
+`vici-startup-final/receipt.json`, `vici-startup-final-r1/receipt.json`,
+`rounded-popover-final/wk-ui-matrix.json` e
+`native-current-package-receipt.json`, `late-installed-ui/canonical-receipt.json`
+e `late-installed-ui/current-wk-receipt.json`. Eles registram comandos, logs, hashes,
+paridade e limites de cada rodada. A campanha final mudou apenas o diretório de
+saída dos recibos, conservando seletores e verificações do script original.
+Revisões independentes das fatias de produção e da correção do teste passaram.
+Os checkpoints abaixo são históricos e não ampliam essa prova atual.
 
 ## Checkpoint local das preferências — 13/11/2026
 

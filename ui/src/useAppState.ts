@@ -14,6 +14,18 @@ import {
   saveSettings,
 } from "./settings";
 
+/**
+ * Only the automatic first-use screen is derived from an earlier snapshot; a
+ * later authoritative `installed` confirmation leaves it stale (it keeps
+ * offering Install after a late successful installation). Every explicit route
+ * is the user's intent and must never be taken over by a snapshot: only
+ * `onboarding` is reconciled, and only from a real (non-demo) snapshot.
+ */
+export function reconcileRoute(previous: Route, snapshot: Snapshot): Route {
+  if (snapshot.demo || snapshot.helper !== "installed") return previous;
+  return previous.page === "onboarding" ? { page: "panel" } : previous;
+}
+
 export function useAppState() {
   const [local, setLocal] = useState(loadSettings);
   const locale = resolveLocale(local.locale, navigator.languages);
@@ -58,6 +70,10 @@ export function useAppState() {
       )
         navigate({ page: "onboarding" });
     }
+    // Late authoritative install: the automatic first-use screen is now stale.
+    // A functional updater reads the latest route, so this memoized callback
+    // never navigates away from a route the user chose meanwhile.
+    navigate((previous) => reconcileRoute(previous, snapshot));
     // Fresh authoritative state: flush preference intent that was waiting for
     // one (first snapshot, or a reply that could not be reconciled in place).
     void preferencesRef.current?.sync();
@@ -187,12 +203,7 @@ export function useAppState() {
       if (event.key !== "Escape" || event.defaultPrevented) return;
       // Modal Escape belongs to the dialog; it must not hide the native panel.
       if (document.querySelector("dialog[open]")) return;
-      const expanded =
-        document.querySelector<HTMLDetailsElement>(".options[open]");
-      if (expanded) {
-        expanded.open = false;
-        expanded.querySelector("summary")?.focus();
-      } else if (window.ipc) {
+      if (window.ipc) {
         void invoke({ type: "hide" }).catch(() => {});
       }
     };

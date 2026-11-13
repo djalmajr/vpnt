@@ -27,15 +27,21 @@ pub(super) fn stamp(path: &Path, owner: u32) -> Result<files::Stamp, Error> {
     crate::fs_permissions::check_path(path, true).map_err(|_| Error::Changed)?;
     Ok(files::Stamp::of(&meta))
 }
+/// None means only a refused startup connection; every other error is terminal
+/// for this open call. A client is returned only after the existing peer checks.
 pub(super) fn connect(
     path: &Path,
     owner: u32,
     pid: u32,
     expires: Instant,
     cancel: Arc<AtomicBool>,
-) -> Result<Client, Error> {
+) -> Result<Option<Client>, Error> {
     let budget = Budget::until(expires, Some(cancel.clone())).map_err(map)?;
-    let stream = connect_deadline(path, &budget).map_err(map)?;
+    let stream = match connect_deadline(path, &budget) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+        Err(error) => return Err(map(error)),
+    };
     let mut peer: i32 = 0;
     let mut length = std::mem::size_of_val(&peer) as libc::socklen_t;
     // SOL_LOCAL/LOCAL_PEERPID from the Darwin sys/un.h API. PID is bound to
@@ -56,11 +62,13 @@ pub(super) fn connect(
     {
         return Err(Error::Changed);
     }
-    Client::from_stream_until(stream, owner, expires, cancel).map_err(|e| match e {
-        crate::helper::vici::Error::Canceled => Error::Canceled,
-        crate::helper::vici::Error::Timeout => Error::Timeout,
-        _ => Error::Changed,
-    })
+    Client::from_stream_until(stream, owner, expires, cancel)
+        .map(Some)
+        .map_err(|e| match e {
+            crate::helper::vici::Error::Canceled => Error::Canceled,
+            crate::helper::vici::Error::Timeout => Error::Timeout,
+            _ => Error::Changed,
+        })
 }
 fn map(e: std::io::Error) -> Error {
     match crate::helper::vici::Error::from(e) {

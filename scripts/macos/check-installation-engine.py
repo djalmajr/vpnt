@@ -75,6 +75,7 @@ def mutations():
         ('hardlink-destination-accepted', base + '/image.rs', lambda s: replace(s, '        || metadata.nlink() != 1\n', ''), links),
         ('symlink-destination-followed', base + '/image.rs', lambda s: replace(s, '.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)', '.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)'), links),
         ('unsafe-destination-mode-accepted', base + '/image.rs', lambda s: replace(s, '        || metadata.mode() & 0o7022 != 0\n', ''), links),
+        ('sticky-tools-directory-rejected', base + '/tree.rs', lambda s: replace(s, '(existing != mode && !(mode == 0o755 && existing == 0o1755))', 'existing != mode'), invariant + 'a_sticky_public_tools_directory_traverses_install_update_rollback_and_remove_unchanged'),
         ('runtime-path-escape', base + '/tree.rs', lambda s: replace(s, 'if !version_ok(version) || (name != "manifest.json" && !runtime::valid_name(name)) {', 'if false {'), namespace),
         ('policy-preservation-ignored', base + '.rs', lambda s: replace(s, 'for phase in [0, 1, 2] {', 'for phase in [2, 0, 1] {'), crashes),
         ('rollback-skipped', base + '.rs', lambda s: replace(s, '.rollback(&self.tree)', '.verify(&self.tree, false)'), prefix + 'recovery::every_injected_install_update_and_remove_failure_restores_the_previous_file_images'),

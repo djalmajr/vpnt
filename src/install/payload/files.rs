@@ -6,6 +6,12 @@ use std::{
     path::Component,
 };
 
+/// Directory bits that grant or escalate access: setuid, setgid, group write and
+/// other write. Sticky is deliberately absent: on an already trusted directory it
+/// only restricts who may remove entries, so the system helper directory
+/// (root:wheel `01755`) is admitted as-is, without changing its permissions.
+const UNSAFE_DIRECTORY_BITS: u32 = 0o6022;
+
 pub(crate) fn directory(path: &Path, owner: u32, private: bool) -> Result<(), Error> {
     if !path.is_absolute()
         || path
@@ -19,8 +25,8 @@ pub(crate) fn directory(path: &Path, owner: u32, private: bool) -> Result<(), Er
         let own = ancestor == path;
         if !metadata.is_dir()
             || (metadata.uid() != 0 && metadata.uid() != owner)
-            || metadata.mode() & 0o7022 != 0
-            || (own && (metadata.uid() != owner || (private && metadata.mode() & 0o777 != 0o700)))
+            || metadata.mode() & UNSAFE_DIRECTORY_BITS != 0
+            || (own && (metadata.uid() != owner || (private && metadata.mode() & 0o7777 != 0o700)))
         {
             return Err(Error::UntrustedPath);
         }

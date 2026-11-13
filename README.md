@@ -4,9 +4,10 @@
 Windows e no Linux, com a mesma interface nos três.
 
 > Protótipo visual aprovado. A interface bilíngue e o runtime estão preparados
-> em um pacote de desenvolvimento local. Instalação, efeitos nativos das
-> preferências e VPN real ainda não foram validados. Windows e Linux ficam
-> para depois.
+> em um pacote de desenvolvimento local. O Installer concluiu a instalação dos
+> arquivos e o aplicativo já reconhece o componente instalado. Efeitos nativos
+> das preferências e VPN real permanecem pendentes. Windows e
+> Linux ficam para depois. Consulte o checkpoint atual em `VALIDATION.md`.
 
 ## Proposta
 
@@ -144,9 +145,12 @@ Repetir reutiliza apenas uma saída íntegra; corrupção é recusada. `--verify
 audita um pacote existente contra o mesmo payload. O pacote é verificado como
 sem assinatura; distribuição assinada/notarizada continua pendente.
 
-Execução positiva como root e efeito do Installer no sistema continuam
-pendentes. Veja os limites e os comandos de
-reprodução em `VALIDATION.md`.
+O Installer local já concluiu a gravação dos executáveis admitidos, com hashes
+e permissões conferidos. A chamada expirou durante a autenticação humana; após
+fechar o Installer, o app retomou o helper e Preferências exibiu “Componente
+instalado”. A navegação após confirmação tardia foi corrigida e validada na
+WKWebView isolada; não houve segunda instalação real para repetir esse caso.
+Veja os limites e os comandos de reprodução em `VALIDATION.md`.
 
 Para incluir esse componente no próprio `.app`, use o payload admitido:
 
