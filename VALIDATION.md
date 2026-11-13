@@ -39,12 +39,24 @@ O gate de classes segue sem regras e não representa cobertura visual.
 
 [PASS, renderer isolado] Os interruptores compartilham contorno mais retangular,
 com raio externo de 3 px e interno de 1 px, derivado da borda e do recuo. A
-versão compacta mede 24 × 14 px, com botão de 10 px; o select nativo medido
-na WebView tem 18 px de altura. Ícones grandes e linhas mantêm suas medidas.
+versão compacta mede 24 × 14 px, com botão de 10 px. Antes da padronização
+abaixo, o select nativo medido na WebView tinha 18 px de altura. Ícones grandes
+e linhas mantêm suas medidas.
 A WKWebView mediu cartões e preferências em oito combinações de pt-BR/en-US,
 claro/escuro e larguras de 280/640 px. Passaram geometria, alinhamento nos dois
 estados, foco e ausência de overflow horizontal. As entradas DOM são sintéticas;
 isso não representa captura visual nem interação com uma VPN real.
+
+[PASS, controles padronizados] Botões, inputs e selects de linha única usam
+24 px de altura, texto de 12 px e recuo horizontal de 10 px. O componente
+compartilhado mantém o `select` real, com chevron decorativo e sem tabstop extra.
+O renderer isolado passou oito combinações de idioma/tema/largura, medindo
+botões, campos e seletores com 24 px, foco, mudança e restauração do tema,
+ausência de overflow/CSP e o switch inalterado. Os quatro casos de formulário
+também passaram. A integração canônica repetiu os gates UI; os assets gerados
+coincidem byte a byte com os do renderer privado. No app normal atualizado,
+a geometria de acessibilidade confirmou botões e seletores com 24 px e switches
+de 24 × 14 px. Essas medidas nativas não são captura visual nem VPN real.
 
 [PASS, testes com fixtures] As suítes completas passaram com 627 testes desktop
 e 568 core, sem falhas e com dois ignorados em cada suíte. Depois delas, somente

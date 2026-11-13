@@ -1,5 +1,12 @@
 import { useState } from "react";
-import { Dialog, Group, Header, Row, type T } from "../components/common";
+import {
+  Dialog,
+  Group,
+  Header,
+  Row,
+  Select,
+  type T,
+} from "../components/common";
 import type { Profile as VpnProfile, VpnView } from "../model";
 import type { Navigate, Run } from "../navigation";
 import { blankProfile } from "../profileDefaults";
@@ -97,9 +104,10 @@ export function Profile({
       >
         <Group>
           {input("name", "name")}
+          {/* biome-ignore lint/a11y/noLabelWithoutControl: Select renders a native <select> inside the label */}
           <label className="field">
             <span>{t("type")}</span>
-            <select
+            <Select
               value={value.kind}
               disabled={saving}
               onChange={(event) =>
@@ -108,7 +116,7 @@ export function Profile({
             >
               <option value="ipsec">{t("ipsec")}</option>
               <option value="ssl">{t("ssl")}</option>
-            </select>
+            </Select>
           </label>
           {input("gateway", "gateway", "vpn.example.com")}
           <label className="field">
@@ -147,9 +155,10 @@ export function Profile({
         <Group>
           {input("probeHost", "probeHost", "10.20.0.15")}
           <p className="hint">{t("probeHostHint")}</p>
+          {/* biome-ignore lint/a11y/noLabelWithoutControl: Select renders a native <select> inside the label */}
           <label className="field">
             <span>{t("method")}</span>
-            <select
+            <Select
               value={value.probeMethod}
               disabled={saving}
               onChange={(event) =>
@@ -161,7 +170,7 @@ export function Profile({
             >
               <option value="ping_tcp">{t("pingTcp")}</option>
               <option value="tcp">{t("tcp")}</option>
-            </select>
+            </Select>
           </label>
           <label className="field">
             <span>{t("tcpPort")}</span>

@@ -255,6 +255,18 @@ horizontais e 5 px verticais por linha, ícone de 15 px e 8 px entre ícone e
 texto. O painel cresce com o conteúdo e rola até o limite da tela. Campos e
 seletores encolhem dentro da largura disponível. Nenhum fluxo depende de hover.
 
+Por indicação do Djalma em 2026-11-13, todo controle padrão de linha única —
+botão, campo de texto e seletor — mede a mesma altura de 24 px
+(`control-height`), usa o texto de controle de 12 px e 10 px de recuo horizontal
+(`control-x`); no seletor, o recuo direito cresce para caber o ícone e o
+intervalo até ele. O seletor continua sendo o `select` nativo: `appearance: none`
+remove só a seta do sistema, e o ícone `down` compartilhado, de 13 px
+(`icon-inline`) e ancorado a 10 px do canto direito, ocupa o lugar dela — não há
+dropdown próprio. A altura é declarada em `height`, não `min-height`, porque o
+WebKit desenhava o seletor com 18 px apesar do mínimo; a largura continua vindo
+do conteúdo e do espaço disponível. Cartões de VPN, linhas de perfil e linhas de
+menu mantêm a altura do próprio conteúdo, para não cortar rótulo nem tradução.
+
 O menu é ancorado ao próprio gatilho pelo primitivo Radix: abre acima dele
 (`side="top"`), alinhado à borda final (`align="end"`), com 6 px entre gatilho e
 menu e 8 px de margem de colisão em cada lado (`collisionPadding`). O primitivo
@@ -325,6 +337,13 @@ Controles compartilhados seguem os papéis do ai-usagebar: texto de controle de
 primário e o de perigo preenchido recebem brilho 1.08 no hover
 (`hover-brightness`), um token e não um valor solto.
 
+O controle de seleção é o componente compartilhado `Select`, que embrulha um
+`<select>` nativo real — mesmas props, valor controlado, `onChange`, `disabled`,
+`aria-label` e opções — num `span.select-control` não interativo, sem tabstop
+próprio. O ícone `down` compartilhado é `aria-hidden` e não captura ponteiro,
+então clique, foco, teclado e o rótulo implícito de `field` continuam no
+elemento nativo.
+
 ### Ícone da barra de menus
 
 Usar SF Symbols nativos como imagens de template, acompanhando a aparência da
@@ -349,5 +368,8 @@ demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de alt
 - Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
   `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
   do host nativo, não do CSS.
+- Não trocar o `select` nativo por dropdown próprio, nem fixar a altura de
+  cartões e linhas para igualar controles: só os controles de linha única usam os
+  24 px de `control-height`.
 - Não simular conexão real por haver processo ou rota: exigir teste de tráfego.
 - Percentuais e medidas de `sr-only` são estrutura de acessibilidade, não novos tokens visuais.

@@ -181,8 +181,10 @@ select {
   border: 0;
   border-radius: var(--radius-control);
   background: var(--control);
-  min-height: var(--control-height);
-  padding: 0 var(--space-sm);
+  /* Explicit height, not min-height: WebKit rendered the native select 18 px
+     tall when only min-height was set. */
+  height: var(--control-height);
+  padding: 0 var(--control-x);
   font-size: var(--font-control);
 }
 select:not(:disabled):hover {
@@ -193,7 +195,7 @@ input {
   border-radius: var(--radius-control);
   background: var(--field);
   height: var(--control-height);
-  padding: 0 var(--space-sm);
+  padding: 0 var(--control-x);
   font-size: var(--font-control);
 }
 .panel {
@@ -242,6 +244,33 @@ h2 {
   width: calc(var(--control-height) + var(--space-xs));
   height: calc(var(--control-height) + var(--space-xs));
 }
+/* Standard select: the real <select> keeps the platform popup, keyboard and
+   disabled semantics; this wrapper only positions the shared chevron. */
+.select-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+}
+.select-control > select {
+  appearance: none;
+  flex: 1;
+  width: 100%;
+  padding-right: calc(var(--control-x) + var(--icon-inline) + var(--space-xs));
+}
+.select-control > .icon {
+  position: absolute;
+  right: var(--control-x);
+  top: 50%;
+  width: var(--icon-inline);
+  height: var(--icon-inline);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.select-control > select:disabled {
+  color: var(--secondary);
+}
 .icon-button {
   display: inline-flex;
   align-items: center;
@@ -285,6 +314,11 @@ h2 {
 .setting-row button,
 .setting-row select {
   flex: 0 0 auto;
+}
+/* The wrapper is the flex item inside a row; the label span keeps the fill. */
+.setting-row > span.select-control {
+  flex: 0 0 auto;
+  max-width: 100%;
 }
 .setting-row button {
   max-width: 52%;
@@ -533,10 +567,11 @@ dialog p {
   flex: 0 0 auto;
 }
 .field > input,
-.field > select {
+.field > .select-control {
   flex: 1;
   width: 0;
   min-width: 0;
+  max-width: 100%;
 }
 input[aria-invalid="true"] {
   border-color: var(--red);

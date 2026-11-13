@@ -1,4 +1,9 @@
-import { type ReactNode, useLayoutEffect, useRef } from "react";
+import {
+  type ReactNode,
+  type SelectHTMLAttributes,
+  useLayoutEffect,
+  useRef,
+} from "react";
 import type { MessageKey } from "../i18n";
 
 export type T = (
@@ -43,6 +48,19 @@ export function Icon({
     >
       <path d={paths[name]} />
     </svg>
+  );
+}
+/* A real native <select>: the platform popup and keyboard semantics stay with
+   the element, the wrapper only hosts the shared chevron. */
+export function Select({
+  children,
+  ...props
+}: SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <span className="select-control">
+      <select {...props}>{children}</select>
+      <Icon name="down" />
+    </span>
   );
 }
 export function Header({

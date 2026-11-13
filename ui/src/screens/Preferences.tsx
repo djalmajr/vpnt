@@ -1,4 +1,12 @@
-import { Group, Header, Icon, Row, type T, Toggle } from "../components/common";
+import {
+  Group,
+  Header,
+  Icon,
+  Row,
+  Select,
+  type T,
+  Toggle,
+} from "../components/common";
 import type { NativePreferences, Snapshot } from "../model";
 import type { Navigate } from "../navigation";
 import type { Settings } from "../settings";
@@ -39,7 +47,7 @@ export function Preferences({
           />
         </Row>
         <Row label={t("language")}>
-          <select
+          <Select
             aria-label={t("language")}
             value={settings.locale}
             onChange={(event) =>
@@ -49,10 +57,10 @@ export function Preferences({
             <option value="system">{t("system")}</option>
             <option value="pt-BR">Português (Brasil)</option>
             <option value="en-US">English (US)</option>
-          </select>
+          </Select>
         </Row>
         <Row label={t("theme")}>
-          <select
+          <Select
             aria-label={t("theme")}
             value={settings.theme}
             onChange={(event) =>
@@ -62,13 +70,13 @@ export function Preferences({
             <option value="system">{t("system")}</option>
             <option value="light">{t("light")}</option>
             <option value="dark">{t("dark")}</option>
-          </select>
+          </Select>
         </Row>
       </Group>
       <h2 className="section-title">{t("tunnelTest")}</h2>
       <Group>
         <Row label={t("testEvery")}>
-          <select
+          <Select
             aria-label={t("testEvery")}
             value={settings.interval}
             disabled={pending}
@@ -84,7 +92,7 @@ export function Preferences({
                 {t("seconds", { count })}
               </option>
             ))}
-          </select>
+          </Select>
         </Row>
         <Row label={t("notifyStale")}>
           <Toggle
