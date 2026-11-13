@@ -75,6 +75,10 @@ fn swan_patches() -> BTreeMap<String, String> {
             "charon-parent-eof.patch",
             include_bytes!("../../scripts/macos/patches/charon-parent-eof.patch").as_slice(),
         ),
+        (
+            "strongswan-retain-utun.patch",
+            include_bytes!("../../scripts/macos/patches/strongswan-retain-utun.patch").as_slice(),
+        ),
     ]
     .into_iter()
     .map(|(name, bytes)| (name.into(), format!("{:x}", Sha256::digest(bytes))))

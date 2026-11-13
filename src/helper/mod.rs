@@ -1,5 +1,9 @@
+#[cfg(target_os = "macos")]
+pub(crate) mod charon_channel;
 #[cfg(unix)]
 pub mod controller_lock;
+#[cfg(unix)]
+pub(crate) mod fd_guard;
 #[cfg(unix)]
 pub(crate) mod local_socket;
 pub mod paths;

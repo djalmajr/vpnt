@@ -2,12 +2,13 @@
 
 O runtime privado compila strongSwan 6.1.0 com o backend `kernel-libipsec`
 (`--enable-libipsec --enable-kernel-libipsec`, `--disable-kernel-pfkey`) e
-aplica exatamente quatro patches, nesta ordem:
+aplica exatamente cinco patches, nesta ordem:
 `charon-private-pid.patch`, `strongswan-utun-framing.patch`,
-`strongswan-libipsec-no-routes.patch`, `charon-parent-eof.patch`. A fonte é
+`strongswan-libipsec-no-routes.patch`, `charon-parent-eof.patch`,
+`strongswan-retain-utun.patch`. A fonte é
 sempre reextraída do tarball verificado; o build não reutiliza árvore de build
 gerada para outro backend ou outro conjunto de patches. O manifest declara
-`strongswan.backend = "kernel-libipsec"` e o hash exato dos quatro patches, e a
+`strongswan.backend = "kernel-libipsec"` e o hash exato dos cinco patches, e a
 admissão Rust recusa backend ausente/divergente, patch faltante ou hash
 alterado.
 
@@ -98,3 +99,17 @@ plugins. A parada normal continua sendo VICI + o stop gracioso/forçado do
 privada, e deixa PID/journal privados para a recuperação do helper. Limite: não
 há teste com charon real, login item ou morte de processo pai neste repositório;
 as provas atuais são de fixture, com filhos próprios e pipes anônimos.
+
+`strongswan-retain-utun.patch` modifica apenas
+`src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c`. Acrescenta a
+opção privada `charon.plugins.kernel-libipsec.vpnt_retain_utun` (padrão
+`false`). Quando ligada, depois do `tun_device_create` + `set_mtu` + `up` e
+antes de `lib->set`/publicação, envia o fd original do tun em um único
+datagrama `AF_UNIX`/`SOCK_DGRAM` no FD 3 herdado (`SCM_RIGHTS`, payload VPUFv1
+de 8 bytes), marca o fd do tun com `FD_CLOEXEC`, valida família/tipo/conexão e
+fecha o fd 3 em toda saída habilitada. Canal inválido, falha de flags ou de
+`sendmsg` destrói o tun e retorna `NULL` antes da publicação. Desligada, não
+toca o fd 3 nem o fd do tun. A verificação do builder procura o literal
+`.plugins.kernel-libipsec.vpnt_retain_utun` no `bin/charon`; o manifest inclui
+o hash deste quinto patch. Limite: o fixture C valida o construtor e o handoff
+com pipe/socketpair, sem charon ou UTUN real.

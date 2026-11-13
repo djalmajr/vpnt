@@ -7,6 +7,7 @@ use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 mod admission;
 mod binding;
 mod fixture;
+mod userspace;
 mod utun;
 use fixture::Fixture;
 #[derive(Clone, Default)]

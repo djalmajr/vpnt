@@ -52,7 +52,7 @@ def main():
         ('rejected-response-accepted', io, lambda s: replace(s, 'Some("no") => Err(Error::Rejected)', 'Some("no") => Ok(())'), failed),
         ('start-replayed', control, lambda s: replace(s, 'self.phase != Phase::Prepared', 'false'), lifecycle),
         ('load-uncertainty-after-reply', control, lambda s: replace(s, '        self.loaded = true;\n        self.ack(&call, "load-conn", self.config.connection())?;', '        self.ack(&call, "load-conn", self.config.connection())?;\n        self.loaded = true;'), failed),
-        ('namespace-not-rechecked', control, lambda s: replace(s, '        self.registry\n            .lock()\n            .map_err(|_| Error::Unavailable)?\n            .ensure_clear(&self.reservation)?;\n', ''), namespace),
+        ('namespace-not-rechecked', control, lambda s: replace(s, '        self.registry\n            .lock()\n            .map_err(|_| Error::Unavailable)?\n            .ensure_initiate_clear(&self.reservation)?;\n', ''), namespace),
         ('cleanup-replayed', control, lambda s: replace(s, '!self.cleanup_sent && admission.is_ok()', 'admission.is_ok()'), lifecycle),
         ('producer-retirement-not-required', control, lambda s: replace(s, 'if !retired {', 'if false {'), lifecycle),
         ('kernel-absence-not-required', registry, lambda s: replace(s, '        self.ensure_clear(reservation)?;\n', ''), lifecycle),

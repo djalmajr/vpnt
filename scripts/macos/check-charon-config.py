@@ -21,11 +21,14 @@ runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 
 
-def run(label, args, env=None):
+def run(label, args, env=None, expected=0, assertion=None):
     result = subprocess.run(list(map(str, args)), cwd=ROOT, env=env, capture_output=True, timeout=90)
-    (REPORTS / f'{label}.log').write_bytes(result.stdout + result.stderr)
-    if result.returncode:
-        raise RuntimeError(f'{label}: exit {result.returncode}; see {REPORTS / (label + ".log")}')
+    output = result.stdout + result.stderr
+    (REPORTS / f'{label}.log').write_bytes(output)
+    if result.returncode != expected:
+        raise RuntimeError(f'{label}: exit {result.returncode}, expected {expected}; see {REPORTS / (label + ".log")}')
+    if assertion is not None and assertion.encode() not in output:
+        raise RuntimeError(f'{label}: missing assertion {assertion!r}; see {REPORTS / (label + ".log")}')
     return result.stdout
 
 
@@ -74,14 +77,25 @@ def main():
             configuration = directory / f'{i}.conf'
             configuration.write_bytes(rendered)
             run(f'parse-{i}', [directory / 'parse', configuration, path], env)
+            # The original parser must refuse the same rendered input after the
+            # only kernel-libipsec plugin section is renamed to libipsec. The
+            # key stays; the namespace assertion in the parser fixture fails.
+            needle = b'kernel-libipsec { vpnt_retain_utun'
+            if rendered.count(needle) != 1:
+                raise RuntimeError(f'render-{i}: expected one namespace anchor')
+            mangled = directory / f'{i}.libipsec.conf'
+            mangled.write_bytes(rendered.replace(needle, b'libipsec { vpnt_retain_utun', 1))
+            run(f'parse-namespace-{i}', [directory / 'parse', mangled, path], env,
+                expected=1, assertion='settings assertion:')
         receipt = {'archiveSha256': runtime.SWAN_SHA, 'cases': len(paths),
+                   'positiveCases': len(paths), 'refusedNamespaceCases': len(paths),
                    'charonStarted': False, 'vpnStarted': False,
                    'preparedArtifactSha256': {str(p.relative_to(ROOT)): runtime.digest(p) for p in [library, build / 'config.h', crypto]},
                    'sourceSha256': {str(p.relative_to(ROOT)): runtime.digest(p) for p in [
                        Path(__file__), ROOT / 'tests/fixtures/charon_config.rs', ROOT / 'tests/fixtures/charon_settings.c',
                        ROOT / 'src/connection/ipsec/producer/config.rs', ROOT / 'src/connection/ipsec/producer/files.rs', ROOT / 'src/fs_permissions.rs']}}
     (REPORTS / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    print('Original strongSwan settings parser: two production-renderer cases passed; temporary files removed; no charon/VPN')
+    print('Original strongSwan settings parser: two production-renderer cases passed and two namespace refusals; temporary files removed; no charon/VPN')
 
 
 if __name__ == '__main__':

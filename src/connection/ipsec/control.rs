@@ -114,7 +114,7 @@ impl<N: Observer, P: Peer> Control<N, P> {
         self.registry
             .lock()
             .map_err(|_| Error::Unavailable)?
-            .ensure_clear(&self.reservation)?;
+            .ensure_initiate_clear(&self.reservation)?;
         let request = self.config.initiate(call.remaining()?)?;
         self.ack(&call, "initiate", request)?;
         self.phase = Phase::Initiated;

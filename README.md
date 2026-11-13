@@ -349,35 +349,44 @@ altera. O comando interno desativa ACSP/DHCP, proxy ARP e persistência.
 A execução privilegiada e a prova de remoção dos recursos reais continuam
 pendentes. Não foi executado o pppd do sistema.
 
-### Integração atual: kernel-libipsec, observação e admissão
+### Integração atual: kernel-libipsec e interface retida
 
-O runtime privado preparado compila strongSwan 6.1.0 com o backend de usuário
-`kernel-libipsec` e `kernel-pfroute`, sem `kernel-pfkey`, e aplica quatro
-patches fixos: PID privado, enquadramento do utun, respeito a `install_routes`
-no kernel-libipsec e o pipe de vida do pai (`vpnt_parent_eof`). O manifest
-declara `strongswan.backend = "kernel-libipsec"` e o hash dos quatro patches; a
-admissão recusa backend diferente, patch faltante ou hash alterado, e a
-verificação do build confere pelos símbolos do binário que libipsec e pfroute
-existem e que PF_KEY não foi compilado. O mínimo de macOS gravado no manifest é
-metadado derivado da máquina que preparou o runtime, não um novo mínimo do
-projeto; o host Rust e os fixtures continuam exigindo 13.
+O runtime privado preparado compila strongSwan 6.1.0 com `kernel-libipsec` e
+`kernel-pfroute`, sem `kernel-pfkey`, e aplica cinco patches fixos: PID privado,
+enquadramento do utun, respeito a `install_routes`, pipe de vida do pai e
+transferência do descritor do utun por canal herdado. O manifest declara o
+backend e os hashes exatos; a admissão recusa inventário diferente. O mínimo
+macOS do manifest é metadado do build local, não um novo mínimo do projeto.
 
-O helper ainda **recusa despacho IPsec real** até o driver de rotas, VIP e
-cleanup estar integrado. Nada nesta etapa prova túnel conectado ou tráfego. O
-codec e o leitor PF_KEY continuam preparados, somente leitura e históricos: o
-backend de usuário não os exige e não há alegação de tabela vazia forjada. O
-contrato `KernelClaims` segue inalterado, à espera de um adaptador explícito de
-recursos de usuário.
+O produtor guarda o filho original antes de qualquer etapa que possa falhar,
+confere sua identidade e registra a admissão antes de receber o descritor. O
+canal é de uso único e vinculado à alocação do filho; cancelamento durante o
+handoff encerra aquela tentativa. O plugin fecha o canal logo após enviar.
+O receptor aceita esse término depois do primeiro datagrama válido e continua
+recusando mensagens extras. Descritores recusados são fechados, com prova de
+EOF nos fixtures; um número de descritor fechado não serve como identidade.
 
-A observação de utun usa um contexto público somente leitura sobre o filho
-original, com nome e índice opacos e sem autoridade de lease ou rota; a prova
-positiva de utun é sintética e apenas o caso negativo de UDP com filho próprio é
-nativo. Antes de qualquer conexão ou envio de credencial compartilhada, o
-controle consulta `stats` e exige a lista de plugins efetivamente carregada
-(`kernel-libipsec`, `kernel-pfroute`, `socket-default`, `vici`), recusando
-PF_KEY, listas ausentes, duplicadas ou malformadas. O pipe do pai é uma
-capacidade Rust de filho comum, composta com o fixture do watcher original do
-charon; não há prova com morte real de daemon pai.
+`take_interface` devolve uma interface retida somente após correlacionar o
+descritor recebido com a observação do filho pelo SDK e com o nome/índice da
+interface. O tipo não é clonável nem serializável e não concede autoridade de
+rota ou VIP. Sua referência precisa ser fechada durante o início do cleanup,
+após a parada do produtor e antes de esperar a interface desaparecer. A prova
+positiva de utun continua sintética; os testes nativos usam objetos comuns.
+
+Antes de enviar configuração ou credencial, o controle VICI exige a lista
+efetiva de plugins e recusa backend ausente, PF_KEY, duplicatas ou listas
+malformadas. `UserspaceObserver` separa a ocupação anterior ao initiate da
+ausência completa necessária ao release. Ele exige um ledger completo do
+domínio IPsec; o ledger real, o driver de VIP/rotas e a proteção do transporte
+ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
+não recebe uma implementação vazia para simular sucesso.
+
+O helper ainda **recusa despacho IPsec real** até completar essa integração.
+O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
+usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,
+cleanup real ou coexistência com uma VPN existente. Os checks reproduzíveis e
+os estados PASS/NOT RUN estão em `VALIDATION.md`.
+
 
 ## Proposta visual
 

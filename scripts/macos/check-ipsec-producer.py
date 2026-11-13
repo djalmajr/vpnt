@@ -94,7 +94,7 @@ def main():
         ('charon-stdout-piped', process, lambda s: replace(s, '.stdout(Stdio::null())', '.stdout(Stdio::piped())'), lifecycle),
         ('charon-stderr-piped', process, lambda s: replace(s, '.stderr(Stdio::null())', '.stderr(Stdio::piped())'), lifecycle),
         ('charon-parent-eof-disabled', config, lambda s: replace(s, 'vpnt_parent_eof = yes', 'vpnt_parent_eof = no'), lifecycle),
-        ('charon-wrong-backend', config, lambda s: replace(s, 'kernel-libipsec', 'kernel-pfkey'), lifecycle),
+        ('charon-wrong-backend', config, lambda s: replace(s, 'eap-mschapv2 kernel-libipsec kernel-pfroute', 'eap-mschapv2 kernel-pfkey kernel-pfroute'), lifecycle),
         ('charon-shared-ike-port', config, lambda s: replace(s, 'port = 0', 'port = 500'), lifecycle),
         ('charon-automatic-routes', config, lambda s: replace(s, 'install_routes = no', 'install_routes = yes'), lifecycle),
         ('charon-automatic-virtual-ip', config, lambda s: replace(s, 'install_virtual_ip = no', 'install_virtual_ip = yes'), lifecycle),

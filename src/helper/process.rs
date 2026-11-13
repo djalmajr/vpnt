@@ -1,5 +1,8 @@
 //! Ownership and cleanup of direct child processes. This proves process exit,
 //! not VPN route/SA cleanup; each driver must verify its own tunnel resources.
+use super::fd_guard;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::{
     io,
     path::{Path, PathBuf},
@@ -15,7 +18,23 @@ pub struct StopOutcome {
 
 pub struct ManagedChild {
     child: Child,
+    pid: u32,
+    #[cfg(target_os = "macos")]
+    authority: Authority,
     status: Option<ExitStatus>,
+}
+
+/// Per-spawn authority: two handles match only when they share this allocation.
+/// A recycled PID keeps a different allocation, so identity survives `reap`.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct Authority(Arc<()>);
+
+#[cfg(target_os = "macos")]
+impl Authority {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 pub(crate) enum Environment {
@@ -37,6 +56,7 @@ impl ManagedChild {
     ) -> io::Result<Self> {
         Self::spawn_configured(command, environment, false)
     }
+    #[cfg(test)]
     pub(crate) fn spawn_charon(command: &mut Command, configuration: &Path) -> io::Result<Self> {
         Self::spawn_configured(
             command,
@@ -99,15 +119,37 @@ impl ManagedChild {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         }
-        let child = command.spawn()?;
+        // Descriptor reception installs fds before it can mark them CLOEXEC;
+        // every spawn shares this one guard so no child can inherit one.
+        let child = {
+            let _guard = fd_guard::spawn();
+            command.spawn()?
+        };
         Ok(Self {
+            pid: child.id(),
             child,
+            #[cfg(target_os = "macos")]
+            authority: Authority(Arc::new(())),
             status: None,
         })
     }
 
     pub fn id(&self) -> u32 {
-        self.child.id()
+        self.pid
+    }
+
+    /// Opaque spawn authority for the charon capability binding. The handle
+    /// keeps the allocation alive while any receiver still refers to it.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn authority(&self) -> Authority {
+        self.authority.clone()
+    }
+
+    /// Test seam for PID reuse: only the recorded PID changes, the authority
+    /// allocation stays the one this handle was spawned with.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn retarget_pid_for_test(&mut self, pid: u32) {
+        self.pid = pid;
     }
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()

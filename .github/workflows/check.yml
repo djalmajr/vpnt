@@ -134,6 +134,20 @@ jobs:
           brew install openssl@4
           python3 scripts/macos/check-transport-consumer.py
 
+  runtime-handoff:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install runtime fixture prerequisites
+        run: brew install openssl@4 m4
+      - name: Build the pinned strongSwan and openfortivpn runtime without elevation
+        run: python3 scripts/macos/build-runtime.py --jobs 2
+      - name: Verify permanent original-TU handoff fixture
+        run: python3 scripts/macos/check-utun-handoff.py
+
   core:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

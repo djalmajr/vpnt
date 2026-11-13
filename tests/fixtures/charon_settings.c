@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
     demand(!settings->get_bool(settings, "charon.install_routes", TRUE));
     demand(!settings->get_bool(settings, "charon.install_virtual_ip", TRUE));
     demand(settings->get_bool(settings, "charon.vpnt_parent_eof", FALSE));
+    demand(settings->get_bool(settings,
+        "charon.plugins.kernel-libipsec.vpnt_retain_utun", FALSE));
     char expected[1024];
     snprintf(expected, sizeof(expected), "%s/pid", argv[2]);
     demand(strcmp(settings->get_str(settings, "charon.vpnt_pid_file", "missing"), expected) == 0);

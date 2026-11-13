@@ -30,6 +30,7 @@ SWAN_PATCHES = [
     ROOT / "scripts/macos/patches/strongswan-utun-framing.patch",
     ROOT / "scripts/macos/patches/strongswan-libipsec-no-routes.patch",
     ROOT / "scripts/macos/patches/charon-parent-eof.patch",
+    ROOT / "scripts/macos/patches/strongswan-retain-utun.patch",
 ]
 FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
@@ -225,6 +226,8 @@ def verify_runtime(root):
         raise RuntimeError("charon does not support a private PID per profile")
     if b"charon.vpnt_parent_eof" not in (root / "bin/charon").read_bytes():
         raise RuntimeError("charon does not support the private parent EOF capability")
+    if b".plugins.kernel-libipsec.vpnt_retain_utun" not in (root / "bin/charon").read_bytes():
+        raise RuntimeError("charon does not support private TUN retention")
     verify_backend(root / "bin/charon")
     ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(root / "certs/ca-bundle.pem")
     # Test actual loading in the staging directory. These overrides are for this

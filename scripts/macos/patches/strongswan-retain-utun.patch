@@ -1,0 +1,209 @@
+--- a/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
++++ b/src/libcharon/plugins/kernel_libipsec/kernel_libipsec_plugin.c
+@@ -23,8 +23,133 @@
+ #include <ipsec.h>
+ #include <networking/tun_device.h>
+ 
++#ifdef __APPLE__
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <stddef.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <unistd.h>
++#endif
++
+ #define TUN_DEFAULT_MTU 1400
+ 
++#ifdef __APPLE__
++#define VPNT_CHANNEL_FD 3
++#define VPNT_CHANNEL_SEND_RETRIES 8
++
++/**
++ * Mark the inherited channel close-on-exec before any other use.
++ */
++static bool vpnt_channel_prepare()
++{
++	int flags = fcntl(VPNT_CHANNEL_FD, F_GETFD);
++
++	if (flags < 0)
++	{
++		return FALSE;
++	}
++	return fcntl(VPNT_CHANNEL_FD, F_SETFD, flags | FD_CLOEXEC) == 0;
++}
++
++/**
++ * Require an anonymous connected AF_UNIX SOCK_DGRAM.
++ */
++static bool vpnt_channel_connected()
++{
++	struct sockaddr_un local = { 0 }, peer = { 0 };
++	socklen_t length, size;
++	size_t path;
++	int type;
++
++	path = offsetof(struct sockaddr_un, sun_path);
++	length = sizeof(local);
++	if (getsockname(VPNT_CHANNEL_FD, (struct sockaddr*)&local, &length) != 0 ||
++		local.sun_family != AF_UNIX ||
++		length < path || length > sizeof(local) ||
++		(length > path && local.sun_path[0] != '\0'))
++	{
++		return FALSE;
++	}
++	length = sizeof(peer);
++	if (getpeername(VPNT_CHANNEL_FD, (struct sockaddr*)&peer, &length) != 0 ||
++		peer.sun_family != AF_UNIX ||
++		length < path || length > sizeof(peer) ||
++		(length > path && peer.sun_path[0] != '\0'))
++	{
++		return FALSE;
++	}
++	size = sizeof(type);
++	if (getsockopt(VPNT_CHANNEL_FD, SOL_SOCKET, SO_TYPE, &type, &size) != 0 ||
++		size != sizeof(type) || type != SOCK_DGRAM)
++	{
++		return FALSE;
++	}
++	return TRUE;
++}
++
++/**
++ * Send the original TUN fd once, non-blocking, with the fixed VPUFv1 payload.
++ */
++static bool vpnt_send_utun(int fd)
++{
++	char payload[8] = { 0x56, 0x50, 0x55, 0x46, 1, 0, 0, 0 };
++	char control[CMSG_SPACE(sizeof(int))];
++	struct iovec iov;
++	struct msghdr message;
++	struct cmsghdr *cmsg;
++	int one = 1;
++	int flags;
++	int attempt;
++
++	/* Prevent the original TUN fd from leaking into a later exec. */
++	flags = fcntl(fd, F_GETFD);
++	if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
++	{
++		return FALSE;
++	}
++
++	if (!vpnt_channel_connected() ||
++		setsockopt(VPNT_CHANNEL_FD, SOL_SOCKET, SO_NOSIGPIPE, &one,
++				   sizeof(one)) != 0)
++	{
++		return FALSE;
++	}
++	memset(&message, 0, sizeof(message));
++	iov.iov_base = payload;
++	iov.iov_len = sizeof(payload);
++	message.msg_iov = &iov;
++	message.msg_iovlen = 1;
++	message.msg_control = control;
++	message.msg_controllen = sizeof(control);
++	cmsg = CMSG_FIRSTHDR(&message);
++	if (!cmsg)
++	{
++		return FALSE;
++	}
++	cmsg->cmsg_level = SOL_SOCKET;
++	cmsg->cmsg_type = SCM_RIGHTS;
++	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++	memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
++	for (attempt = 0; attempt < VPNT_CHANNEL_SEND_RETRIES; attempt++)
++	{
++		if (sendmsg(VPNT_CHANNEL_FD, &message, MSG_DONTWAIT) ==
++			(ssize_t)sizeof(payload))
++		{
++			return TRUE;
++		}
++		if (errno != EINTR)
++		{
++			return FALSE;
++		}
++	}
++	return FALSE;
++}
++#endif
++
++
+ typedef struct private_kernel_libipsec_plugin_t private_kernel_libipsec_plugin_t;
+ 
+ /**
+@@ -131,9 +256,29 @@
+ 		},
+ 	);
+ 
++#ifdef __APPLE__
++	bool retain_utun = lib->settings->get_bool(lib->settings,
++				"%s.plugins.kernel-libipsec.vpnt_retain_utun", FALSE,
++				lib->ns);
++
++	if (retain_utun && !vpnt_channel_prepare())
++	{
++		DBG1(DBG_KNL, "kernel-libipsec channel preparation failed");
++		close(VPNT_CHANNEL_FD);
++		free(this);
++		return NULL;
++	}
++#endif
++
+ 	if (!libipsec_init())
+ 	{
+ 		DBG1(DBG_LIB, "initialization of libipsec failed");
++#ifdef __APPLE__
++		if (retain_utun)
++		{
++			close(VPNT_CHANNEL_FD);
++		}
++#endif
+ 		destroy(this);
+ 		return NULL;
+ 	}
+@@ -142,6 +287,12 @@
+ 	if (!this->tun)
+ 	{
+ 		DBG1(DBG_KNL, "failed to create TUN device");
++#ifdef __APPLE__
++		if (retain_utun)
++		{
++			close(VPNT_CHANNEL_FD);
++		}
++#endif
+ 		destroy(this);
+ 		return NULL;
+ 	}
+@@ -149,9 +300,29 @@
+ 		!this->tun->up(this->tun))
+ 	{
+ 		DBG1(DBG_KNL, "failed to configure TUN device");
++#ifdef __APPLE__
++		if (retain_utun)
++		{
++			close(VPNT_CHANNEL_FD);
++		}
++#endif
+ 		destroy(this);
+ 		return NULL;
+ 	}
++#ifdef __APPLE__
++	if (retain_utun)
++	{
++		bool sent = vpnt_send_utun(this->tun->get_fd(this->tun));
++
++		close(VPNT_CHANNEL_FD);
++		if (!sent)
++		{
++			DBG1(DBG_KNL, "kernel-libipsec channel send failed");
++			destroy(this);
++			return NULL;
++		}
++	}
++#endif
+ 	lib->set(lib, "kernel-libipsec-tun", this->tun);
+ 
+ 	/* set TUN device as default to install VIPs */

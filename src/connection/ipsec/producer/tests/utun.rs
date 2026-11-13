@@ -185,3 +185,5 @@ fn public_observation_is_bounded_while_the_producer_mutex_is_held() {
     assert!(peer.producer.lock().unwrap().child_exited());
     registry.release(&reservation).unwrap();
 }
+
+mod retained;

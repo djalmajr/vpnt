@@ -17,7 +17,9 @@ use std::{
 };
 
 mod native;
+pub(crate) mod retained;
 use native::Live;
+pub use retained::RetainedInterface;
 
 const FD_LIMIT: usize = 4096;
 

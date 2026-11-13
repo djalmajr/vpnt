@@ -2088,3 +2088,92 @@ foi refeito nesta etapa; o novo
 `--verify-only` não prova paridade de fonte entre revisões do script. Nenhuma
 instalação privilegiada, VPN real, tráfego, utun real, efeito de login ou CI
 verde é afirmado aqui.
+
+## Retenção do utun e canal herdado do produtor (checkpoint local)
+
+Comandos locais, como usuário comum, sem daemon, VPN ou instalação:
+
+```bash
+RUST_TEST_THREADS=4 cargo test --locked --offline --no-default-features --lib helper::charon_channel
+RUST_TEST_THREADS=4 cargo test --locked --offline --no-default-features --lib connection::ipsec::producer
+cargo test --locked --offline --no-default-features --lib connection::macos::utun_observer
+python3 scripts/macos/build-runtime.py --jobs 2
+python3 scripts/macos/build-runtime.py --verify-only
+python3 scripts/macos/check-utun-handoff.py
+python3 scripts/macos/check-charon-config.py
+```
+
+- [PASS, fixture nativo local] O canal genérico tem sete testes com processos
+  comuns e descritores de streams. O recebimento é de uso único, vinculado à
+  alocação do `ManagedChild` original; PID sozinho não concede autoridade. A
+  criação do par, a marcação de descritores recebidos e os spawns compartilham
+  um guard, sem mantê-lo durante o poll ou a espera pelo filho.
+- [PASS, fixture nativo local] A matriz recusa 254 direitos em um datagrama e
+  prova, por EOF no peer, que todas as referências importadas foram fechadas.
+  Os subprocessos de teste aguardam prontidão antes do `recvmsg` não bloqueante;
+  os casos de truncamento e de falta de slots não dependem da ordem do scheduler.
+  `EMSGSIZE` permanece erro recuperável sem descritores instalados; layout
+  truncado ou inconsistente encerra o importador com `_exit(78)`, sem core.
+- [PASS, fixture nativo local] O plugin fecha o canal imediatamente após o
+  envio. Depois de um primeiro datagrama válido, `ECONNRESET` na segunda leitura
+  significa fim do canal; o mesmo erro na primeira leitura continua sendo
+  recusa. Dois datagramas seguidos de fechamento continuam recusados. O probe
+  independente deste host confirmou mensagens enfileiradas antes do erro 54.
+- [PASS, runtime privado preparado] O build local com os cinco patches terminou
+  com exit 0 e insumos estáveis. Foram verificados dez arquivos; o TU compilado
+  coincide com o candidato corrigido. O manifest deste build tem hash
+  `0e2cb1cf004c7e34174886d81222052d55ab7e1d389f7dfbe8a4f2e521e5c2e7`.
+  O mínimo macOS 26.0 continua metadado deste host, não um novo mínimo suportado.
+  O recibo está em `output/fixtures/retained-runtime-receipt.json`.
+- [PASS, consumidor C original em fixture] `check-utun-handoff.py` extrai o
+  arquivo original do tarball verificado, aplica o patch canônico sem fuzz e
+  compila o TU completo. Oito cenários e treze mutações passaram, com baseline
+  e restauração. O fixture substitui o TUN por um objeto comum; não carrega
+  plugins do charon. A falha de preparo anterior à inicialização libera apenas
+  a estrutura já alocada, sem chamar `libipsec_deinit` antes de init; uma mutação
+  reproduz essa regressão por assertion controlada. O checker usa os mesmos
+  pré-requisitos de arquivo local no CI e no desenvolvimento, sem recibo privado.
+- [PASS, fonte e fixture] O observador de recursos em espaço de usuário mantém
+  separadas a ocupação anterior ao initiate e a ausência completa exigida no
+  release. O contrato legado de `KernelClaims` continua completo. A fonte real
+  do ledger ainda precisa registrar a admissão antes do prepare e mantê-la até
+  a parada e a ausência verificada dos recursos; vetores injetados não provam
+  esse ledger. Sete testes do adaptador e sete mutações foram executados em
+  cópia privada, antes da integração final.
+- [PASS, integração local] Fmt, clippy com `-D warnings`, build e as suítes
+  completas passaram: 352 testes desktop e 336 core no host macOS, dois ignored
+  em cada suíte. O teste ignorado do runtime preparado foi executado à parte
+  e passou. São 26 testes do produtor, 11 do observador (incluindo dois casos
+  sintéticos da correlação) e sete do canal. O take recusa objeto comum, é de
+  uso único e respeita prazo/cancelamento inclusive com o mapa ativo ocupado.
+  Cancelar o handoff fica latched; cancelar apenas a espera posterior por VICI
+  preserva a tentativa já admitida. A parada é confirmada antes de soltar o pin.
+- [PASS, limpeza em fixture] O teste de retire usa um stream cujo peer fica no
+  pai: o filho mantém a referência original até sair e o helper deve fechar a
+  sua após o reap. EOF comprova o encerramento das duas referências; a antiga
+  asserção racy por `F_GETFD` foi removida. A mutação que mantém o pin é recusada
+  por essa assertion observável, sem reduzir o número de threads.
+- [PASS, parser original] Dois renderers com caminhos distintos passaram no
+  parser original com `charon.plugins.kernel-libipsec.vpnt_retain_utun`.
+  Renomear apenas a seção para `libipsec` nos mesmos dois documentos produz
+  exit 1 e uma assertion do parser. O fixture textual sozinho não é a prova.
+- [PASS, mutações e pacote] As matrizes completas do produtor (32 mutações)
+  e do controle (61) passaram com baseline/restauração. Os dois gates Python
+  de recuperação/build-inputs passaram com sete testes cada. O pacote local
+  `target/vpnt-retained-checkpoint.app` contém o binário byte a byte do build;
+  é um host sem instalar o componente. O recibo
+  `output/fixtures/retained-integration-receipt.json` registra 14 passos verdes
+  e 371 insumos estáveis. A UI/design permaneceu inalterada em 33 insumos;
+  foram reutilizados os checks de UI válidos do checkpoint anterior.
+- [NOT RUN, utun real] A admissão de um utun real permanece sem prova. Uma
+  interface observada é uma amostra; a referência retida fixa o socket, sem
+  conceder autoridade de rota/VIP. Fixtures e comparações sintéticas não
+  substituem o consumidor privilegiado real.
+- [NOT RUN, CI remoto] Foi preparado um job `runtime-handoff` macOS separado
+  para construir o runtime e executar o consumidor C. A configuração local não
+  equivale a execução ou aprovação remota.
+- [NOT RUN, VPN real] Não foram executados charon/utun reais, instalação
+  privilegiada, políticas IPsec de socket, rotas/VIP, tráfego de túnel ou teste
+  de coexistência. O Driver IPsec, o ledger real e a proteção do transporte UDP
+  permanecem pendentes. Nenhuma VPN real pode ser declarada conectada com esta
+  evidência.

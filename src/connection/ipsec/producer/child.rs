@@ -1,9 +1,11 @@
 use super::*;
 use crate::{
     connection::macos::utun_observer::{self, InterfaceObservation},
-    helper::{process::ManagedChild, runtime::Program},
+    helper::{charon_channel, local_socket::Budget, process::ManagedChild, runtime::Program},
 };
 use std::{fs, process::Command, sync::atomic::Ordering, time::Duration};
+
+pub(super) mod interface;
 pub(super) struct Producer<'a> {
     context: Arc<NativeContext<'a>>,
     pub lease: state::Lease,
@@ -14,6 +16,9 @@ pub(super) struct Producer<'a> {
     pub released: bool,
     failure: Option<Error>,
     socket: Option<files::Stamp>,
+    /// Unadmitted descriptor from the child's single handoff. Private: it
+    /// carries no type, route or cleanup authority until it is admitted.
+    descriptor: Option<charon_channel::Descriptor>,
 }
 impl<'a> Producer<'a> {
     pub fn new(context: Arc<NativeContext<'a>>, lease: state::Lease) -> Self {
@@ -27,6 +32,7 @@ impl<'a> Producer<'a> {
             released: false,
             failure: None,
             socket: None,
+            descriptor: None,
         }
     }
     fn call(expires: Instant, cancel: &AtomicBool) -> Result<(), Error> {
@@ -38,7 +44,7 @@ impl<'a> Producer<'a> {
         }
         Ok(())
     }
-    fn spawn(&mut self, expires: Instant, cancel: &AtomicBool) -> Result<(), Error> {
+    fn spawn(&mut self, expires: Instant, cancel: &Arc<AtomicBool>) -> Result<(), Error> {
         self.attempted = true;
         self.context.validate()?;
         self.lease.validate()?;
@@ -57,14 +63,13 @@ impl<'a> Producer<'a> {
         ] {
             command.arg(format!("--debug-{group}")).arg("-1");
         }
-        self.child = Some(
-            ManagedChild::spawn_charon(
-                &mut command,
-                &self.lease.directory.path.join(state::CONFIG),
-            )
-            .map_err(|_| Error::Unavailable)?,
-        );
-        let child = self.child.as_mut().unwrap();
+        let configuration = self.lease.directory.path.join(state::CONFIG);
+        let (child, receiver) =
+            charon_channel::spawn(command, &configuration).map_err(|_| Error::Unavailable)?;
+        // The exact original handle is stored before anything else can fail, so
+        // every later error keeps its own RAII cleanup.
+        self.child = Some(child);
+        let child = self.child.as_mut().expect("stored above");
         if child.poll().map_err(|_| Error::Unavailable)?.is_some() {
             return Err(Error::Unavailable);
         }
@@ -80,6 +85,14 @@ impl<'a> Producer<'a> {
         self.identity = Some(process.identity.clone());
         self.lease
             .stage(record::Stage::Running, Some((&process.identity).into()))?;
+        // The durable birth is recorded before the handoff, so a canceled or
+        // failed reception still leaves the exact original child owned and
+        // reapable; the attempt itself is terminal either way.
+        let mut receiver = receiver;
+        let budget = Budget::until(expires, Some(cancel.clone())).map_err(map_budget)?;
+        let child = self.child.as_mut().expect("stored above");
+        let descriptor = receiver.receive(child, &budget).map_err(map_handoff)?;
+        self.descriptor = Some(descriptor);
         Ok(())
     }
     fn current(&mut self) -> Result<(), Error> {
@@ -113,6 +126,13 @@ impl<'a> Producer<'a> {
             return Err(Error::Changed);
         }
         self.current()?;
+        self.observe_child(expires, cancel)
+    }
+    fn observe_child(
+        &mut self,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<InterfaceObservation, Error> {
         let identity = self.identity.as_ref().ok_or(Error::Changed)?.clone();
         let executable = self.context.runtime.program(Program::Charon);
         let expected = utun_observer::Expected {
@@ -141,6 +161,8 @@ impl<'a> Producer<'a> {
         if !self.attempted
             && let Err(e) = self.spawn(expires, &cancel)
         {
+            // Every spawn/handoff error is latched: the receiver is consumed,
+            // so a fresh retry must never reach VICI without the capability.
             self.failure = Some(e);
             return Err(e);
         }
@@ -186,6 +208,12 @@ impl<'a> Producer<'a> {
             .is_none_or(|c| c.poll().unwrap().is_some())
     }
     #[cfg(test)]
+    pub(super) fn cached_fd(&self) -> Option<i32> {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.raw_fd())
+    }
+    #[cfg(test)]
     pub(super) fn status(&mut self) -> Option<std::process::ExitStatus> {
         self.child.as_mut().and_then(|c| c.poll().unwrap())
     }
@@ -200,6 +228,9 @@ impl<'a> Producer<'a> {
                 .stop(Duration::from_secs(3))
                 .map_err(|_| Error::Unavailable)?;
         }
+        // Stop succeeded: release the pin before re-checking admission, so a
+        // changed context cannot keep it. A failed stop keeps the pin.
+        self.descriptor = None;
         self.context.validate()?;
         if self.lease.record.stage != record::Stage::Stopped {
             self.lease.stage(
@@ -216,62 +247,20 @@ impl Drop for Producer<'_> {
     }
 }
 
-pub(super) fn observe_active<'a>(
-    context: &NativeContext<'a>,
-    owner: &Owner,
-    expires: Instant,
-    cancel: &AtomicBool,
-) -> Result<InterfaceObservation, Error> {
-    loop {
-        utun_observer::check(expires, cancel).map_err(map_check)?;
-        let live: Vec<SharedProducer<'a>> = context
-            .active
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
-        let mut matching: Option<SharedProducer<'a>> = None;
-        let mut busy = false;
-        for producer in live {
-            let matches = match producer.try_lock() {
-                Ok(guard) => {
-                    let matches = guard.lease.record.owner() == *owner;
-                    drop(guard);
-                    matches
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Unavailable),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    busy = true;
-                    false
-                }
-            };
-            if matches {
-                if matching.is_some() {
-                    return Err(Error::Changed);
-                }
-                matching = Some(producer);
-            }
-        }
-        if busy {
-            utun_observer::check(expires, cancel).map_err(map_check)?;
-            std::thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-        let Some(producer) = matching else {
-            return Err(Error::Unavailable);
-        };
-        loop {
-            utun_observer::check(expires, cancel).map_err(map_check)?;
-            match producer.try_lock() {
-                Ok(mut producer) => return producer.observe_interface(owner, expires, cancel),
-                Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Unavailable),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    utun_observer::check(expires, cancel).map_err(map_check)?;
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
+fn map_budget(error: std::io::Error) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut => Error::Timeout,
+        std::io::ErrorKind::ConnectionAborted => Error::Canceled,
+        _ => Error::Unavailable,
+    }
+}
+
+fn map_handoff(error: std::io::Error) -> Error {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut => Error::Timeout,
+        std::io::ErrorKind::ConnectionAborted => Error::Canceled,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => Error::Changed,
+        _ => Error::Unavailable,
     }
 }
 

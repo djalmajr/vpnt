@@ -1,7 +1,7 @@
 //! Native producer admission. Still not dispatched by the application. Kernel
 //! and VIP/route observers must supply complete absence before finalization.
 use super::{Config, Error, Observer, Peer, Registry, Reservation};
-pub use crate::connection::macos::utun_observer::InterfaceObservation;
+pub use crate::connection::macos::utun_observer::{InterfaceObservation, RetainedInterface};
 use crate::{
     connection::{
         macos::process::{Identity, Process},
@@ -20,6 +20,8 @@ mod files;
 mod record;
 mod socket;
 mod state;
+mod userspace;
+pub use userspace::{ResourceClaims, UserspaceObserver};
 
 type SharedProducer<'a> = Arc<Mutex<child::Producer<'a>>>;
 type WeakProducer<'a> = Weak<Mutex<child::Producer<'a>>>;
@@ -108,6 +110,16 @@ impl<'a> NativeContext<'a> {
             kernel,
         }
     }
+    /// Explicit userspace admission observer bound to this verified
+    /// kernel-libipsec context. `resources` must describe the complete fresh
+    /// pending IPsec resource domain; a test/empty adapter is not a production
+    /// substitute for the missing real ledger.
+    pub fn userspace_observer<R: ResourceClaims>(
+        self: &Arc<Self>,
+        resources: R,
+    ) -> UserspaceObserver<'a, R> {
+        UserspaceObserver::new(self.clone(), resources)
+    }
     /// Observe the utun control socket of the active producer for `owner`.
     ///
     /// Read-only and bounded: it never spawns or reopens a producer, exposes no
@@ -129,7 +141,24 @@ impl<'a> NativeContext<'a> {
         expires: Instant,
         cancel: &AtomicBool,
     ) -> Result<InterfaceObservation, Error> {
-        child::observe_active(self, owner, expires, cancel)
+        child::interface::observe_active(self, owner, expires, cancel)
+    }
+    /// Take the typed retained interface of the active attempt for `owner`.
+    ///
+    /// Bounded `try_lock` lookup, exactly once, only for the same
+    /// attempted/non-retired/non-released producer. The returned value pins the
+    /// received socket and carries the observation stamps; it confers no route
+    /// or cleanup authority by itself.
+    pub fn take_interface(
+        &self,
+        owner: &Owner,
+        expires: Instant,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<RetainedInterface, Error> {
+        self.validate()?;
+        let retained = child::interface::take_active(self, owner, expires, &cancel)?;
+        self.validate()?;
+        Ok(retained)
     }
     fn lookup(&self, owner: &Owner) -> Result<Option<SharedProducer<'a>>, Error> {
         let live: Vec<_> = self

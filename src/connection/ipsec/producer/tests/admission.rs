@@ -96,6 +96,27 @@ fn socket_wait_honors_cancellation_and_deadline_and_retains_the_original_produce
             .directory
             .path
             .join("pid");
+        // Fixture phase prerequisite: run the spawn/handoff once so the
+        // cancellation below lands in the VICI socket wait, never in
+        // reception. This deadline is a fixture barrier, not a product result;
+        // it is generous so child startup cannot masquerade as a handoff
+        // failure under parallel load.
+        let warm = peer
+            .open(
+                reservation.owner(),
+                Instant::now() + Duration::from_secs(2),
+                token(),
+            )
+            .err();
+        assert_eq!(
+            warm,
+            Some(Error::Timeout),
+            "fixture prerequisite: the handoff must complete and VICI stay silent"
+        );
+        assert!(
+            peer.producer.lock().unwrap().cached_fd().is_some(),
+            "fixture prerequisite: the handoff must be cached before the socket wait"
+        );
         let cancel = token();
         let signal = cancel.clone();
         let canceler = std::thread::spawn(move || {

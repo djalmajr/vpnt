@@ -16,6 +16,17 @@ const MAX_MANUAL_REQID: u16 = 0x3fff;
 pub trait Observer {
     fn occupied(&mut self) -> Result<BTreeSet<u32>, Error>;
     fn producer_stopped(&mut self, owner: &Owner) -> Result<bool, Error>;
+    /// Pre-initiate only. A userspace observer may exclude the exact requested
+    /// owner/reqid when it belongs to its own unreleased, Running producer. The
+    /// default is full occupancy: the legacy kernel contract is unchanged, and
+    /// finalization (`release`) must use [`Observer::occupied`], never this view.
+    fn occupied_before_initiate(
+        &mut self,
+        _owner: &Owner,
+        _reqid: u16,
+    ) -> Result<BTreeSet<u32>, Error> {
+        self.occupied()
+    }
     /// Called only after stopped + a fresh clear observation. A native observer
     /// must durably complete its admission before the in-memory slot is freed.
     fn completed(&mut self, _owner: &Owner, _reqid: u16) -> Result<(), Error> {
@@ -114,6 +125,22 @@ impl<N: Observer> Registry<N> {
     pub fn ensure_clear(&mut self, reservation: &Reservation) -> Result<(), Error> {
         self.validate(reservation)?;
         if self.occupied()?.contains(&u32::from(reservation.reqid)) {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+    /// Recheck before `initiate` only. This never completes or releases a
+    /// reservation; `ensure_clear` and `release` remain full-absence checks.
+    /// Reqid bounds are validated exactly like `occupied()`.
+    pub fn ensure_initiate_clear(&mut self, reservation: &Reservation) -> Result<(), Error> {
+        self.validate(reservation)?;
+        let occupied = self
+            .observer
+            .occupied_before_initiate(&reservation.owner, reservation.reqid)?;
+        if occupied.iter().any(|id| *id > u32::from(u16::MAX)) {
+            return Err(Error::Invalid);
+        }
+        if occupied.contains(&u32::from(reservation.reqid)) {
             return Err(Error::Busy);
         }
         Ok(())
