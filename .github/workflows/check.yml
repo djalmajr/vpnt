@@ -147,6 +147,8 @@ jobs:
         run: python3 scripts/macos/build-runtime.py --jobs 2
       - name: Verify permanent original-TU handoff fixture
         run: python3 scripts/macos/check-utun-handoff.py
+      - name: Verify permanent original-TU protected UDP fixture
+        run: python3 scripts/macos/check-protected-udp.py
 
   core:
     runs-on: ubuntu-24.04

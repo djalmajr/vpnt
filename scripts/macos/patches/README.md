@@ -2,13 +2,13 @@
 
 O runtime privado compila strongSwan 6.1.0 com o backend `kernel-libipsec`
 (`--enable-libipsec --enable-kernel-libipsec`, `--disable-kernel-pfkey`) e
-aplica exatamente cinco patches, nesta ordem:
+aplica exatamente seis patches, nesta ordem:
 `charon-private-pid.patch`, `strongswan-utun-framing.patch`,
 `strongswan-libipsec-no-routes.patch`, `charon-parent-eof.patch`,
-`strongswan-retain-utun.patch`. A fonte é
+`strongswan-retain-utun.patch`, `strongswan-protected-udp.patch`. A fonte é
 sempre reextraída do tarball verificado; o build não reutiliza árvore de build
 gerada para outro backend ou outro conjunto de patches. O manifest declara
-`strongswan.backend = "kernel-libipsec"` e o hash exato dos cinco patches, e a
+`strongswan.backend = "kernel-libipsec"` e o hash exato dos seis patches, e a
 admissão Rust recusa backend ausente/divergente, patch faltante ou hash
 alterado.
 
@@ -113,3 +113,19 @@ toca o fd 3 nem o fd do tun. A verificação do builder procura o literal
 `.plugins.kernel-libipsec.vpnt_retain_utun` no `bin/charon`; o manifest inclui
 o hash deste quinto patch. Limite: o fixture C valida o construtor e o handoff
 com pipe/socketpair, sem charon ou UTUN real.
+
+`strongswan-protected-udp.patch` modifica apenas
+`src/libcharon/plugins/socket_default/socket_default_socket.c`. Acrescenta a
+opção privada `charon.plugins.socket-default.vpnt_protect_transport` (padrão
+`false`) e `charon.plugins.socket-default.vpnt_ifindex` (obrigatório entre 1 e
+65535 quando ligada). Ligada, depois de criar o socket UDP e antes do bind,
+marca o socket com `FD_CLOEXEC`, aplica `IP_BOUND_IF`/`IPV6_BOUND_IF` ao índice
+exato e instala a política local `IP_IPSEC_POLICY`/`IPV6_IPSEC_POLICY` de
+BYPASS nas direções de saída e entrada; qualquer falha fecha o próprio socket,
+sem fallback de rota ou porta. Desligada, nenhum desses passos ocorre e o
+callback upstream `bypass_socket` é preservado; o decap e as tabelas globais
+não mudam. A verificação do builder procura o literal
+`.plugins.socket-default.vpnt_protect_transport` no `bin/charon`; o manifest
+inclui o hash deste sexto patch. Limite: o fixture de socket original
+intercepta o `setsockopt` de política, sem instalar BYPASS real; não há prova de
+sucesso de política privilegiada no kernel, charon ou UTUN.

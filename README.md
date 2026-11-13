@@ -352,9 +352,10 @@ pendentes. Não foi executado o pppd do sistema.
 ### Integração atual: kernel-libipsec e interface retida
 
 O runtime privado preparado compila strongSwan 6.1.0 com `kernel-libipsec` e
-`kernel-pfroute`, sem `kernel-pfkey`, e aplica cinco patches fixos: PID privado,
-enquadramento do utun, respeito a `install_routes`, pipe de vida do pai e
-transferência do descritor do utun por canal herdado. O manifest declara o
+`kernel-pfroute`, sem `kernel-pfkey`, e aplica seis patches fixos: PID privado,
+enquadramento do utun, respeito a `install_routes`, pipe de vida do pai,
+transferência do descritor do utun por canal herdado e proteção opcional dos
+sockets UDP. O manifest declara o
 backend e os hashes exatos; a admissão recusa inventário diferente. O mínimo
 macOS do manifest é metadado do build local, não um novo mínimo do projeto.
 
@@ -377,9 +378,17 @@ Antes de enviar configuração ou credencial, o controle VICI exige a lista
 efetiva de plugins e recusa backend ausente, PF_KEY, duplicatas ou listas
 malformadas. `UserspaceObserver` separa a ocupação anterior ao initiate da
 ausência completa necessária ao release. Ele exige um ledger completo do
-domínio IPsec; o ledger real, o driver de VIP/rotas e a proteção do transporte
-ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
+domínio IPsec; o ledger real, o driver de VIP/rotas e a habilitação da proteção
+do transporte ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
 não recebe uma implementação vazia para simular sucesso.
+
+O sexto patch acrescenta proteção opcional aos sockets UDP do charon: vincula
+cada socket ao índice de saída capturado e aplica BYPASS local nas duas direções,
+antes do bind, recusando qualquer falha. O gate permanente
+`python3 scripts/macos/check-protected-udp.py` compila a unidade original inteira
+e intercepta as chamadas de política para conferir o ABI e as falhas. Isso não
+prova a eficácia da política no kernel. A opção permanece desligada por padrão;
+a configuração do produtor ainda precisa consumir a seleção de saída validada.
 
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de

@@ -2198,3 +2198,38 @@ python3 scripts/macos/check-charon-config.py
   protocolo ou os prazos do produtor real.
 - [NOT RUN, VPN real] Esta correção não executa túnel, instalação privilegiada,
   política IPsec, configuração de VIP/rotas ou tráfego real.
+
+### Runtime com proteção opcional dos sockets UDP
+
+- [PASS, build local] O runtime foi reconstruído como usuário comum com seis
+  patches exatos, dez arquivos e fonte estável. Manifest:
+  `29f98c64faba81dccd1cb653cabc8bd622980e41f720d22ecfbb63fa1d61f00b`.
+  O sexto patch é `strongswan-protected-udp.patch`, hash
+  `147557bd04e5087ba1e25d90e14d482d4b4257660cac8b8515cfd4f2c7e2dcec`.
+  O recibo está em `output/fixtures/protected-runtime-receipt.json`.
+- [PASS, gate C e SDK simulado] `python3 scripts/macos/check-protected-udp.py`
+  extrai o tarball verificado e compila o TU original completo com o patch.
+  Sete casos e doze mutações passaram, incluindo as duas famílias, ordem
+  antes do bind, duas direções de política, CLOEXEC, índice e recusa de falhas.
+  Os sockets UDP e o bound-if são nativos; as chamadas de BYPASS são
+  interceptadas. Nenhum pacote ou política IPsec real é enviado/aplicado.
+- [PASS, admissão] O inventário Rust exige os seis patches e recusa o conjunto
+  antigo de cinco, a ausência/alteração do sexto ou conteúdo extra. O teste
+  ignorado do runtime preparado foi executado explicitamente e passou.
+- [PASS, integração] Quinze passos passaram com 377 insumos estáveis:
+  fmt, clippy de todos os targets/features com `-D warnings`, 353 testes desktop,
+  337 core no host macOS (dois ignorados em cada), recuperação/build-inputs,
+  admissão do runtime preparado, build, 32 mutações do produtor, 61 do controle,
+  parser original, handoff original, UDP protegido, verificação do runtime e
+  pacote local. Recibo: `output/fixtures/protected-integration-receipt.json`.
+  A revisão independente cobriu o mapa do runtime, patch e gate permanente.
+- [PASS, pacote local] `target/vpnt-protected-checkpoint.app` é um host sem
+  componente instalado. O binário deve coincidir com o build registrado no
+  recibo de checkpoint. A UI e o protótipo não mudaram; sua evidência anterior
+  é reutilizada por hashes dos mesmos 33 insumos.
+- [NOT RUN, produto e CI remoto] A opção continua desligada por padrão. A
+  seleção de saída validada, sua ligação ao produtor e o Driver/ledger de
+  VIP/rotas ainda precisam ser integrados. CI inclui o gate permanente após
+  o build do runtime, mas não foi executado remotamente. A prova real de
+  BYPASS, charon/utun, instalação, tráfego, cleanup e coexistência continua
+  pendente; não há túnel real declarado conectado.
