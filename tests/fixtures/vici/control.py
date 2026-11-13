@@ -130,6 +130,19 @@ def sas():
             'name': child, 'uniqueid': '3', 'reqid': '0', 'state': 'CREATED',
             'mode': 'TUNNEL', 'local-ts': [], 'remote-ts': []}}
         return [{name: ike}, {name: fresh}]
+    if mode in ('compatible-overlap', 'overlap-conflict'):
+        c['state'] = 'REKEYING'
+        c2 = copy.deepcopy(c)
+        c2['uniqueid'], c2['state'] = '2', 'INSTALLED'
+        c2['spi-in'], c2['spi-out'] = 'abcd0104', 'abcd0105'
+        if mode == 'overlap-conflict':
+            c2['remote-ts'] = ['10.20.0.0/25']
+        ike['child-sas'] = {child + '-1': c, child + '-2': c2}
+    if mode == 'inactive-only':
+        ike['state'] = 'REKEYED'
+        c['state'] = 'REKEYED'
+    if mode == 'narrowed':
+        c['remote-ts'] = ['10.20.0.0/25']
     changes = {'bad-reqid': (c, 'reqid', '42'), 'bad-spi': (c, 'spi-in', '00000000'),
                'bad-remote-ts': (c, 'remote-ts', ['10.21.0.0/24']),
                'wide-local-ts': (c, 'local-ts', ['0.0.0.0/0']),

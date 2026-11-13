@@ -30,6 +30,8 @@ pub enum Phase {
     Released,
 }
 
+mod selected;
+
 pub struct Control<N: Observer, P: Peer> {
     registry: Arc<Mutex<Registry<N>>>,
     reservation: Reservation,

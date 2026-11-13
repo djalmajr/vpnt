@@ -2364,3 +2364,61 @@ python3 scripts/macos/check-charon-config.py
   coexistência, instalação privilegiada e CI remoto não são provados por este
   escopo. Os testes usam filho C comum, sockets locais e consultas de saída sem
   envio de datagramas; nenhum perfil ou túnel pessoal foi alterado.
+
+
+### Consumidores de SA, sonda e backend UTUN preparados
+
+- [PASS, consumidor VICI real em fixture] `Control::selected` consulta o lote
+  completo, seleciona o maior child ID compatível, exige cobertura negociada,
+  move o Candidate e revalida prazo/namespace. `owner` é metadado imutável.
+  Os casos incluem overlap compatível/incompatível, rekey, IPv6, lote vazio ou
+  inativo, cobertura estreitada, cancelamento, prazo expirado e fases Dirty e
+  Released. O teste normal compara o Candidate completo e o delta de auditoria
+  permite apenas list-sas, sem novo load/initiate. O fixture Python usa 298
+  linhas e mantém os modos negativos anteriores.
+- [PASS, sonda compartilhada] SSL e IPsec usam o mesmo run_until/finish e um
+  único Instant desde a entrada, antes da primeira validação. Cancelamento e
+  prazo são conferidos depois de current verdadeiro ou falso; nenhuma tentativa
+  segue expiração conhecida. O teste com current de 50 ms sob orçamento de
+  20 ms exige Unresponsive e ausência de conexão aceita no listener real.
+  Os cinco testes SSL originais e os corpos de ping/scoped foram preservados;
+  esses corpos mudaram apenas de módulo. A origem do tráfego é VIP da família
+  exata, DNS e socket vinculados à interface, sem fallback para a rota padrão.
+- [PASS, lógica de escopo compartilhada] A fila UTUN retém o pin e o peer
+  original no erro/drop. Stop falso/erro mantém os recursos; stop confirmado
+  libera as referências antes da prova de ausência. Duplicata é recusada antes
+  de criar guard ou enfileirar a parada de um produtor ativo. O escopo revalida
+  pin, sink, contexto e a abertura do peer original com o mesmo Instant.
+  A fila PPP existente continua passiva; a fila UTUN pode parar apenas seu
+  original conhecido. Não há API DELETE/CHANGE por chave.
+- [PASS, ausência por dados reais em fixture] O predicado compartilhado recusa
+  nome ou índice antigo, qualquer rota no índice antigo e host route de VIP
+  sem dono UP. Preserva rota no índice estrangeiro que possui o endereço ou
+  RTF_LOCAL no índice exato de loopback UP com endereço estrangeiro UP. O lo0
+  pode ser o próprio dono se realmente possui o VIP; não precisa ser um dono
+  físico separado. Um índice desconhecido não é aceito por existir algum lo0.
+  São dados sintéticos de Interfaces/Snapshot, não uma ausência nativa de UTUN.
+- [PASS, consumidor C/UDS do writer] A API aceita somente ConfiguredUtun;
+  o mesmo núcleo privado recebe o source fake em cfg(test). O consumer C lê
+  bytes via UnixDatagram e confere opcode, família, prefixo, origem e índice;
+  ele gera ACK e o Rust valida o ACK. Erro antes do envio não produz byte;
+  ACK perdido, cancelamento ou pin stale depois do envio preservam o recibo.
+  Não houve RTM_ADD em socket PF_ROUTE real.
+- [PASS, integração final desta etapa] Fmt, clippy de todos os targets/features
+  com -D warnings, 457 testes desktop e 441 core passaram, dois ignorados em
+  cada suíte. O gate de controle matou 61 mutantes e o de política de rotas
+  matou 67, com baselines e restaurações verdes. Build e pacote local passaram;
+  fonte estável em `output/fixtures/utun-consumers-integration-receipt.json`.
+  O pacote é `target/vpnt-utun-consumers-checkpoint.app`, sem instalar nada.
+- [PASS, revisão e camadas] Revisões independentes aprovaram Control5/r1,
+  Probe5, writer2 e routefix6/r1. Os workers forneceram os mutantes específicos
+  da sonda e do ciclo de retenção; o integrador executou as duas suítes completas
+  e os 128 mutantes de controle/rotas. Os wrappers de ConfiguredUtun/contexto
+  real ainda são prova estática/de tipos; fixtures não fabricam esses tipos.
+  UI/design e runtime de seis patches permaneceram iguais.
+- [NOT RUN, integração de produto] O ledger, seu vínculo com pins/rotas e o
+  Driver ainda precisam integrar esses consumidores ao despacho. O helper
+  continua recusando IPsec real. VIP/RTM_ADD/BYPASS reais, tráfego de VPN,
+  remoção efetiva após último FD, coexistência com VPN pessoal, instalação
+  privilegiada e CI remoto continuam sem execução. Nenhum segredo, perfil ou
+  túnel pessoal foi usado ou alterado nesta etapa.

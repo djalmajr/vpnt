@@ -416,6 +416,21 @@ O plano exige cobertura completa das redes solicitadas pelos seletores
 negociados; cobertura parcial é recusada. Isso é política de metadados, sem
 prova de posse, tráfego ou túnel conectado.
 
+O controle já oferece um consumidor que reúne snapshot VICI completo, seleção
+compatível e cobertura negociada, com o mesmo prazo e cancelamento. A sonda
+IPsec reutiliza DNS, origem e tráfego da sonda SSL; confere a interface retida e
+a observação do produtor original antes e depois do handshake, sem reiniciar o
+prazo. O retorno de tráfego, sozinho, não autoriza o estado conectado.
+
+O backend de rotas preparado aceita a interface configurada e o peer original,
+preserva recibos após tentativas de ADD e não possui DELETE por chave. Sua fila
+UTUN mantém o pin até confirmar a parada do produtor; depois verifica ausência
+de interface, rotas explícitas/implícitas e aliases. A fila PPP permanece
+passiva. Rotas de um endereço compartilhado só são preservadas com endereço e
+índice estrangeiros observados, incluindo uma rota LOCAL no loopback correto.
+A adaptação ao UTUN real continua sem prova positiva; os consumidores executados
+usam sockets locais e estruturas do SDK.
+
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,

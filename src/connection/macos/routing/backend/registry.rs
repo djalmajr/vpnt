@@ -78,6 +78,13 @@ impl<S: Scope, K: Table> Registry<S, K> {
             table,
         })
     }
+    pub(super) fn has_owner_or_index(&self, owner: &Owner, index: u16) -> bool {
+        self.entries.contains_key(&index)
+            || self
+                .entries
+                .values()
+                .any(|entry| entry.owner.uid == owner.uid && entry.owner.profile == owner.profile)
+    }
     pub fn register(
         &mut self,
         scope: S,

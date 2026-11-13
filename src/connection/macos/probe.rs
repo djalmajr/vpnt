@@ -5,18 +5,31 @@ use super::{
     ppp::OwnedPpp,
     resolve, tcp,
 };
-use crate::{
-    helper::process::ManagedChild,
-    model::{Profile, VpnKind},
-};
+use crate::model::{Profile, VpnKind};
+use icmp::ping;
 use std::{
     net::{IpAddr, SocketAddr},
-    process::Command,
     sync::atomic::{AtomicBool, Ordering},
-    thread,
     time::{Duration, Instant},
 };
+// The unchanged SSL fixtures inherit `thread` through `use super::*`.
+#[cfg(test)]
+use std::thread;
 
+/// Link family: the SSL probe and the owned IPsec utun share one run loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Ssl,
+    Ipsec,
+}
+impl Kind {
+    fn vpn(self) -> VpnKind {
+        match self {
+            Kind::Ssl => VpnKind::Ssl,
+            Kind::Ipsec => VpnKind::Ipsec,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Method {
     Ping,
@@ -34,6 +47,10 @@ pub enum Outcome {
 trait Link {
     fn interface(&self) -> &Interface;
     fn current(&self) -> bool;
+    /// Default keeps every existing/SSL link exactly as before.
+    fn kind(&self) -> Kind {
+        Kind::Ssl
+    }
 }
 impl Link for OwnedPpp {
     fn interface(&self) -> &Interface {
@@ -53,6 +70,9 @@ pub fn probe(
     run(link, profile, canceled, timeout, false)
 }
 
+/// The public finite-timeout wrapper: the absolute deadline starts here,
+/// before the first link/current observation, and is the only clock the run
+/// core uses. The timeout range belongs to the wrapper.
 fn run(
     link: &impl Link,
     profile: &Profile,
@@ -60,46 +80,63 @@ fn run(
     timeout: Duration,
     allow_local_fixture: bool,
 ) -> Outcome {
-    if profile.validate().is_err()
-        || profile.kind != VpnKind::Ssl
-        || timeout.is_zero()
-        || timeout > Duration::from_secs(30)
-    {
+    if timeout.is_zero() || timeout > Duration::from_secs(30) {
         return Outcome::InvalidTarget;
-    }
-    if canceled.load(Ordering::Acquire) {
-        return Outcome::Canceled;
-    }
-    if !link.current() {
-        return Outcome::InvalidLink;
     }
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return Outcome::InvalidTarget;
     };
+    run_until(link, profile, canceled, deadline, allow_local_fixture)
+}
+
+/// Same run loop with one supplied absolute deadline. It never rebases a
+/// fresh `now + timeout`; every check and the DNS/traffic caps derive from the
+/// remaining part of this Instant.
+fn run_until(
+    link: &impl Link,
+    profile: &Profile,
+    canceled: &AtomicBool,
+    deadline: Instant,
+    allow_local_fixture: bool,
+) -> Outcome {
+    // Precedence: profile/kind, cancel, total expiry, then link validity.
+    if profile.validate().is_err() || profile.kind != link.kind().vpn() {
+        return Outcome::InvalidTarget;
+    }
+    if let Err(outcome) = checked_current(link, canceled, deadline) {
+        return outcome;
+    }
+    // Keep a traffic reserve when only one DNS family completes; the half cap
+    // is derived from the remaining total, never from a fresh timeout.
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Outcome::Unresponsive;
+    };
+    if remaining.is_zero() {
+        return Outcome::Unresponsive;
+    }
     let interface = link.interface();
     let protocol = u32::from(interface.addresses.iter().any(IpAddr::is_ipv4))
         | (u32::from(interface.addresses.iter().any(IpAddr::is_ipv6)) << 1);
+    let dns_deadline = (Instant::now() + (remaining / 2).min(Duration::from_secs(2))).min(deadline);
     let targets = match resolve::resolve(
         &profile.probe_host,
         interface.index,
         protocol,
-        // Preserve a budget for traffic when only one DNS family completes.
-        (Instant::now() + (timeout / 2).min(Duration::from_secs(2))).min(deadline),
+        dns_deadline,
         canceled,
     ) {
         Ok(targets) => targets,
         Err(tcp::Error::Canceled) => return Outcome::Canceled,
         Err(_) => {
-            return if link.current() {
-                Outcome::Unresponsive
-            } else {
-                Outcome::InvalidLink
+            return match checked_current(link, canceled, deadline) {
+                Ok(()) => Outcome::Unresponsive,
+                Err(outcome) => outcome,
             };
         }
     };
     let local = match Interfaces::read() {
         Ok(local) => local,
-        Err(_) => return Outcome::InvalidLink,
+        Err(_) => return failure_or(canceled, deadline, Outcome::InvalidLink),
     };
     let mut attempted = false;
     for target in targets {
@@ -113,21 +150,15 @@ fn run(
             continue;
         }
         attempted = true;
-        if canceled.load(Ordering::Acquire) {
-            return Outcome::Canceled;
-        }
-        if !link.current() {
-            return Outcome::InvalidLink;
+        if let Err(outcome) = checked_current(link, canceled, deadline) {
+            return outcome;
         }
         if profile.probe_method == "ping_tcp" && ping(interface, source, target, deadline, canceled)
         {
             return finish(link, Method::Ping, canceled, deadline);
         }
-        if canceled.load(Ordering::Acquire) {
-            return Outcome::Canceled;
-        }
-        if !link.current() {
-            return Outcome::InvalidLink;
+        if let Err(outcome) = checked_current(link, canceled, deadline) {
+            return outcome;
         }
         let attempt = (Instant::now() + Duration::from_secs(1)).min(deadline);
         match tcp::connect(
@@ -146,26 +177,59 @@ fn run(
             break;
         }
     }
-    if canceled.load(Ordering::Acquire) {
-        Outcome::Canceled
-    } else if !link.current() {
-        Outcome::InvalidLink
-    } else if attempted {
+    if let Err(outcome) = checked_current(link, canceled, deadline) {
+        return outcome;
+    }
+    if attempted {
         Outcome::Unresponsive
     } else {
         Outcome::InvalidTarget
     }
 }
 
-fn finish(link: &impl Link, method: Method, canceled: &AtomicBool, deadline: Instant) -> Outcome {
+/// Cancellation and total expiry win over both a successful and a failed
+/// current/pin observation, including one that lands inside the bounded work.
+/// False current maps to InvalidLink only after the cancel/expiry rechecks.
+fn checked_current(
+    link: &impl Link,
+    canceled: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), Outcome> {
+    if canceled.load(Ordering::Acquire) {
+        return Err(Outcome::Canceled);
+    }
+    if Instant::now() >= deadline {
+        return Err(Outcome::Unresponsive);
+    }
+    let current = link.current();
+    if canceled.load(Ordering::Acquire) {
+        return Err(Outcome::Canceled);
+    }
+    if Instant::now() >= deadline {
+        return Err(Outcome::Unresponsive);
+    }
+    if !current {
+        return Err(Outcome::InvalidLink);
+    }
+    Ok(())
+}
+
+/// A non-current failure (bad local view, failed wrapper pin) still lets a
+/// cancel or the total deadline take precedence.
+fn failure_or(canceled: &AtomicBool, deadline: Instant, failure: Outcome) -> Outcome {
     if canceled.load(Ordering::Acquire) {
         Outcome::Canceled
-    } else if !link.current() {
-        Outcome::InvalidLink
-    } else if Instant::now() > deadline {
+    } else if Instant::now() >= deadline {
         Outcome::Unresponsive
     } else {
-        Outcome::Responsive(method)
+        failure
+    }
+}
+
+fn finish(link: &impl Link, method: Method, canceled: &AtomicBool, deadline: Instant) -> Outcome {
+    match checked_current(link, canceled, deadline) {
+        Ok(()) => Outcome::Responsive(method),
+        Err(outcome) => outcome,
     }
 }
 
@@ -204,55 +268,17 @@ fn source(interface: &Interface, target: IpAddr) -> Option<IpAddr> {
             _ => true,
         })
 }
-fn scoped(address: IpAddr, name: &str) -> String {
-    match address {
-        IpAddr::V6(value) if value.is_unicast_link_local() => format!("{value}%{name}"),
-        _ => address.to_string(),
-    }
-}
-fn ping(
-    interface: &Interface,
-    source: IpAddr,
-    target: IpAddr,
-    deadline: Instant,
-    canceled: &AtomicBool,
-) -> bool {
-    let mut command = Command::new(if target.is_ipv4() {
-        "/sbin/ping"
-    } else {
-        "/sbin/ping6"
-    });
-    command.args([
-        "-n",
-        "-c",
-        "1",
-        if target.is_ipv4() { "-b" } else { "-B" },
-        &interface.name,
-        "-S",
-        &scoped(source, &interface.name),
-        &scoped(target, &interface.name),
-    ]);
-    let Ok(mut child) = ManagedChild::spawn(&mut command) else {
-        return false;
-    };
-    let until = (Instant::now() + Duration::from_millis(700)).min(deadline);
-    let result = loop {
-        if canceled.load(Ordering::Acquire) || Instant::now() >= until {
-            break false;
-        }
-        match child.poll() {
-            Ok(Some(status)) => break status.success(),
-            Err(_) => break false,
-            _ => {}
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-    // One numeric target/one echo produces bounded output, retained only in
-    // the child's private pipes until exit. No ping output enters the UI/log.
-    let _ = child.stop(Duration::from_millis(50));
-    result
-}
 
+mod icmp;
+mod utun;
+pub use utun::probe_utun;
+
+#[cfg(test)]
+#[path = "probe/current_tests.rs"]
+mod current_tests;
 #[cfg(test)]
 #[path = "probe_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "probe/utun_tests.rs"]
+mod utun_tests;

@@ -27,6 +27,8 @@ impl AddReceipt {
         self.confirmation
     }
 }
+mod retained;
+
 pub struct AddWriter<'a> {
     fd: OwnedFd,
     controller: &'a ControllerLock,

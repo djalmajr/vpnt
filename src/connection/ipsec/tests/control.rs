@@ -218,4 +218,5 @@ fn namespace_conflict_and_preflight_cancellation_cannot_reach_initiate() {
 
 mod backend;
 mod io;
+mod selected;
 mod snapshots;
