@@ -188,11 +188,19 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
         // SAFETY: fd 3 is the inherited endpoint; closing it is the drop the
         // receiver performs on every outcome.
         unsafe { libc::close(3) };
-        super::write_out(match outcome {
-            Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => b"outcome=emsgsize\n",
-            Ok(()) => b"outcome=ok\n",
-            Err(_) => b"outcome=other\n",
-        });
+        match outcome {
+            Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
+                super::write_out(b"outcome=emsgsize\n");
+            }
+            Ok(()) => super::write_out(b"outcome=ok\n"),
+            Err(error) => {
+                let line = match error.raw_os_error() {
+                    Some(errno) => format!("outcome=errno:{errno}\n"),
+                    None => format!("outcome=kind:{:?}\n", error.kind()),
+                };
+                super::write_out(line.as_bytes());
+            }
+        }
         // Stay alive until the parent has observed the peer EOF, so that EOF
         // cannot be explained by this process exiting.
         let mut byte = [0u8; 1];
@@ -217,9 +225,14 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
     std::thread::sleep(Duration::from_millis(50));
     let (writer, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let copies = [writer.as_raw_fd(); RIGHT_COPIES];
-    // A child that skipped its readiness wait may already have closed FD3; the
-    // outcome line below still distinguishes EMSGSIZE from EAGAIN.
-    let _ = send_rights_once(parent_end.as_raw_fd(), &copies);
+    // The slot-exhaustion assertion requires this fixture's datagram to be sent;
+    // report a failed send separately from the child's receive outcome.
+    send_rights_once(parent_end.as_raw_fd(), &copies).unwrap_or_else(|error| {
+        match error.raw_os_error() {
+            Some(errno) => panic!("128-right fixture send failed: errno={errno}"),
+            None => panic!("128-right fixture send failed: kind={:?}", error.kind()),
+        }
+    });
     drop((writer, parent_end));
 
     let line = super::await_outcome(&mut stdout);

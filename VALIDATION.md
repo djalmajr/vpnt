@@ -97,10 +97,35 @@ Não houve segunda instalação real para repetir o timeout com o novo host.
 de teste já servido por um túnel existente. A validação de VPN foi interrompida
 nesse pré-requisito, conforme a autorização de preservar conexões e configurações.
 
+[PASS, persistência nativa] No app normal, sem perfis, a escolha de reconexão
+automática foi alterada pela UI, gravada no domínio próprio de UserDefaults e
+restaurada corretamente após sair pelo menu e reabrir o app. A escolha original
+foi restaurada; a chave criada somente pelo teste foi removida após conferir
+os valores iniciais. Isso prova a persistência da escolha, não uma reconexão
+real. Login e permissão de notificações não foram alterados nesse teste.
+
+[FAIL, primeiro CI remoto] O [primeiro workflow Checks](https://github.com/djalmajr/vpnt/actions/runs/43492181916)
+passou os jobs Linux core e runtime-handoff. O job macOS passou os gates UI,
+tokens e helpers de build, mas parou na suíte nativa: 519 testes passaram,
+dois falharam e um foi ignorado. As falhas foram o orçamento positivo de 100 ms
+do fixture de egress e o resultado não discriminado do importer sob limite de
+FDs. Os passos posteriores de campanhas/empacotamento desse job não rodaram;
+a falha original permanece registrada. A correção e o próximo CI são evidências
+separadas, sem promover esse primeiro workflow a sucesso.
+
+[PASS local, diagnóstico remoto pendente] O fixture positivo de egress passou
+a usar 2 s com o mesmo desconto mínimo de 20 ms no tempo remanescente. O caso
+negativo de 50 ms e as categorias de cancelamento/timeout foram preservados;
+nenhum prazo de produção mudou. O teste do importer agora discrimina errno e
+falha de envio, mantendo o aceite estrito de EMSGSIZE e a prova de EOF enquanto
+o filho vive. Fmt, clippy all-targets/all-features e os três testes focados
+passaram localmente. O próximo CI ainda precisa fornecer o resultado de macOS15;
+o diagnóstico não encerra a falha remota nem amplia os erros aceitos.
+
 [NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
-coexistência operacional, efeitos nativos positivos de login/notificações,
-aceite visual por captura do popover e CI remoto. A instalação parcial acima
-não altera o estado desses itens.
+coexistência operacional, efeitos nativos positivos de login/notificações e
+aceite visual por captura do popover. A instalação e a persistência acima não
+alteram o estado desses itens.
 
 Os recibos locais não versionados em `output/fixtures/` são
 `vici-startup-final/receipt.json`, `vici-startup-final-r1/receipt.json`,

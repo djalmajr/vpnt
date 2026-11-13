@@ -5,8 +5,9 @@ Windows e no Linux, com a mesma interface nos três.
 
 > Protótipo visual aprovado. A interface bilíngue e o runtime estão preparados
 > em um pacote de desenvolvimento local. O Installer concluiu a instalação dos
-> arquivos e o aplicativo já reconhece o componente instalado. Efeitos nativos
-> das preferências e VPN real permanecem pendentes. Windows e
+> arquivos e o aplicativo já reconhece o componente instalado. A persistência
+> das preferências foi verificada; abertura no login, notificações e VPN real
+> permanecem pendentes. Windows e
 > Linux ficam para depois. Consulte o checkpoint atual em `VALIDATION.md`.
 
 ## Proposta

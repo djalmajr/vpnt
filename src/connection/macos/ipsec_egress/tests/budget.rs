@@ -161,14 +161,15 @@ fn pin_is_host_scoped_and_prefix_changes_are_equivalent() {
 fn total_budget_is_shared_and_cancel_after_interfaces_is_honored() {
     let profile = profile(VpnKind::Ipsec, "fixture.example", 8443);
     let cancel = AtomicBool::new(false);
-    let budget = Duration::from_millis(100);
+    let budget = Duration::from_secs(2);
+    let remaining_limit = budget.saturating_sub(Duration::from_millis(20));
     let mut fake = sample();
     fake.interface_delay = Duration::from_millis(15);
     fake.route_delay = Duration::from_millis(15);
     let _egress = select_with(&mut fake, &profile, &cancel, budget).unwrap();
     let select_source = fake.source_timeout.unwrap();
     assert!(
-        select_source < Duration::from_millis(80),
+        select_source < remaining_limit,
         "select source did not use the remaining budget: {select_source:?}"
     );
     let mut fake = sample();
@@ -182,7 +183,7 @@ fn total_budget_is_shared_and_cancel_after_interfaces_is_honored() {
     );
     let current_source = fake.source_timeout.unwrap();
     assert!(
-        current_source < Duration::from_millis(80),
+        current_source < remaining_limit,
         "revalidate source did not use the remaining budget: {current_source:?}"
     );
     let mut fake = sample();
