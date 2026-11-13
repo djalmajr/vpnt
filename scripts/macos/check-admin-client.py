@@ -51,7 +51,7 @@ def main():
         ('cached-authentication-permitted', 'src/helper/admin_client.rs', lambda s: replace(s, '["-A", "-k", "--", paths::HELPER, "admin"]', '["-A", "--", paths::HELPER, "admin"]'), client + 'elevation_command_is_closed_and_never_uses_shell_or_cached_authentication', False),
         ('active-profile-administration-admitted', 'src/broker/admin.rs', lambda s: replace(s, '        if self\n            .connections', '        if false && self\n            .connections'), active, False),
         ('edited-profile-can-connect', 'src/broker/commands.rs', lambda s: replace(s, '        if self.editing(id) {', '        if false {'), active, False),
-        ('edited-profile-can-save-secrets', 'src/broker/commands.rs', lambda s: replace(s, '                if self.editing(&id) {', '                if false {'), active, False),
+        ('edited-profile-can-save-secrets', 'src/broker/commands.rs', lambda s: replace(s, '            Command::SaveSecrets { id, password, psk } => {\n                if self.editing(&id) {', '            Command::SaveSecrets { id, password, psk } => {\n                if false {'), active, False),
         ('metadata-confirmation-ignored', 'src/broker/admin.rs', lambda s: replace(s, 'let mut result = if confirmed', 'let mut result = if true'), confirmed, False),
         ('keychain-removal-omitted', 'src/broker/admin.rs', lambda s: replace(s, 'self.secrets.remove(id, *kind).is_err()', 'false'), active, False),
         ('keychain-cleanup-failure-hidden', 'src/broker/admin.rs', lambda s: replace(s, 'result = Err("secret_cleanup_failed");', 'result = Ok(());'), broker + 'a_partial_keychain_cleanup_reports_failure_after_the_profile_was_removed', False),

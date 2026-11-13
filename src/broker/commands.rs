@@ -6,6 +6,14 @@ impl<S: SecretStore> Broker<S> {
         expires: Instant,
     ) -> Result<Snapshot, &'static str> {
         self.poll();
+        // Direct Broker callers carry the same manual intent as the actor.
+        // Interrupt after poll so newly observed reconnect work is covered too.
+        if matches!(
+            &command,
+            Command::Connect { .. } | Command::Disconnect { .. }
+        ) {
+            self.interrupt_automatic(&command);
+        }
         if Instant::now() >= expires {
             return Err("backend_unavailable");
         }
@@ -30,6 +38,31 @@ impl<S: SecretStore> Broker<S> {
                 self.component.close();
                 self.retry = None;
                 self.lost(false);
+            }
+            Command::Connect { id } => {
+                let state = self.connections.get(&id).ok_or("not_found")?.view.state;
+                if !self.ready {
+                    return Err("backend_unavailable");
+                }
+                if self.editing(&id) {
+                    return Err("admin_busy");
+                }
+                if state == State::Disconnecting {
+                    return Err("unavailable");
+                }
+                if !state.active() {
+                    self.connect(&id, false, expires)?;
+                }
+            }
+            Command::Disconnect { id } => {
+                self.connections.get(&id).ok_or("not_found")?;
+                if !self.ready {
+                    return Err("backend_unavailable");
+                }
+                if self.editing(&id) {
+                    return Err("admin_busy");
+                }
+                self.disconnect(&id)?;
             }
             Command::Toggle { id } => {
                 let state = self.connections.get(&id).ok_or("not_found")?.view.state;

@@ -121,6 +121,22 @@ impl App {
             return Err("not_implemented");
         }
         match command {
+            Command::Connect { id } => {
+                let state = self.connection(&id)?.session.state();
+                if matches!(
+                    state,
+                    ConnectionState::Disconnecting
+                        | ConnectionState::Offline
+                        | ConnectionState::HelperMissing
+                        | ConnectionState::MissingProgram
+                ) {
+                    return Err("unavailable");
+                }
+                if !state.active() {
+                    self.start(&id, false, now)?;
+                }
+            }
+            Command::Disconnect { id } => self.stop(&id, now)?,
             Command::Toggle { id } => {
                 let connection = self.connection(&id)?;
                 if matches!(
@@ -291,6 +307,134 @@ impl App {
         });
         if connection.log.len() > 60 {
             connection.log.remove(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod explicit_intent_tests {
+    use super::*;
+
+    #[test]
+    fn demo_connect_preserves_active_and_rejects_disconnecting() {
+        let mut app = App::demo();
+        let now = Instant::now();
+        app.dispatch_at(
+            Command::Connect {
+                id: "cluster".into(),
+            },
+            now,
+        )
+        .unwrap();
+        let generation = app.connection("cluster").unwrap().session.generation();
+        app.dispatch_at(
+            Command::Connect {
+                id: "cluster".into(),
+            },
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            app.connection("cluster").unwrap().session.generation(),
+            generation
+        );
+        let connected = app.snapshot_at(now + Duration::from_secs(2));
+        assert_eq!(connected.vpns[0].state, ConnectionState::Connected);
+        let result = app
+            .dispatch_at(
+                Command::Connect {
+                    id: "cluster".into(),
+                },
+                now + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(result.vpns[0].state, ConnectionState::Connected);
+        assert_eq!(
+            app.connection("cluster").unwrap().session.generation(),
+            generation
+        );
+        app.dispatch_at(
+            Command::Disconnect {
+                id: "cluster".into(),
+            },
+            now + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            app.dispatch_at(
+                Command::Connect {
+                    id: "cluster".into()
+                },
+                now + Duration::from_secs(2)
+            )
+            .err(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            app.snapshot_at(now + Duration::from_secs(3)).vpns[0].state,
+            ConnectionState::Off
+        );
+    }
+
+    #[test]
+    fn demo_disconnect_from_off_and_stale_active_view_never_starts() {
+        let mut app = App::demo();
+        let now = Instant::now();
+        let off_stop = app
+            .dispatch_at(
+                Command::Disconnect {
+                    id: "cluster".into(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(off_stop.vpns[0].state, ConnectionState::Disconnecting);
+        assert_eq!(
+            app.snapshot_at(now + Duration::from_secs(1)).vpns[0].state,
+            ConnectionState::Off
+        );
+        app.dispatch_at(
+            Command::Connect {
+                id: "cluster".into(),
+            },
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+        let caller = app.snapshot_at(now + Duration::from_secs(3));
+        assert_eq!(caller.vpns[0].state, ConnectionState::Connected);
+        app.dispatch_at(
+            Command::Disconnect {
+                id: "cluster".into(),
+            },
+            now + Duration::from_secs(3),
+        )
+        .unwrap();
+        app.snapshot_at(now + Duration::from_secs(4));
+        let late = app
+            .dispatch_at(
+                Command::Disconnect {
+                    id: caller.vpns[0].profile.id.clone(),
+                },
+                now + Duration::from_secs(4),
+            )
+            .unwrap();
+        assert_eq!(late.vpns[0].state, ConnectionState::Disconnecting);
+        assert_eq!(
+            app.snapshot_at(now + Duration::from_secs(6)).vpns[0].state,
+            ConnectionState::Off
+        );
+        for command in [
+            Command::Connect {
+                id: "absent".into(),
+            },
+            Command::Disconnect {
+                id: "absent".into(),
+            },
+        ] {
+            assert_eq!(
+                app.dispatch_at(command, now + Duration::from_secs(6)).err(),
+                Some("not_found")
+            );
         }
     }
 }

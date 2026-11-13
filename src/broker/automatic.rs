@@ -45,7 +45,9 @@ impl<S: SecretStore> Broker<S> {
     /// their work when the action addresses only one profile.
     pub(crate) fn interrupt_automatic(&mut self, command: &Command) {
         let target = match command {
-            Command::Toggle { id }
+            Command::Connect { id }
+            | Command::Disconnect { id }
+            | Command::Toggle { id }
             | Command::Reconnect { id }
             | Command::RemoveProfile { id }
             | Command::SaveSecrets { id, .. } => Some(id.as_str()),

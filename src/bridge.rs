@@ -22,6 +22,12 @@ pub struct Request {
 pub enum Command {
     // Empty struct variants reject extra fields; serde unit variants do not.
     GetSnapshot {},
+    Connect {
+        id: String,
+    },
+    Disconnect {
+        id: String,
+    },
     Toggle {
         id: String,
     },
@@ -89,4 +95,47 @@ pub fn parse_request(body: &str) -> Result<Request, &'static str> {
 
 pub fn trusted_origin(origin: &str) -> bool {
     matches!(origin, "vpnt://localhost/index.html" | "vpnt://localhost/")
+}
+
+#[cfg(test)]
+mod explicit_intent_tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_explicit_intent_and_keeps_toggle_legacy() {
+        for kind in ["connect", "disconnect", "toggle"] {
+            let request = parse_request(&format!(
+                r#"{{"id":"request-1","command":{{"type":"{kind}","id":"one"}}}}"#
+            ))
+            .unwrap();
+            match (kind, request.command) {
+                ("connect", Command::Connect { id })
+                | ("disconnect", Command::Disconnect { id })
+                | ("toggle", Command::Toggle { id }) => assert_eq!(id, "one"),
+                _ => panic!("wrong typed command"),
+            }
+        }
+    }
+
+    #[test]
+    fn parser_rejects_missing_extra_and_unknown_intent_fields() {
+        for command in [
+            r#"{"type":"connect"}"#,
+            r#"{"type":"disconnect"}"#,
+            r#"{"type":"connect","id":"one","desired":true}"#,
+            r#"{"type":"disconnect","id":"one","generation":1}"#,
+            r#"{"type":"disconnect","id":"one","password":"fictional"}"#,
+            r#"{"type":"set_desired_state","id":"one"}"#,
+        ] {
+            assert!(
+                parse_request(&format!(r#"{{"id":"request-1","command":{command}}}"#)).is_err()
+            );
+        }
+        assert!(
+            parse_request(
+                r#"{"id":"request-1","command":{"type":"connect","id":"one"},"extra":true}"#
+            )
+            .is_err()
+        );
+    }
 }

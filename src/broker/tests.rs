@@ -13,6 +13,7 @@ mod automatic_notifications;
 mod automatic_reconnect;
 mod automatic_support;
 mod ipsec_dispatch;
+mod manual_intent;
 mod recovery;
 #[derive(Clone)]
 struct Secrets {

@@ -64,6 +64,10 @@ export type Command =
         | "quit";
     }
   | { type: "toggle" | "reconnect" | "probe" | "remove_profile"; id: string }
+  // Explicit direction for the manual card action. `toggle` stays typed only as
+  // the legacy contract: a toggle derives the command from the latest snapshot,
+  // which may already disagree with what the user is looking at.
+  | { type: "connect" | "disconnect"; id: string }
   | { type: "save_profile"; profile: Profile }
   | { type: "save_secrets"; id: string; password: string; psk: string }
   | { type: "set_preferences"; preferences: NativePreferences }

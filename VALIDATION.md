@@ -32,8 +32,8 @@ variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
 ## Checkpoint atual — 13/11/2026
 
-[PASS, execução local] A UI passou lint, typecheck, build e 36 testes
-(305 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
+[PASS, execução local] A UI passou lint, typecheck, build e 43 testes
+(443 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
 janela e na WebView, menu compartilhado Radix e os símbolos nativos da bandeja.
 O gate de classes segue sem regras e não representa cobertura visual.
 
@@ -72,18 +72,31 @@ preservando as escolhas e a chave de preferências do usuário, sem alterar essa
 preferências para o ensaio. São amostras de CSS e entradas DOM, sem captura de
 pixels nem execução de uma nova operação nativa de preferência nessa prova.
 
-[PASS, testes com fixtures] As suítes completas passaram com 627 testes desktop
-e 568 core, sem falhas e com dois ignorados em cada suíte. Depois delas, somente
-os pré-requisitos temporais de um teste novo de startup foram corrigidos;
-o código Rust de produção e as dependências permaneceram idênticos. A correção
-posterior de navegação e a correção da porta no formulário alteraram somente
-a UI e seus testes, validados separadamente abaixo. Os ajustes adicionais do
-importer e do orçamento alteraram somente testes Rust. Após a correção de startup passaram fmt, clippy
-all-targets/all-features com `-D warnings`, os dois
-testes de startup, baseline e restauração dos 126 testes IPsec e a campanha de
-32 mutações do produtor. O build de todos os binários também passou. As duas
-suítes completas são evidência reaproveitada por essa paridade, não uma nova
-execução após a correção exclusiva do teste.
+[PASS, integração local atual] As suítes completas foram executadas novamente
+após integrar as intenções explícitas de conexão: 638 testes desktop e 579 core,
+sem falhas e com dois ignorados em cada suíte. Os hashes atuais de todos os
+inputs registrados coincidem com o recibo `explicit-intent-integrated/receipt.json`.
+Fmt e clippy all-targets/all-features com `-D warnings` passaram. As contagens
+627/568 das rodadas anteriores permanecem históricas; não substituem esta execução.
+
+[PASS, direção da ação] Os cartões enviam `connect` ou `disconnect` conforme
+a ação apresentada. Um clique para cancelar/desligar não vira uma nova conexão
+se o estado mudar para Off entre render e despacho. Connect em estado ativo
+preserva a geração e não recarrega segredos; Disconnect segue por ID mesmo
+quando o snapshot corrente já é Off. O protocolo do helper continua na versão 3.
+Os testes com Broker/Client/peer reproduziram o Connect indevido do comando
+legado; as mutações da direção explícita falharam nas assertions funcionais.
+O comando legado `toggle` continua aceito para compatibilidade, sem uso nesses
+novos caminhos de cartão e de salvar senha/conectar.
+
+[PASS, consumidor da interface] A WKWebView privada carregou os assets atuais,
+o hook real e o parser tipado Rust, despachando apenas para `App::demo`.
+Passaram 36 casos de pt-BR/en-US × claro/escuro: cancelar em Connecting,
+Verifying e Reconnecting; desligar Connected; iniciar Off; reconectar/desligar
+Unresponsive; salvar senha e conectar; recusa de salvamento sem conexão.
+Os cliques/entradas DOM e os snapshots de estado são sintéticos; isso não prova
+VPN nem interação física. O app normal atualizado foi aberto, admitiu o mesmo
+componente instalado e conservou exatamente as preferências anteriores.
 
 O retry de startup trata somente `ConnectionRefused` entre bind e listen do
 socket VICI, conservando o prazo absoluto, cancelamento e verificações de
@@ -219,6 +232,29 @@ Baseline e restauração passaram; remover o latch fez a chamada seguinte retorn
 `Timeout` e falhar na assertion funcional esperada. No canônico, fmt, clippy
 all-targets/all-features e os sete testes do grupo retained passaram. Somente o
 teste mudou; o próximo CI ainda precisa validar as suítes e campanhas completas.
+
+[FAIL, quarto job macOS] O [quarto workflow](https://github.com/djalmajr/vpnt/actions/runs/43511198121)
+passou core e runtime-handoff, os testes nativos e as campanhas de instalação,
+Broker, administração, componente e canal do helper. Parou no passo 21 por
+âncora obsoleta de mutação: a chamada de refresh passou a receber `interval`.
+Não foi falha de assertion do produto; os passos posteriores ficaram sem execução.
+
+[PASS local, manutenção das campanhas] Foram corrigidas quatro âncoras em três
+scripts, conservando mutantes, seletores e verificações: refresh de metadados,
+duas emissões de estado do controlador e o guard de SaveSecrets, agora delimitado
+pelo seu match arm. Passaram as campanhas completas de perfis (23 mutações,
+10 baselines/restaurações), administração (17 e 6) e rotas (67 e 8), sem deriva
+dos inputs. O próximo workflow ainda precisa confirmar o head com essas mudanças.
+
+[FAIL, salvamento nativo ainda não confirmado] O formulário real foi preenchido
+e validado após polling, mas a tentativa de SaveProfile retornou alteração não
+confirmada sem abrir diálogo de senha. Depois, a lista atual do app permaneceu
+sem o perfil; o rascunho próprio foi descartado pelo fluxo normal e não houve
+novo pedido. A admissão dos dois adaptadores passou. Uma sonda de leitura nativa
+encontrou `EPERM` em `proc_pidinfo` para o sudo root pertencente ao app, enquanto
+`proc_pidpath` e `sysctl(KERN_PROC_PID)` responderam. Isso identifica um guard
+incompatível no askpass; a execução original não tem trace que prove ter parado
+exatamente nesse ramo. A correção e seu aceite nativo permanecem pendentes.
 
 [NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
 coexistência operacional, abertura após logout/login, entrega de notificações e

@@ -37,7 +37,7 @@ export function SecretsDialog({
               if (ok) {
                 setPassword("");
                 setPsk("");
-                if (connect) await run({ type: "toggle", id: vpn.profile.id });
+                if (connect) await run({ type: "connect", id: vpn.profile.id });
                 close();
               }
             })

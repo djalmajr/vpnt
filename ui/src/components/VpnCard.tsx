@@ -59,13 +59,18 @@ export function VpnCard({
               : state === "missing_program"
                 ? "programHint"
                 : null;
-  const toggle = () => {
-    if (state === "missing_secret") secrets();
-    else
-      void run({
-        type: state === "unresponsive" ? "reconnect" : "toggle",
-        id: profile.id,
-      });
+  const principal = () => {
+    if (state === "missing_secret") {
+      secrets();
+      return;
+    }
+    if (state === "unresponsive") {
+      void run({ type: "reconnect", id: profile.id });
+      return;
+    }
+    // The user clicked what the card shows, so the command names the direction
+    // instead of re-reading the latest snapshot (which may already be off).
+    void run({ type: on ? "disconnect" : "connect", id: profile.id });
   };
   return (
     <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
@@ -73,7 +78,7 @@ export function VpnCard({
         type="button"
         className="card-toggle"
         disabled={disabled}
-        onClick={toggle}
+        onClick={principal}
         aria-label={`${profile.name}: ${t(`state.${state}`)}`}
         aria-pressed={on}
       >
@@ -138,7 +143,9 @@ export function VpnCard({
                 {state === "unresponsive" ? (
                   <button
                     type="button"
-                    onClick={() => void run({ type: "toggle", id: profile.id })}
+                    onClick={() =>
+                      void run({ type: "disconnect", id: profile.id })
+                    }
                   >
                     {t("disconnect")}
                   </button>

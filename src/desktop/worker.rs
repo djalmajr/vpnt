@@ -196,7 +196,9 @@ impl Worker {
         // that action before retrying any still-current background work.
         if matches!(
             &request.command,
-            crate::bridge::Command::Toggle { .. }
+            crate::bridge::Command::Connect { .. }
+                | crate::bridge::Command::Disconnect { .. }
+                | crate::bridge::Command::Toggle { .. }
                 | crate::bridge::Command::Reconnect { .. }
                 | crate::bridge::Command::DisconnectAll {}
                 | crate::bridge::Command::SaveProfile { .. }
@@ -211,7 +213,9 @@ impl Worker {
         }
         let seconds = if matches!(
             request.command,
-            crate::bridge::Command::Toggle { .. }
+            crate::bridge::Command::Connect { .. }
+                | crate::bridge::Command::Disconnect { .. }
+                | crate::bridge::Command::Toggle { .. }
                 | crate::bridge::Command::Reconnect { .. }
                 | crate::bridge::Command::SaveSecrets { .. }
                 | crate::bridge::Command::SaveProfile { .. }

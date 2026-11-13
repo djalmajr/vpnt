@@ -80,6 +80,12 @@ Novos perfis usam porta remota 500 para IPsec e 443 para SSL; o campo é editáv
 nos dois tipos. Abrir um perfil existente ou trocar seu tipo conserva a porta
 escolhida. Nenhuma configuração existente é migrada automaticamente.
 
+A ação do cartão carrega direção explícita: `connect` para ligar e
+`disconnect` para cancelar/desligar o perfil apresentado. Assim, um estado que
+muda entre o clique e o despacho não converte um pedido de desligamento em uma
+nova conexão. O comando `toggle` continua no contrato legado; os novos caminhos
+de cartão e de salvar senha/conectar usam os comandos direcionais.
+
 Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
 Os clientes VPN também podem ser preparados em um runtime separado, ainda sem

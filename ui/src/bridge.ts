@@ -29,6 +29,8 @@ window.__vpntReply = (reply) => {
 export async function invoke(command: Command): Promise<Snapshot> {
   const interactive = [
     "toggle",
+    "connect",
+    "disconnect",
     "reconnect",
     "save_secrets",
     "save_profile",
