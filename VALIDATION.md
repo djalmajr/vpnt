@@ -103,9 +103,12 @@ expiração e o rascunho foram preservados, sem pedido repetido de instalação.
 A mesma versão passou novamente as 24 combinações de layout e os gates UI.
 Não houve segunda instalação real para repetir o timeout com o novo host.
 
-[BLOCKED, VPN real] A consulta de rota, sem envio de pacotes, encontrou o destino
+[BLOCKED no primeiro preparo, VPN real] A consulta de rota, sem envio de pacotes, encontrou o destino
 de teste já servido por um túnel existente. A validação de VPN foi interrompida
 nesse pré-requisito, conforme a autorização de preservar conexões e configurações.
+Uma consulta posterior encontrou saída pela interface de rede local e ausência
+dos processos antigos; isso removeu aquele conflito observado, sem provar VPN.
+O novo perfil permanece sem salvamento e a conexão ainda não foi solicitada.
 
 [PASS, persistência nativa] No app normal, sem perfis, a escolha de reconexão
 automática foi alterada pela UI, gravada no domínio próprio de UserDefaults e
@@ -113,6 +116,14 @@ restaurada corretamente após sair pelo menu e reabrir o app. A escolha original
 foi restaurada; a chave criada somente pelo teste foi removida após conferir
 os valores iniciais. Isso prova a persistência da escolha, não uma reconexão
 real. Login e permissão de notificações não foram alterados nesse teste.
+
+[PASS, registro nativo de login] Em teste posterior pelo app normal, a opção
+de abertura no login foi ativada e observada como ligada após a resposta do
+host, inclusive no armazenamento próprio. A desativação foi observada pela UI
+e os valores iniciais foram restaurados; a chave criada somente pelo teste
+voltou a ficar ausente. Isso prova registro/desregistro e reconciliação da
+preferência, sem executar logout/login nem comprovar abertura de uma sessão.
+Nenhuma autorização de notificações ou permissão global foi concedida.
 
 [FAIL, primeiro CI remoto] O [primeiro workflow Checks](https://github.com/djalmajr/vpnt/actions/runs/43492181916)
 passou os jobs Linux core e runtime-handoff. O job macOS passou os gates UI,
@@ -161,11 +172,30 @@ EINVAL localmente e foi preservada; a sonda mínima confirmou essa diferença.
 Baseline e restauração dos dois importers passaram; injetar erro desconhecido
 e manter uma referência viva fizeram as assertions correspondentes falharem.
 Fmt, clippy all-targets/all-features, dois importers e build passaram no canônico.
-O EOF após EMFILE ainda exige a próxima execução de macOS15. Produção, guardas,
-permissões e runtime instalado permaneceram sem alteração nessa correção.
+O teste remoto de capacidade passou no terceiro CI abaixo. Seu log de sucesso
+não discrimina qual dos dois erros foi aceito; não se atribui esse resultado
+especificamente a EMFILE. Produção, guardas, permissões e runtime instalado
+permaneceram sem alteração na correção.
+
+[FAIL, terceiro job macOS] O [terceiro workflow](https://github.com/djalmajr/vpnt/actions/runs/43507426983)
+passou Linux core e runtime-handoff. Os dois testes nativos do importer passaram,
+incluindo capacidade/EOF com o filho vivo. O job macOS parou em outro teste:
+cancelamento de handoff, na exigência de que o nascimento do filho já constasse
+no registro. A biblioteca terminou com 520 passados, um erro e um ignorado;
+as campanhas posteriores ainda não rodaram nesse workflow.
+
+[PASS local, sincronização do teste] O fixture de cancelamento agora espera
+o sinal de handoff e o registro durável `Running` com a identidade do filho
+antes de cancelar. O sinal isolado podia preceder esse registro; a ordem
+exata do runner não foi reproduzida nem é afirmada como observada. Permanecem
+as exigências de `Canceled`, latch na chamada seguinte, identidade e retirada.
+Baseline e restauração passaram; remover o latch fez a chamada seguinte retornar
+`Timeout` e falhar na assertion funcional esperada. No canônico, fmt, clippy
+all-targets/all-features e os sete testes do grupo retained passaram. Somente o
+teste mudou; o próximo CI ainda precisa validar as suítes e campanhas completas.
 
 [NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
-coexistência operacional, efeitos nativos positivos de login/notificações e
+coexistência operacional, abertura após logout/login, entrega de notificações e
 aceite visual por captura do popover. A instalação e a persistência acima não
 alteram o estado desses itens.
 

@@ -165,25 +165,40 @@ fn canceled_handoff_is_latched_and_a_fresh_open_cannot_reach_vici() {
     let ready = fixture.directory.join("handoff.ready");
     let cancel = token();
     let signal = cancel.clone();
-    let canceler = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "fixture never reached the handoff"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        signal.store(true, Ordering::Release);
+    let admitted = thread::scope(|scope| {
+        let canceler = scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if ready.exists() {
+                    // The child can signal while the parent is still publishing
+                    // Running. Do not cancel that earlier durable write: this
+                    // case tests the handoff after the birth is recorded.
+                    let observed = state(&context);
+                    if observed.stage == record::Stage::Running && observed.child.is_some() {
+                        signal.store(true, Ordering::Release);
+                        return observed.child;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture never reached the handoff with a durable child"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        // Cancellation follows both child readiness and durable birth admission.
+        assert_eq!(
+            peer.open(reservation.owner(), until(), cancel).err(),
+            Some(Error::Canceled)
+        );
+        canceler.join().unwrap()
     });
-    // Cancellation lands while the receiver is waiting for the handoff.
-    assert_eq!(
-        peer.open(reservation.owner(), until(), cancel).err(),
-        Some(Error::Canceled)
-    );
-    canceler.join().unwrap();
     let original = state(&context).child.clone();
     assert!(original.is_some());
+    assert_eq!(
+        original, admitted,
+        "durable child changed during cancellation"
+    );
     // A fresh call must be the latched cancellation, not a new socket wait.
     let started = Instant::now();
     assert_eq!(
