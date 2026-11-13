@@ -289,7 +289,13 @@ referência ai-usagebar; cartões e menus usam 10 px; o diálogo continua em 12 
 nativo: a janela é transparente e a camada AppKit é recortada em 13 pt contínuos,
 então no CSS basta o raio do próprio painel sobre a raiz transparente — não há
 `height: 100%`/`overflow: hidden` em `html`/`body`, que cortaria o portal do menu
-no `body`. O interruptor mantém 28 por 16 px, com botão de 12 px e 1 px de recuo.
+no `body`. Por indicação do Djalma em 2026-11-13, os interruptores são mais
+retangulares: usam borda de 1 px com `separator`, como os inputs, mas raio
+externo de 3 px, calculado como `rounded.sm` menos a espessura da borda.
+O botão interno acompanha o contorno com raio de 1 px, calculado descontando
+borda e recuo do raio externo compartilhado (`--switch-radius`).
+Mantêm 28 por 16 px, botão de 12 px e 1 px de recuo, tanto nos cartões quanto
+nas preferências, em ambos os temas.
 
 ## Components
 

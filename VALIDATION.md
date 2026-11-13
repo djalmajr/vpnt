@@ -32,17 +32,25 @@ variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
 ## Checkpoint atual — 13/11/2026
 
-[PASS, execução local] A UI passou lint, typecheck, build e 28 testes
-(247 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
+[PASS, execução local] A UI passou lint, typecheck, build e 34 testes
+(272 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
 janela e na WebView, menu compartilhado Radix e os símbolos nativos da bandeja.
 O gate de classes segue sem regras e não representa cobertura visual.
+
+[PASS, renderer isolado] Os interruptores compartilham contorno mais retangular,
+com raio externo de 3 px e interno de 1 px, derivado da borda e do recuo. A
+WKWebView mediu cartões e preferências em oito combinações de pt-BR/en-US,
+claro/escuro e larguras de 280/640 px. Passaram geometria, alinhamento nos dois
+estados, foco e ausência de overflow horizontal. As entradas DOM são sintéticas;
+isso não representa captura visual nem interação com uma VPN real.
 
 [PASS, testes com fixtures] As suítes completas passaram com 627 testes desktop
 e 568 core, sem falhas e com dois ignorados em cada suíte. Depois delas, somente
 os pré-requisitos temporais de um teste novo de startup foram corrigidos;
 o código Rust de produção e as dependências permaneceram idênticos. A correção
-posterior de navegação alterou somente o hook da UI e seu teste, validados
-separadamente abaixo. Após a correção de startup passaram fmt, clippy
+posterior de navegação e a correção da porta no formulário alteraram somente
+a UI e seus testes, validados separadamente abaixo. Os ajustes adicionais do
+importer e do orçamento alteraram somente testes Rust. Após a correção de startup passaram fmt, clippy
 all-targets/all-features com `-D warnings`, os dois
 testes de startup, baseline e restauração dos 126 testes IPsec e a campanha de
 32 mutações do produtor. O build de todos os binários também passou. As duas
@@ -113,14 +121,46 @@ FDs. Os passos posteriores de campanhas/empacotamento desse job não rodaram;
 a falha original permanece registrada. A correção e o próximo CI são evidências
 separadas, sem promover esse primeiro workflow a sucesso.
 
-[PASS local, diagnóstico remoto pendente] O fixture positivo de egress passou
+[PASS local, primeira correção de teste] O fixture positivo de egress passou
 a usar 2 s com o mesmo desconto mínimo de 20 ms no tempo remanescente. O caso
 negativo de 50 ms e as categorias de cancelamento/timeout foram preservados;
-nenhum prazo de produção mudou. O teste do importer agora discrimina errno e
-falha de envio, mantendo o aceite estrito de EMSGSIZE e a prova de EOF enquanto
-o filho vive. Fmt, clippy all-targets/all-features e os três testes focados
-passaram localmente. O próximo CI ainda precisa fornecer o resultado de macOS15;
-o diagnóstico não encerra a falha remota nem amplia os erros aceitos.
+nenhum prazo de produção mudou. O primeiro diagnóstico do importer discriminou
+errno e falha de envio, ainda com aceite estrito de EMSGSIZE. Fmt, clippy
+all-targets/all-features e os três testes focados passaram localmente nessa
+rodada; o resultado remoto seguinte e o ajuste de capacidade estão abaixo.
+
+[PASS, formulário no consumidor isolado] O formulário original enviou um novo
+perfil IPsec com porta 443 e não expôs o campo para edição. O padrão foi
+corrigido para 500 no IPsec, mantendo 443 no SSL, conforme a
+[configuração de IKE do strongSwan](https://github.com/strongswan/strongswan/blob/master/src/swanctl/swanctl.opt).
+O campo existente agora aparece nos dois tipos. Quatro casos na WKWebView real
+passaram pelo formulário e pelo bridge tipado Rust até o despacho demo:
+IPsec 500, SSL 443, edição customizada 4505 e perfil existente 5555. Trocas de
+tipo e polling conservaram as portas escolhidas. Nenhum perfil real, segredo
+ou túnel foi criado. A versão canônica também repetiu os seis casos de navegação
+e as 24 combinações de layout, além dos 34 testes unitários da UI.
+
+[FAIL, segundo job macOS] O [segundo workflow](https://github.com/djalmajr/vpnt/actions/runs/43494994078)
+passou Linux core e o caso de orçamento no macOS. A biblioteca macOS terminou
+com 520 passados, um erro e um ignorado: o importer recebeu EMFILE (errno 24)
+após envio confirmado, em vez de EMSGSIZE. A assertion anterior parou antes da
+prova de EOF; portanto esse job não comprova ausência de referências retidas.
+Os passos posteriores do job continuaram sem execução nessa rodada.
+
+[PASS local, prova remota pendente] O teste de capacidade passou a aceitar
+somente EMSGSIZE e EMFILE, mantendo a prova de EOF enquanto o filho aguarda
+stdin, saída normal e recusa dos demais resultados. As
+[fontes da Apple para externalização](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/kern/uipc_usrreq.c)
+e [alocação de descritores](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/bsd/kern/kern_descrip.c)
+mostram as duas vias de erro; isso não atesta a versão do kernel do runner.
+O timeout da leitura do fixture é configurado antes do envio, enquanto o par
+está conectado. A tentativa inicial de configurá-lo depois do EOF falhou com
+EINVAL localmente e foi preservada; a sonda mínima confirmou essa diferença.
+Baseline e restauração dos dois importers passaram; injetar erro desconhecido
+e manter uma referência viva fizeram as assertions correspondentes falharem.
+Fmt, clippy all-targets/all-features, dois importers e build passaram no canônico.
+O EOF após EMFILE ainda exige a próxima execução de macOS15. Produção, guardas,
+permissões e runtime instalado permaneceram sem alteração nessa correção.
 
 [NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
 coexistência operacional, efeitos nativos positivos de login/notificações e
@@ -131,7 +171,8 @@ Os recibos locais não versionados em `output/fixtures/` são
 `vici-startup-final/receipt.json`, `vici-startup-final-r1/receipt.json`,
 `rounded-popover-final/wk-ui-matrix.json` e
 `native-current-package-receipt.json`, `late-installed-ui/canonical-receipt.json`
-e `late-installed-ui/current-wk-receipt.json`. Eles registram comandos, logs, hashes,
+e `late-installed-ui/current-wk-receipt.json`, além dos novos recibos em
+`profile-port/` e `importer-capacity/`. Eles registram comandos, logs, hashes,
 paridade e limites de cada rodada. A campanha final mudou apenas o diretório de
 saída dos recibos, conservando seletores e verificações do script original.
 Revisões independentes das fatias de produção e da correção do teste passaram.

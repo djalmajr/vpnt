@@ -76,6 +76,10 @@ O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
 instala programas de VPN, componentes privilegiados ou regras do sudoers.
 O askpass é produzido separadamente em `target/debug/vpnt-askpass`, sem instalar
 ou executar sudo. O build só verifica sua recusa a um pai não autorizado.
+Novos perfis usam porta remota 500 para IPsec e 443 para SSL; o campo é editável
+nos dois tipos. Abrir um perfil existente ou trocar seu tipo conserva a porta
+escolhida. Nenhuma configuração existente é migrada automaticamente.
+
 Os checks e os limites de evidência estão em [`VALIDATION.md`](VALIDATION.md).
 
 Os clientes VPN também podem ser preparados em um runtime separado, ainda sem

@@ -2,25 +2,7 @@ import { useState } from "react";
 import { Dialog, Group, Header, Row, type T } from "../components/common";
 import type { Profile as VpnProfile, VpnView } from "../model";
 import type { Navigate, Run } from "../navigation";
-
-function blankProfile(kind: "ipsec" | "ssl"): VpnProfile {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return {
-    id: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-      "",
-    ),
-    kind,
-    name: "",
-    gateway: "",
-    username: "",
-    networks: [],
-    port: 443,
-    certificate: "",
-    probeHost: "",
-    probePort: 8443,
-    probeMethod: "ping_tcp",
-  };
-}
+import { blankProfile } from "../profileDefaults";
 
 export function Profile({
   vpn,
@@ -129,19 +111,17 @@ export function Profile({
             </select>
           </label>
           {input("gateway", "gateway", "vpn.example.com")}
-          {value.kind === "ssl" && (
-            <label className="field">
-              <span>{t("port")}</span>
-              <input
-                type="number"
-                disabled={saving}
-                min={1}
-                max={65535}
-                value={value.port || ""}
-                onChange={(event) => set("port", Number(event.target.value))}
-              />
-            </label>
-          )}
+          <label className="field">
+            <span>{t("port")}</span>
+            <input
+              type="number"
+              disabled={saving}
+              min={1}
+              max={65535}
+              value={value.port || ""}
+              onChange={(event) => set("port", Number(event.target.value))}
+            />
+          </label>
           {input("username", "username")}
           {value.kind === "ipsec" ? (
             <>

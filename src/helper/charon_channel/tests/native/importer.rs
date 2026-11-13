@@ -12,9 +12,9 @@ use std::{
 
 /// Markers that turn a re-executed test binary into an isolated importer.
 const FAIL_STOP_MARKER: &str = "VPNT_CHARON_CHANNEL_FAIL_STOP_CHILD";
-const EMSGSIZE_MARKER: &str = "VPNT_CHARON_CHANNEL_EMSGSIZE_CHILD";
+const CAPACITY_MARKER: &str = "VPNT_CHARON_CHANNEL_CAPACITY_CHILD";
 const FAIL_STOP_TEST: &str = "helper::charon_channel::tests::native::importer::truncated_ancillary_data_fail_stops_the_importing_process";
-const EMSGSIZE_TEST: &str = "helper::charon_channel::tests::native::importer::small_fd_limit_returns_emsgsize_without_fail_stop";
+const CAPACITY_TEST: &str = "helper::charon_channel::tests::native::importer::small_fd_limit_refuses_rights_without_fail_stop";
 /// One descriptor fits (12 + 4); anything more truncates the control layout.
 const REDUCED_CONTROL: usize = 16;
 /// Room for well over the rights the slot-limited child is sent.
@@ -166,8 +166,8 @@ fn truncated_ancillary_data_fail_stops_the_importing_process() {
 // A missing-slot error installs nothing and must surface as an error, with
 // every reference gone while the importer is still alive.
 #[test]
-fn small_fd_limit_returns_emsgsize_without_fail_stop() {
-    if std::env::var_os(EMSGSIZE_MARKER).is_some() {
+fn small_fd_limit_refuses_rights_without_fail_stop() {
+    if std::env::var_os(CAPACITY_MARKER).is_some() {
         super::write_out(b"ready\n");
         let limit = libc::rlimit {
             rlim_cur: CHILD_FD_LIMIT,
@@ -192,6 +192,9 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
             Err(error) if error.raw_os_error() == Some(libc::EMSGSIZE) => {
                 super::write_out(b"outcome=emsgsize\n");
             }
+            Err(error) if error.raw_os_error() == Some(libc::EMFILE) => {
+                super::write_out(b"outcome=emfile\n");
+            }
             Ok(()) => super::write_out(b"outcome=ok\n"),
             Err(error) => {
                 let line = match error.raw_os_error() {
@@ -214,7 +217,7 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
         unsafe { libc::_exit(0) };
     }
 
-    let (child, parent_end) = spawn_importer(EMSGSIZE_MARKER, EMSGSIZE_TEST);
+    let (child, parent_end) = spawn_importer(CAPACITY_MARKER, CAPACITY_TEST);
     let mut importer = Importer { child };
     let mut stdout = importer.child.stdout.take().unwrap();
     let ready = super::await_line(&mut stdout, "ready");
@@ -224,6 +227,7 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
     );
     std::thread::sleep(Duration::from_millis(50));
     let (writer, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let copies = [writer.as_raw_fd(); RIGHT_COPIES];
     // The slot-exhaustion assertion requires this fixture's datagram to be sent;
     // report a failed send separately from the child's receive outcome.
@@ -237,21 +241,21 @@ fn small_fd_limit_returns_emsgsize_without_fail_stop() {
 
     let line = super::await_outcome(&mut stdout);
     assert!(
-        line.ends_with("outcome=emsgsize\n"),
-        "unexpected EMSGSIZE outcome: {line:?}"
+        line.ends_with("outcome=emsgsize\n") || line.ends_with("outcome=emfile\n"),
+        "unexpected capacity outcome: {line:?}"
     );
     let mut byte = [0u8; 1];
     assert_eq!(
         peer.read(&mut byte).unwrap_or(1),
         0,
-        "a right survived the EMSGSIZE rollback"
+        "a right survived the capacity rollback"
     );
     // Now the child may finish; it exits only after this stdin closes.
     drop(importer.child.stdin.take());
-    let status = wait_exit(&mut importer.child, "EMSGSIZE child");
+    let status = wait_exit(&mut importer.child, "capacity child");
     assert!(
         status.success(),
-        "EMSGSIZE child exit: {status:?}\n{}",
+        "capacity child exit: {status:?}\n{}",
         stderr_of(&mut importer.child)
     );
 }

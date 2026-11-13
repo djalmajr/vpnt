@@ -290,6 +290,7 @@ h2 {
   max-width: 52%;
 }
 .switch {
+  --switch-radius: calc(var(--radius-sm) - var(--border-width));
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
@@ -297,7 +298,8 @@ h2 {
   width: var(--switch-width);
   height: var(--switch-height);
   min-height: var(--switch-height);
-  border-radius: var(--radius-card);
+  border: var(--border-width) solid var(--separator);
+  border-radius: var(--switch-radius);
   padding: var(--switch-inset);
   background: var(--switch-off);
   --button-hover: var(--switch-off);
@@ -312,7 +314,11 @@ h2 {
   width: var(--switch-knob);
   height: var(--switch-knob);
   background: var(--white);
-  border-radius: var(--radius-control);
+  border-radius: calc(
+    var(--switch-radius) -
+    var(--border-width) -
+    var(--switch-inset)
+  );
 }
 .dim {
   opacity: var(--dim-opacity);
