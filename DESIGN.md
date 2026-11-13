@@ -54,9 +54,9 @@ x-layout:
   panel-width: "320px"
   control-height: "24px"
   control-x: "10px"
-  switch-width: "28px"
-  switch-height: "16px"
-  switch-knob: "12px"
+  switch-width: "24px"
+  switch-height: "14px"
+  switch-knob: "10px"
   switch-inset: "1px"
   panel-max-height: "720px"
   field-label-width: "92px"
@@ -264,8 +264,10 @@ nunca usa coordenadas fixas de tela. A altura máxima vem de
 viewport menos 16 px (2 × `space-sm`); quando o conteúdo não cabe, o menu rola
 dentro de si mesmo em vez de esconder as primeiras ações. O `sideOffset` de 6 px
 da referência é uma exceção documentada: o deslocamento é calculado em JS, então
-o valor fica no componente e não vira token CSS. O interruptor clássico mede 28
-por 16 px, com botão de 12 px e 1 px de recuo.
+o valor fica no componente e não vira token CSS. Por indicação do Djalma, o
+interruptor é mais compacto que o clássico: 24 por 14 px, com botão de 10 px e
+1 px de recuo. Ícones grandes e linhas de preferências conservam 28 px,
+independentes da largura do interruptor.
 
 ### Conflicting visual priorities
 
@@ -294,7 +296,7 @@ retangulares: usam borda de 1 px com `separator`, como os inputs, mas raio
 externo de 3 px, calculado como `rounded.sm` menos a espessura da borda.
 O botão interno acompanha o contorno com raio de 1 px, calculado descontando
 borda e recuo do raio externo compartilhado (`--switch-radius`).
-Mantêm 28 por 16 px, botão de 12 px e 1 px de recuo, tanto nos cartões quanto
+Usam 24 por 14 px, botão de 10 px e 1 px de recuo, tanto nos cartões quanto
 nas preferências, em ambos os temas.
 
 ## Components

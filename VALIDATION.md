@@ -39,7 +39,9 @@ O gate de classes segue sem regras e não representa cobertura visual.
 
 [PASS, renderer isolado] Os interruptores compartilham contorno mais retangular,
 com raio externo de 3 px e interno de 1 px, derivado da borda e do recuo. A
-WKWebView mediu cartões e preferências em oito combinações de pt-BR/en-US,
+versão compacta mede 24 × 14 px, com botão de 10 px; o select nativo medido
+na WebView tem 18 px de altura. Ícones grandes e linhas mantêm suas medidas.
+A WKWebView mediu cartões e preferências em oito combinações de pt-BR/en-US,
 claro/escuro e larguras de 280/640 px. Passaram geometria, alinhamento nos dois
 estados, foco e ausência de overflow horizontal. As entradas DOM são sintéticas;
 isso não representa captura visual nem interação com uma VPN real.

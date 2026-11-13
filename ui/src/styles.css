@@ -48,9 +48,9 @@
   --panel-width: 320px;
   --control-height: 24px;
   --control-x: 10px;
-  --switch-width: 28px;
-  --switch-height: 16px;
-  --switch-knob: 12px;
+  --switch-width: 24px;
+  --switch-height: 14px;
+  --switch-knob: 10px;
   --switch-inset: 1px;
   --dim-opacity: 0.45;
   --hover-brightness: 1.08;
@@ -239,8 +239,8 @@ h2 {
   vertical-align: middle;
 }
 .icon.large {
-  width: var(--switch-width);
-  height: var(--switch-width);
+  width: calc(var(--control-height) + var(--space-xs));
+  height: calc(var(--control-height) + var(--space-xs));
 }
 .icon-button {
   display: inline-flex;
@@ -268,7 +268,7 @@ h2 {
 }
 .setting-row {
   display: flex;
-  min-height: var(--switch-width);
+  min-height: calc(var(--control-height) + var(--space-xs));
   align-items: center;
   justify-content: space-between;
   gap: var(--space-sm);
