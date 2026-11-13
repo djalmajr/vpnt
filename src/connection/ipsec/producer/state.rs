@@ -1,17 +1,25 @@
 use super::{
-    Config, Error, Reservation, config,
+    Error,
+    bound::budget::{self, Budget},
+    config,
     files::{Directory, Stamp, Unstarted},
     record::{self, Birth, Record, Stage},
 };
+use crate::connection::ipsec::{Config, Reservation};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     fs,
+    num::NonZeroU16,
     os::unix::fs::{FileTypeExt, MetadataExt},
     sync::{Arc, Mutex},
 };
 pub(super) const CONFIG: &str = "strongswan.conf";
 const CLAIM: &str = "claim.json";
 const MAX: u64 = 8192;
+mod lease;
+
 pub(super) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -19,6 +27,10 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 pub(super) struct Store {
     pub root: Directory,
     io: Mutex<()>,
+    /// Test-only one-shot hook: set a caller's cancel flag after the record
+    /// scan and immediately before the first durable create.
+    #[cfg(test)]
+    pub(super) before_create: Mutex<Option<Arc<AtomicBool>>>,
 }
 impl Store {
     pub fn open(parent: &std::path::Path, owner: u32) -> Result<Arc<Self>, Error> {
@@ -37,8 +49,24 @@ impl Store {
         Ok(Arc::new(Self {
             root,
             io: Mutex::new(()),
+            #[cfg(test)]
+            before_create: Mutex::new(None),
         }))
     }
+    #[cfg(test)]
+    pub(super) fn cancel_before_create(&self, cancel: Arc<AtomicBool>) {
+        *self.before_create.lock().expect("before_create hook") = Some(cancel);
+    }
+
+    #[cfg(test)]
+    pub(super) fn io_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.io.lock().expect("io lock")
+    }
+
+    /// Intentionally unbudgeted: Observer callers (`unrepresented`, `stopped`,
+    /// `completed`) have no caller deadline in their public contract; do not
+    /// invent a global deadline. Active open/observe/take paths use the
+    /// bounded [`Lease`] entrypoints instead.
     pub fn records(&self) -> Result<Vec<Record>, Error> {
         let _lock = self.io.lock().map_err(|_| Error::Unavailable)?;
         self.records_unlocked()
@@ -73,9 +101,13 @@ impl Store {
         config: &Config,
         controller: Birth,
         runtime_hash: String,
+        transport_interface: Option<NonZeroU16>,
+        budget: Option<&Budget>,
     ) -> Result<Lease, Error> {
-        let _lock = self.io.lock().map_err(|_| Error::Unavailable)?;
+        let _lock = budget::lock(budget, &self.io)?;
+        budget::check(budget)?;
         let records = self.records_unlocked()?;
+        budget::check(budget)?;
         if records.iter().any(|r| {
             r.reqid == reservation.reqid()
                 || (r.uid == reservation.owner().uid && r.profile == reservation.owner().profile)
@@ -85,6 +117,17 @@ impl Store {
         if records.len() >= 64 {
             return Err(Error::Exhausted);
         }
+        // Deterministic test seam: cancel/expire between the record scan and
+        // the first durable write. Production never arms this hook.
+        #[cfg(test)]
+        if let Some(cancel) = self
+            .before_create
+            .lock()
+            .map_err(|_| Error::Unavailable)?
+            .take()
+        {
+            cancel.store(true, Ordering::Release);
+        }
         let mut selected = None;
         for _ in 0..16 {
             let mut random = [0u8; 16];
@@ -93,6 +136,8 @@ impl Store {
                 return Err(Error::Unavailable);
             }
             let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            // Never start the first durable write after a known cancel/expiry.
+            budget::check(budget)?;
             match Directory::create(self.root.path.join(&id), self.root.owner) {
                 Ok(dir) => {
                     selected = Some((id, dir));
@@ -105,7 +150,11 @@ impl Store {
         let (session, dir) = selected.ok_or(Error::Exhausted)?;
         let mut unstarted = Unstarted(Some(dir));
         let dir = unstarted.0.as_ref().unwrap();
-        let conf = config::render(&dir.path)?;
+        budget::check(budget)?;
+        let conf = match transport_interface {
+            Some(index) => config::render_bound(&dir.path, index)?,
+            None => config::render(&dir.path)?,
+        };
         let owner = reservation.owner();
         let record = Record {
             version: 1,
@@ -121,16 +170,21 @@ impl Store {
             controller,
             runtime_hash,
             configuration_hash: digest(conf.as_bytes()),
+            transport_interface,
             stage: Stage::Prepared,
             child: None,
         };
         record.valid()?;
+        budget::check(budget)?;
         let config_stamp = dir.write_new(CONFIG, conf.as_bytes())?;
+        budget::check(budget)?;
         let record_stamp = dir.write_new(
             CLAIM,
             &serde_json::to_vec(&record).map_err(|_| Error::Invalid)?,
         )?;
+        budget::check(budget)?;
         dir.sync()?;
+        budget::check(budget)?;
         self.root.sync()?;
         Ok(Lease {
             store: self.clone(),
@@ -149,68 +203,6 @@ pub(super) struct Lease {
     config_stamp: Stamp,
     record_stamp: Stamp,
     removed: bool,
-}
-impl Lease {
-    fn validate_unlocked(&self) -> Result<(), Error> {
-        self.store.root.validate()?;
-        let (bytes, stamp) = self.directory.read(CLAIM, MAX)?;
-        if stamp != self.record_stamp
-            || bytes != serde_json::to_vec(&self.record).map_err(|_| Error::Invalid)?
-        {
-            return Err(Error::Changed);
-        }
-        let (conf, stamp) = self.directory.read(CONFIG, MAX)?;
-        if stamp != self.config_stamp || digest(&conf) != self.record.configuration_hash {
-            return Err(Error::Changed);
-        }
-        inventory(&self.directory)
-    }
-    pub fn validate(&self) -> Result<(), Error> {
-        let _lock = self.store.io.lock().map_err(|_| Error::Unavailable)?;
-        self.validate_unlocked()
-    }
-    pub fn stage(&mut self, stage: Stage, child: Option<Birth>) -> Result<(), Error> {
-        let _lock = self.store.io.lock().map_err(|_| Error::Unavailable)?;
-        self.validate_unlocked()?;
-        if !matches!(
-            (self.record.stage, stage),
-            (Stage::Prepared, Stage::Starting | Stage::Stopped)
-                | (Stage::Starting, Stage::Running | Stage::Stopped)
-                | (Stage::Running, Stage::Stopped)
-        ) {
-            return Err(Error::Changed);
-        }
-        let mut next = self.record.clone();
-        next.stage = stage;
-        next.child = child;
-        next.valid()?;
-        let stamp = self.directory.write_new(
-            ".next",
-            &serde_json::to_vec(&next).map_err(|_| Error::Invalid)?,
-        )?;
-        fs::rename(
-            self.directory.path.join(".next"),
-            self.directory.path.join(CLAIM),
-        )
-        .map_err(|_| Error::Unavailable)?;
-        self.record = next;
-        self.record_stamp = stamp;
-        self.directory.sync()
-    }
-    /// The caller is Observer.completed, after native absence and owned exit.
-    pub fn complete(&mut self) -> Result<(), Error> {
-        let _lock = self.store.io.lock().map_err(|_| Error::Unavailable)?;
-        if self.removed {
-            return self.store.root.sync();
-        }
-        self.validate_unlocked()?;
-        if self.record.stage != Stage::Stopped {
-            return Err(Error::Busy);
-        }
-        self.directory.remove_own()?;
-        self.removed = true;
-        self.store.root.sync()
-    }
 }
 fn inventory(dir: &Directory) -> Result<(), Error> {
     for name in dir.inventory()? {

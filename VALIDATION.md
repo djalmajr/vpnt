@@ -2306,3 +2306,61 @@ python3 scripts/macos/check-charon-config.py
 - [NOT RUN, integração final] O produtor vinculado, o backend UTUN de rotas,
   o ledger, o Driver e seu despacho ainda estão em trabalho. O helper continua
   recusando IPsec real; estes testes não provam tráfego ou túnel conectado.
+
+
+### Produtor vinculado à saída, prazos do lease e seleção de SAs
+
+- [PASS, integração local afetada] `prepare_bound` recebe a reserva, o perfil e
+  `IpsecEgress`; constrói o Config e o renderer protegido com índice não zero.
+  O construtor antigo que aceita Config arbitrário fica somente em cfg(test).
+  Spawn e abertura revalidam a saída original sem DNS ou fallback. O record
+  persiste o índice como metadado e não permite adoção de processo recuperado.
+- [PASS, prazo e cancelamento em fixtures nativos] O mesmo deadline/cancel passa
+  por admissão, mapa ativo, mutex do produtor, preparação da store e validação
+  e estágio do lease. O estágio confere o prazo antes da escrita. O teste com
+  kqueue observa que cancelamento antes do primeiro create não produz escrita
+  transitória, mesmo com unwind; outros testes seguram os locks por dois segundos
+  e exigem retorno antecipado. Falha anterior à tentativa permite retry com novo
+  orçamento; o retry alcança o VICI do filho C original. Falha após spawn mantém
+  o handle original e a tentativa terminal. O lease compartilha o corpo de stage
+  com um prewrite; essa extração é semanticamente equivalente, não byte a byte.
+- [PASS, limites explícitos] Teardown/completed e Observer de metadados não
+  recebem deadline de conexão e conservam suas operações sem esse orçamento.
+  Chamadas síncronas de filesystem/SDK não são interrompíveis; os limites
+  comprovados são os checkpoints e as esperas cooperativas. Não há promessa de
+  interromper um fsync ou consulta ao kernel que já começou.
+- [PASS, seleção de metadados] `Config::select` ignora candidatos inativos,
+  recusa sobreposição ativa incompatível e escolhe o maior child ID entre os
+  compatíveis. `route_networks` revalida o candidato e exige cobertura completa
+  pela união dos seletores remotos, inclusive IPv6 até u128::MAX. Em full tunnel,
+  família completamente ausente fica para o sink existente; cobertura parcial
+  de uma família anunciada é erro. A seleção não concede autoridade de rota.
+- [PASS, executado pelo integrador] Fmt, clippy de todos os targets/features com
+  `-D warnings` e 93 testes IPsec passaram. Os 32 mutantes do produtor, build e
+  pacote local também passaram. O receipt inicial é
+  `output/fixtures/lease-selection-scope-receipt.json`; a conclusão fica em
+  `output/fixtures/lease-selection-scope-r1-receipt.json`. Entre os dois mudou
+  somente o checker: os mutantes de cancelamento e prazo passaram a alterar
+  tanto o guard do filho quanto o guard adicional do lease. Remover só o guard
+  antigo sobreviveu por proteção redundante; essa execução foi preservada em
+  `output/fixtures/lease-selection-producer-original-survivor`, sem contar kill.
+- [PASS, evidência fornecida e revisão] As cópias dos workers registram 43 testes
+  do produtor, 13 de seleção, sete mutantes de budget, três de lease e seis de
+  seleção mortos por assertions, com restauração verde. O integrador executou
+  os 93 testes e o gate de 32 mutantes; as contagens dos workers permanecem
+  identificadas como evidência fornecida. As revisões independentes aprovaram
+  a cadeia de budget e a seleção. A proveniência anterior à extração é
+  registrada no receipt bound-producer-integration-r1; hashes da main posterior
+  incluem a extração e a formatação. Os três anchors movidos acompanham Lease.
+- [PASS, pacote e reutilização] `target/vpnt-ipsec-scope-checkpoint.app` é pacote
+  local do host, sem instalação. Runtime de seis patches e UI/design permanecem
+  iguais. As suítes completas anteriores passaram com 387 desktop e 371 core,
+  dois ignorados em cada; não foram reexecutadas após lease7/selection3. A falha
+  inicial de teto de tempo do fixture PF_KEY foi preservada, seguida de um teste
+  isolado verde e da suíte core verde na mesma fonte anterior.
+- [NOT RUN, produto real] Ainda faltam integrar o ledger, Driver, sonda e backend
+  de rotas ao despacho. O helper continua recusando IPsec real. charon/UTUN,
+  BYPASS efetivo, VIP/RTM_ADD reais, remoção após último FD, conexão, tráfego,
+  coexistência, instalação privilegiada e CI remoto não são provados por este
+  escopo. Os testes usam filho C comum, sockets locais e consultas de saída sem
+  envio de datagramas; nenhum perfil ou túnel pessoal foi alterado.

@@ -1,6 +1,6 @@
 //! Native producer admission. Still not dispatched by the application. Kernel
 //! and VIP/route observers must supply complete absence before finalization.
-use super::{Config, Error, Observer, Peer, Registry, Reservation};
+use super::{Error, Observer, Peer};
 pub use crate::connection::macos::utun_observer::{InterfaceObservation, RetainedInterface};
 use crate::{
     connection::{
@@ -9,11 +9,13 @@ use crate::{
     },
     helper::{controller_lock::ControllerLock, runtime::Runtime, vici::Client},
 };
+use bound::budget::{self, Budget};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, Weak, atomic::AtomicBool},
     time::Instant,
 };
+mod bound;
 mod child;
 mod config;
 mod files;
@@ -74,35 +76,6 @@ impl<'a> NativeContext<'a> {
         }
         self.runtime.verify().map_err(|_| Error::Changed)?;
         self.store.root.validate()
-    }
-    pub fn prepare<N: Observer>(
-        self: &Arc<Self>,
-        registry: &Registry<N>,
-        reservation: &Reservation,
-        configuration: &Config,
-    ) -> Result<NativePeer<'a>, Error> {
-        let _lock = self.admission.lock().map_err(|_| Error::Unavailable)?;
-        registry.validate(reservation)?;
-        if !configuration.matches(reservation) {
-            return Err(Error::Changed);
-        }
-        self.validate()?;
-        let hash = self
-            .runtime
-            .file_hashes()
-            .get("bin/charon")
-            .ok_or(Error::Changed)?
-            .clone();
-        let lease =
-            self.store
-                .prepare(reservation, configuration, (&self.identity).into(), hash)?;
-        let session = lease.record.session.clone();
-        let producer = Arc::new(Mutex::new(child::Producer::new(self.clone(), lease)));
-        self.active
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .insert(session, Arc::downgrade(&producer));
-        Ok(NativePeer { producer })
     }
     pub fn observer<K: KernelClaims>(self: &Arc<Self>, kernel: K) -> NativeObserver<'a, K> {
         NativeObserver {
@@ -270,10 +243,9 @@ impl Peer for NativePeer<'_> {
         expires: Instant,
         cancel: Arc<AtomicBool>,
     ) -> Result<Client, Error> {
-        self.producer
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .open(owner, expires, cancel)
+        let budget = Budget::new(expires, cancel.clone());
+        let mut producer = budget::lock(Some(&budget), &self.producer)?;
+        producer.open(owner, expires, cancel)
     }
     fn retire(&mut self, owner: &Owner) -> Result<bool, Error> {
         let mut p = self.producer.lock().map_err(|_| Error::Unavailable)?;

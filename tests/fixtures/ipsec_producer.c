@@ -22,6 +22,13 @@ static void read_file(const char *path,char *out,size_t cap) {
     FILE *file=fopen(path,"rb");demand(file!=NULL);
     size_t n=fread(out,1,cap-1,file);demand(!ferror(file) && feof(file));out[n]=0;fclose(file);
 }
+static int json_int(const char *json,const char *key,int fallback) {
+    char pattern[96];snprintf(pattern,sizeof(pattern),"\"%s\":",key);
+    const char *start=strstr(json,pattern);if(!start)return fallback;
+    start+=strlen(pattern);while(*start==' ')start++;
+    if(*start<'0' || *start>'9')return fallback;
+    return atoi(start);
+}
 static void setting(const char *config,const char *key,char *out,size_t cap) {
     const char *start=strstr(config,key);demand(start!=NULL);start+=strlen(key);
     const char *end=strchr(start,'"');demand(end!=NULL && (size_t)(end-start)<cap);
@@ -110,6 +117,13 @@ int main(int argc,char **argv) {
     struct stat st;demand(lstat(directory,&st)==0 && S_ISDIR(st.st_mode) && (st.st_mode&07777)==0700);
     snprintf(record,sizeof(record),"%s/claim.json",directory);read_file(record,claim,sizeof(claim));
     char binding[96];snprintf(binding,sizeof(binding),"\"controller\":{\"pid\":%d,",getppid());demand(strstr(claim,binding));
+    int transport=json_int(claim,"transport_interface",0);
+    if(transport>0) {
+        char marker[64];snprintf(marker,sizeof(marker),"vpnt_ifindex = %d",transport);
+        demand(strstr(config,"socket-default {") && strstr(config,"vpnt_protect_transport = yes") && strstr(config,marker));
+    } else {
+        demand(!strstr(config,"vpnt_protect_transport = yes"));
+    }
     if(strstr(claim,"\"stage\":\"starting\"")) {demand(strstr(claim,"\"child\":null"));}
     else {snprintf(binding,sizeof(binding),"\"child\":{\"pid\":%d,",getpid());demand(strstr(claim,"\"stage\":\"running\"") && strstr(claim,binding));}
     setting(config,"socket = \"unix://",socket_path,sizeof(socket_path));

@@ -109,13 +109,43 @@ impl<'a> Producer<'a> {
         if self.lease.record.owner() != *owner || self.retired || self.released || !self.attempted {
             return Err(Error::Changed);
         }
-        self.current()?;
+        self.current(expires, cancel)?;
         let descriptor = self.descriptor.take().ok_or(Error::Changed)?;
         let observation = self.observe_child(expires, cancel)?;
-        self.current()?;
+        self.current(expires, cancel)?;
         let retained = RetainedInterface::admit(descriptor, observation, expires, cancel)
             .map_err(map_observe)?;
-        self.current()?;
+        self.current(expires, cancel)?;
         Ok(retained)
+    }
+    #[cfg(test)]
+    pub(in crate::connection::ipsec::producer) fn invalidate_binding(&mut self) {
+        if let Some(binding) = self.binding.as_mut() {
+            binding.invalidate_for_test();
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::connection::ipsec::producer) fn fail_next_binding(&mut self, error: Error) {
+        if let Some(binding) = self.binding.as_ref() {
+            binding.fail_next_validation(error);
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::connection::ipsec::producer) fn child_exited(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_none_or(|c| c.poll().unwrap().is_some())
+    }
+    #[cfg(test)]
+    pub(in crate::connection::ipsec::producer) fn cached_fd(&self) -> Option<i32> {
+        self.descriptor
+            .as_ref()
+            .map(|descriptor| descriptor.raw_fd())
+    }
+    #[cfg(test)]
+    pub(in crate::connection::ipsec::producer) fn status(
+        &mut self,
+    ) -> Option<std::process::ExitStatus> {
+        self.child.as_mut().and_then(|c| c.poll().unwrap())
     }
 }

@@ -1,6 +1,7 @@
 use super::{Error, Owner};
 use crate::connection::macos::process::Identity;
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU16;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +48,10 @@ pub(super) struct Record {
     pub controller: Birth,
     pub runtime_hash: String,
     pub configuration_hash: String,
+    /// Opaque captured egress index for a protected attempt; absent in legacy
+    /// records and for the test-only unbound wrapper.
+    #[serde(default)]
+    pub transport_interface: Option<NonZeroU16>,
     pub stage: Stage,
     pub child: Option<Birth>,
 }

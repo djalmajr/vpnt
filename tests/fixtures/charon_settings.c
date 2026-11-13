@@ -2,10 +2,11 @@
 #include <library.h>
 #include <settings/settings.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define demand(yes) do { if (!(yes)) { fprintf(stderr, "settings assertion: line %d\n", __LINE__); return 1; } } while (0)
 int main(int argc, char **argv) {
-    demand(argc == 3);
+    demand(argc == 3 || argc == 4);
     demand(library_init(argv[1], "vpnt-settings-fixture"));
     settings_t *settings = settings_create(NULL);
     demand(settings != NULL && settings->load_files(settings, argv[1], FALSE));
@@ -17,6 +18,18 @@ int main(int argc, char **argv) {
     demand(settings->get_bool(settings, "charon.vpnt_parent_eof", FALSE));
     demand(settings->get_bool(settings,
         "charon.plugins.kernel-libipsec.vpnt_retain_utun", FALSE));
+    if (argc == 4) {
+        int expected_index = atoi(argv[3]);
+        demand(settings->get_bool(settings,
+            "charon.plugins.socket-default.vpnt_protect_transport", FALSE));
+        demand(settings->get_int(settings,
+            "charon.plugins.socket-default.vpnt_ifindex", -1) == expected_index);
+    } else {
+        demand(!settings->get_bool(settings,
+            "charon.plugins.socket-default.vpnt_protect_transport", FALSE));
+        demand(settings->get_int(settings,
+            "charon.plugins.socket-default.vpnt_ifindex", -1) == -1);
+    }
     char expected[1024];
     snprintf(expected, sizeof(expected), "%s/pid", argv[2]);
     demand(strcmp(settings->get_str(settings, "charon.vpnt_pid_file", "missing"), expected) == 0);

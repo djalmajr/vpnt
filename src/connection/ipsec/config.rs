@@ -6,6 +6,8 @@ use crate::{
     secrets::Credentials,
 };
 use std::{collections::BTreeSet, fmt::Write, net::IpAddr, time::Duration};
+
+mod selection;
 /// Request metadata only. Every transport operation must revalidate its
 /// reservation; a built config is neither a live lease nor tunnel evidence.
 pub struct Config {

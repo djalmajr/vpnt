@@ -378,8 +378,8 @@ Antes de enviar configuração ou credencial, o controle VICI exige a lista
 efetiva de plugins e recusa backend ausente, PF_KEY, duplicatas ou listas
 malformadas. `UserspaceObserver` separa a ocupação anterior ao initiate da
 ausência completa necessária ao release. Ele exige um ledger completo do
-domínio IPsec; o ledger real, o driver de VIP/rotas e a habilitação da proteção
-do transporte ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
+domínio IPsec; o ledger real, o Driver de VIP/rotas e o despacho pela aplicação
+ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
 não recebe uma implementação vazia para simular sucesso.
 
 O sexto patch acrescenta proteção opcional aos sockets UDP do charon: vincula
@@ -388,14 +388,19 @@ antes do bind, recusando qualquer falha. O gate permanente
 `python3 scripts/macos/check-protected-udp.py` compila a unidade original inteira
 e intercepta as chamadas de política para conferir o ABI e as falhas. Isso não
 prova a eficácia da política no kernel. A opção permanece desligada por padrão;
-a configuração do produtor ainda precisa consumir a seleção de saída validada.
+o caminho produtivo preparado exige a seleção de saída validada e habilita a
+proteção somente para o índice capturado.
 
 A seleção de saída IPsec já possui um tipo não serializável que captura a
 interface existente, o endereço de origem e a rota específica do gateway.
 A revalidação consulta o escopo da interface capturada, sem refazer DNS nem
 seguir as novas rotas globais do túnel. O seletor nativo usa UDP somente para
-consultar a origem, sem enviar datagramas. Esse tipo guarda metadados; ainda
-precisa ser ligado ao produtor protegido e não concede autoridade de rota.
+consultar a origem, sem enviar datagramas. `prepare_bound` constrói a configuração
+a partir desse tipo e da reserva, sem aceitar endpoints ou configuração
+arbitrários. O spawn e cada abertura revalidam a saída original, sem fallback.
+As esperas pelos mutexes de admissão, produtor e lease respeitam o mesmo prazo e
+cancelamento; syscalls já em voo não são interrompíveis. A seleção continua sem
+conceder autoridade de rota.
 
 A preparação de VIPs já consome a interface retida, preserva o pin e registra
 toda a intenção de endereço em caso de falha parcial. Antes de cada atribuição,
@@ -404,6 +409,12 @@ verifica endereços, flags e cópias em interfaces estrangeiras. O adaptador exi
 UID real e efetivo de root antes de tentar o ioctl. O Driver ainda precisa
 vincular essa operação à admissão e ao produtor corretos; a prova positiva no
 utun real continua pendente.
+
+A seleção de SAs admite sobreposição de rekey somente quando os candidatos
+ativos concordam nos endpoints, VIPs e seletores, escolhendo o maior child ID.
+O plano exige cobertura completa das redes solicitadas pelos seletores
+negociados; cobertura parcial é recusada. Isso é política de metadados, sem
+prova de posse, tráfego ou túnel conectado.
 
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de

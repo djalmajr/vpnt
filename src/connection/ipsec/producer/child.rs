@@ -1,3 +1,4 @@
+use super::bound::{map_budget, map_check, map_handoff, map_observe};
 use super::*;
 use crate::{
     connection::macos::utun_observer::{self, InterfaceObservation},
@@ -16,15 +17,24 @@ pub(super) struct Producer<'a> {
     pub released: bool,
     failure: Option<Error>,
     socket: Option<files::Stamp>,
+    binding: Option<bound::Binding>,
     /// Unadmitted descriptor from the child's single handoff. Private: it
     /// carries no type, route or cleanup authority until it is admitted.
     descriptor: Option<charon_channel::Descriptor>,
+    /// Test-only pause immediately before the Starting stage write.
+    #[cfg(test)]
+    stage_pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 impl<'a> Producer<'a> {
-    pub fn new(context: Arc<NativeContext<'a>>, lease: state::Lease) -> Self {
+    pub fn new(
+        context: Arc<NativeContext<'a>>,
+        lease: state::Lease,
+        binding: Option<bound::Binding>,
+    ) -> Self {
         Self {
             context,
             lease,
+            binding,
             child: None,
             identity: None,
             attempted: false,
@@ -33,6 +43,8 @@ impl<'a> Producer<'a> {
             failure: None,
             socket: None,
             descriptor: None,
+            #[cfg(test)]
+            stage_pause: None,
         }
     }
     fn call(expires: Instant, cancel: &AtomicBool) -> Result<(), Error> {
@@ -45,16 +57,28 @@ impl<'a> Producer<'a> {
         Ok(())
     }
     fn spawn(&mut self, expires: Instant, cancel: &Arc<AtomicBool>) -> Result<(), Error> {
+        if let Some(binding) = self.binding.as_ref() {
+            binding.validate(expires, cancel)?;
+        }
+        // Bounded, read-only revalidation before the attempt is marked: a
+        // caller deadline/cancel while the lease io is held leaves the attempt
+        // open and retryable. Once `attempted` is set, failures latch.
+        self.lease.validate_bounded(expires, cancel)?;
         self.attempted = true;
         self.context.validate()?;
-        self.lease.validate()?;
         for name in ["v", "pid"] {
             match fs::symlink_metadata(self.lease.directory.path.join(name)) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 _ => return Err(Error::Changed),
             }
         }
-        self.lease.stage(record::Stage::Starting, None)?;
+        #[cfg(test)]
+        if let Some((ready, release)) = self.stage_pause.take() {
+            let _ = ready.send(());
+            let _ = release.recv_timeout(Duration::from_secs(2));
+        }
+        self.lease
+            .stage_bounded(record::Stage::Starting, None, expires, cancel)?;
         Self::call(expires, cancel)?;
         let mut command = Command::new(self.context.runtime.program(Program::Charon));
         for group in [
@@ -83,8 +107,12 @@ impl<'a> Producer<'a> {
             return Err(Error::Changed);
         }
         self.identity = Some(process.identity.clone());
-        self.lease
-            .stage(record::Stage::Running, Some((&process.identity).into()))?;
+        self.lease.stage_bounded(
+            record::Stage::Running,
+            Some((&process.identity).into()),
+            expires,
+            cancel,
+        )?;
         // The durable birth is recorded before the handoff, so a canceled or
         // failed reception still leaves the exact original child owned and
         // reapable; the attempt itself is terminal either way.
@@ -95,9 +123,9 @@ impl<'a> Producer<'a> {
         self.descriptor = Some(descriptor);
         Ok(())
     }
-    fn current(&mut self) -> Result<(), Error> {
+    fn current(&mut self, expires: Instant, cancel: &AtomicBool) -> Result<(), Error> {
         self.context.validate()?;
-        self.lease.validate()?;
+        self.lease.validate_bounded(expires, cancel)?;
         let child = self.child.as_mut().ok_or(Error::Unavailable)?;
         if child.poll().map_err(|_| Error::Unavailable)?.is_some() {
             return Err(Error::Unavailable);
@@ -125,7 +153,7 @@ impl<'a> Producer<'a> {
         if self.lease.record.owner() != *owner || self.retired || self.released || !self.attempted {
             return Err(Error::Changed);
         }
-        self.current()?;
+        self.current(expires, cancel)?;
         self.observe_child(expires, cancel)
     }
     fn observe_child(
@@ -161,14 +189,23 @@ impl<'a> Producer<'a> {
         if !self.attempted
             && let Err(e) = self.spawn(expires, &cancel)
         {
-            // Every spawn/handoff error is latched: the receiver is consumed,
-            // so a fresh retry must never reach VICI without the capability.
-            self.failure = Some(e);
+            // A pre-attempt binding/cancel/timeout error leaves the attempt
+            // open. Once `attempted` is set (starting/handoff included), the
+            // receiver is consumed and every failure stays latched.
+            if self.attempted {
+                self.failure = Some(e);
+            }
             return Err(e);
         }
         loop {
             Self::call(expires, &cancel)?;
-            self.current()?;
+            self.current(expires, &cancel)?;
+            if let Some(binding) = self.binding.as_ref()
+                && let Err(error) = binding.validate(expires, &cancel)
+            {
+                self.failure = Some(error);
+                return Err(error);
+            }
             let path = self.lease.directory.path.join("v");
             match socket::stamp(&path, self.context.runtime.owner()) {
                 Err(Error::Unavailable) => {
@@ -190,7 +227,13 @@ impl<'a> Producer<'a> {
                     if socket::stamp(&path, self.context.runtime.owner())? != stamp {
                         return Err(Error::Changed);
                     }
-                    self.current()?;
+                    self.current(expires, &cancel)?;
+                    if let Some(binding) = self.binding.as_ref()
+                        && let Err(error) = binding.validate(expires, &cancel)
+                    {
+                        self.failure = Some(error);
+                        return Err(error);
+                    }
                     Self::call(expires, &cancel)?;
                     self.socket = Some(stamp);
                     return Ok(client);
@@ -202,20 +245,12 @@ impl<'a> Producer<'a> {
         self.retired && self.lease.record.stage == record::Stage::Stopped
     }
     #[cfg(test)]
-    pub(super) fn child_exited(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .is_none_or(|c| c.poll().unwrap().is_some())
-    }
-    #[cfg(test)]
-    pub(super) fn cached_fd(&self) -> Option<i32> {
-        self.descriptor
-            .as_ref()
-            .map(|descriptor| descriptor.raw_fd())
-    }
-    #[cfg(test)]
-    pub(super) fn status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.as_mut().and_then(|c| c.poll().unwrap())
+    pub(super) fn pause_before_stage(
+        &mut self,
+        ready: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.stage_pause = Some((ready, release));
     }
     pub fn retire(&mut self) -> Result<bool, Error> {
         if self.released {
@@ -244,43 +279,5 @@ impl<'a> Producer<'a> {
 impl Drop for Producer<'_> {
     fn drop(&mut self) {
         let _ = self.retire();
-    }
-}
-
-fn map_budget(error: std::io::Error) -> Error {
-    match error.kind() {
-        std::io::ErrorKind::TimedOut => Error::Timeout,
-        std::io::ErrorKind::ConnectionAborted => Error::Canceled,
-        _ => Error::Unavailable,
-    }
-}
-
-fn map_handoff(error: std::io::Error) -> Error {
-    match error.kind() {
-        std::io::ErrorKind::TimedOut => Error::Timeout,
-        std::io::ErrorKind::ConnectionAborted => Error::Canceled,
-        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => Error::Changed,
-        _ => Error::Unavailable,
-    }
-}
-
-fn map_check(error: utun_observer::Error) -> Error {
-    match error {
-        utun_observer::Error::Canceled => Error::Canceled,
-        utun_observer::Error::Timeout => Error::Timeout,
-        _ => Error::Unavailable,
-    }
-}
-
-fn map_observe(error: utun_observer::Error) -> Error {
-    match error {
-        utun_observer::Error::NotFound => Error::Unavailable,
-        utun_observer::Error::Ambiguous | utun_observer::Error::Changed => Error::Changed,
-        utun_observer::Error::Canceled => Error::Canceled,
-        utun_observer::Error::Timeout => Error::Timeout,
-        utun_observer::Error::Unavailable => Error::Unavailable,
-        utun_observer::Error::Exhausted => Error::Exhausted,
-        utun_observer::Error::Permission => Error::PermissionDenied,
-        utun_observer::Error::Invalid => Error::Invalid,
     }
 }

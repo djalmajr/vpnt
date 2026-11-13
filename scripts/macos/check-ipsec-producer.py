@@ -67,20 +67,20 @@ def main():
 '''
     mutations = [
         ('root-admission-omitted', context, lambda s: replace(s, 'if unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {', 'if false {'), lifecycle),
-        ('config-binding-omitted', context, lambda s: replace(s, '!configuration.matches(reservation)', 'false'), binding),
-        ('reservation-authority-omitted', context, lambda s: replace(s, '        registry.validate(reservation)?;\n', ''), binding),
+        ('config-binding-omitted', 'src/connection/ipsec/producer/bound.rs', lambda s: replace(s, '!configuration.matches(reservation)', 'false'), binding),
+        ('reservation-authority-omitted', 'src/connection/ipsec/producer/bound.rs', lambda s: replace(s, '        registry.validate(reservation)?;\n', ''), binding),
         ('durable-reqid-collision-ignored', state, lambda s: replace(s, 'r.reqid == reservation.reqid()', 'false'), binding),
         ('durable-profile-collision-ignored', state, lambda s: replace(s, '(r.uid == reservation.owner().uid && r.profile == reservation.owner().profile)', 'false'), dormant),
         ('dormant-reqid-forgotten', context, lambda s: replace(s, 'ids.extend(self.context.unrepresented()?);', 'let _ = self.context.unrepresented()?;'), dormant),
         ('drop-deletes-uncertain-claim', child, lambda s: replace(s, '        let _ = self.retire();', '        let _ = self.retire(); let _ = self.lease.complete();'), dormant),
-        ('configuration-digest-unchecked', state, lambda s: replace(s, ' || digest(&conf) != self.record.configuration_hash', ''), altered),
-        ('configuration-inode-unchecked', state, lambda s: replace(s, 'stamp != self.config_stamp || ', ''), altered),
+        ('configuration-digest-unchecked', 'src/connection/ipsec/producer/state/lease.rs', lambda s: replace(s, ' || digest(&conf) != self.record.configuration_hash', ''), altered),
+        ('configuration-inode-unchecked', 'src/connection/ipsec/producer/state/lease.rs', lambda s: replace(s, 'stamp != self.config_stamp || ', ''), altered),
         ('configuration-readable-by-others', files, lambda s: replace(s, '|| meta.mode() & 0o7777 != 0o600', '|| false'), altered),
         ('socket-peer-pid-unchecked', 'src/connection/ipsec/producer/socket.rs', lambda s: replace(s, '        || peer as u32 != pid\n', ''), foreign),
         ('foreign-owner-can-retire', context, lambda s: replace(s, 'p.lease.record.owner() != *owner', 'false'), lifecycle),
         ('owned-child-not-retired', child, lambda s: replace(s, stop, ''), lifecycle),
         ('admission-failure-skips-owned-retirement', child, lambda s: replace(s, '        // Stop only our unreaped Child,', '        self.context.validate()?; self.lease.validate()?;\n        // Stop only our unreaped Child,'), altered),
-        ('persistent-phase-reentered', state, lambda s: replace(s, phase_guard, ''), phases),
+        ('persistent-phase-reentered', 'src/connection/ipsec/producer/state/lease.rs', lambda s: replace(s, phase_guard, ''), phases),
         ('completed-claim-retained', context, lambda s: replace(s, '        p.lease.complete()?;\n', ''), lifecycle),
         ('completed-producer-retained', context, lambda s: replace(s, prune, ''), lifecycle),
         ('durable-completion-omitted', registry, lambda s: replace(s, callback, ''), completion),
@@ -99,10 +99,27 @@ def main():
         ('charon-automatic-routes', config, lambda s: replace(s, 'install_routes = no', 'install_routes = yes'), lifecycle),
         ('charon-automatic-virtual-ip', config, lambda s: replace(s, 'install_virtual_ip = no', 'install_virtual_ip = yes'), lifecycle),
     ]
+    # Lease revalidation repeats the same budget guard during the socket wait.
+    # Remove/extend both layers in these logical mutants; changing only the
+    # child guard is now equivalent because the lease still stops the call.
+    budget = 'src/connection/ipsec/producer/bound/budget.rs'
+    extra_guards = {
+        'producer-cancellation-ignored': [
+            (budget, lambda s: replace(s, 'if cancel.load(Ordering::Acquire) {', 'if false {')),
+        ],
+        'producer-deadline-extended': [
+            (budget, lambda s: replace(s, 'Instant::now() >= expires', 'Instant::now() >= expires + Duration::from_secs(1)')),
+        ],
+    }
+
+    def changes(label, file, mutate):
+        return [(file, mutate), *extra_guards.get(label, [])]
+
     for label, file, mutate, _ in mutations:
-        source = (ROOT / file).read_text()
-        if mutate(source) == source:
-            raise RuntimeError(f'{label}: unchanged mutation')
+        for path, change in changes(label, file, mutate):
+            source = (ROOT / path).read_text()
+            if change(source) == source:
+                raise RuntimeError(f'{label}: unchanged mutation in {path}')
     inputs = [p for folder in ['src', 'tests'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()]
     inputs += [Path(__file__), Path(__file__).with_name('check-broker.py'), ROOT / 'Cargo.toml', ROOT / 'Cargo.lock']
     inputs += build_inputs.source_files(ROOT)
@@ -127,13 +144,16 @@ def main():
             # Green control for the parent-pipe test before any mutant.
             receipt['baseline-parent-pipe'] = base.run(copy, 'baseline-parent-pipe', parent_pipe)
             for label, file, mutate, expected in mutations:
-                target = copy / file
-                original = target.read_text()
+                group = changes(label, file, mutate)
+                originals = {path: (copy / path).read_text() for path, _ in group}
                 try:
-                    target.write_text(mutate(original))
+                    for path, change in group:
+                        (copy / path).write_text(change(originals[path]))
                     receipt[label] = base.run(copy, label, expected, expected)
+                    receipt[label]['mutatedFiles'] = list(originals)
                 finally:
-                    target.write_text(original)
+                    for path, original in originals.items():
+                        (copy / path).write_text(original)
             receipt['restored'] = base.run(copy, 'restored', 'connection::ipsec::')
             receipt['restored-parent-pipe'] = base.run(copy, 'restored-parent-pipe', parent_pipe)
     finally:
