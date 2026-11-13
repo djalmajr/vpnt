@@ -15,3 +15,4 @@ mod tcp;
 pub(crate) mod utun_observer;
 pub(crate) mod utun_socket;
 pub use interfaces::Interfaces;
+pub mod vip;

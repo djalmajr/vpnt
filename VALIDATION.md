@@ -2266,3 +2266,43 @@ python3 scripts/macos/check-charon-config.py
   produtor/Driver; não há autorização de rota, tráfego de túnel ou Connected
   decorrente desse token. VIP/rotas, ledger, despacho, políticas reais, instalação,
   coexistência e CI remoto continuam pendentes.
+
+### Preparação de VIP no utun retido
+
+- [PASS, lógica compartilhada em fixture] `ConfiguredUtun` consome a referência
+  retida, preserva a intenção completa e a devolve com o pin em falha parcial.
+  Antes de cada alias, a lógica lê uma snapshot nova, verifica nome/índice/flags,
+  exige ausência dos VIPs ainda não escritos e confere os já atribuídos somente
+  na interface própria. Endereço estrangeiro observado impede a próxima escrita.
+  A verificação após cada escrita e na saúde recusa flags baixas, endereço ausente
+  ou duplicado em interface estrangeira. A exclusão não é atômica: enumeração
+  seguida de ioctl não impede uma atribuição concorrente externa entre os passos.
+- [PASS, recusa nativa sem privilégio] O adaptador exige UID real e efetivo zero
+  antes do encoder, socket ou ioctl. O teste ordinário com nome contendo NUL
+  recebe PermissionDenied; o mutante sem o guard falha por InvalidInput ainda
+  no encoder, antes de qualquer socket/ioctl. Não houve atribuição real de VIP.
+- [PASS, consumidor SDK] O fixture C independente confere os comandos de ioctl,
+  tamanhos e campos dos aliases IPv4 /32 e IPv6 /128 produzidos pelo encoder
+  existente. Ele recebe bytes por stdin e não chama socket ou ioctl. O encoder
+  e o comportamento de OwnedSink permaneceram iguais, com mudança de visibilidade.
+- [PASS, escopo afetado] Quatorze testes VIP e seis do sink passaram. Fmt, clippy
+  de todos os targets/features com `-D warnings`, build e pacote local também
+  passaram. O lint inicial pediu apenas parênteses no helper de flags; a expressão
+  equivalente foi corrigida e os 14 testes foram executados na fonte final.
+  `output/fixtures/vip-scope-receipt.json` registra 386 insumos estáveis, quatro
+  passos finais e os dois checks já executados no mesmo código (clippy/VIP).
+  A revisão independente fechou as colisões por alias, a verificação das flags,
+  o guard de UID e a mudança mecânica do helper.
+- [PASS, pacote e reutilização] O host local é
+  `target/vpnt-vip-checkpoint.app`, sem componente instalado. Runtime de seis
+  patches, UI/design (33 hashes), egress, produtor/controle, parser e gates C
+  conservaram seus insumos. As últimas suítes completas permanecem 353 desktop
+  e 337 core, com dois ignorados em cada; não foram reexecutadas nesta etapa.
+- [NOT RUN, caminho privilegiado] O construtor com RetainedInterface real,
+  a atribuição efetiva de VIP, seus efeitos no kernel, a remoção após o último
+  FD e a coexistência continuam sem execução. O retorno do pin/intenção foi
+  revisado pelo tipo; os testes usam o mesmo núcleo lógico com snapshots e
+  escritas capturadas, sem fabricar uma referência retida de produção.
+- [NOT RUN, integração final] O produtor vinculado, o backend UTUN de rotas,
+  o ledger, o Driver e seu despacho ainda estão em trabalho. O helper continua
+  recusando IPsec real; estes testes não provam tráfego ou túnel conectado.

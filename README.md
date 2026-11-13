@@ -397,6 +397,14 @@ seguir as novas rotas globais do túnel. O seletor nativo usa UDP somente para
 consultar a origem, sem enviar datagramas. Esse tipo guarda metadados; ainda
 precisa ser ligado ao produtor protegido e não concede autoridade de rota.
 
+A preparação de VIPs já consome a interface retida, preserva o pin e registra
+toda a intenção de endereço em caso de falha parcial. Antes de cada atribuição,
+ela recusa endereços existentes e confere novamente a interface; depois,
+verifica endereços, flags e cópias em interfaces estrangeiras. O adaptador exige
+UID real e efetivo de root antes de tentar o ioctl. O Driver ainda precisa
+vincular essa operação à admissão e ao produtor corretos; a prova positiva no
+utun real continua pendente.
+
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,

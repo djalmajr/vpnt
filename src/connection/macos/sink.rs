@@ -1,11 +1,14 @@
 //! A new, FD-owned UTUN for blackhole routes, never an existing interface.
 //! Both packet directions are disabled before assigning a private host address.
 mod native;
+// Crate-private reuse of the existing SDK-exact alias encoder and ioctl codes;
+// the encoder bytes and OwnedSink behaviour are unchanged.
 use super::{Interfaces, routing::Snapshot};
 use crate::{
     connection::routes::{Error, Network},
     helper::controller_lock::ControllerLock,
 };
+pub(crate) use native::{ALIAS4, ALIAS6, alias};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},

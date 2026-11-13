@@ -5,8 +5,8 @@ pub(super) struct Native;
 const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const OPT_FLAGS: i32 = 1;
 const OPT_NAME: i32 = 2;
-pub(super) const ALIAS4: libc::c_ulong = 0x8040_691a;
-pub(super) const ALIAS6: libc::c_ulong = 0x8080_691a;
+pub(crate) const ALIAS4: libc::c_ulong = 0x8040_691a;
+pub(crate) const ALIAS6: libc::c_ulong = 0x8080_691a;
 
 fn socket(family: i32, protocol: i32) -> io::Result<OwnedFd> {
     // SAFETY: no memory arguments; transfer a new descriptor into one owner.
@@ -167,7 +167,7 @@ impl Api for Native {
         bytes
     }
 }
-pub(super) fn alias(name: &str, source: IpAddr) -> io::Result<Vec<u8>> {
+pub(crate) fn alias(name: &str, source: IpAddr) -> io::Result<Vec<u8>> {
     if name.len() >= libc::IFNAMSIZ || !name.is_ascii() || name.as_bytes().contains(&0) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
