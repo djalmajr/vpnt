@@ -21,13 +21,16 @@ pub(super) fn assign<A: Api, F: FnMut() -> Result<(), Error>>(
         current()?;
         check(expires, cancel)?;
         let snapshot = api.interfaces().map_err(|_| Error::Unavailable)?;
+        check(expires, cancel)?;
         preflight_next(&snapshot, target, &vips[..index], &vips[index..])?;
         check(expires, cancel)?;
         current()?;
+        check(expires, cancel)?;
         api.assign(&target.name, vip)
             .map_err(|_| Error::Unavailable)?;
         check(expires, cancel)?;
         let after = api.interfaces().map_err(|_| Error::Unavailable)?;
+        check(expires, cancel)?;
         verify(&after, target, &vips[..=index])?;
     }
     Ok(())

@@ -4,10 +4,12 @@ mod add_codec;
 mod backend;
 mod codec;
 mod read;
+mod resource_fence;
 mod write;
 use crate::connection::routes::{Address, Error, Key, Network, NextHop, Route};
 pub use backend::{InterfaceToken, NativeBackend, NativeReceipt};
 pub use read::{Reader, Snapshot};
+pub use resource_fence::{ResourceFence, RouteWork};
 pub use write::{AddReceipt, AddWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

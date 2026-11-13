@@ -30,7 +30,7 @@ O gate de classes ainda não tem classes proibidas configuradas; sua execução
 não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
 variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
-O checkpoint integrado final (`5222128`) passou fmt, clippy com `-D warnings`, build,
+O checkpoint integrado histórico (`5222128`) passou fmt, clippy com `-D warnings`, build,
 308 testes desktop e 292 core (dois ignored por suíte) e a matriz de 42
 mutações do codec PF_KEY. Na UI, lint, typecheck, oito testes (114 assertions),
 build e 81 tokens passaram; o gate de classes segue sem regras. O recibo em
@@ -2497,3 +2497,82 @@ python3 scripts/macos/check-charon-config.py
   inalterados. Esse lote não integra ledger ou Driver IPsec. O helper nativo
   segue somente SSL; conexão/cleanup de VPN real, UTUN/VIP/rotas/BYPASS reais,
   instalação privilegiada e CI remoto continuam NOT RUN.
+
+
+### Driver IPsec, ledger e rotas ligados ao despacho local
+
+- [PASS, revisão estática] Driver R2, ledger R1, VIP com prazo absoluto e
+  Coordinator com guard foram revisados separadamente e na composição final.
+  A Factory anuncia IPsec somente com domínio nativo admitido. O Driver usa
+  o produtor original, reserva única, seleção VICI, pin configurado, leases e
+  sonda compartilhada. configure_until recebe o Instant original; o guard de
+  rotas recebe o mesmo prazo/cancelamento. Sonda recusa token diferente falso
+  e respeita cancelamento verdadeiro antes de tráfego. Esses gates de tipos
+  e wrappers opacos ainda não têm positivo privilegiado executado.
+- [PASS, fixtures executados pelo integrador] Escopo ledger/VIP: 124 IPsec,
+  30 VIP, 56 routing e 12 early-cleanup, com fmt/clippy. O Coordinator passou
+  sete testes reais de guard/rollback. A primeira seleção de zero testes por
+  mtime preservado de cópia não foi aceita; a fonte idêntica foi recompilada
+  e sete testes efetivos passaram. Recibos ledger-vip-scope e
+  coordinator-guard-landing em output/fixtures registram essas camadas.
+- [PASS, integração local completa] native-ipsec-integration-receipt.json
+  registra fonte estável, fmt, clippy all-targets/all-features -D warnings,
+  538 testes desktop e 522 core, dois ignorados por suíte, 8 testes UI
+  (114 assertions), tokens, build Rust e pacote local. Os três comandos de
+  lint/typecheck/build UI desse runner imprimiram ajuda do Bun com exit0 e NÃO
+  foram aceitos como execução; o recibo original foi preservado. A correção
+  usa subprocess cwd=ui, bun run lint/typecheck/build; Biome verificou 28
+  arquivos, tsc --noEmit passou e Vite transformou 33 módulos. O rerun também
+  passou os 8 testes, tokens/classes, build Rust e empacotamento. Recibos:
+  ui-runner-help-false-success.json e final-local-package-r1-receipt.json.
+  Mutações: perfis23, controle61, produtor32 e rotas67; baseline/restauração
+  verdes. A matriz de classes segue sem regras; não é cobertura de estilos.
+- [PASS, ambiente reconciliado] O sandbox recusou PF_ROUTE com EPERM; o job
+  HC do usuário comum abriu o socket sem enviar bytes e passou o escopo222.
+  A falha anterior foi preservada, não classificada como teste aprovado.
+  Esse diagnóstico explica a pré-condição exata observada, não cada uma das
+  falhas derivadas individualmente. Nenhum socket de rota recebeu escrita.
+- [LIMITES, limpeza e prazo] Falha após configure encerra a geração e inicia
+  cleanup; não há retry de setup parcial na mesma geração. Falha externa de
+  integridade do runtime/controlador conserva claims e pins até recuperação
+  confiável. Chamadas SDK em voo não são interrompíveis; register_utun usa
+  seu próprio orçamento interno de 2 s antes do guard de aquisição. Erros de
+  guard viram Unavailable no Driver; não concedem sucesso ou liberação.
+- [NOT RUN, aceitação de produto] Daemon charon, UTUN/VIP/BYPASS/RTM_ADD reais,
+  tráfego/cleanup/coexistência de VPN, instalação privilegiada e CI remoto
+  continuam pendentes. O componente não foi instalado; perfis, credenciais
+  e túneis pessoais não foram usados ou alterados. A Factory habilitada no
+  código não significa conexão validada. As seções anteriores são evidência
+  histórica dos checkpoints em que foram escritas.
+
+
+### Interface de demonstração e pacote atual
+
+- [PASS, navegador/simulado] Chrome abriu o servidor loopback do .app local.
+  Os três assets servidos coincidem por SHA-256 com ui/dist após o build real.
+  Conectar, cancelar antes de concluir, reconectar, desligar e exibir o estado
+  sem tráfego foram exercitados somente com perfis fictícios em memória. O
+  seletor de idioma deixou de compartilhar o limite de 52% dos botões: agora
+  Português (Brasil) permanece inteiro em 280 px, usando o select nativo.
+- [PASS, render e medidas] pt-BR/en-US × claro/escuro × viewport280/320/640:
+  12 casos sem overflow horizontal; painel280 no viewport280 e320 nos demais.
+  Padding/gap8, fonte12, linha16, controles24 e foco2px foram medidos no DOM.
+  O formulário também ficou sem overflow nas três larguras. O diálogo abriu
+  com foco em Cancelar; Tab não alcançou controles de fundo (houve uma parada
+  de foco no chrome do navegador), e Escape fechou sem remoção. Capturas e
+  medições: output/fixtures/browser-demo-validation/. As preferências visuais
+  não provam efeitos de reconexão, notificações ou login ainda não ligados.
+- [ENV, host visual] CUA falhou duas vezes em getState antes de abrir o app,
+  com encerramento do processo Node. Não há prova visual atual de tray ou
+  WKWebView. O navegador é fallback de UI, não substitui aceitação nativa.
+  Registro: output/fixtures/native-ui-automation-environment.json.
+- [PASS, artefato local] target/vpnt.app inclui o componente auditado;
+  --inspect-component passou como usuário comum. O runtime existente foi
+  verificado (10 arquivos), sem rebuild e sem executar daemon. Payload17
+  arquivos, política sudoers analisada somente em arquivo temporário, pacote
+  construído/extraído/admitido e hashes conferidos. O componente deste build
+  é destinado ao UID502 e macOS26.0; esse mínimo vem do runtime local, sem
+  alterar o mínimo13.0 do projeto. Pacote de desenvolvimento sem assinatura
+  de distribuição. O recibo final-local-package-r1 registra sourceUnchanged,
+  installationPerformed=false e hashes do host/componente. Nenhuma instalação,
+  elevação, alteração de VPN pessoal ou publicação foi feita.

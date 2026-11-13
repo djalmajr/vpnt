@@ -1,5 +1,6 @@
 //! Retained configured-UTUN scope, its original-producer adapter and the
 //! typed registration entry point. Nothing here fabricates a configured link.
+use super::super::resource_fence::RouteWork;
 use super::utun_retirement::{Guard, Lifecycle, Pin, Retire, UtunPin};
 use super::{AddWriter, Error, NativeBackend, Route, retirement};
 use crate::connection::{
@@ -133,7 +134,11 @@ impl<'a> NativeBackend<'a> {
         owner: Owner,
         networks: &[String],
         canceled: &Arc<AtomicBool>,
+        work: RouteWork,
     ) -> Result<(super::InterfaceToken, Vec<Route>), Error> {
+        if work.owner() != &owner {
+            return Err(Error::Invalid);
+        }
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         if !std::ptr::eq(self.controller, link.controller()) {
             return Err(Error::Invalid);
@@ -184,6 +189,7 @@ impl<'a> NativeBackend<'a> {
         let mut retirement =
             self.utun_retired
                 .open_guard(conflict, owner.clone(), pin.clone(), peer.clone())?;
+        retirement.attach_work(work)?;
         let writer = AddWriter::open(self.controller)?;
         let sink = if needs_sink {
             match OwnedSink::create(!ipv4, self.controller) {

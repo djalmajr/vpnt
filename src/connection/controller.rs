@@ -47,9 +47,8 @@ trait Factory: Sync {
     fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
         Ok(None)
     }
-    /// Actual capability of this factory. Production's `NativeFactory` keeps
-    /// this SSL-only default; the future native Driver must explicitly override
-    /// it for IPsec after its real attempt is wired.
+    /// Actual capability of this factory. The default is SSL-only; the native
+    /// factory advertises IPsec only with its verified context and real ledger.
     fn supports(&self, kind: VpnKind) -> bool {
         kind == VpnKind::Ssl
     }

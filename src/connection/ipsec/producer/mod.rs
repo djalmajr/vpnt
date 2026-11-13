@@ -1,4 +1,4 @@
-//! Native producer admission. Still not dispatched by the application. Kernel
+//! Owner-bound native producer admission for the helper. Kernel
 //! and VIP/route observers must supply complete absence before finalization.
 use super::{Error, Observer, Peer};
 pub use crate::connection::macos::utun_observer::{InterfaceObservation, RetainedInterface};
@@ -19,10 +19,12 @@ mod bound;
 mod child;
 mod config;
 mod files;
+mod ledger;
 mod record;
 mod socket;
 mod state;
 mod userspace;
+pub use ledger::{Admission, NativeLedger};
 pub use userspace::{ResourceClaims, UserspaceObserver};
 
 type SharedProducer<'a> = Arc<Mutex<child::Producer<'a>>>;
@@ -35,6 +37,7 @@ pub struct NativeContext<'a> {
     store: Arc<state::Store>,
     active: Mutex<BTreeMap<String, WeakProducer<'a>>>,
     admission: Mutex<()>,
+    ledger_claimed: AtomicBool,
 }
 impl<'a> NativeContext<'a> {
     pub fn new(controller: &'a ControllerLock) -> Result<Arc<Self>, Error> {
@@ -62,6 +65,7 @@ impl<'a> NativeContext<'a> {
             store,
             active: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(()),
+            ledger_claimed: AtomicBool::new(false),
         }))
     }
     fn validate(&self) -> Result<(), Error> {

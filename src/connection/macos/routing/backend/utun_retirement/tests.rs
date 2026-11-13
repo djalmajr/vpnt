@@ -17,6 +17,7 @@ struct TestPin {
     name: &'static str,
     index: u16,
     absent: Arc<AtomicBool>,
+    read_error: Arc<AtomicBool>,
     alive: Option<Arc<()>>,
 }
 impl TestPin {
@@ -27,6 +28,7 @@ impl TestPin {
                 name: "utun7",
                 index,
                 absent: Arc::new(AtomicBool::new(true)),
+                read_error: Arc::new(AtomicBool::new(false)),
                 alive: Some(alive.clone()),
             },
             Arc::downgrade(&alive),
@@ -34,6 +36,9 @@ impl TestPin {
     }
     fn absent_flag(&self) -> Arc<AtomicBool> {
         self.absent.clone()
+    }
+    fn error_flag(&self) -> Arc<AtomicBool> {
+        self.read_error.clone()
     }
 }
 impl Pin for TestPin {
@@ -44,6 +49,9 @@ impl Pin for TestPin {
         self.index
     }
     fn absent(&self) -> Result<bool, Error> {
+        if self.read_error.load(Ordering::Acquire) {
+            return Err(Error::Unavailable);
+        }
         Ok(self.absent.load(Ordering::Acquire))
     }
     fn release(&mut self) {
@@ -105,8 +113,6 @@ fn queue_preserves_the_last_pin_until_the_original_stop_is_confirmed() {
         .unwrap();
     assert!(alive.upgrade().is_some());
     drop(guard);
-    // `drop-pin-before-stop`: a Drop that releases the pin without a confirmed
-    // stop loses the retained descriptor and fails here.
     assert!(alive.upgrade().is_some());
     assert_eq!(peer.calls(), 0);
     assert!(queue.has_entries().unwrap());
@@ -152,7 +158,6 @@ fn confirmed_stop_releases_the_pin_before_fresh_absence() {
         alive.upgrade().is_none(),
         "confirmed stop drops the pin first"
     );
-    // `ignore-implicit-route`: absence is not assumed from the released pin.
     assert_eq!(guard.complete(), Ok(false));
     absent.store(true, Ordering::Release);
     assert_eq!(guard.complete(), Ok(true));
@@ -211,8 +216,6 @@ fn duplicate_conflict_creates_no_guard_or_stop() {
     };
     assert_eq!(error, Error::Busy);
     assert_eq!(peer.calls(), 0, "duplicate must not stop the producer");
-    // The rejected registration only drops its own unconsumed clone; the
-    // active producer's pin is untouched and no cleanup entry exists.
     drop(alive);
     assert!(!queue.has_entries().unwrap());
 }
@@ -232,3 +235,6 @@ fn sink_absence_is_checked_after_the_pin() {
     sink.gone.store(true, Ordering::Release);
     assert_eq!(guard.complete(), Ok(true));
 }
+
+#[path = "tests/work.rs"]
+mod work;

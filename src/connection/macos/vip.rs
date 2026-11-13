@@ -37,6 +37,9 @@ pub enum Family {
 pub(in crate::connection::macos) mod retired;
 pub use retired::RetiredUtun;
 
+#[cfg(test)]
+mod deadline_tests;
+
 pub struct ConfiguredUtun<'a> {
     retained: RetainedInterface,
     controller: &'a ControllerLock,
@@ -70,6 +73,9 @@ struct Target {
 
 impl<'a> ConfiguredUtun<'a> {
     /// Assign the negotiated Candidate VIPs to the pinned original utun.
+    ///
+    /// The relative form converts its budget to one absolute entry deadline;
+    /// the absolute form is `configure_until`.
     pub fn configure(
         retained: RetainedInterface,
         candidate: &Candidate,
@@ -102,6 +108,51 @@ impl<'a> ConfiguredUtun<'a> {
                 error: Error::Invalid,
             });
         };
+        Self::assign_until(retained, intended, vips, controller, expires, cancel)
+    }
+
+    /// Assign with an absolute caller deadline, capped at one operation's
+    /// `MAX_TIMEOUT`. The deadline is never rebased to a fresh `now + remaining`
+    /// after a pause, so a caller's shorter budget is not extended here.
+    pub fn configure_until(
+        retained: RetainedInterface,
+        candidate: &Candidate,
+        controller: &'a ControllerLock,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Self, VipFailure> {
+        let intended = candidate.vips.clone();
+        let vips = match validate_candidate(candidate) {
+            Ok(vips) => vips,
+            Err(error) => {
+                return Err(VipFailure {
+                    retained,
+                    intended,
+                    error,
+                });
+            }
+        };
+        let expires = cap_deadline(expires, Instant::now());
+        Self::assign_until(retained, intended, vips, controller, expires, cancel)
+    }
+
+    /// Shared implementation: one absolute deadline for the whole assignment,
+    /// with the original pin and every intended VIP retained on failure.
+    fn assign_until(
+        retained: RetainedInterface,
+        intended: Vec<IpAddr>,
+        vips: Vec<IpAddr>,
+        controller: &'a ControllerLock,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<Self, VipFailure> {
+        if let Err(error) = check(expires, cancel) {
+            return Err(VipFailure {
+                retained,
+                intended,
+                error,
+            });
+        }
         let target = Target {
             name: retained.name().to_owned(),
             index: retained.index(),
@@ -177,6 +228,16 @@ pub(super) fn check(expires: Instant, cancel: &AtomicBool) -> Result<(), Error> 
         return Err(Error::Timeout);
     }
     Ok(())
+}
+
+/// One absolute deadline cannot exceed a single operation's `MAX_TIMEOUT`, but
+/// a shorter caller deadline is preserved exactly. `now` is the single entry
+/// timestamp; no remaining `Duration` is computed and re-added later.
+fn cap_deadline(expires: Instant, now: Instant) -> Instant {
+    match now.checked_add(MAX_TIMEOUT) {
+        Some(cap) => expires.min(cap),
+        None => expires,
+    }
 }
 
 /// Candidate metadata rules. Never authority, only the negotiated VIP shape.

@@ -189,9 +189,10 @@ mensagens `load-shared` em memória. O produtor nativo preparado cria uma admiss
 privada antes do spawn, confere o processo original e o peer PID/UID do socket,
 e conserva tentativas incertas após encerramento. Seus testes executam um
 programa C fictício; o parser original do strongSwan verifica separadamente a
-configuração gerada, sem executar charon. Ainda faltam observador SA/SPD,
-recuperação de claims, endereço virtual, tráfego e cleanup integrados ao driver.
-O helper continua recusando conexão IPsec até completar essa integração.
+configuração gerada, sem executar charon. O despacho local já reúne o ledger,
+o controle, VIPs, sonda e rotas de usuário no Driver IPsec. Essa composição
+compila e passa pelos fixtures; sua aceitação com daemon e túnel reais ainda
+não foi executada.
 
 O codec PF_KEY Darwin já interpreta metadados de SA/política produzidos pelo
 SDK, com saída sem payloads de chaves. O consumidor da extensão NAT-T também
@@ -206,7 +207,8 @@ Quarenta e uma mutações nomeadas e um recibo de 261 hashes acompanham esse
 caminho; a prova nativa de MSG_CTRUNC e a atomicidade entre a criação do
 descritor e o spawn de filhos, antes do uso em runtime, continuam pendentes.
 O término observado não garante completude das tabelas ou autoriza liberar
-recursos; o observador e a recuperação IPsec ainda precisam dessa integração.
+recursos. O backend produtivo atual usa kernel-libipsec e ledger de recursos
+retidos, sem depender desse leitor PF_KEY.
 
 Preferências nativas têm um valor validado (intervalo 10/30/60, notificação,
 reconexão e abrir no login) e um intake preparado: a ponte aceita o comando, o
@@ -284,13 +286,13 @@ O executável `vpnt-helper` aceita somente `runtime` ou `admin`, exige UID real 
 efetivo root e um socketpair anônimo herdado em FD 0. O UID do peer vem do kernel;
 SUDO_UID e campos de UID do IPC não selecionam o storage. Somente usuários com
 storage root já preparado podem entrar. O modo runtime chama o controlador SSL
-sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil.
+e, quando o domínio nativo é admitido, IPsec, sob o lock global; admin lê um documento e EOF antes de salvar/remover perfil.
 A administração disputa uma reserva persistente por perfil, sem tomar o lock
 de rede: um perfil em uso é recusado e os demais podem ser editados. O controlador
 conserva a reserva até comprovar cleanup, inclusive se o worker falhar.
 Antes de iniciar, relê o perfil sob essa reserva. Snapshot atualiza os metadados
-inativos sem interromper os ativos; IPsec aparece no catálogo, com seu driver
-ainda pendente. Leitura e escrita rodam fora do controlador, com filas e
+inativos sem interromper os ativos; a Factory anuncia IPsec somente quando
+o domínio nativo verificado está disponível. Leitura e escrita rodam fora do controlador, com filas e
 prazos limitados; EOF/sinais encerram admissões e aguardam cleanup. Há testes de
 socket, arquivos/flock reais de fixture e controlador com rede simulada.
 O binário faz parte do payload que pode ser incluído no .app; não está instalado.
@@ -378,8 +380,9 @@ Antes de enviar configuração ou credencial, o controle VICI exige a lista
 efetiva de plugins e recusa backend ausente, PF_KEY, duplicatas ou listas
 malformadas. `UserspaceObserver` separa a ocupação anterior ao initiate da
 ausência completa necessária ao release. Ele exige um ledger completo do
-domínio IPsec; o ledger real, o Driver de VIP/rotas e o despacho pela aplicação
-ainda precisam ser integrados. `KernelClaims` mantém seu contrato completo e
+domínio IPsec. O ledger e o Driver já estão ligados ao despacho local: a
+admissão retém o produtor original e seus metadados, pins e obrigações de
+rotas até confirmação de parada e ausência. `KernelClaims` mantém seu contrato completo e
 não recebe uma implementação vazia para simular sucesso.
 
 O sexto patch acrescenta proteção opcional aos sockets UDP do charon: vincula
@@ -406,9 +409,9 @@ A preparação de VIPs já consome a interface retida, preserva o pin e registra
 toda a intenção de endereço em caso de falha parcial. Antes de cada atribuição,
 ela recusa endereços existentes e confere novamente a interface; depois,
 verifica endereços, flags e cópias em interfaces estrangeiras. O adaptador exige
-UID real e efetivo de root antes de tentar o ioctl. O Driver ainda precisa
-vincular essa operação à admissão e ao produtor corretos; a prova positiva no
-utun real continua pendente.
+UID real e efetivo de root antes de tentar o ioctl. O Driver liga a operação
+à admissão e ao produtor originais, com o mesmo prazo absoluto e cancelamento;
+a prova positiva no utun real continua pendente.
 
 A seleção de SAs admite sobreposição de rekey somente quando os candidatos
 ativos concordam nos endpoints, VIPs e seletores, escolhendo o maior child ID.
@@ -432,8 +435,9 @@ A adaptação ao UTUN real continua sem prova positiva; os consumidores executad
 usam sockets locais e estruturas do SDK.
 
 O despacho consulta a capacidade efetiva da Factory antes de validar segredos
-ou alterar a geração ativa. A Factory nativa continua oferecendo somente SSL;
-a aceitação de IPsec nos testes usa um adaptador privado. Um pedido recusado
+ou alterar a geração ativa. A Factory nativa oferece SSL e oferece IPsec
+quando seu domínio verificado foi admitido. Os testes do controlador usam
+adaptadores privados; isso não prova a conexão nativa. Um pedido recusado
 não cancela a conexão anterior. A visão de ausência do UTUN já captura toda a
 intenção de VIPs e os endereços observados, inclusive link-local implícito, a
 partir do mesmo pin validado antes e depois do snapshot. Ela observa apenas o
@@ -446,7 +450,14 @@ um ready tardio não chega à sonda. O timeout continua repetindo a limpeza até
 sua confirmação. A sonda de tráfego possui orçamento próprio; chamadas
 síncronas já em voo são conferidas ao retornar, sem promessa de interrupção.
 
-O helper ainda **recusa despacho IPsec real** até completar essa integração.
+O Driver IPsec local compõe reserva de perfil/namespace, produtor original,
+controle VICI, VIPs, leases de rotas e sonda. A limpeza preserva claims
+incertos e só conclui após as obrigações de recursos. Erro depois da
+configuração encerra a geração e entra em cleanup; não repete setup parcial.
+Falha de integridade de runtime/controlador mantém claims e pins bloqueados
+até recuperação confiável. A instalação e aceitação privilegiadas continuam
+pendentes; nenhum túnel real é declarado validado.
+
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,
 cleanup real ou coexistência com uma VPN existente. Os checks reproduzíveis e

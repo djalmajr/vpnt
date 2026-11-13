@@ -41,6 +41,7 @@ pub struct Reservation {
     serial: u64,
     authority: Arc<()>,
 }
+#[derive(Clone)]
 pub(super) struct Binding {
     authority: Arc<()>,
     serial: u64,

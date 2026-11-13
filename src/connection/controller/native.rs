@@ -1,6 +1,8 @@
 use super::profiles::{ProfileUse, Profiles};
 use super::*;
 mod cleanup;
+mod factory;
+mod ipsec;
 use crate::{
     connection::{
         macos::{
@@ -21,6 +23,8 @@ use crate::{
     model::VpnKind,
     storage::StoreError,
 };
+use factory::NativeFactory;
+use ipsec::NativeDomain;
 use std::sync::{
     Mutex,
     atomic::Ordering,
@@ -28,11 +32,6 @@ use std::sync::{
 };
 
 type Routes<'a> = Arc<Mutex<Coordinator<NativeBackend<'a>>>>;
-struct NativeFactory<'a> {
-    routes: Routes<'a>,
-    profiles: Arc<Profiles>,
-}
-
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
 /// The prepared helper binds uid to its inherited caller and keeps this
 /// controller/lock alive through EOF and every outstanding cleanup. Installed
@@ -58,67 +57,16 @@ pub fn run_ssl(
     let routes = Arc::new(Mutex::new(
         Coordinator::new(backend).map_err(|_| ErrorCode::Unavailable)?,
     ));
+    // A missing IPsec domain is a real unsupported capability; SSL still runs.
+    let domain = NativeDomain::new(controller).ok();
     engine::run(
-        NativeFactory {
-            routes,
-            profiles: store,
-        },
+        NativeFactory::new(routes, store, domain),
         uid,
         profiles,
         requests,
         output,
         Timing::default(),
     )
-}
-impl<'a> Factory for NativeFactory<'a> {
-    type Attempt = NativeAttempt<'a>;
-    fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
-        self.profiles
-            .load()
-            .map(Some)
-            .map_err(|_| ErrorCode::UntrustedConfiguration)
-    }
-    fn create(
-        &self,
-        profile: Profile,
-        uid: u32,
-        generation: u64,
-        credentials: Credentials,
-        canceled: Arc<AtomicBool>,
-    ) -> Self::Attempt {
-        NativeAttempt {
-            owner: Owner {
-                uid,
-                profile: profile.id.clone(),
-                generation,
-            },
-            profile,
-            profiles: self.profiles.clone(),
-            profile_use: None,
-            credentials: Some(credentials),
-            routes: self.routes.clone(),
-            canceled,
-            before: None,
-            before_routes: None,
-            client: None,
-            link: None,
-            token: None,
-            lease: None,
-            spawn_attempted: false,
-            stopped: false,
-            uncertain_cleanup: false,
-        }
-    }
-    fn idle(&self) -> bool {
-        let Ok(mut routes) = self.routes.lock() else {
-            return false;
-        };
-        routes.retry_cleanup();
-        routes.backend_mut().reap_retired().is_ok()
-            && !routes.has_resources()
-            && !routes.backend_mut().has_resources()
-            && self.profiles.idle()
-    }
 }
 struct NativeAttempt<'a> {
     owner: Owner,

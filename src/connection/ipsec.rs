@@ -13,8 +13,8 @@ pub use control::{Control, Peer, Phase};
 pub use namespace::{Observer, Registry, Reservation};
 #[cfg(target_os = "macos")]
 pub use producer::{
-    InterfaceObservation, KernelClaims, NativeContext, NativeObserver, NativePeer, ResourceClaims,
-    RetainedInterface, UserspaceObserver,
+    Admission, InterfaceObservation, KernelClaims, NativeContext, NativeLedger, NativeObserver,
+    NativePeer, ResourceClaims, RetainedInterface, UserspaceObserver,
 };
 pub use snapshot::Candidate;
 

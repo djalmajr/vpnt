@@ -259,6 +259,8 @@ h2 {
 .setting-row button,
 .setting-row select {
   flex: 0 0 auto;
+}
+.setting-row button {
   max-width: 52%;
 }
 .switch {

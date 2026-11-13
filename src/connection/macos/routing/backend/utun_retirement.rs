@@ -1,6 +1,7 @@
 //! Active owned retirement for retained-UTUN scopes. Unlike the passive PPP
 //! queue, this keeps a pin and the original peer until stop is confirmed; only
 //! then is the pin released and fresh absence allowed to finish cleanup.
+use super::super::resource_fence::RouteWork;
 use super::*;
 use crate::connection::macos::{
     Interfaces,
@@ -86,6 +87,8 @@ struct Entry<P: Pin, E: Retire, S: Sink> {
     /// Cleared only after the original stop is confirmed.
     peer: Option<E>,
     sink: Option<S>,
+    /// Retained until stop, pin release and fresh absence all succeed.
+    work: Option<RouteWork>,
 }
 
 pub(super) struct Lifecycle<P: Pin, E: Retire, S: Sink> {
@@ -121,6 +124,7 @@ impl<P: Pin, E: Retire, S: Sink> Lifecycle<P, E, S> {
                 pin,
                 peer: Some(peer),
                 sink: None,
+                work: None,
             }),
             stopped: false,
         }
@@ -184,6 +188,9 @@ impl<P: Pin, E: Retire, S: Sink> Entry<P, E, S> {
         {
             return Ok(false);
         }
+        if let Some(work) = self.work.as_mut() {
+            work.complete()?;
+        }
         Ok(true)
     }
 }
@@ -195,6 +202,22 @@ pub(super) struct Guard<P: Pin, E: Retire, S: Sink> {
 }
 
 impl<P: Pin, E: Retire, S: Sink> Guard<P, E, S> {
+    /// Bind the linear work handle exactly once before any allocation. A
+    /// failure leaves a fresh Pending work to Drop-complete (no allocation).
+    pub(super) fn attach_work(&mut self, mut work: RouteWork) -> Result<(), Error> {
+        let Some(entry) = self.entry.as_mut() else {
+            return Err(Error::Changed);
+        };
+        if entry.work.is_some() {
+            return Err(Error::Busy);
+        }
+        if work.owner() != &entry.owner {
+            return Err(Error::Invalid);
+        }
+        work.bind(&entry.owner)?;
+        entry.work = Some(work);
+        Ok(())
+    }
     /// Record sink metadata even when creation failed partway.
     pub(super) fn set_sink(&mut self, sink: Option<S>) {
         if let Some(entry) = self.entry.as_mut() {
@@ -227,7 +250,7 @@ impl<P: Pin, E: Retire, S: Sink> Guard<P, E, S> {
         if !self.stopped {
             return Ok(false);
         }
-        let Some(entry) = self.entry.as_ref() else {
+        let Some(entry) = self.entry.as_mut() else {
             return Ok(true);
         };
         if !entry.pin.absent()? {
@@ -237,6 +260,9 @@ impl<P: Pin, E: Retire, S: Sink> Guard<P, E, S> {
             && !sink.gone()?
         {
             return Ok(false);
+        }
+        if let Some(work) = entry.work.as_mut() {
+            work.complete()?;
         }
         self.entry = None;
         Ok(true)

@@ -11,6 +11,10 @@ use std::{
 /// claim is an error; there is no default or empty production implementation.
 pub trait ResourceClaims {
     fn pending_owners(&mut self) -> Result<Vec<Owner>, Error>;
+
+    /// Infallible post-durable hook. It runs only after
+    /// `NativeContext::completed` succeeded and must not perform I/O.
+    fn completed(&mut self, _owner: &Owner) {}
 }
 
 /// Explicit userspace admission observer. It maps every real pending owner to
@@ -59,7 +63,9 @@ impl<R: ResourceClaims> Observer for UserspaceObserver<'_, R> {
     }
 
     fn completed(&mut self, owner: &Owner, reqid: u16) -> Result<(), Error> {
-        self.context.completed(owner, reqid)
+        self.context.completed(owner, reqid)?;
+        self.resources.completed(owner);
+        Ok(())
     }
 }
 

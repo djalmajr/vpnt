@@ -1,5 +1,6 @@
 pub mod egress;
 mod interfaces;
+pub(crate) mod ipsec_early_cleanup;
 pub mod ipsec_egress;
 pub mod ppp;
 pub mod ppp_attachment;

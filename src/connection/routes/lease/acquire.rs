@@ -1,6 +1,19 @@
 use super::{AcquireError, BTreeMap, Backend, Claim, Coordinator, Error, Lease, Owner, Route};
 impl<B: Backend> Coordinator<B> {
     pub fn acquire(&mut self, owner: Owner, routes: &[Route]) -> Result<Lease, AcquireError> {
+        self.acquire_guarded(owner, routes, || Ok(()))
+    }
+
+    /// Same acquire with a caller-budget precondition before claim creation and
+    /// between every admitted/attached operation. The guard is a pure
+    /// precondition; it never grants route authority.
+    pub fn acquire_guarded<F: FnMut() -> Result<(), Error>>(
+        &mut self,
+        owner: Owner,
+        routes: &[Route],
+        mut check: F,
+    ) -> Result<Lease, AcquireError> {
+        check()?;
         if !owner.valid() || routes.is_empty() {
             return Err(Error::Invalid.into());
         }
@@ -14,6 +27,7 @@ impl<B: Backend> Coordinator<B> {
         {
             return Err(Error::Busy.into());
         }
+        check()?;
         self.next = self.next.checked_add(1).ok_or(Error::Limit)?;
         let token = self.next;
         self.claims.insert(
@@ -29,7 +43,7 @@ impl<B: Backend> Coordinator<B> {
             manager: self.manager,
             token,
         };
-        match self.extend(&lease, routes) {
+        match self.extend_guarded(&lease, routes, check) {
             Ok(()) => Ok(lease),
             Err(error) => {
                 let mut cleanup = error.cleanup;
@@ -47,6 +61,19 @@ impl<B: Backend> Coordinator<B> {
     /// pins. An incomplete extension never authorizes Connected. On pending
     /// rollback the caller must stop the client, then release the retained lease.
     pub fn extend(&mut self, lease: &Lease, routes: &[Route]) -> Result<(), AcquireError> {
+        self.extend_guarded(lease, routes, || Ok(()))
+    }
+
+    /// Append routes under the same caller budget. Guard failures before the
+    /// first attach leave old keys untouched; failures after any attempt use
+    /// the same extension failure/release-tail rollback as an operation error.
+    pub fn extend_guarded<F: FnMut() -> Result<(), Error>>(
+        &mut self,
+        lease: &Lease,
+        routes: &[Route],
+        mut check: F,
+    ) -> Result<(), AcquireError> {
+        check()?;
         self.validate(lease)?;
         if routes.is_empty() || routes.len() > 128 {
             return Err(Error::Invalid.into());
@@ -75,14 +102,25 @@ impl<B: Backend> Coordinator<B> {
             .owner
             .clone();
         for route in desired.values() {
+            check()?;
             self.admit(&owner, *route)?;
+            check()?;
         }
         for key in keys {
+            if let Err(reason) = check() {
+                return Err(self.extension_failure(lease.token, keep, reason));
+            }
             if let Err(reason) = self.attach(lease.token, desired[&key]) {
+                return Err(self.extension_failure(lease.token, keep, reason));
+            }
+            if let Err(reason) = check() {
                 return Err(self.extension_failure(lease.token, keep, reason));
             }
         }
         if let Err(reason) = self.validate(lease) {
+            return Err(self.extension_failure(lease.token, keep, reason));
+        }
+        if let Err(reason) = check() {
             return Err(self.extension_failure(lease.token, keep, reason));
         }
         Ok(())
@@ -97,3 +135,6 @@ impl<B: Backend> Coordinator<B> {
         AcquireError { reason, cleanup }
     }
 }
+
+#[cfg(test)]
+mod guard_tests;
