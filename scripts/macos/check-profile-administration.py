@@ -67,6 +67,9 @@ def main():
     cached='connection::controller::profiles::tests::changed_or_removed_metadata_cannot_start_the_cached_profile'
     refresh='connection::controller::engine::metadata_tests::snapshot_refresh_preserves_a_live_profile_and_exposes_edited_new_and_removed_metadata'
     atomic='connection::controller::engine::metadata_tests::a_rejected_refresh_cannot_partially_edit_idle_slots_or_cancel_a_live_slot'
+    capable='connection::controller::engine::tests::capabilities_tests::capability_factory_accepts_valid_ipsec'
+    missing_psk='connection::controller::engine::tests::capabilities_tests::ipsec_missing_psk_is_invalid_secret'
+    revocation='connection::controller::engine::tests::capabilities_tests::revocation_keeps_active_generation_and_route'
     mutants=[
         ('reservation-release-waits-for-fork',reservation,lambda s:replace(s,'let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };','let _ = self.file.as_raw_fd();'),['--lib','storage::reservation::tests::release_does_not_wait_for_a_transient_duplicate_of_the_owned_descriptor'],'storage::reservation::tests::release_does_not_wait_for_a_transient_duplicate_of_the_owned_descriptor'),
         ('save-without-target-reservation',store,lambda s:without_reservation(s,'    pub fn save(','    pub fn remove('),['--test','profile_reservations',isolated],isolated),
@@ -87,7 +90,10 @@ def main():
         ('queued-profile-can-change',metadata,lambda s:replace(s,' || slot.pending.is_some()',''),['--lib','connection::controller::engine::metadata::tests::a_queued_connection_protects_its_profile_before_the_worker_is_launched'],'connection::controller::engine::metadata::tests::a_queued_connection_protects_its_profile_before_the_worker_is_launched'),
         ('refresh-mutates-live-slot',metadata,lambda s:replace(s,'if slot.worker.is_some() || slot.pending.is_some() {','if false {'),['--lib',atomic],atomic),
         ('failed-refresh-partially-mutates-idle-slot',metadata,partial_refresh,['--lib',atomic],atomic),
-        ('ipsec-dispatched-to-ssl','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if slot.profile.kind != VpnKind::Ssl {','if false {'),['--lib','connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'],'connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'),
+        ('ipsec-dispatched-to-ssl','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if !factory.supports(slot.profile.kind) {','if false {'),['--lib','connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'],'connection::controller::engine::metadata_tests::ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker'),
+        ('hardcoded-ssl-support','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if !factory.supports(slot.profile.kind) {','if slot.profile.kind != VpnKind::Ssl {'),['--lib',capable],capable),
+        ('ssl-validation-for-ipsec','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'if credentials.validate(slot.profile.kind).is_err() {','if credentials.validate(VpnKind::Ssl).is_err() {'),['--lib',missing_psk],missing_psk),
+        ('cancel-before-capability-denial','src/connection/controller/engine/dispatch.rs',lambda s:replace(s,'            if !factory.supports(slot.profile.kind) {','            slot.cancel();\n            if !factory.supports(slot.profile.kind) {'),['--lib',revocation],revocation),
     ]
     source={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for base in ['src','tests','ui/src/locales'] for p in sorted((ROOT/base).rglob('*')) if p.is_file()}
     for key, digest in build_inputs.source_hashes(ROOT).items():

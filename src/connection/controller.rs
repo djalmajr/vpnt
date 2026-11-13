@@ -8,7 +8,10 @@ mod native;
 mod profiles;
 mod worker;
 use crate::{
-    helper::protocol::ErrorCode, model::Profile, secrets::Credentials, session::ConnectionState,
+    helper::protocol::ErrorCode,
+    model::{Profile, VpnKind},
+    secrets::Credentials,
+    session::ConnectionState,
 };
 #[cfg(target_os = "macos")]
 pub use native::run_ssl;
@@ -43,6 +46,12 @@ trait Factory: Sync {
     type Attempt: Attempt;
     fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
         Ok(None)
+    }
+    /// Actual capability of this factory. Production's `NativeFactory` keeps
+    /// this SSL-only default; the future native Driver must explicitly override
+    /// it for IPsec after its real attempt is wired.
+    fn supports(&self, kind: VpnKind) -> bool {
+        kind == VpnKind::Ssl
     }
     fn create(
         &self,

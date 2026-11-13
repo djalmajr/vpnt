@@ -431,6 +431,15 @@ passiva. Rotas de um endereço compartilhado só são preservadas com endereço 
 A adaptação ao UTUN real continua sem prova positiva; os consumidores executados
 usam sockets locais e estruturas do SDK.
 
+O despacho consulta a capacidade efetiva da Factory antes de validar segredos
+ou alterar a geração ativa. A Factory nativa continua oferecendo somente SSL;
+a aceitação de IPsec nos testes usa um adaptador privado. Um pedido recusado
+não cancela a conexão anterior. A visão de ausência do UTUN já captura toda a
+intenção de VIPs e os endereços observados, inclusive link-local implícito, a
+partir do mesmo pin validado antes e depois do snapshot. Ela observa apenas o
+UTUN conhecido, sem bloquear por uma nova rota PPP alheia. A origem desses
+metadados no UTUN configurado ainda tem prova estática, sem positivo nativo.
+
 O helper ainda **recusa despacho IPsec real** até completar essa integração.
 O codec/leitor PF_KEY permanece histórico e somente leitura; o backend de
 usuário não depende dele. Nenhum teste atual prova túnel conectado, tráfego,

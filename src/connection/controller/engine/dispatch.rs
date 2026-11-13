@@ -1,7 +1,8 @@
 use super::*;
 
-pub(super) fn dispatch(
+pub(super) fn dispatch<F: Factory>(
     request: Request,
+    factory: &F,
     slots: &mut BTreeMap<String, Slot<'_>>,
     output: &mut VecDeque<Message>,
 ) {
@@ -52,11 +53,11 @@ pub(super) fn dispatch(
     }
     match request.command {
         Command::Connect { credentials, .. } => {
-            if slot.profile.kind != VpnKind::Ssl {
+            if !factory.supports(slot.profile.kind) {
                 fail(output, ErrorCode::MissingProgram);
                 return;
             }
-            if credentials.validate(VpnKind::Ssl).is_err() {
+            if credentials.validate(slot.profile.kind).is_err() {
                 fail(output, ErrorCode::InvalidSecret);
                 return;
             }

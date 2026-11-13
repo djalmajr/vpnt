@@ -2422,3 +2422,43 @@ python3 scripts/macos/check-charon-config.py
   remoção efetiva após último FD, coexistência com VPN pessoal, instalação
   privilegiada e CI remoto continuam sem execução. Nenhum segredo, perfil ou
   túnel pessoal foi usado ou alterado nesta etapa.
+
+
+### Capacidade da Factory e ausência tipada do UTUN
+
+- [PASS, consumidor do controlador em fixture] O despacho consulta a Factory
+  real antes de consumir segredos, cancelar ou alterar geração. A validação
+  usa o tipo do perfil: IPsec sem PSK é recusado, e um pedido sem suporte
+  preserva a conexão ativa anterior. A Factory nativa permanece somente SSL;
+  os casos positivos de IPsec são do adaptador privado de teste, com o parser,
+  worker e coordenador existentes.
+- [PASS, metadados e predicado] RetiredUtun é opaco e não retém FD nem concede
+  autoridade de rota. Seus construtores tipados validam o mesmo pin antes e
+  depois da leitura exata de nome/índice, unindo VIPs pretendidos e todos os
+  endereços observados. A conversão do índice é checada. O corpo do predicado
+  compartilhado foi movido sem alteração de bytes; erro de leitura não confirma
+  ausência. Os testes usam Interfaces/Snapshot sintéticos e uma consulta nativa
+  somente de leitura; os construtores com ConfiguredUtun/VipFailure são prova
+  estática/de tipos, sem fabricar esses valores opacos.
+- [PASS, execução do integrador] Fmt e clippy de todos os targets/features com
+  -D warnings, 21 testes do controlador, 24 de VIP e 46 de rotas passaram.
+  O gate de perfis executou 23 mutantes mortos pelas assertions esperadas,
+  cinco baselines e cinco restaurações verdes. Build e pacote local passaram
+  com 412 entradas de fonte estáveis. Receipt:
+  output/fixtures/ledger-prereqs-scope-receipt.json. Pacote:
+  target/vpnt-ledger-prereqs-checkpoint.app; não foi instalado.
+- [PASS, escopo da evidência] Revisões independentes aprovaram engine5 e
+  retired4; o integrador revisou o port do checker e executou o gate completo.
+  As suítes completas anteriores, 457 desktop/441 core com dois ignorados
+  em cada, pertencem ao checkpoint 6a7347a e não foram reexecutadas neste lote.
+  UI/design e runtime de seis patches permanecem inalterados.
+- [PENDENTE, ledger e Driver] A revisão de uma cópia privada do ledger apontou
+  que retire não passava uma tentativa Live para Draining, impedindo o release
+  no caminho de Control.cleanup. Essa cópia não foi integrada. A correção,
+  retenção de pins e conclusão de rotas estão em implementação separada,
+  assim como o Driver nativo e o prazo que inclui setup. Nenhum desses itens
+  pendentes é contado como aprovado neste checkpoint.
+- [NOT RUN, produto real] O helper ainda recusa IPsec real. Não houve charon,
+  UTUN/VIP/RTM_ADD/BYPASS real, tráfego de VPN, coexistência com túnel pessoal,
+  instalação privilegiada, publicação ou CI remoto. O pacote é preparação
+  local; não comprova conexão ou limpeza de recursos no kernel.

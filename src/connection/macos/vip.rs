@@ -34,6 +34,9 @@ pub enum Family {
     V6,
 }
 
+pub(in crate::connection::macos) mod retired;
+pub use retired::RetiredUtun;
+
 pub struct ConfiguredUtun<'a> {
     retained: RetainedInterface,
     controller: &'a ControllerLock,

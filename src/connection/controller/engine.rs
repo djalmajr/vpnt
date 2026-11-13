@@ -4,9 +4,11 @@ use super::{
     worker::{self, Finished, Signals},
     *,
 };
+#[cfg(test)]
+use crate::model::VpnKind;
 use crate::{
     helper::protocol::{Command, Message, Request, TunnelStatus, VERSION},
-    model::{VpnKind, valid_profile_id},
+    model::valid_profile_id,
 };
 use dispatch::dispatch;
 use std::{
@@ -148,7 +150,7 @@ pub(super) fn run<F: Factory>(
                                 error,
                             });
                         } else {
-                            dispatch(request, &mut slots, &mut outgoing);
+                            dispatch(request, &factory, &mut slots, &mut outgoing);
                         }
                     }
                     Err(TryRecvError::Empty) => break,

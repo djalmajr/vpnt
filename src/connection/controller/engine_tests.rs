@@ -757,3 +757,6 @@ fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_e
     h.finish();
     assert!(read_message(&mut client).unwrap().is_none());
 }
+
+#[path = "engine/capabilities_tests.rs"]
+mod capabilities_tests;
