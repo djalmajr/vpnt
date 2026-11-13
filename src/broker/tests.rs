@@ -8,6 +8,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+mod automatic_interval;
+mod automatic_notifications;
+mod automatic_reconnect;
+mod automatic_support;
+mod ipsec_dispatch;
 mod recovery;
 #[derive(Clone)]
 struct Secrets {
@@ -104,22 +109,23 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
 }
 #[test]
 fn incompatible_helper_or_expired_keychain_load_cannot_receive_credentials_or_start_a_tunnel() {
-    let mut peer = Peer::new("version");
-    let secrets = Secrets::new();
-    let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
-    wait(&mut broker, |s| s.helper == "outdated");
-    assert!(
-        broker
-            .dispatch(
-                Command::Toggle { id: "one".into() },
-                Instant::now() + Duration::from_secs(1)
-            )
-            .is_err()
-    );
-    assert_eq!(loads.load(Ordering::Relaxed), 0);
-    drop(broker);
-    drop(peer);
+    for mode in ["version", "old2"] {
+        let mut peer = Peer::new(mode);
+        let secrets = Secrets::new();
+        let loads = secrets.loads.clone();
+        let mut broker = Broker::new(Some(peer.take()), secrets);
+        wait(&mut broker, |s| s.helper == "outdated");
+        assert_eq!(
+            broker
+                .dispatch(
+                    Command::Toggle { id: "one".into() },
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .err(),
+            Some("not_found")
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
+    }
     let mut peer = Peer::new("flow");
     let mut secrets = Secrets::new();
     secrets.delay = Duration::from_millis(30);

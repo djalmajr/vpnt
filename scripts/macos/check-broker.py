@@ -87,18 +87,20 @@ def main():
         ("runtime-replaced-before-reap","src/broker/retry.rs",lambda s:replace(s," || previous.is_some_and(|c| !c.finished())",""),recovery,False),
         ("runtime-retry-unpaced","src/broker/retry.rs",lambda s:replace(s,"Instant::now() < self.next || ",""),pacing,False),
         ("runtime-resumes-without-snapshot",model,lambda s:replace(s,"self.startup = Instant::now() + Duration::from_secs(5);\n                self.begin();","self.startup = Instant::now() + Duration::from_secs(5);"),recovery,False),
-        ("quit-relaunches-runtime",commands,lambda s:replace(s,"                self.retry = None;\n",""),recovery,False),
+        # Either shutdown guard alone prevents restart. Remove both to test
+        # the observable regression instead of an equivalent single-line edit.
+        ("quit-relaunches-runtime",commands,lambda s:replace(s,"                self.component.close();\n                self.retry = None;\n",""),recovery,False),
     ]
     ui="ui/src/commandFlow.ts"
     poll="a poll started before cancellation cannot restore the old snapshot or error"
     action="an earlier action cannot overwrite a newer action or authorize its navigation"
     ui_mutations=[
-        ("old-poll-restores-snapshot",ui,lambda s:replace(s,"if (live() && started === revision) receive(snapshot);","if (live()) receive(snapshot);"),poll),
+        ("old-poll-restores-snapshot",ui,lambda s:replace(s,"if (!live() || started !== revision) return false;","if (!live()) return false;"),poll),
         ("old-poll-restores-error",ui,lambda s:replace(s,'if (live() && started === revision) fail("backend_unavailable");','if (live()) fail("backend_unavailable");'),poll),
-        ("old-action-overwrites-or-navigates",ui,lambda s:replace(s,"        if (started !== revision) return false;\n",""),action),
-        ("old-action-restores-error",ui,lambda s:replace(s,"if (started === revision)","if (true)"),action),
-        ("polling-overlaps-actions",ui,lambda s:replace(s,"      if (running) return;\n",""),"polling pauses for all pending actions and resumes after both success and failure"),
-        ("disposed-poll-publishes-snapshot",ui,lambda s:replace(s,"if (live() && started === revision) receive(snapshot);","if (started === revision) receive(snapshot);"),"disposed polling cannot affect the active page"),
+        ("old-action-overwrites-or-navigates",ui,lambda s:replace(s,"      if (started !== revision) return { ok: false, superseded: true };\n",""),action),
+        ("old-action-restores-error",ui,lambda s:replace(s,"if (!superseded) fail(code);","fail(code);"),action),
+        ("polling-overlaps-actions",ui,lambda s:replace(s,"      if (running) return false;\n",""),"polling pauses for all pending actions and resumes after both success and failure"),
+        ("disposed-poll-publishes-snapshot",ui,lambda s:replace(s,"if (!live() || started !== revision) return false;","if (started !== revision) return false;"),"disposed polling cannot affect the active page"),
         ("disposed-poll-publishes-error",ui,lambda s:replace(s,'if (live() && started === revision) fail("backend_unavailable");','if (started === revision) fail("backend_unavailable");'),"disposed polling cannot affect the active page"),
     ]
     source = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for base in ["src", "tests", "ui/src"] for p in sorted((ROOT / base).rglob("*")) if p.is_file()}

@@ -16,7 +16,7 @@ use crate::{
 #[cfg(target_os = "macos")]
 pub use native::run_ssl;
 use std::{
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -75,8 +75,25 @@ impl Default for Timing {
         Self {
             connect: Duration::from_secs(60),
             probe: Duration::from_secs(5),
-            interval: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
             poll: Duration::from_millis(50),
         }
+    }
+}
+
+/// Probe cadence shared with one live worker. `SetProbeInterval` replaces the
+/// value under the same lock the worker reads, so no new thread or timer is
+/// created per update and the next due time is recomputed from the last probe.
+#[derive(Clone)]
+struct ProbeClock(Arc<Mutex<Duration>>);
+impl ProbeClock {
+    fn new(interval: Duration) -> Self {
+        Self(Arc::new(Mutex::new(interval)))
+    }
+    fn get(&self) -> Duration {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    fn set(&self, interval: Duration) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = interval;
     }
 }

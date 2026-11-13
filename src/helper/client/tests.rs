@@ -112,6 +112,7 @@ fn a_private_child_receives_the_request_and_shutdown_waits_for_its_cleanup_witho
 fn malformed_and_incompatible_replies_fail_the_channel_instead_of_becoming_snapshots() {
     for (mode, expected) in [
         ("protocol", Error::Incompatible),
+        ("old", Error::Incompatible),
         ("malformed", Error::Unavailable),
     ] {
         let mut peer = Peer::new(mode);
@@ -142,4 +143,60 @@ fn malformed_and_incompatible_replies_fail_the_channel_instead_of_becoming_snaps
         wait(|| client.finished());
         assert!(peer.cleaned());
     }
+}
+
+#[test]
+fn a_genuine_protocol_two_helper_is_incompatible_and_receives_no_connect_command() {
+    // `old2` sends a real v2 snapshot: its connections have no `failures`
+    // field, so the frame fails the current typed shape before the version is
+    // read. The helper client must still classify it as incompatible.
+    let mut peer = Peer::new("old2");
+    let mut client = peer.take();
+    client
+        .send(Request {
+            id: "first".into(),
+            command: super::super::protocol::Command::Snapshot {},
+        })
+        .unwrap();
+    // Take the first terminal channel result and compare it, so a wrong
+    // classification fails on the value instead of a waiter deadline.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let error = loop {
+        match client.poll() {
+            Ok(_) => {}
+            Err(error) => break error,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "helper client produced no terminal error"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(error, Error::Incompatible);
+    // The channel is terminally failed: a credential-bearing request cannot be
+    // written after the skew is detected.
+    assert!(
+        client
+            .send(Request {
+                id: "connect".into(),
+                command: super::super::protocol::Command::Connect {
+                    id: "one".into(),
+                    generation: 1,
+                    interval: crate::preferences::ProbeInterval::TEN,
+                    credentials: crate::secrets::Credentials {
+                        password: "fictional-client-secret".into(),
+                        psk: "".into(),
+                    },
+                },
+            })
+            .is_err()
+    );
+    wait(|| client.finished());
+    assert!(peer.cleaned());
+    let commands =
+        std::fs::read_to_string(peer.marker.with_extension("commands")).unwrap_or_default();
+    assert!(
+        !commands.lines().any(|command| command == "connect"),
+        "an incompatible helper must never receive a connect command"
+    );
 }

@@ -30,6 +30,40 @@ O gate de classes ainda não tem classes proibidas configuradas; sua execução
 não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
 variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
+## Checkpoint local das preferências — 13/11/2026
+
+[PASS, execução local] Fmt e clippy all-targets/all-features com `-D warnings`;
+608 testes desktop e 563 core, nenhum erro e dois ignorados por suíte. A UI
+passou lint, typecheck, build e 25 testes (215 assertions). As revisões
+independentes e os 12 cenários visuais da demonstração também passaram.
+Mutações afetadas: 17 Broker, 7 fluxo UI e 26 componente, com baseline e
+restauração. O gate de classes continua sem regras.
+
+[PASS, artefato preparado] Build de todos os binários, askpass com recusa de pai
+não autorizado, verificação dos dez arquivos do runtime, payload de 17 arquivos,
+empacotamento e inspeção de `target/vpnt.app`. O componente preparado é para o
+usuário local; o runtime deste build exige macOS 26.0. Nada foi instalado.
+
+Os recibos `preferences-final-integration{,-r1,-r2}-receipt.json` em
+`output/fixtures/` registram cada etapa e `sourceUnchanged=true` por rodada.
+A primeira rodada passou as suítes completas e parou em um mutante equivalente:
+remover somente `retry=None` ainda conservava o guard `component.close()`. A
+correção remove ambos os guards no mutante e a campanha completa passou. A
+rodada r1 parou depois no gerador do askpass, que ainda exigia somente quatro
+chaves no catálogo compartilhado. O gerador passou a validar as seis chaves
+atuais e embutir somente as quatro de autenticação; r2 passou a preparação e a
+inspeção. As falhas originais e o primeiro sobrevivente foram preservados.
+
+As suítes foram reaproveitadas após provar que a mudança intermediária era
+somente o seletor de mutação e um comentário de teste; as campanhas foram
+reaproveitadas após a correção isolada do gerador do askpass. Não houve nova
+mudança de lógica Rust, dependências ou UI nessas reexecuções. Os demais
+checkpoints deste documento são históricos e não ampliam a prova atual.
+
+[NOT RUN] Instalação privilegiada, login/defaults/notificações reais, tráfego e
+cleanup de VPN real, coexistência com VPNs existentes, aceite visual de
+tray/WKWebView e CI remoto. A demonstração HTTP não prova esses itens.
+
 O checkpoint integrado histórico (`5222128`) passou fmt, clippy com `-D warnings`, build,
 308 testes desktop e 292 core (dois ignored por suíte) e a matriz de 42
 mutações do codec PF_KEY. Na UI, lint, typecheck, oito testes (114 assertions),
@@ -87,49 +121,98 @@ processos de VPN ou instalação de sudoers.
 ## Preferências nativas e abertura no login (em integração)
 
 ```bash
-cargo test --locked --no-default-features --test preferences --test bridge --test application
-cargo test --locked --no-default-features --lib broker::preferences_tests
-cargo test --locked --offline --all-features --lib broker::component::tests::lifecycle::preferences
+cargo test --locked --offline --lib preferences::host
+cargo test --locked --offline --lib broker::
+cargo test --locked --offline --lib connection::controller
+cargo test --locked --offline --test helper_protocol
+cargo test --locked --offline --all-features --lib desktop::notifications
+cargo test --locked --offline --all-features --lib desktop::preferences::tests
 cargo test --locked --offline --all-features --lib desktop::login_item
 ```
 
-[PASS, portable contract] Sete testes públicos verificam os defaults da UI,
-os intervalos inteiros 10/30/60, conversão e rejeição de campos desconhecidos,
-ausentes ou mal tipados. Seis mutações foram detectadas em cópia isolada, com
-baseline e restauração; o manifesto fica em
-`output/fixtures/preferences-contract-commit-evidence.json` e os logs/drivers
-em `output/fixtures/preferences-contract/`. Esse valor entrou no checkpoint
-`cc2e837`; o intake, em `8e7b769`.
+[PASS, execução focada do integrador] Após a correção dos callbacks de
+notificações (`Channel: Send + Sync`, callback `Send`, slot one-shot protegido
+por mutex e consumido fora do lock), fmt e clippy all-targets/all-features com
+`-D warnings` passaram. Os oito testes do coordenador de preferências passaram.
+A rodada seguinte passou 32 testes Broker, 36 controlador, 9 protocolo,
+21 notificações, 2 decodificação/recusa do binário sem bundle e 12 login item.
+O recibo `output/fixtures/preferences-composition-scope-r2-receipt.json`
+registra `sourceUnchanged=true`. São provas focadas da composição ainda não
+commitada; não substituem o gate integrado final nem a prova real do produto.
 
-[PASS, bridge e broker] A ponte aceita o comando com o tipo validado e exige
-objeto no campo de preferências: a forma posicional que o serde do valor também
-aceita é recusada por um decodificador próprio da ponte, sem segundo schema. O
-`Snapshot` sempre ecoa a escolha. O app de demonstração guarda os quatro valores
-em memória, sem chaveiro, helper ou OS, e o app normal continua recusando
-mutações não-demo. O broker guarda e ecoa a escolha depois dos gates de
-expiração e de componente ocupado, e recusa `startup=true` com
-`startup_unavailable` até o adaptador de login ser ligado, preservando os quatro
-valores anteriores. Provas: dois testes de ponte, quatro privados do broker e um
-no fixture real de componente (operação viva, `component_busy` sem alterar
-escolhas, filho próprio concluído). Sete mutações nomeadas do intake e a que
-isenta o comando do gate de componente falham no teste previsto; logs em
-`output/fixtures/preferences-intake/` e
-`output/fixtures/preferences-component-gate/`.
+[PASS, UI na composição inicial] Lint, typecheck, 18 testes (169 assertions),
+build, 81 tokens e gate de classes passaram antes da compilação Rust. O build
+foi executado com cwd `ui`, atualizando os assets embutidos. O gate de classes
+continua sem regras. Uma revisão posterior encontrou recomposição a partir de
+snapshot antigo após resposta supersedida; a versão R2a e sua validação
+fecharam esse achado, conforme o checkpoint consolidado acima.
 
-[PASS, adaptador de login preparado] O adaptador nativo usa somente
-`SMAppService` (ServiceManagement, macOS 13+) e compila/liga no desktop, com
-doze testes de lógica — inclusive a recusa do binário de teste sem bundle — e
-doze mutações nomeadas na fonte final (checkpoint `5222128`), reproduzíveis com
-`cargo test --locked --offline --all-features --lib desktop::login_item`; logs e
-recibo em `output/fixtures/login-item-final/`. Ele não é chamado pela UI nem
-pelo broker: nada registra, desregistra ou abre System Settings.
+[PASS, oráculos de Host fornecidos pelo worker] Oito testes em uma pequena
+crate com as três fontes produtivas exatas e sete mutações mortas por
+assertions. Protegem restauração sem registro, alteração explícita do login,
+aprovação pendente, expiração, preservação de efeito observado após erro,
+falha de persistência e status indisponível. Fontes e baseline foram
+restaurados; relatório e logs preservados fora do conteúdo versionado.
 
-[NOT RUN, efeitos e serviço real] Helper, UI e persistência ainda não consomem
-o comando; intervalo efetivo de probe, notificações, reconexão automática e
-abertura no login não têm efeito ligado. `register`, `unregister`, `status`,
-aprovação em System Settings e falha de assinatura de um login item real não
-foram executados. O ramo macOS < 13 de `available!` continua NOT RUN: o guard
-está presente e é a primeira instrução da admissão, sem seam artificial.
+[FAIL, histórico preservado] A primeira composição parou no clippy por três
+ocorrências na tipagem/armazenamento dos callbacks de teste. A rodada r1 passou
+clippy e Host, mas falhou em dois testes Broker: o chaveiro descartável retornou
+`-50` sob execução restrita, e uma indentação incorreta na integração do peer
+fictício recusava SSL junto com IPsec. O teste de chaveiro passou fora do
+sandbox; a indentação foi corrigida e o teste da recusa IPsec passou. A rodada
+r2 passou os 32 Broker. Os recibos e logs originais `preferences-composition-
+scope*` foram preservados; as falhas não foram contadas como aprovação.
+
+[IMPLEMENTADO, em revisão] A UI mantém apenas idioma/tema no armazenamento
+local; preferências nativas vêm do snapshot obrigatório. O Broker aplica o Host
+e preserva o estado observado após erro, recusando alterações enquanto uma
+operação de componente vive. O backend real lê somente a chave fixa no domínio
+persistente `dev.vpnt.app`; armazenamento inválido não vira sucesso volátil.
+Carregar valores não registra login item. O protocolo 3 propaga intervalo e
+falhas de probe. A política preparada controla notificações e uma tentativa
+automática após três falhas, com guard de intenção manual após carregar
+segredos. A revisão independente encontrou classificação incorreta de um
+Snapshot realmente v2 (sem o campo novo); a correção R1a passou em três testes Client, 37 controlador e dez do codec.
+O Broker também executou a classificação de um corpo v2 sem carregar segredos.
+O cabeçalho tipado rejeita campos classificadores duplicados; os dados de uma
+versão diferente apenas classificam a falha, nunca viram uma mensagem aceita.
+
+[PASS, regressões de concorrência no integrador] Seis testes novos executam o
+Worker, o parser da ponte e o Client produtivos, ligados a um peer Python
+fictício, com segredos fictícios e uma barreira no segundo load. Cobrem cancelamento manual, instalação
+e remoção recusadas sem reativação após ociosidade, e um pedido de preferência
+que vence após 9,1 segundos. O pedido vencido continua retornando erro e conserva
+a preferência anterior; apenas o trabalho automático pendente é abandonado.
+Nenhum prazo foi ampliado ou rearmado. Os oráculos do Worker foram portados em
+`worker-automatic-r1-landing.json`; a suíte focada passou 6/6 sem ignorados. Os
+testes de Broker e as duas matrizes afetadas passaram na composição final.
+
+[PASS, oráculos de regressão R1a] Em cópia privada existente, remover a
+saturação de falhas ou trocar a classificação tipada por leitura do último valor
+de uma chave duplicada falha na assertion prevista. Baseline e restauração
+passaram; `preferences-protocol-r1a-oracles/receipt.json` conserva os hashes e
+logs. O teste de publicação consome cada Progress, evitando reutilizar o terceiro
+resultado no quarto probe. O oráculo UI `never-reactivate` também falhou no teste
+de reativação do StrictMode; fonte restaurada e baseline 21/21.
+
+[PASS, navegador de demonstração] Doze cenários combinam pt-BR/en-US,
+claro/escuro e larguras 280/320/640 px, sem transbordamento da página ou das
+linhas. Quatro capturas foram inspecionadas visualmente. Um atraso artificial de
+350 ms confirmou switches desabilitados e um documento tipado; teclado Space
+alterou somente o startup simulado. Uma resposta de falha simulada preservou o
+intervalo anterior e mostrou o texto correto nos dois idiomas. Recarregar não
+enviou SetPreferences; localStorage continha somente idioma e tema. Evidências e
+hashes de UI/assets/host em `output/fixtures/browser-preferences-r2a/`. A sessão
+de navegador e o servidor próprio foram encerrados após a coleta. Isso prova a
+UI HTTP de demo, sem efeitos de login/defaults e sem prova de WKWebView nativa.
+
+[NOT RUN, efeitos reais] Os 21 testes de notificações substituem somente o
+canal do SDK por um fake e usam o kernel produtivo. Os testes de login usam
+lógica injetada e a recusa de binário sem bundle. Não houve escrita de defaults
+pessoais, registro/desregistro de login item, pedido de permissão, entrega de
+notificação, uso de chaveiro/perfis reais ou reconexão de VPN. Persistência e
+`SMAppService` no bundle, aprovação em System Settings, assinatura, ramo macOS
+<13 e comportamento de rede real permanecem sem execução positiva.
 
 ## IPsec: transporte de leitura PF_KEY (em integração)
 

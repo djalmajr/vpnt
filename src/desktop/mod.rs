@@ -1,5 +1,7 @@
 mod icon;
 mod login_item;
+mod notifications;
+mod preferences;
 mod worker;
 
 use crate::{

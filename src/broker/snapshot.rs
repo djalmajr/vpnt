@@ -81,6 +81,7 @@ impl<S: SecretStore> Broker<S> {
                     status.state
                 };
                 set_state(&mut c, state);
+                c.failures = status.failures;
                 current.insert(c.view.profile.id.clone(), c);
             } else {
                 let present = self
@@ -103,6 +104,8 @@ impl<S: SecretStore> Broker<S> {
                         },
                         generation: status.generation,
                         pending: None,
+                        failures: status.failures,
+                        policy: behavior::Policy::default(),
                     },
                 );
             }
@@ -115,6 +118,7 @@ impl<S: SecretStore> Broker<S> {
             }
         }
         self.connections = current;
+        self.refresh_actions();
         self.ready = true;
         self.helper = "installed";
         if initial {

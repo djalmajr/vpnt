@@ -3,9 +3,10 @@
 Ícone de bandeja (tray) para ligar, desligar e acompanhar VPNs no macOS, no
 Windows e no Linux, com a mesma interface nos três.
 
-> Protótipo visual aprovado. O host macOS e a interface bilíngue estão em
-> implementação, com um modo de demonstração explícito. A camada de VPN real
-> ainda não está disponível. Windows e Linux ficam para depois.
+> Protótipo visual aprovado. A interface bilíngue e o runtime estão preparados
+> em um pacote de desenvolvimento local. Instalação, efeitos nativos das
+> preferências e VPN real ainda não foram validados. Windows e Linux ficam
+> para depois.
 
 ## Proposta
 
@@ -210,14 +211,26 @@ O término observado não garante completude das tabelas ou autoriza liberar
 recursos. O backend produtivo atual usa kernel-libipsec e ledger de recursos
 retidos, sem depender desse leitor PF_KEY.
 
-Preferências nativas têm um valor validado (intervalo 10/30/60, notificação,
-reconexão e abrir no login) e um intake preparado: a ponte aceita o comando, o
-app de demonstração e o broker guardam e devolvem a escolha no snapshot, e o
-broker recusa abrir no login até o adaptador correspondente ser ligado. O
-adaptador de login item (ServiceManagement, macOS 13+) está compilado e testado
-com lógica fictícia, mas não é chamado pela interface nem registra nada.
-Intervalo efetivo de probe, notificações, reconexão automática, persistência e
-abertura real no login continuam sem efeito e sem prova.
+Preferências nativas estão em integração. A UI envia o documento validado de
+intervalo (10/30/60 segundos), notificações, reconexão e abertura no login ao
+broker; idioma e tema continuam locais à interface. No bundle admitido, o host
+usa o domínio persistente do próprio app e consulta o estado do login item
+(ServiceManagement, macOS 13+). Carregar uma escolha salva não registra o app:
+registro e remoção dependem de uma alteração explícita. Aprovação pendente do
+sistema nunca é apresentada como registro concluído.
+
+O protocolo 3 leva o intervalo ao helper e publica a contagem de falhas de
+tráfego por geração, limitada a três. A política preparada pode notificar uma
+vez por episódio e, se habilitada, tentar reconectar após três falhas, sem
+repetir uma tentativa recusada na mesma geração. Uma ação manual enfileirada
+interrompe a reconexão automática antes do envio após a leitura de segredos.
+Notificações usam o catálogo bilíngue e um token revogável. O modo demo mantém
+apenas simulação em memória e não constrói esses adaptadores nativos.
+
+Os gates focados usam processos fictícios, um chaveiro descartável e backends
+injetados. A composição revisada passou nos testes e no empacotamento local. Persistência no bundle, registro real no
+login, permissão/entrega de notificações e reconexão de VPN real não foram
+executados. Esses limites estão detalhados em `VALIDATION.md`.
 
 O executor de instalação e remoção também exige ausência de admissões IPsec
 pendentes antes de recuperar o journal ou modificar componentes. Um lock livre
@@ -313,7 +326,7 @@ Salvar/remover perfis usa outro worker e um único comando fixo:
 `sudo -A -k -- /Library/PrivilegedHelperTools/dev.vpnt.helper admin`.
 O cliente valida helper e askpass em paths root fixos. O adaptador gráfico
 AppKit usa os mesmos catálogos pt-BR/en-US da UI; a senha da conta só vai para
-o pipe privado do sudo. O protocolo 2 exige AdminReady compatível antes de enviar
+o pipe privado do sudo. O protocolo 3 exige AdminReady compatível antes de enviar
 um documento com EOF; pedidos expirados não são repetidos após autorização tardia.
 A UI continua atendendo comandos de outros perfis. Sucesso exige saída do filho
 próprio e snapshot correlacionado no runtime. Só depois da remoção confirmada

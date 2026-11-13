@@ -6,6 +6,7 @@ use crate::{
     connection::routes::Coordinator,
     helper::protocol::{Command, ErrorCode, Message},
     model::{Profile, VpnKind},
+    preferences::ProbeInterval,
     secrets::{Credentials, Secret},
     session::ConnectionState,
 };
@@ -113,6 +114,7 @@ fn connect(harness: &mut Harness, id: &str, generation: u64, credentials: Creden
     harness.command(Command::Connect {
         id: id.into(),
         generation,
+        interval: ProbeInterval::TEN,
         credentials,
     })
 }

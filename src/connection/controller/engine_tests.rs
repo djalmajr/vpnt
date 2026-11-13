@@ -7,6 +7,7 @@ use crate::{
         process::ManagedChild,
         protocol::{parse_request, read_message, write_message},
     },
+    preferences::ProbeInterval,
     secrets::Secret,
 };
 use std::{
@@ -24,6 +25,7 @@ struct Control {
     responsive: bool,
     hold_probe: bool,
     probed: bool,
+    probes: usize,
     invalidate_after_probe: bool,
     invalid: bool,
     cleanup_allowed: bool,
@@ -214,6 +216,7 @@ impl Attempt for FixtureAttempt {
                 let mut kernel = self.kernel.lock().unwrap();
                 let c = kernel.attempts.get_mut(&self.key()).unwrap();
                 c.probed = true;
+                c.probes += 1;
                 if c.invalidate_after_probe {
                     c.invalid = true;
                 }
@@ -304,6 +307,7 @@ impl Harness {
         self.command(Command::Connect {
             id: id.into(),
             generation,
+            interval: ProbeInterval::TEN,
             credentials: Credentials {
                 password: Secret::from("fixture-password"),
                 psk: Secret::from(""),
@@ -348,7 +352,18 @@ impl Harness {
         }
     }
     fn state(&self, id: &str, generation: u64, state: ConnectionState) -> bool {
-        self.seen.iter().any(|message| matches!(message, Message::Changed { profile_id, generation: g, state: s } if profile_id==id && *g==generation && *s==state))
+        self.seen.iter().any(|message| matches!(message, Message::Changed { profile_id, generation: g, state: s, .. } if profile_id==id && *g==generation && *s==state))
+    }
+    fn barrier(&self, mut predicate: impl FnMut(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate(self) {
+            assert!(
+                Instant::now() < deadline,
+                "controller barrier timed out; received {} messages",
+                self.seen.len()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
     }
     fn started(&mut self, id: &str, generation: u64) {
         self.wait(|h| {
@@ -379,6 +394,7 @@ impl Harness {
                     id: s.id.clone(),
                     generation: s.generation,
                     state: s.state,
+                    failures: s.failures,
                 })
                 .collect()
         } else {
@@ -605,6 +621,7 @@ fn stale_operations_and_invalid_secrets_cannot_cancel_or_replace_current_worker(
     let bad = h.command(Command::Connect {
         id: "one".into(),
         generation: 6,
+        interval: ProbeInterval::TEN,
         credentials: Credentials {
             password: Secret::from("x".repeat(257)),
             psk: Secret::from(""),
@@ -655,6 +672,92 @@ fn unread_output_does_not_block_cancel_and_bounded_overflow_shuts_down_safely() 
     }
     assert!(h.kernel.lock().unwrap().attempts[&("one".into(), 1)].stopped);
     assert!(h.worker.take().unwrap().join().unwrap().is_ok());
+}
+
+#[test]
+fn coalesced_changes_keep_the_third_failure_and_a_responsive_probe_resets_it() {
+    // Capacity one: the engine cannot hand every intermediate status to the
+    // reader, so only the coalesced progress in the slot can carry failure 3.
+    let mut h = Harness::new(vec![profile("one")], 1);
+    h.connect("one", 1);
+    h.started("one", 1);
+    h.control("one", 1, |c| c.ready = true);
+    // The first traffic probe is immediately due and fails; wait for the
+    // engine to publish that settled status before driving manual probes.
+    h.wait(|h| h.state("one", 1, ConnectionState::Unresponsive));
+    h.barrier(|h| h.kernel.lock().unwrap().attempts[&("one".into(), 1)].probes >= 1);
+    // Two more command probes while the bounded output is not drained.
+    for target in [2, 3] {
+        h.command(Command::Probe {
+            id: "one".into(),
+            generation: 1,
+        });
+        h.barrier(|h| h.kernel.lock().unwrap().attempts[&("one".into(), 1)].probes >= target);
+    }
+    // Snapshots are engine round-trips; repeat until the coalesced third
+    // failure is visible instead of assuming the progress was applied in the
+    // same loop iteration that answered the first snapshot.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let states = loop {
+        let states = h.snapshot_states();
+        if states.iter().any(|s| {
+            s.id == "one"
+                && s.generation == 1
+                && s.state == ConnectionState::Unresponsive
+                && s.failures == 3
+        }) {
+            break states;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "coalesced third failure never reached the snapshot"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        states
+            .iter()
+            .find(|s| s.id == "one")
+            .map(|s| (s.generation, s.failures)),
+        Some((1, 3)),
+        "the snapshot must echo the coalesced counter for the current generation"
+    );
+    assert!(h.seen.iter().any(|m| matches!(
+        m,
+        Message::Changed {
+            profile_id,
+            generation: 1,
+            state: ConnectionState::Unresponsive,
+            failures: 3,
+        } if profile_id == "one"
+    )));
+    h.control("one", 1, |c| c.responsive = true);
+    h.command(Command::Probe {
+        id: "one".into(),
+        generation: 1,
+    });
+    h.wait(|h| h.kernel.lock().unwrap().attempts[&("one".into(), 1)].probes >= 4);
+    h.wait(|h| {
+        h.seen.iter().any(|m| {
+            matches!(
+                m,
+                Message::Changed {
+                    profile_id,
+                    generation: 1,
+                    state: ConnectionState::Connected,
+                    failures: 0,
+                } if profile_id == "one"
+            )
+        })
+    });
+    let states = h.snapshot_states();
+    assert!(
+        states
+            .iter()
+            .any(|s| s.id == "one" && s.failures == 0 && s.state == ConnectionState::Connected)
+    );
+    h.control("one", 1, |c| c.cleanup_allowed = true);
+    h.finish();
 }
 
 #[cfg(target_os = "macos")]
@@ -710,6 +813,7 @@ fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_e
             command: Command::Connect {
                 id: "one".into(),
                 generation: 1,
+                interval: ProbeInterval::TEN,
                 credentials: Credentials {
                     password: "fixture-password".into(),
                     psk: "".into(),

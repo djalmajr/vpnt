@@ -153,6 +153,11 @@ const en = {
   demoHint: "Fictional profiles. No VPN connection is made.",
   demoState: "Demonstration state",
   backendUnavailable: "Could not reach vpnt. Reopen the panel to try again.",
+  preferencesNotConfirmed:
+    "The change was not confirmed. It may still be applied.",
+  preferencesUnavailable: "Could not save the preferences.",
+  startupRequiresApproval: "Allow vpnt to open at login in System Settings.",
+  startupUnavailable: "Opening at login is not available in this version.",
   invalidName: "Enter a name.",
   invalidGateway: "Enter a valid gateway.",
   invalidNetwork: "Invalid network. Example: 10.20.0.0/24",
@@ -339,6 +344,13 @@ const pt: Record<MessageKey, string> = {
   demoState: "Estado da demonstração",
   backendUnavailable:
     "Não foi possível falar com o vpnt. Abra o painel de novo para tentar.",
+  preferencesNotConfirmed:
+    "A alteração não foi confirmada. Ela ainda pode ser aplicada.",
+  preferencesUnavailable: "Não foi possível salvar as preferências.",
+  startupRequiresApproval:
+    "Permita a abertura no login nos Ajustes do Sistema.",
+  startupUnavailable:
+    "Abrir ao iniciar a sessão ainda não está disponível nesta versão.",
   invalidName: "Informe um nome.",
   invalidGateway: "Informe um gateway válido.",
   invalidNetwork: "Rede inválida. Exemplo: 10.20.0.0/24",

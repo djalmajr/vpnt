@@ -14,6 +14,7 @@ pub(super) fn map(profiles: Vec<Profile>) -> Result<BTreeMap<String, Profile>, E
 pub(super) fn refresh(
     slots: &mut BTreeMap<String, Slot<'_>>,
     profiles: Vec<Profile>,
+    default: &ProbeClock,
 ) -> Result<(), ErrorCode> {
     let next = map(profiles)?;
     // Validate the complete replacement before touching even an idle slot.
@@ -35,6 +36,8 @@ pub(super) fn refresh(
                 slot.profile = profile;
                 slot.generation += 1;
                 slot.state = ConnectionState::Off;
+                // A new generation never inherits the previous failure streak.
+                slot.failures = 0;
             }
         } else {
             slots.insert(
@@ -43,6 +46,8 @@ pub(super) fn refresh(
                     profile,
                     generation: 0,
                     state: ConnectionState::Off,
+                    failures: 0,
+                    interval: ProbeClock::new(default.get()),
                     worker: None,
                     pending: None,
                 },
@@ -65,6 +70,8 @@ mod tests {
             } else {
                 ConnectionState::Off
             },
+            failures: 0,
+            interval: ProbeClock::new(std::time::Duration::from_secs(60)),
             worker: None,
             pending: pending.then(|| Pending {
                 request: "pending".into(),
@@ -82,12 +89,13 @@ mod tests {
         let mut changed = original.clone();
         changed.gateway = "changed.example.test".into();
         let mut slots = BTreeMap::from([("one".into(), slot)]);
+        let clock = ProbeClock::new(std::time::Duration::from_secs(10));
         assert!(matches!(
-            refresh(&mut slots, vec![changed]),
+            refresh(&mut slots, vec![changed], &clock),
             Err(ErrorCode::ProfileBusy)
         ));
         assert!(matches!(
-            refresh(&mut slots, vec![]),
+            refresh(&mut slots, vec![], &clock),
             Err(ErrorCode::ProfileBusy)
         ));
         assert_eq!(slots["one"].profile, original);
@@ -99,14 +107,15 @@ mod tests {
         let mut slots = BTreeMap::from([("one".into(), slot(u64::MAX, false))]);
         let mut changed = slots["one"].profile.clone();
         changed.name = "Changed".into();
+        let clock = ProbeClock::new(std::time::Duration::from_secs(10));
         assert!(matches!(
-            refresh(&mut slots, vec![changed.clone()]),
+            refresh(&mut slots, vec![changed.clone()], &clock),
             Err(ErrorCode::Unavailable)
         ));
         assert_eq!(slots["one"].profile.name, "Original");
         assert_eq!(slots["one"].generation, u64::MAX);
         slots.get_mut("one").unwrap().generation = u64::MAX - 1;
-        refresh(&mut slots, vec![changed]).unwrap();
+        refresh(&mut slots, vec![changed], &clock).unwrap();
         assert_eq!(slots["one"].generation, u64::MAX);
     }
 }

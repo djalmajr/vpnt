@@ -1,6 +1,8 @@
 //! Normal application state. Only the authenticated helper's current generation
 //! may report a connected tunnel; demo schedules never enter this model.
 mod admin;
+mod automatic;
+mod behavior;
 mod commands;
 mod component;
 mod retry;
@@ -30,6 +32,8 @@ struct Connection {
     view: VpnView,
     generation: u64,
     pending: Option<Pending>,
+    failures: u32,
+    policy: behavior::Policy,
 }
 pub struct Broker<S: SecretStore> {
     client: Option<Client>,
@@ -45,10 +49,20 @@ pub struct Broker<S: SecretStore> {
     component: component::Flow,
     epoch: u64,
     preferences: Preferences,
+    notifier: Box<dyn crate::notifications::Notifier>,
+    locale: crate::localization::Locale,
+    automatic: std::collections::VecDeque<automatic::Action>,
+    sent_interval: Option<crate::preferences::ProbeInterval>,
+    preferences_host: Box<dyn crate::preferences::host::Host>,
 }
 impl<S: SecretStore> Broker<S> {
     pub fn runtime(secrets: S) -> Self {
         Self::reconnecting(retry::Retry::runtime(), secrets)
+    }
+    pub fn with_preferences_host(mut self, host: Box<dyn crate::preferences::host::Host>) -> Self {
+        self.preferences = host.current();
+        self.preferences_host = host;
+        self
     }
     fn reconnecting(retry: retry::Retry, secrets: S) -> Self {
         let mut result = Self::new(None, secrets);
@@ -72,6 +86,11 @@ impl<S: SecretStore> Broker<S> {
             component: component::Flow::new(),
             epoch: 1,
             preferences: Preferences::default(),
+            notifier: Box::new(crate::notifications::Noop),
+            locale: crate::localization::Locale::default(),
+            automatic: automatic::queue(),
+            sent_interval: None,
+            preferences_host: Box::new(crate::preferences::host::Coordinator::memory()),
         };
         result.begin();
         result
@@ -116,6 +135,8 @@ impl<S: SecretStore> Broker<S> {
         }
         self.dead = true;
         self.ready = false;
+        self.sent_interval = None;
+        self.automatic.clear();
         self.helper = if outdated { "outdated" } else { "missing" };
         if let Some(client) = &mut self.client {
             client.close();
@@ -158,6 +179,7 @@ impl<S: SecretStore> Broker<S> {
         }
         self.poll_admin();
         self.poll_component();
+        self.reconcile_interval();
     }
     fn receive(&mut self, message: Message) -> Result<(), ()> {
         match message {
@@ -172,6 +194,7 @@ impl<S: SecretStore> Broker<S> {
                 profile_id,
                 generation,
                 state,
+                failures,
             } => {
                 if !self.ready {
                     return Err(());
@@ -184,6 +207,8 @@ impl<S: SecretStore> Broker<S> {
                     return Err(());
                 }
                 set_state(c, state);
+                c.failures = failures;
+                self.refresh_actions();
             }
             Message::Accepted { id } => {
                 for c in self.connections.values_mut() {
@@ -227,6 +252,10 @@ impl<S: SecretStore> Broker<S> {
 }
 
 fn set_state(c: &mut Connection, state: State) {
+    c.policy.state(c.generation, state);
+    if state != State::Unresponsive {
+        c.failures = 0;
+    }
     if c.view.state == state {
         return;
     }
@@ -247,3 +276,11 @@ fn set_state(c: &mut Connection, state: State) {
 mod preferences_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "desktop"))]
+impl<S: SecretStore> Broker<S> {
+    /// Test-only composition seam with a real transport and injected secrets.
+    pub(crate) fn transport_fixture(client: Client, secrets: S) -> Self {
+        Self::new(Some(client), secrets)
+    }
+}

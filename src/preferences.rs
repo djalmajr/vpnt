@@ -2,6 +2,8 @@
 //! helper integration. Values are validated on entry, so no caller can hold an
 //! interval the helper would refuse.
 
+pub mod host;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::time::Duration;
 

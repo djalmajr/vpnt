@@ -13,9 +13,12 @@ if sys.platform!='darwin' or os.getuid()==0 or os.geteuid()==0:
 catalogs=ROOT/'ui/src/locales/native.json'
 data=catalogs.read_bytes()
 parsed=json.loads(data)
-expected={'authTitle','authPrompt','authConfirm','authCancel'}
+auth={'authTitle','authPrompt','authConfirm','authCancel'}
+expected=auth|{'unresponsiveTitle','unresponsiveBody'}
 assert set(parsed)=={'pt-BR','en-US'}
 assert all(set(c)==expected and all(isinstance(v,str) and v for v in c.values()) for c in parsed.values())
+# Embed only the fields this adapter consumes after validating the shared catalog.
+data=json.dumps({locale:{key:catalog[key] for key in sorted(auth)} for locale,catalog in parsed.items()},ensure_ascii=False).encode()
 output=ROOT/'target/debug/vpnt-askpass'
 output.parent.mkdir(parents=True,exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='vpnt-askpass-',dir=output.parent) as directory:

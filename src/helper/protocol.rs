@@ -1,6 +1,7 @@
 //! Private pipe protocol. Runtime commands cannot modify administrative policy.
 use crate::{
     model::{Profile, valid_profile_id},
+    preferences::ProbeInterval,
     secrets::Credentials,
     session::ConnectionState,
 };
@@ -11,7 +12,7 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
@@ -38,6 +39,7 @@ pub enum Command {
     Connect {
         id: String,
         generation: u64,
+        interval: ProbeInterval,
         credentials: Credentials,
     },
     Disconnect {
@@ -47,6 +49,11 @@ pub enum Command {
     Probe {
         id: String,
         generation: u64,
+    },
+    /// Global probe cadence for this UID/controller. It carries no credential,
+    /// profile or network authority; the closed interval type is the only value.
+    SetProbeInterval {
+        interval: ProbeInterval,
     },
 }
 
@@ -84,6 +91,8 @@ pub struct TunnelStatus {
     pub id: String,
     pub generation: u64,
     pub state: ConnectionState,
+    /// Consecutive failed traffic probes. Only `Unresponsive` carries 1..=3.
+    pub failures: u32,
 }
 
 /// No variant contains credentials or raw client output.
@@ -112,6 +121,7 @@ pub enum Message {
         profile_id: String,
         generation: u64,
         state: ConnectionState,
+        failures: u32,
     },
     Fatal {
         error: ErrorCode,
@@ -129,10 +139,12 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     }
     match &request.command {
         Command::Snapshot {} => {}
+        Command::SetProbeInterval { .. } => {}
         Command::Connect {
             id,
             generation,
             credentials,
+            ..
         } => {
             validate_operation(id, *generation)?;
             // The root runtime additionally checks PSK requirements against its
@@ -180,8 +192,20 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
     let Some(bytes) = read_frame(reader, MAX_MESSAGE_BYTES)? else {
         return Ok(None);
     };
-    let message: Message =
-        serde_json::from_slice(&bytes).map_err(|_| ProtocolError::InvalidRequest)?;
+    let message: Message = match serde_json::from_slice(&bytes) {
+        Ok(message) => message,
+        Err(_) => {
+            // An older helper's body predates this version's field set, so a
+            // shape error would mask the skew (a v2 snapshot has no
+            // `failures`). Classify from the raw version before rejecting the
+            // shape; current-version bodies must still satisfy the strict
+            // schema below and are never accepted through this branch.
+            if version_skew(&bytes) {
+                return Err(ProtocolError::UnsupportedVersion);
+            }
+            return Err(ProtocolError::InvalidRequest);
+        }
+    };
     match &message {
         Message::AdminReady {
             protocol_version,
@@ -212,9 +236,11 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
                 || profiles
                     .iter()
                     .any(|profile| profile.validate().is_err() || !ids.insert(&profile.id))
-                || connections
-                    .iter()
-                    .any(|status| !ids.contains(&status.id) || !running.insert(&status.id))
+                || connections.iter().any(|status| {
+                    !ids.contains(&status.id)
+                        || !running.insert(&status.id)
+                        || !coherent_progress(status.state, status.failures)
+                })
             {
                 return Err(ProtocolError::InvalidRequest);
             }
@@ -225,8 +251,14 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
         Message::Changed {
             profile_id,
             generation,
-            ..
-        } => validate_operation(profile_id, *generation)?,
+            state,
+            failures,
+        } => {
+            validate_operation(profile_id, *generation)?;
+            if !coherent_progress(*state, *failures) {
+                return Err(ProtocolError::InvalidRequest);
+            }
+        }
         _ => {}
     }
     Ok(Some(message))
@@ -252,6 +284,35 @@ fn validate_operation(id: &str, generation: u64) -> Result<(), ProtocolError> {
         return Err(ProtocolError::InvalidRequest);
     }
     Ok(())
+}
+
+/// Every state except `Unresponsive` means zero consecutive traffic failures.
+/// `Unresponsive` always follows at least one actual failed probe, so a counter
+/// outside 1..=3 (including zero) is an incoherent wire payload.
+fn coherent_progress(state: ConnectionState, failures: u32) -> bool {
+    match state {
+        ConnectionState::Unresponsive => (1..=3).contains(&failures),
+        _ => failures == 0,
+    }
+}
+
+/// True only for a versioned frame (`snapshot`/`admin_ready`) whose numeric
+/// `protocol_version` differs from this build's. Every other malformed shape
+/// stays `InvalidRequest`; this probe never accepts a body.
+fn version_skew(bytes: &[u8]) -> bool {
+    // Ignore the per-version body, while keeping serde's duplicate-field
+    // rejection for the two fields used to classify the version.
+    #[derive(Deserialize)]
+    struct Header {
+        #[serde(rename = "type")]
+        kind: String,
+        protocol_version: u64,
+    }
+    let Ok(header) = serde_json::from_slice::<Header>(bytes) else {
+        return false;
+    };
+    matches!(header.kind.as_str(), "snapshot" | "admin_ready")
+        && header.protocol_version != u64::from(VERSION)
 }
 
 fn read_frame(

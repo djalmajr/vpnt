@@ -18,6 +18,7 @@ pub mod install;
 pub mod keychain;
 pub mod localization;
 pub mod model;
+pub mod notifications;
 pub mod preferences;
 #[cfg(feature = "desktop")]
 pub mod preview;

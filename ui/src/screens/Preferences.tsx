@@ -1,5 +1,5 @@
 import { Group, Header, Icon, Row, type T, Toggle } from "../components/common";
-import type { Snapshot } from "../model";
+import type { NativePreferences, Snapshot } from "../model";
 import type { Navigate } from "../navigation";
 import type { Settings } from "../settings";
 
@@ -12,12 +12,13 @@ export function Preferences({
   t,
 }: {
   snapshot: Snapshot;
-  settings: Settings;
+  settings: Settings & { preferencesPending: boolean };
   update: (settings: Settings) => void;
   navigate: Navigate;
   removeComponent: () => void;
   t: T;
 }) {
+  const pending = settings.preferencesPending;
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     update({ ...settings, [key]: value });
   return (
@@ -33,6 +34,7 @@ export function Preferences({
           <Toggle
             label={t("startAtLogin")}
             checked={settings.startup}
+            disabled={pending}
             onChange={(value) => set("startup", value)}
           />
         </Row>
@@ -69,7 +71,13 @@ export function Preferences({
           <select
             aria-label={t("testEvery")}
             value={settings.interval}
-            onChange={(event) => set("interval", Number(event.target.value))}
+            disabled={pending}
+            onChange={(event) =>
+              set(
+                "interval",
+                Number(event.target.value) as NativePreferences["interval"],
+              )
+            }
           >
             {[10, 30, 60].map((count) => (
               <option key={count} value={count}>
@@ -82,6 +90,7 @@ export function Preferences({
           <Toggle
             label={t("notifyStale")}
             checked={settings.notify}
+            disabled={pending}
             onChange={(value) => set("notify", value)}
           />
         </Row>
@@ -89,6 +98,7 @@ export function Preferences({
           <Toggle
             label={t("autoReconnect")}
             checked={settings.reconnect}
+            disabled={pending}
             onChange={(value) => set("reconnect", value)}
           />
         </Row>

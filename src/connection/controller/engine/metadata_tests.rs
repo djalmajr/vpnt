@@ -115,6 +115,7 @@ fn ipsec_metadata_is_visible_without_dispatching_it_to_the_ssl_worker() {
     let id = h.send(Command::Connect {
         id: "ipsec".into(),
         generation: 1,
+        interval: crate::preferences::ProbeInterval::TEN,
         credentials: Credentials {
             password: "fictional".into(),
             psk: "".into(),

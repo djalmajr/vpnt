@@ -35,11 +35,21 @@ export type VpnView = {
   hasPsk: boolean;
   log: { timestamp: number; state: ConnectionState }[];
 };
+export type NativePreferences = {
+  interval: 10 | 30 | 60;
+  notify: boolean;
+  reconnect: boolean;
+  startup: boolean;
+};
 export type Snapshot = {
   version: string;
   demo: boolean;
   helper: "installed" | "missing" | "outdated";
   componentOperation?: "installing" | "removing" | "settling";
+  // Required: the backend that ships inside this app always produces it. The
+  // UI only falls back to documented defaults before the first snapshot (or a
+  // poll) has arrived; it never caches or replays a native choice.
+  preferences: NativePreferences;
   vpns: VpnView[];
 };
 export type Command =
@@ -56,6 +66,7 @@ export type Command =
   | { type: "toggle" | "reconnect" | "probe" | "remove_profile"; id: string }
   | { type: "save_profile"; profile: Profile }
   | { type: "save_secrets"; id: string; password: string; psk: string }
+  | { type: "set_preferences"; preferences: NativePreferences }
   | { type: "set_demo_state"; id: string; state: ConnectionState }
   | { type: "resize"; height: number };
 export type Reply = { id: string; snapshot?: Snapshot; error?: string };

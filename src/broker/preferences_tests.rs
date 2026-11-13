@@ -1,4 +1,5 @@
 use super::*;
+mod host;
 use crate::{
     preferences::ProbeInterval,
     secrets::{Credentials, SecretError},

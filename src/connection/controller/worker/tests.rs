@@ -1,6 +1,7 @@
 use super::*;
 use std::{
-    sync::{Arc, Mutex},
+    collections::VecDeque,
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     thread,
     time::{Duration, Instant},
 };
@@ -77,6 +78,9 @@ fn timing(connect: Duration) -> Timing {
         poll: Duration::from_millis(5),
     }
 }
+fn clock(seconds: u64) -> ProbeClock {
+    ProbeClock::new(Duration::from_secs(seconds))
+}
 
 #[test]
 fn slow_start_times_out_before_ready_and_cleans_up() {
@@ -96,6 +100,7 @@ fn slow_start_times_out_before_ready_and_cleans_up() {
         attempt,
         signals(canceled),
         timing(Duration::from_millis(150)),
+        clock(1),
     );
     assert_eq!(finished.state, ConnectionState::GatewayTimeout);
     assert_eq!(finished.error, Some(ErrorCode::BackendFailure));
@@ -129,6 +134,7 @@ fn slow_ready_true_after_expiry_times_out_without_healthy_or_probe() {
         attempt,
         signals(canceled),
         timing(Duration::from_millis(300)),
+        clock(1),
     );
     assert_eq!(finished.state, ConnectionState::GatewayTimeout);
     assert_eq!(finished.error, Some(ErrorCode::BackendFailure));
@@ -156,6 +162,7 @@ fn canceled_and_expired_returns_off_not_timeout() {
         attempt,
         signals(canceled),
         timing(Duration::from_millis(100)),
+        clock(1),
     );
     assert_eq!(finished.state, ConnectionState::Off);
     assert_eq!(finished.error, None);
@@ -182,10 +189,162 @@ fn timeout_waits_for_cleanup_success() {
         attempt,
         signals(canceled),
         timing(Duration::from_millis(100)),
+        clock(1),
     );
     assert_eq!(finished.state, ConnectionState::GatewayTimeout);
     assert!(
         counters.lock().unwrap().cleanup >= 3,
         "cleanup was skipped or not retried"
     );
+}
+
+/// Scripted traffic probe outcomes, consumed in order; an exhausted script
+/// answers responsively. Counters live outside so the test thread can wait on
+/// an actual probe instead of sleeping for an arbitrary span.
+struct Streak {
+    probes: Arc<AtomicUsize>,
+    outcomes: Arc<Mutex<VecDeque<bool>>>,
+}
+impl Attempt for Streak {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn ready(&mut self) -> Result<bool, Failure> {
+        Ok(true)
+    }
+    fn healthy(&mut self) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+        self.probes.fetch_add(1, Ordering::AcqRel);
+        Ok(self.outcomes.lock().unwrap().pop_front().unwrap_or(true))
+    }
+    fn cleanup(&mut self) -> bool {
+        true
+    }
+}
+
+struct StreakSignal {
+    canceled: Arc<AtomicBool>,
+    probe: Arc<AtomicBool>,
+    state: Arc<Mutex<Option<Progress>>>,
+    probes: Arc<AtomicUsize>,
+}
+fn streak(outcomes: impl IntoIterator<Item = bool>) -> (StreakSignal, Streak) {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let probe = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(Mutex::new(None));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let attempt = Streak {
+        probes: probes.clone(),
+        outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+    };
+    let signal = StreakSignal {
+        canceled,
+        probe,
+        state,
+        probes,
+    };
+    (signal, attempt)
+}
+impl StreakSignal {
+    fn spend(&self) -> Signals {
+        Signals {
+            canceled: self.canceled.clone(),
+            probe: self.probe.clone(),
+            state: self.state.clone(),
+        }
+    }
+    /// Wait until probe `target` has actually run *and* the worker published a
+    /// status matching `expected`, with a deadline. Waiting on the probe count
+    /// alone can return the previous publication: `Attempt::probe` increments
+    /// before the worker computes and stores its `Progress`.
+    fn progress(&self, target: usize, expected: impl Fn(&Progress) -> bool) -> Progress {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if self.probes.load(Ordering::Acquire) >= target {
+                let mut state = self.state.lock().unwrap();
+                if state.as_ref().is_some_and(&expected) {
+                    // Consume the publication. A later saturated probe may
+                    // publish the same value, but cannot reuse this one.
+                    return state.take().unwrap();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "probe {target} did not publish the expected progress"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn failed_probes_saturate_at_three_and_a_responsive_probe_resets_the_streak() {
+    let (signal, attempt) = streak([false, false, false, false, true]);
+    let (canceled, probe) = (signal.canceled.clone(), signal.probe.clone());
+    let handle = thread::spawn({
+        let signals = signal.spend();
+        move || {
+            run(
+                attempt,
+                signals,
+                timing(Duration::from_secs(5)),
+                clock(3600),
+            )
+        }
+    });
+    let first = signal.progress(1, |progress| {
+        progress.state == ConnectionState::Unresponsive
+    });
+    assert_eq!(first.state, ConnectionState::Unresponsive);
+    assert_eq!(first.failures, 1);
+    // A command probe is an actual traffic probe: it counts even though the
+    // 3600 s timer cadence is nowhere near due.
+    for (target, failures) in [(2, 2), (3, 3), (4, 3)] {
+        probe.store(true, Ordering::Release);
+        let progress = signal.progress(target, |progress| {
+            progress.state == ConnectionState::Unresponsive
+        });
+        assert_eq!(progress.state, ConnectionState::Unresponsive);
+        assert_eq!(progress.failures, failures, "counter did not saturate");
+    }
+    probe.store(true, Ordering::Release);
+    let recovered = signal.progress(5, |progress| progress.state == ConnectionState::Connected);
+    assert_eq!(recovered.state, ConnectionState::Connected);
+    assert_eq!(
+        recovered.failures, 0,
+        "responsive probe must reset the streak"
+    );
+    canceled.store(true, Ordering::Release);
+    assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+}
+
+#[test]
+fn shortening_the_live_clock_makes_the_next_timer_probe_due_from_the_last_probe() {
+    let (signal, attempt) = streak([]);
+    let (canceled, interval) = (signal.canceled.clone(), clock(600));
+    let live = interval.clone();
+    let handle = thread::spawn({
+        let signals = signal.spend();
+        move || run(attempt, signals, timing(Duration::from_secs(5)), interval)
+    });
+    // First probe is immediately due because no probe has happened yet.
+    assert_eq!(
+        signal
+            .progress(1, |progress| progress.state == ConnectionState::Connected)
+            .state,
+        ConnectionState::Connected
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        signal.probes.load(Ordering::Acquire),
+        1,
+        "a 600 s cadence must not probe again inside a 200 ms window"
+    );
+    // Replacing the shared duration is read live, from the last actual probe.
+    live.set(Duration::from_millis(20));
+    signal.progress(3, |progress| progress.state == ConnectionState::Connected);
+    canceled.store(true, Ordering::Release);
+    assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
 }

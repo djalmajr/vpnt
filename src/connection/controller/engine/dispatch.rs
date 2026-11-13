@@ -5,6 +5,7 @@ pub(super) fn dispatch<F: Factory>(
     factory: &F,
     slots: &mut BTreeMap<String, Slot<'_>>,
     output: &mut VecDeque<Message>,
+    interval: &ProbeClock,
 ) {
     let fail = |output: &mut VecDeque<_>, error| {
         output.push_back(Message::Failed {
@@ -14,6 +15,19 @@ pub(super) fn dispatch<F: Factory>(
     };
     if !valid_profile_id(&request.id) {
         fail(output, ErrorCode::InvalidRequest);
+        return;
+    }
+    // A global cadence preference: no profile/slot lookup, no credential or
+    // network authority. The handler only replaces shared durations in place.
+    if let Command::SetProbeInterval {
+        interval: requested,
+    } = &request.command
+    {
+        interval.set(requested.duration());
+        for slot in slots.values_mut() {
+            slot.interval.set(requested.duration());
+        }
+        output.push_back(Message::Accepted { id: request.id });
         return;
     }
     let (id, generation) = match &request.command {
@@ -29,6 +43,7 @@ pub(super) fn dispatch<F: Factory>(
                         id: slot.profile.id.clone(),
                         generation: slot.generation,
                         state: slot.state,
+                        failures: slot.failures,
                     })
                     .collect(),
             });
@@ -37,6 +52,7 @@ pub(super) fn dispatch<F: Factory>(
         Command::Connect { id, generation, .. }
         | Command::Disconnect { id, generation }
         | Command::Probe { id, generation } => (id, *generation),
+        Command::SetProbeInterval { .. } => unreachable!(),
     };
     let Some(slot) = slots.get_mut(id) else {
         fail(output, ErrorCode::ProfileNotFound);
@@ -52,7 +68,11 @@ pub(super) fn dispatch<F: Factory>(
         return;
     }
     match request.command {
-        Command::Connect { credentials, .. } => {
+        Command::Connect {
+            interval: requested,
+            credentials,
+            ..
+        } => {
             if !factory.supports(slot.profile.kind) {
                 fail(output, ErrorCode::MissingProgram);
                 return;
@@ -63,11 +83,14 @@ pub(super) fn dispatch<F: Factory>(
             }
             let replacing = slot.worker.is_some();
             slot.cancel();
+            // This generation's cadence; a later `SetProbeInterval` replaces it.
+            slot.interval.set(requested.duration());
             slot.pending = Some(Pending {
                 request: request.id.clone(),
                 credentials,
             });
             slot.generation = generation;
+            slot.failures = 0;
             slot.state = if replacing {
                 ConnectionState::Reconnecting
             } else {
@@ -78,6 +101,7 @@ pub(super) fn dispatch<F: Factory>(
             slot.cancel();
             slot.pending = None;
             slot.generation = generation;
+            slot.failures = 0;
             slot.state = if slot.worker.is_some() {
                 ConnectionState::Disconnecting
             } else {
@@ -100,7 +124,7 @@ pub(super) fn dispatch<F: Factory>(
                 return;
             }
         }
-        Command::Snapshot {} => unreachable!(),
+        Command::Snapshot {} | Command::SetProbeInterval { .. } => unreachable!(),
     }
     output.push_back(Message::Accepted { id: request.id });
     output.push_back(slot.changed());

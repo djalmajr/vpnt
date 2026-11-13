@@ -26,6 +26,12 @@ function scenario() {
     version,
     demo: true,
     helper: "installed",
+    preferences: {
+      interval: 10,
+      notify: true,
+      reconnect: false,
+      startup: false,
+    },
     vpns: [],
   });
   return {
@@ -101,4 +107,34 @@ test("disposed polling cannot affect the active page", async () => {
     expect(s.current()).toBeUndefined();
     expect(s.error()).toBeUndefined();
   }
+});
+
+test("a rejected stale reply is superseded and cannot own the newer action's banner", async () => {
+  const s = scenario();
+  const stale = s.flow.dispatch({
+    type: "set_preferences",
+    preferences: {
+      interval: 30,
+      notify: false,
+      reconnect: true,
+      startup: false,
+    },
+  });
+  const newer = s.flow.dispatch({ type: "toggle", id: "one" });
+  s.pending[1].reject(new Error("invalid_name"));
+  expect(await newer).toEqual({
+    ok: false,
+    code: "invalid_name",
+    superseded: false,
+  });
+  expect(s.error()).toBe("invalid_name");
+  // The old preference command rejects late with a writable failure code.
+  s.pending[0].reject(new Error("backend_unavailable"));
+  expect(await stale).toEqual({
+    ok: false,
+    code: "backend_unavailable",
+    superseded: true,
+  });
+  // The hook must not override the newer action's error for a stale reply.
+  expect(s.error()).toBe("invalid_name");
 });

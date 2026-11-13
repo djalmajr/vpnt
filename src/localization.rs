@@ -33,4 +33,6 @@ pub struct NativeMessages {
     pub auth_prompt: String,
     pub auth_confirm: String,
     pub auth_cancel: String,
+    pub unresponsive_title: String,
+    pub unresponsive_body: String,
 }

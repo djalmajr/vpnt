@@ -74,10 +74,12 @@ export function Header({
 export function Toggle({
   label,
   checked,
+  disabled = false,
   onChange,
 }: {
   label: string;
   checked: boolean;
+  disabled?: boolean;
   onChange: (checked: boolean) => void;
 }) {
   return (
@@ -86,7 +88,8 @@ export function Toggle({
       role="switch"
       aria-label={label}
       aria-checked={checked}
-      className={`switch ${checked ? "on" : ""}`}
+      disabled={disabled}
+      className={`switch ${checked ? "on" : ""} ${disabled ? "dim" : ""}`}
       onClick={() => onChange(!checked)}
     >
       <span />

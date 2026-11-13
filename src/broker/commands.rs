@@ -89,10 +89,14 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Command::SetPreferences { preferences } => {
-                if preferences.startup {
-                    return Err("startup_unavailable");
+                match self.preferences_host.apply(preferences, expires) {
+                    Ok(observed) => self.preferences = observed,
+                    Err(failure) => {
+                        self.preferences = failure.observed;
+                        self.refresh_actions();
+                        return Err(failure.error.code());
+                    }
                 }
-                self.preferences = preferences;
             }
             Command::SetDemoState { .. } => return Err("invalid_request"),
             Command::SaveProfile { .. }
@@ -100,19 +104,32 @@ impl<S: SecretStore> Broker<S> {
             | Command::InstallHelper {}
             | Command::RemoveHelper {} => return Err("not_implemented"),
         }
+        self.refresh_actions();
         Ok(self.snapshot())
     }
     fn connect(&mut self, id: &str, reconnect: bool, expires: Instant) -> Result<(), &'static str> {
+        self.connect_guarded(id, reconnect, expires, &|| true)
+    }
+    pub(super) fn connect_guarded(
+        &mut self,
+        id: &str,
+        reconnect: bool,
+        expires: Instant,
+        current: &dyn Fn() -> bool,
+    ) -> Result<(), &'static str> {
+        if !current() {
+            return Err("operation_canceled");
+        }
         if !self.ready {
             return Err("backend_unavailable");
+        }
+        if self.component.busy() {
+            return Err("component_busy");
         }
         if self.editing(id) {
             return Err("admin_busy");
         }
         let c = self.connections.get_mut(id).ok_or("not_found")?;
-        if c.view.profile.kind != VpnKind::Ssl {
-            return Err("not_implemented");
-        }
         let credentials = match self.secrets.load(id, c.view.profile.kind) {
             Ok(credentials) => credentials,
             Err(crate::secrets::SecretError::Missing) => {
@@ -123,6 +140,12 @@ impl<S: SecretStore> Broker<S> {
             }
             Err(_) => return Err("backend_unavailable"),
         };
+        if !current() {
+            return Err("operation_canceled");
+        }
+        if self.component.busy() {
+            return Err("component_busy");
+        }
         credentials
             .validate(c.view.profile.kind)
             .map_err(|_| "invalid_secret")?;
@@ -137,6 +160,7 @@ impl<S: SecretStore> Broker<S> {
                 id: id.into(),
                 generation,
                 credentials,
+                interval: self.preferences.interval,
             },
             Some(if reconnect {
                 State::Reconnecting

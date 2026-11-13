@@ -17,6 +17,8 @@ desktop = [
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-service-management",
+    "dep:objc2-user-notifications",
+    "dep:block2",
 ]
 
 [dependencies]
@@ -42,6 +44,9 @@ objc2-foundation = { version = "0.3", optional = true, default-features = false,
     "std",
     "NSBundle",
     "NSString",
+    "NSUserDefaults",
+    "NSDictionary",
+    "NSError",
 ] }
 objc2-service-management = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
@@ -49,6 +54,19 @@ objc2-service-management = { version = "0.3.2", optional = true, default-feature
     "objc2",
     "objc2-foundation",
 ] }
+
+# User notifications (UNUserNotificationCenter). Locked transitive versions only:
+# objc2-user-notifications 0.3.2, block2 0.6.2.
+objc2-user-notifications = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "UNUserNotificationCenter",
+    "UNNotificationSettings",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "block2",
+] }
+block2 = { version = "0.6.2", optional = true }
 
 [build-dependencies]
 # Locked transitive version; builds only the macOS SDK utun shim.

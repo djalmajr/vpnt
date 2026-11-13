@@ -7,7 +7,11 @@ use crate::{
     secrets::{Credentials, SecretError, SecretStore},
 };
 use std::{
-    sync::mpsc::{self, SyncSender},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
     time::{Duration, Instant},
 };
 
@@ -37,25 +41,50 @@ struct Work {
 }
 pub(super) struct Worker {
     input: SyncSender<Work>,
+    intent: Arc<AtomicU64>,
+    #[cfg(test)]
+    idle_cycles: Arc<AtomicU64>,
 }
 impl Worker {
     pub fn new(demo: bool, reply: impl Fn(Reply) + Send + 'static) -> Result<Self, std::io::Error> {
         Self::spawn(
             move || {
                 let demo = demo.then(App::demo);
-                let normal = demo
-                    .is_none()
-                    .then(|| Broker::runtime(Keychain(MacKeychain::for_current_user())));
+                let normal = demo.is_none().then(|| {
+                    let broker = Broker::runtime(Keychain(MacKeychain::for_current_user()));
+                    let broker =
+                        if let Some(notifier) = super::notifications::Adapter::current_bundle() {
+                            broker.with_notifier(Box::new(notifier))
+                        } else {
+                            broker
+                        };
+                    match super::preferences::current_bundle() {
+                        Ok(host) => broker.with_preferences_host(host),
+                        Err(crate::preferences::host::Error::Storage) => broker
+                            .with_preferences_host(Box::new(
+                                crate::preferences::host::Unavailable::new(
+                                    crate::preferences::host::Error::Storage,
+                                ),
+                            )),
+                        Err(_) => broker,
+                    }
+                });
                 (demo, normal)
             },
             reply,
         )
     }
-    fn spawn(
-        init: impl FnOnce() -> (Option<App>, Option<Broker<Keychain>>) + Send + 'static,
+    fn spawn<S: SecretStore + 'static>(
+        init: impl FnOnce() -> (Option<App>, Option<Broker<S>>) + Send + 'static,
         reply: impl Fn(Reply) + Send + 'static,
     ) -> Result<Self, std::io::Error> {
         let (input, requests) = mpsc::sync_channel::<Work>(32);
+        let intent = Arc::new(AtomicU64::new(1));
+        let actor_intent = intent.clone();
+        #[cfg(test)]
+        let idle_cycles = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let actor_idle_cycles = idle_cycles.clone();
         std::thread::Builder::new()
             .name("vpnt-application".into())
             .spawn(move || {
@@ -75,8 +104,15 @@ impl Worker {
                             reply(response(id, result));
                         }
                     }
+                    let observed_intent = actor_intent.load(Ordering::Acquire);
                     match requests.recv_timeout(Duration::from_millis(20)) {
                         Ok(work) => {
+                            if let Some(normal) = &mut normal {
+                                normal.interrupt_automatic(&work.request.command);
+                                if let Some(locale) = work.request.locale {
+                                    normal.set_locale(locale);
+                                }
+                            }
                             if matches!(
                                 work.request.command,
                                 crate::bridge::Command::GetSnapshot {}
@@ -134,14 +170,45 @@ impl Worker {
                             };
                             reply(response(work.request.id, result));
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Some(normal) = &mut normal {
+                                normal.perform_automatic(|| {
+                                    actor_intent.load(Ordering::Acquire) == observed_intent
+                                });
+                            }
+                            #[cfg(test)]
+                            actor_idle_cycles.fetch_add(1, Ordering::Release);
+                        }
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
             })?;
-        Ok(Self { input })
+        Ok(Self {
+            input,
+            intent,
+            #[cfg(test)]
+            idle_cycles,
+        })
     }
     pub fn send(&self, request: Request, received: Instant) -> Result<(), ()> {
+        // A queued manual action interrupts background reconnect before it can
+        // submit credentials after a blocking keychain read. The actor processes
+        // that action before retrying any still-current background work.
+        if matches!(
+            &request.command,
+            crate::bridge::Command::Toggle { .. }
+                | crate::bridge::Command::Reconnect { .. }
+                | crate::bridge::Command::DisconnectAll {}
+                | crate::bridge::Command::SaveProfile { .. }
+                | crate::bridge::Command::RemoveProfile { .. }
+                | crate::bridge::Command::SaveSecrets { .. }
+                | crate::bridge::Command::InstallHelper {}
+                | crate::bridge::Command::RemoveHelper {}
+                | crate::bridge::Command::Quit {}
+        ) || matches!(&request.command, crate::bridge::Command::SetPreferences { preferences } if !preferences.reconnect)
+        {
+            self.intent.fetch_add(1, Ordering::AcqRel);
+        }
         let seconds = if matches!(
             request.command,
             crate::bridge::Command::Toggle { .. }
@@ -183,6 +250,10 @@ fn response(id: String, result: Result<crate::model::Snapshot, &'static str>) ->
 mod tests {
     use super::*;
     mod administration;
+    mod automatic;
+    mod automatic_component;
+    mod automatic_deadline;
+    mod automatic_support;
     mod component;
     #[test]
     fn expired_native_requests_cannot_start_a_demo_or_replay_after_a_ui_timeout() {

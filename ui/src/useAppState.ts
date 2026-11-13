@@ -5,11 +5,18 @@ import type { T } from "./components/common";
 import { type MessageKey, resolveLocale, translate } from "./i18n";
 import type { Snapshot } from "./model";
 import type { Route } from "./navigation";
-import { loadSettings, saveSettings } from "./settings";
+import { createPreferencesFlow } from "./preferencesFlow";
+import {
+  defaultPreferences,
+  loadSettings,
+  preferencesDiff,
+  type Settings,
+  saveSettings,
+} from "./settings";
 
 export function useAppState() {
-  const [settings, updateSettings] = useState(loadSettings);
-  const locale = resolveLocale(settings.locale, navigator.languages);
+  const [local, setLocal] = useState(loadSettings);
+  const locale = resolveLocale(local.locale, navigator.languages);
   const t: T = useCallback(
     (key, values) => translate(locale, key, values),
     [locale],
@@ -19,6 +26,11 @@ export function useAppState() {
   );
   const [snapshot, setSnapshot] = useState<Snapshot>();
   const receivedSnapshot = useRef<Snapshot | undefined>(undefined);
+  const liveRef = useRef(true);
+  const preferencesRef = useRef<
+    ReturnType<typeof createPreferencesFlow> | undefined
+  >(undefined);
+  const [preferencesPending, setPreferencesPending] = useState(false);
   const [route, navigate] = useState<Route>({ page: "panel" });
   const [error, setError] = useState<MessageKey>();
   const [componentAction, setComponentAction] = useState<
@@ -46,6 +58,9 @@ export function useAppState() {
       )
         navigate({ page: "onboarding" });
     }
+    // Fresh authoritative state: flush preference intent that was waiting for
+    // one (first snapshot, or a reply that could not be reconciled in place).
+    void preferencesRef.current?.sync();
   }, []);
   const flow = useMemo(
     () =>
@@ -59,6 +74,9 @@ export function useAppState() {
           backend_unavailable: "backendUnavailable",
           admin_busy: "adminBusy",
           profile_busy: "profileBusy",
+          preferences_unavailable: "preferencesUnavailable",
+          startup_requires_approval: "startupRequiresApproval",
+          startup_unavailable: "startupUnavailable",
           admin_expired: "adminExpired",
           admin_canceled: "adminUnconfirmed",
           admin_unconfirmed: "adminUnconfirmed",
@@ -74,6 +92,68 @@ export function useAppState() {
       }),
     [receive],
   );
+  const preferences = useMemo(
+    () =>
+      createPreferencesFlow({
+        authoritative: () => receivedSnapshot.current?.preferences,
+        send: async (preferences) => {
+          const result = await flow.dispatch({
+            type: "set_preferences",
+            preferences,
+          });
+          // A write timeout/expiry is not "vpnt is unreachable": the panel is
+          // reachable and the host may still apply it.
+          if (
+            !result.ok &&
+            !result.superseded &&
+            result.code === "backend_unavailable"
+          )
+            setError("preferencesNotConfirmed");
+          return result;
+        },
+        refresh: () =>
+          liveRef.current
+            ? flow.poll(() => liveRef.current)
+            : Promise.resolve(false),
+        onPendingChange: setPreferencesPending,
+      }),
+    [flow],
+  );
+  preferencesRef.current = preferences;
+  // Live only while the screen is mounted: the cleanup discards queued changes
+  // and the setup revives the same instance (React StrictMode re-runs both).
+  useEffect(() => {
+    liveRef.current = true;
+    preferences.setLive(true);
+    return () => {
+      liveRef.current = false;
+      preferences.setLive(false);
+    };
+  }, [preferences]);
+  // The snapshot owns the four native values (required by the shared model);
+  // the defaults apply only before the first snapshot arrives. Locale/theme
+  // stay local; `preferencesPending` is transient rendering state.
+  const settings: Settings & { preferencesPending: boolean } = {
+    ...local,
+    ...(snapshot?.preferences ?? defaultPreferences),
+    preferencesPending,
+  };
+  const rendered = useRef(settings);
+  rendered.current = settings;
+  const updateSettings = useCallback(
+    (next: Settings) => {
+      const current = rendered.current;
+      if (next.locale !== current.locale || next.theme !== current.theme)
+        setLocal((previous) => ({
+          ...previous,
+          locale: next.locale,
+          theme: next.theme,
+        }));
+      const change = preferencesDiff(current, next);
+      if (Object.keys(change).length) void preferences.update(change);
+    },
+    [preferences],
+  );
   useEffect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -88,9 +168,9 @@ export function useAppState() {
     };
   }, [flow]);
   useEffect(() => {
-    saveSettings(settings);
+    saveSettings(local);
     document.documentElement.lang = locale;
-  }, [settings, locale]);
+  }, [local, locale]);
   useEffect(() => {
     const media = matchMedia("(prefers-color-scheme: dark)");
     const changed = () => setSystemDark(media.matches);

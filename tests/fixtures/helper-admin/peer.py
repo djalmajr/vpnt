@@ -18,7 +18,7 @@ try:
         until=time.monotonic()+5
         while not os.path.exists(marker+".allow_ready") and time.monotonic()<until:
             if select.select([s],[],[],0.005)[0] and not s.recv(1,socket.MSG_PEEK):break
-    send(dict(type="admin_ready",protocol_version=999 if mode=="protocol" else 2,version="old" if mode=="version" else "0.1.0"))
+    send(dict(type="admin_ready",protocol_version=999 if mode=="protocol" else 3,version="old" if mode=="version" else "0.1.0"))
     open(marker+".ready","w").close()
     f=s.makefile("rb",buffering=0)
     line=f.readline()

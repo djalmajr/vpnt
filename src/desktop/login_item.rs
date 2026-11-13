@@ -12,10 +12,6 @@
 //! build fails the native operation, which surfaces as `Error::Failed`, never as
 //! success.
 
-// The desktop actor that consumes this adapter belongs to the next slice; until
-// then a production build has no caller for these items.
-#![allow(dead_code)]
-
 use objc2::{available, rc::Retained};
 use objc2_foundation::NSBundle;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};

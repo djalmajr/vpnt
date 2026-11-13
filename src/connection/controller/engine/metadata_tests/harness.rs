@@ -174,12 +174,13 @@ impl Harness {
         self.send(Command::Connect {
             id: id.into(),
             generation: 1,
+            interval: crate::preferences::ProbeInterval::TEN,
             credentials: Credentials {
                 password: "fictional".into(),
                 psk: "".into(),
             },
         });
-        self.wait(|m|matches!(m,Message::Changed{profile_id,generation:1,state:ConnectionState::Connected}if profile_id==id));
+        self.wait(|m|matches!(m,Message::Changed{profile_id,generation:1,state:ConnectionState::Connected,..}if profile_id==id));
     }
 }
 impl Drop for Harness {

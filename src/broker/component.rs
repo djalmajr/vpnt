@@ -84,6 +84,13 @@ impl<S: SecretStore> Broker<S> {
         broker.retry = Some(retry::Retry::fixture(reconnect));
         broker
     }
+    /// Refuse admission in actor tests without opening an installer/remover.
+    #[cfg(all(test, feature = "desktop"))]
+    pub(crate) fn refuse_components(mut self) -> Self {
+        self.component.connect =
+            Box::new(|_, _, _, _| Err(ComponentError::Rejected(crate::install::Error::Busy)));
+        self
+    }
     pub fn begin_component(
         &mut self,
         command: Command,

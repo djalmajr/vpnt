@@ -9,10 +9,18 @@ pub(super) struct Finished {
     pub state: ConnectionState,
     pub error: Option<ErrorCode>,
 }
+/// Latest coalesced worker status. `failures` counts consecutive actual failed
+/// traffic probes, so replacing an older status in the slot never loses the
+/// third failure: the engine only ever sees the newest `Progress`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct Progress {
+    pub state: ConnectionState,
+    pub failures: u32,
+}
 pub(super) struct Signals {
     pub canceled: Arc<AtomicBool>,
     pub probe: Arc<AtomicBool>,
-    pub state: Arc<Mutex<Option<ConnectionState>>>,
+    pub state: Arc<Mutex<Option<Progress>>>,
 }
 fn timeout() -> Failure {
     Failure {
@@ -20,14 +28,19 @@ fn timeout() -> Failure {
         error: ErrorCode::BackendFailure,
     }
 }
-pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -> Finished {
-    let send = |state| {
+pub(super) fn run(
+    mut attempt: impl Attempt,
+    signals: Signals,
+    timing: Timing,
+    interval: ProbeClock,
+) -> Finished {
+    let send = |state, failures| {
         // One coalesced status per worker. A slow pipe reader never blocks
         // traffic/cleanup or loses the latest state to a full progress queue.
         *signals
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(state);
+            .unwrap_or_else(|error| error.into_inner()) = Some(Progress { state, failures });
     };
     let canceled = || signals.canceled.load(Ordering::Acquire);
     let result = (|| {
@@ -67,15 +80,25 @@ pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -
         if canceled() {
             return Ok(());
         }
-        send(ConnectionState::Verifying);
-        let mut next_probe = Instant::now();
+        send(ConnectionState::Verifying, 0);
+        let mut last_probe: Option<Instant> = None;
+        let mut failures = 0_u32;
         loop {
             if canceled() {
                 return Ok(());
             }
             attempt.healthy()?;
-            if signals.probe.swap(false, Ordering::AcqRel) || Instant::now() >= next_probe {
+            if canceled() {
+                return Ok(());
+            }
+            // The due time is always derived from the last actual probe plus the
+            // current cadence, never from a repeatedly rebased `now`. A special
+            // command probe is an actual traffic probe and counts like a timer
+            // probe; health checks and snapshot polls never do.
+            let due = last_probe.is_none_or(|last| Instant::now() >= last + interval.get());
+            if signals.probe.swap(false, Ordering::AcqRel) || due {
                 let responsive = attempt.probe(&signals.canceled, timing.probe)?;
+                last_probe = Some(Instant::now());
                 if canceled() {
                     return Ok(());
                 }
@@ -85,17 +108,20 @@ pub(super) fn run(mut attempt: impl Attempt, signals: Signals, timing: Timing) -
                 if canceled() {
                     return Ok(());
                 }
-                send(if responsive {
-                    ConnectionState::Connected
-                } else {
-                    ConnectionState::Unresponsive
-                });
-                next_probe = Instant::now() + timing.interval;
+                failures = if responsive { 0 } else { (failures + 1).min(3) };
+                send(
+                    if responsive {
+                        ConnectionState::Connected
+                    } else {
+                        ConnectionState::Unresponsive
+                    },
+                    failures,
+                );
             }
             thread::sleep(timing.poll);
         }
     })();
-    send(ConnectionState::Disconnecting);
+    send(ConnectionState::Disconnecting, 0);
     // Cancel all outstanding network operations before releasing resources.
     signals.canceled.store(true, Ordering::Release);
     while !attempt.cleanup() {

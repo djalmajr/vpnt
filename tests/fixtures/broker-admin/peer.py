@@ -9,7 +9,7 @@ try:
         if select.select([s],[],[],0.005)[0]:
             if s.recv(1,socket.MSG_PEEK):raise AssertionError("document before ready")
             break
-    s.sendall(b'{"type":"admin_ready","protocol_version":2,"version":"0.1.0"}\n')
+    s.sendall(b'{"type":"admin_ready","protocol_version":3,"version":"0.1.0"}\n')
     f=s.makefile('rb',buffering=0);line=f.readline()
     if line:
         request=json.loads(line);assert not f.read(1)

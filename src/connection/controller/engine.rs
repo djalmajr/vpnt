@@ -35,6 +35,8 @@ struct Slot<'scope> {
     profile: Profile,
     generation: u64,
     state: ConnectionState,
+    failures: u32,
+    interval: ProbeClock,
     worker: Option<Worker<'scope>>,
     pending: Option<Pending>,
 }
@@ -49,6 +51,7 @@ impl Slot<'_> {
             profile_id: self.profile.id.clone(),
             generation: self.generation,
             state: self.state,
+            failures: self.failures,
         }
     }
 }
@@ -72,6 +75,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
     };
     let profile = slot.profile.clone();
     let generation = slot.generation;
+    let interval = slot.interval.clone();
     let worker_canceled = canceled.clone();
     let thread = scope.spawn(move || {
         let attempt = factory.create(
@@ -81,7 +85,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
             pending.credentials,
             worker_canceled,
         );
-        worker::run(attempt, signals, timing)
+        worker::run(attempt, signals, timing, interval)
     });
     slot.worker = Some(Worker {
         generation,
@@ -107,6 +111,10 @@ pub(super) fn run<F: Factory>(
         return Err(ErrorCode::UntrustedConfiguration);
     }
     let profiles = metadata::map(profiles)?;
+    // The controller-wide preference; each slot starts from it and `Connect`
+    // may set that generation's clock. `SetProbeInterval` updates the default
+    // and every existing slot clock, so queued and live generations follow it.
+    let interval = ProbeClock::new(timing.interval);
     thread::scope(|scope| {
         let mut slots: BTreeMap<_, _> = profiles
             .into_iter()
@@ -117,6 +125,8 @@ pub(super) fn run<F: Factory>(
                         profile,
                         generation: 0,
                         state: ConnectionState::Off,
+                        failures: 0,
+                        interval: ProbeClock::new(interval.get()),
                         worker: None,
                         pending: None,
                     },
@@ -137,7 +147,7 @@ pub(super) fn run<F: Factory>(
                         let refreshed = if matches!(request.command, Command::Snapshot {}) {
                             factory.profiles().and_then(|profiles| {
                                 if let Some(profiles) = profiles {
-                                    metadata::refresh(&mut slots, profiles)?;
+                                    metadata::refresh(&mut slots, profiles, &interval)?;
                                 }
                                 Ok(())
                             })
@@ -150,7 +160,7 @@ pub(super) fn run<F: Factory>(
                                 error,
                             });
                         } else {
-                            dispatch(request, &factory, &mut slots, &mut outgoing);
+                            dispatch(request, &factory, &mut slots, &mut outgoing, &interval);
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -164,14 +174,15 @@ pub(super) fn run<F: Factory>(
                 if !closing
                     && let Some(worker) = &slot.worker
                     && worker.generation == slot.generation
-                    && let Some(state) = worker
+                    && let Some(progress) = worker
                         .signals
                         .state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .take()
                 {
-                    slot.state = state;
+                    slot.state = progress.state;
+                    slot.failures = progress.failures;
                     outgoing.push_back(slot.changed());
                 }
                 if closing {
@@ -201,6 +212,7 @@ pub(super) fn run<F: Factory>(
                         } else {
                             ConnectionState::Off
                         };
+                        slot.failures = 0;
                         if !closing {
                             outgoing.push_back(slot.changed());
                         }
@@ -228,10 +240,13 @@ pub(super) fn run<F: Factory>(
                     profile_id,
                     generation,
                     state,
+                    failures,
                 } = &message
-                    && !slots
-                        .get(profile_id)
-                        .is_some_and(|slot| slot.generation == *generation && slot.state == *state)
+                    && !slots.get(profile_id).is_some_and(|slot| {
+                        slot.generation == *generation
+                            && slot.state == *state
+                            && slot.failures == *failures
+                    })
                 {
                     continue;
                 }
@@ -261,6 +276,9 @@ pub(super) fn run<F: Factory>(
     })
 }
 
+#[cfg(test)]
+#[path = "engine/dispatch_tests.rs"]
+mod dispatch_tests;
 #[cfg(test)]
 mod metadata_tests;
 #[cfg(test)]
