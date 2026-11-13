@@ -1,9 +1,12 @@
 use crate::{
     model::{Profile, Snapshot},
+    preferences::Preferences,
     secrets::Secret,
     session::ConnectionState,
 };
 use serde::{Deserialize, Serialize};
+
+mod preferences;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +46,10 @@ pub enum Command {
     SetDemoState {
         id: String,
         state: ConnectionState,
+    },
+    SetPreferences {
+        #[serde(deserialize_with = "preferences::deserialize")]
+        preferences: Preferences,
     },
     InstallHelper {},
     RemoveHelper {},

@@ -1,4 +1,5 @@
 use super::*;
+mod preferences;
 struct Harness {
     broker: Broker<Secrets>,
     old: Peer,

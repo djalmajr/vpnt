@@ -88,6 +88,12 @@ impl<S: SecretStore> Broker<S> {
                     set_state(c, State::Off);
                 }
             }
+            Command::SetPreferences { preferences } => {
+                if preferences.startup {
+                    return Err("startup_unavailable");
+                }
+                self.preferences = preferences;
+            }
             Command::SetDemoState { .. } => return Err("invalid_request"),
             Command::SaveProfile { .. }
             | Command::RemoveProfile { .. }

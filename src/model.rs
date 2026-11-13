@@ -1,3 +1,4 @@
+use crate::preferences::Preferences;
 use crate::session::ConnectionState;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -132,5 +133,6 @@ pub struct Snapshot {
     pub helper: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component_operation: Option<&'static str>,
+    pub preferences: Preferences,
     pub vpns: Vec<VpnView>,
 }

@@ -12,6 +12,7 @@ use crate::{
         protocol::{self, Message, Request},
     },
     model::{LogEntry, Snapshot, VpnKind, VpnView},
+    preferences::Preferences,
     secrets::{Credentials, SecretStore},
     session::ConnectionState as State,
 };
@@ -43,6 +44,7 @@ pub struct Broker<S: SecretStore> {
     administration: admin::Flow,
     component: component::Flow,
     epoch: u64,
+    preferences: Preferences,
 }
 impl<S: SecretStore> Broker<S> {
     pub fn runtime(secrets: S) -> Self {
@@ -69,6 +71,7 @@ impl<S: SecretStore> Broker<S> {
             administration: admin::Flow::new(),
             component: component::Flow::new(),
             epoch: 1,
+            preferences: Preferences::default(),
         };
         result.begin();
         result
@@ -217,6 +220,7 @@ impl<S: SecretStore> Broker<S> {
             demo: false,
             helper: self.helper,
             component_operation: self.component.status(),
+            preferences: self.preferences,
             vpns: self.connections.values().map(|c| c.view.clone()).collect(),
         }
     }
@@ -239,5 +243,7 @@ fn set_state(c: &mut Connection, state: State) {
     }
 }
 
+#[cfg(test)]
+mod preferences_tests;
 #[cfg(test)]
 mod tests;

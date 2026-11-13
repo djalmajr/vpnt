@@ -25,6 +25,7 @@ struct Scheduled {
 #[derive(Default)]
 pub struct App {
     demo: bool,
+    preferences: crate::preferences::Preferences,
     connections: Vec<Connection>,
     scheduled: Vec<Scheduled>,
 }
@@ -81,6 +82,7 @@ impl App {
             demo: self.demo,
             helper: if self.demo { "installed" } else { "missing" },
             component_operation: None,
+            preferences: self.preferences,
             vpns: self
                 .connections
                 .iter()
@@ -201,6 +203,7 @@ impl App {
                 self.connection(&id)?.session = Session::with_state(state);
                 self.scheduled.retain(|scheduled| scheduled.id != id);
             }
+            Command::SetPreferences { preferences } => self.preferences = preferences,
             Command::InstallHelper {} | Command::RemoveHelper {} => return Err("not_implemented"),
             Command::GetSnapshot {}
             | Command::Quit {}
