@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -23,14 +24,24 @@ def replace(source, before, after):
     return source.replace(before, after)
 
 
+def diagnostic_tail(log):
+    text = log.decode('utf-8', errors='replace')
+    # Remove terminal strings (including OSC hyperlinks), CSI and ESC commands.
+    text = re.sub(r'(?:\x1b[\]PX^_]|[\x90\x98\x9d\x9e\x9f]).*?(?:\x07|\x1b\\|\x9c|$)', '', text, flags=re.DOTALL)
+    text = re.sub(r'(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-~]', '', text)
+    return ''.join(c for c in text if c.isprintable() or c in '\n\t')[-8000:]
+
+
 def run(copy, label, selector, failed=None):
     command = ['cargo', 'test', '--locked', '--offline', '--no-default-features', *selector]
     result = subprocess.run(command, cwd=copy, capture_output=True, timeout=120)
     log = result.stdout + result.stderr
     (REPORTS / (label + '.log')).write_bytes(log)
     if result.returncode != (101 if failed else 0):
+        print(f'{label}: cargo log tail (up to 8000 characters):\n{diagnostic_tail(log)}', file=sys.stderr, flush=True)
         raise RuntimeError(f'{label}: unexpected exit {result.returncode}')
     if failed and (f'test {failed} ... FAILED'.encode() not in log or b'panicked at' not in log or b'test result: FAILED.' not in log):
+        print(f'{label}: cargo log tail (up to 8000 characters):\n{diagnostic_tail(log)}', file=sys.stderr, flush=True)
         raise RuntimeError(f'{label}: expected executed consumer assertion, not a build error')
     print(f'{label}: exit {result.returncode}', flush=True)
     return {'command': command, 'exit': result.returncode, 'assertion': failed}
