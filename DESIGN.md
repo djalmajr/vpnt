@@ -274,7 +274,18 @@ reposiciona em resize e rolagem, inverte o lado quando falta espaço acima e
 nunca usa coordenadas fixas de tela. A altura máxima vem de
 `--radix-dropdown-menu-content-available-height` e a largura é limitada ao
 viewport menos 16 px (2 × `space-sm`); quando o conteúdo não cabe, o menu rola
-dentro de si mesmo em vez de esconder as primeiras ações. O `sideOffset` de 6 px
+dentro de si mesmo em vez de esconder as primeiras ações. Por indicação do Djalma
+em 2026-11-14, o menu aberto num painel de um único cartão não pode ficar cortado
+nem rolar havendo espaço físico na tela: enquanto o menu está aberto, o painel
+pede ao host a altura que comporta o conteúdo intrínseco do menu (`scrollHeight`
+mais bordas, mesmo quando o menu está limitado), mais `sideOffset`,
+`collisionPadding` e a distância do gatilho à borda inferior do painel, e o
+rodapé desce para essa borda; o Radix então coloca todas as ações acima do
+gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura natural
+anterior volta. A reserva é temporária, nunca vai além de `panel-max-height`
+(720 px) e o host ainda limita à tela; só quando a tela não comporta o menu ele
+rola. Não é aberta exceção de CSS para o menu: o dimensionamento fica em
+`ui/src/panelSizing.ts`. O `sideOffset` de 6 px
 da referência é uma exceção documentada: o deslocamento é calculado em JS, então
 o valor fica no componente e não vira token CSS. Por indicação do Djalma, o
 interruptor é mais compacto que o clássico: 24 por 14 px, com botão de 10 px e
@@ -287,7 +298,9 @@ Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como n
 
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
 320 px quando há espaço; em viewport menor, ocupa a largura disponível. Em
-viewport baixo, o menu rola e continua alcançável; nenhuma ação é cortada.
+viewport fisicamente baixo, o menu rola e continua alcançável; nenhuma ação é
+cortada. Havendo espaço na tela, a altura do painel cresce para o menu (ver
+Layout), em vez de rolar.
 
 ## Elevation & Depth
 
@@ -334,8 +347,10 @@ O menu de opções é um componente compartilhado (`Menu`, `MenuItem`,
 botão real com o rótulo traduzido e o ícone `down`, `Content` dentro de
 `Portal`. O primitivo cuida de ancoragem viva, Escape e clique fora, navegação
 por teclado, itens desabilitados, retorno de foco ao gatilho (exceto quando a
-saída foi um clique fora) e limpeza; não há ARIA menu feito à mão, medição de
-DOM nem listeners globais. As linhas são `div` emitidas pelo primitivo e
+saída foi um clique fora) e limpeza; não há ARIA menu feito à mão, coordenada de
+menu nem listeners globais. A medição de DOM é só de tamanho: o tamanho da janela
+pedida ao host (conteúdo intrínseco do menu e distância do gatilho à borda do
+painel); a posição do menu continua sendo do Radix. As linhas são `div` emitidas pelo primitivo e
 estilizadas por `data-highlighted` (realce cinza no ponteiro e no teclado) e
 `data-disabled` (não interativo, sem realce); o separador é a `div`
 `role="separator"` do primitivo. Cada ação atual tem ícone do vocabulário
@@ -396,7 +411,11 @@ demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de alt
 - Não trocar realce por filtro de brilho global, nem deixar linha de menu com
   fundo transparente no hover ou no foco por teclado.
 - Não deixar o menu crescer além do viewport: largura e altura vêm do espaço
-  disponível, com rolagem interna e 8 px de borda.
+  disponível, com rolagem interna e 8 px de borda; a rolagem só vale quando a
+  tela não comporta o menu, pois a janela cresce temporariamente para ele.
+- Não fixar permanentemente uma altura grande para o painel, nem calcular a
+  posição do menu: só o tamanho da janela é dimensionado, e a reserva é liberada
+  ao fechar, navegar ou desmontar.
 - Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
   `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
   do host nativo, não do CSS.

@@ -39,8 +39,8 @@ As 20 campanhas originais permanecem, com os mesmos comandos, versões,
 permissões, timeouts e quatro threads de teste; `fail-fast: false` preserva as
 demais expansões quando uma falha. Contratos locais independentes passaram e
 detectaram a omissão de uma campanha e a retirada de `needs: macos`. A revisão
-estrutural passou. O CI8 executou os três grupos: instalação e rede passaram;
-controle parou na pré-checagem do namespace IPsec, conforme registrado abaixo.
+estrutural passou. O CI9 concluiu os três grupos com sucesso no head `f7f5314`;
+o CI8 histórico parou na pré-checagem do namespace IPsec, conforme registrado abaixo.
 O CI7 usava a distribuição serial anterior e foi supersedido pelo envio do CI8.
 
 ## Checkpoint atual — 14/11/2026
@@ -49,10 +49,52 @@ O CI7 usava a distribuição serial anterior e foi supersedido pelo envio do CI8
 Store de credencial com username/credencial corretos e Save corrigido,
 conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
 Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor, um
-CI remoto verde (o CI8 falhou; veja abaixo). Evidência nativa, simulada,
+correção do cancelamento real preso em Disconnecting. O CI9 terminou verde em
+`f7f5314`, antes das mudanças locais posteriores de UI. Evidência nativa, simulada,
 fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
-VPN real. Esta atualização documenta somente o checkpoint atual; os demais
+VPN real bem-sucedida. Esta atualização documenta somente o checkpoint atual; os demais
 checkpoints do arquivo continuam históricos.
+
+[PASS, nono CI remoto completo] O [CI9](https://github.com/djalmajr/vpnt/actions/runs/43560166115),
+head `f7f53141a7974cdee23667ddb1c746f604cef388`, terminou com sucesso nos seis
+jobs: core, runtime, macOS base e os três grupos de oráculos. O macOS base passou
+655 testes nativos, zero falhas e dois ignorados; UI43/443 assertions, 94 tokens
+e as campanhas afetadas passaram, inclusive namespace43, VICI10, controle IPsec61,
+produtor32 e rotas67, com baselines/restaurações verdes. Recibos e log integral
+em `output/fixtures/ci9-ipsec-correction/ci9-terminal-summary.json` e
+`ci9-all-jobs.log`. O resultado remoto não cobre o checkpoint UI local `5fb09bf`
+nem o ajuste de altura posterior, e não executou VPN ou instalação real.
+
+[PASS local, altura do menu; aplicação nativa pendente] Ao abrir Opções, a UI
+reserva altura para o conteúdo intrínseco completo e move o rodapé; fechar ou
+navegar libera a reserva. Radix continua responsável pela posição e pela rolagem
+quando falta espaço físico. O baseline reproduziu a falha no WebKit: conteúdo
+de 182 px limitado a 106 px apesar de teto 720. A correção passou 16 casos (dois
+idiomas/temas, larguras 280/320/640 e teto curto 180). Nos casos com espaço, a
+janela passa de 180 para 228 px, com seis ações visíveis e menu de 182 px sem rolagem;
+fechar restaura a altura. Foco/Escape, navegação, limite de tela e convergência
+dos pedidos foram exercitados. Quatro capturas do próprio WKWebView invisível
+foram conferidas nos temas claro/escuro e larguras menor/maior. São assets reais
+com snapshots/eventos DOM sintéticos e janela própria, sem backend ou VPN real.
+Recibos: `output/fixtures/popover-menu-fit-validation/`.
+
+A revisão independente não encontrou regressões na fatia. A integração passou
+lint, typecheck, 46 testes/459 assertions, build UI, 94 tokens, build do host,
+pacote e inspect, com fonte estável e assets idênticos aos exercitados. O gate
+de classes segue sem regras proibidas. O candidato é
+`target/VPN Tray UI Review.app`, com o mesmo componente B10; não substituiu o app
+que mantém a tentativa real em diagnóstico. A aplicação no app corrente e o
+teste físico de abertura do menu permanecem pendentes. A suíte Rust completa
+não foi repetida para essa mudança exclusiva da UI.
+
+[FAIL real, cancelamento em investigação] O usuário iniciou o Cluster e clicou
+Cancelar. O log mostrado registra Disconnected e Connecting às10:30:38, seguido
+de Disconnecting às10:31:16, sem conclusão. O sample do helper, coletado pelo
+usuário com privilégios, confirma o worker dentro de cleanup; há revalidações do
+runtime no caminho de Registry e retire. Isso não identifica sozinho o motivo
+de retenção nem prova que houve autenticação/tráfego. Evidência preservada em
+`output/fixtures/native-cancel-20261114/`. O app/helper e a tentativa foram
+preservados. Nenhuma ausência de processo foi promovida a prova de cleanup.
 
 [FAIL, oitavo CI remoto; matriz executada] O [CI8](https://github.com/djalmajr/vpnt/actions/runs/43552915787),
 head `f099690`, terminou em falha. Core, runtime, macOS base, instalação e rede
@@ -66,7 +108,7 @@ sobrevivente nem falha de compilação. VICI deadlines e controle IPsec ficaram
 `multi-monitor-integration/ci8-all-jobs.log` e `ci8-terminal-summary.json`.
 O CI7 foi cancelado ao ser supersedido; seus gates parciais não são PASS global.
 
-[PASS local, correção do oráculo; novo CI pendente] A âncora antiga agora
+[PASS local e no CI9, correção do oráculo] A âncora antiga agora
 identifica somente a view full de `occupied()`, e uma mutação separada verifica
 `occupied_before_initiate`. O teste novo usa o Registry real com Observer
 fictício e views independentes: 65536/u32::MAX são inválidos no pre-initiate,
@@ -537,12 +579,13 @@ ainda não substitui a prova do componente instalado anteriormente. Nenhum
 Installer, senha ou conexão foi executado nessa preparação. (O usuário
 instalou depois manualmente esse build B9; veja o início deste checkpoint.)
 
-[NOT RUN] Store de credencial com username/credencial corretos, Save corrigido
+[PENDENTE DE ACEITE] Store de credencial com username/credencial corretos, Save corrigido
 após a tentativa R4 incerta, tráfego, conectar/cancelar/reconectar/desligar e
 cleanup de VPN real (Cluster), coexistência operacional, abertura após
 logout/login, entrega de notificações, demais atalhos nativos de edição e aceite
-visual final nos temas e monitores reais. O CI remoto completo após a correção
-local do oráculo do CI8 também permanece pendente. Colar nos dois campos já foi
+visual final nos temas e monitores reais. O CI9 completo passou após a correção
+local do oráculo do CI8; a tentativa real posterior de cancelar ficou presa,
+como registrado no início deste checkpoint. Colar nos dois campos já foi
 confirmado pelo usuário com texto fictício, e o host atualizado já foi empacotado, inspecionado,
 aplicado e observado em modo normal; veja os recibos no início deste checkpoint.
 A instalação, o startup, o Save R3 e a persistência não provam os itens restantes.

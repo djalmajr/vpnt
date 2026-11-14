@@ -457,6 +457,18 @@ h2 {
 .footer {
   padding-left: 0;
 }
+/* While the Options menu is open the window is asked for more height (see
+   panelSizing.ts). The panel then fills the window and the footer drops to its
+   bottom edge, so the trigger sits low enough for Radix to put every action
+   above it. Closing removes the marker and the natural height returns. If the
+   screen cannot hold that much, the host clamps the window and the menu scrolls
+   as before. */
+:root[data-menu-reserve] .panel {
+  min-height: min(100vh, var(--panel-max-height));
+}
+:root[data-menu-reserve] .footer {
+  margin-top: auto;
+}
 .vpn-card {
   display: flex;
   flex-direction: column;

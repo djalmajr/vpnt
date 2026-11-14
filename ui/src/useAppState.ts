@@ -5,6 +5,7 @@ import type { T } from "./components/common";
 import { type MessageKey, resolveLocale, translate } from "./i18n";
 import type { Snapshot } from "./model";
 import type { Route } from "./navigation";
+import { observePanelHeight } from "./panelSizing";
 import { createPreferencesFlow } from "./preferencesFlow";
 import {
   defaultPreferences,
@@ -210,21 +211,13 @@ export function useAppState() {
     document.addEventListener("keydown", onEscape);
     return () => document.removeEventListener("keydown", onEscape);
   }, []);
+  // Reports the panel height, temporarily raised while the Options menu needs
+  // room (see `panelSizing`); the cleanup releases the observer and the marker.
   useEffect(() => {
     if (!window.ipc) return;
-    let previous = 0;
-    const observer = new ResizeObserver(() => {
-      const height = Math.ceil(
-        document.getElementById("panel")?.getBoundingClientRect().height ?? 360,
-      );
-      if (height !== previous) {
-        previous = height;
-        void invoke({ type: "resize", height }).catch(() => {});
-      }
+    return observePanelHeight((height) => {
+      void invoke({ type: "resize", height }).catch(() => {});
     });
-    const root = document.getElementById("root");
-    if (root) observer.observe(root);
-    return () => observer.disconnect();
   }, []);
   const selected = useMemo(
     () =>
