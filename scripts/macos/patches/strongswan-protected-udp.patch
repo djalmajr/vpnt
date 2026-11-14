@@ -1,0 +1,126 @@
+--- a/src/libcharon/plugins/socket_default/socket_default_socket.c
++++ b/src/libcharon/plugins/socket_default/socket_default_socket.c
+@@ -42,6 +42,11 @@
+ #include <netinet/udp.h>
+ #include <net/if.h>
+ 
++#ifdef __APPLE__
++#include <net/pfkeyv2.h>
++#include <netinet6/ipsec.h>
++#endif
++
+ #include <daemon.h>
+ #include <threading/thread.h>
+ 
+@@ -68,6 +73,70 @@
+ 
+ #ifndef HAVE_IN6ADDR_ANY
+ static const struct in6_addr in6addr_any = IN6ADDR_ANY_INIT;
++#endif
++
++#ifdef __APPLE__
++/**
++ * Bind an owned UDP socket to the captured egress interface and install the
++ * exact per-socket IPsec bypass policy; no global SPD/SAD or route write.
++ * The caller closes the socket on any failure, rolling back this socket's
++ * policies; nothing falls back to the default route.
++ */
++static bool vpnt_protect_udp_socket(int skt, int family)
++{
++	struct sadb_x_policy policy;
++	unsigned int index;
++	int ifindex, flags;
++	u_int sol, ipsec_policy;
++
++	ifindex = lib->settings->get_int(lib->settings,
++				"%s.plugins.socket-default.vpnt_ifindex", 0, lib->ns);
++	if (ifindex < 1 || ifindex > 65535)
++	{
++		return FALSE;
++	}
++	switch (family)
++	{
++		case AF_INET:
++			sol = SOL_IP;
++			ipsec_policy = IP_IPSEC_POLICY;
++			break;
++		case AF_INET6:
++			sol = SOL_IPV6;
++			ipsec_policy = IPV6_IPSEC_POLICY;
++			break;
++		default:
++			return FALSE;
++	}
++
++	flags = fcntl(skt, F_GETFD);
++	if (flags < 0 || fcntl(skt, F_SETFD, flags | FD_CLOEXEC) < 0)
++	{
++		return FALSE;
++	}
++	index = (unsigned int)ifindex;
++	if (setsockopt(skt, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
++				family == AF_INET ? IP_BOUND_IF : IPV6_BOUND_IF,
++				&index, sizeof(index)) < 0)
++	{
++		return FALSE;
++	}
++	memset(&policy, 0, sizeof(policy));
++	policy.sadb_x_policy_len = sizeof(policy) / sizeof(uint64_t);
++	policy.sadb_x_policy_exttype = SADB_X_EXT_POLICY;
++	policy.sadb_x_policy_type = IPSEC_POLICY_BYPASS;
++	policy.sadb_x_policy_dir = IPSEC_DIR_OUTBOUND;
++	if (setsockopt(skt, sol, ipsec_policy, &policy, sizeof(policy)) < 0)
++	{
++		return FALSE;
++	}
++	policy.sadb_x_policy_dir = IPSEC_DIR_INBOUND;
++	if (setsockopt(skt, sol, ipsec_policy, &policy, sizeof(policy)) < 0)
++	{
++		return FALSE;
++	}
++	return TRUE;
++}
+ #endif
+ 
+ typedef struct private_socket_default_socket_t private_socket_default_socket_t;
+@@ -664,6 +733,9 @@
+ 	socklen_t addrlen;
+ 	u_int sol, pktinfo = 0;
+ 	int skt;
++#ifdef __APPLE__
++	bool vpnt_protect = FALSE;
++#endif
+ 
+ 	memset(&addr, 0, sizeof(addr));
+ 	addr.sockaddr.sa_family = family;
+@@ -699,6 +771,17 @@
+ 		return -1;
+ 	}
+ 
++#ifdef __APPLE__
++	vpnt_protect = lib->settings->get_bool(lib->settings,
++				"%s.plugins.socket-default.vpnt_protect_transport", FALSE,
++				lib->ns);
++	if (vpnt_protect && !vpnt_protect_udp_socket(skt, family))
++	{
++		close(skt);
++		return -1;
++	}
++#endif
++
+ 	if (family == AF_INET6 &&
+ 		setsockopt(skt, SOL_IPV6, IPV6_V6ONLY, &on, sizeof(on)) < 0)
+ 	{
+@@ -764,7 +847,12 @@
+ 	}
+ #endif
+ 
++#ifdef __APPLE__
++	if (!vpnt_protect &&
++		!charon->kernel->bypass_socket(charon->kernel, skt, family))
++#else
+ 	if (!charon->kernel->bypass_socket(charon->kernel, skt, family))
++#endif
+ 	{
+ 		DBG1(DBG_NET, "installing IKE bypass policy failed");
+ 	}

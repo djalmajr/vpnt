@@ -1,0 +1,13 @@
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -113,8 +113,8 @@
+ {
+ 	log_info("Interface %s is UP.\n", tunnel->ppp_iface);
+ 
+-	{
+-		/* Drop invalid route by pppd (or tun) in all cases. */
++	if (tunnel->config->set_routes) {
++		/* vpnt: --no-routes must also leave existing routes untouched. */
+ 		int ret = ipv4_drop_wrong_route(tunnel);
+ 
+ 		if (ret != 0)

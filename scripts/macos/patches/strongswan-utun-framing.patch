@@ -1,0 +1,67 @@
+--- a/src/libstrongswan/networking/tun_device.c
++++ b/src/libstrongswan/networking/tun_device.c
+@@ -431,9 +431,23 @@
+ 	ssize_t s;
+ 
+ #ifdef __APPLE__
+-	/* UTUN's expect the packets to be prepended by a 32-bit protocol number
+-	 * instead of parsing the packet again, we assume IPv4 for now */
+-	uint32_t proto = htonl(AF_INET);
++	/* UTUN expects a 32-bit protocol family in network byte order. Validate
++	 * the IP version instead of silently assuming IPv4. */
++	uint8_t version;
++
++	if (packet.len < 1)
++	{
++		DBG1(DBG_LIB, "refusing empty packet for TUN device %s", this->if_name);
++		return FALSE;
++	}
++	version = packet.ptr[0] >> 4;
++	if (version != 4 && version != 6)
++	{
++		DBG1(DBG_LIB, "refusing unsupported IP version %u for TUN device %s",
++			 version, this->if_name);
++		return FALSE;
++	}
++	uint32_t proto = htonl(version == 6 ? AF_INET6 : AF_INET);
+ 	packet = chunk_cata("cc", chunk_from_thing(proto), packet);
+ #endif
+ 	s = write(this->tunfd, packet.ptr, packet.len);
+@@ -457,7 +471,17 @@
+ 	ssize_t len;
+ 	bool old;
+ 
++#ifdef __APPLE__
++	size_t capacity = get_mtu(this) + sizeof(uint32_t);
++
++	/* The utun frame is a 4-byte family followed by one IP packet. Read one
++	 * byte beyond the valid maximum so an oversized datagram is rejected
++	 * instead of silently truncated. The IP packet itself is parsed by the
++	 * caller (ip_packet_create); this layer does not duplicate that parser. */
++	data = chunk_alloca(capacity + 1);
++#else
+ 	data = chunk_alloca(get_mtu(this));
++#endif
+ 
+ 	old = thread_cancelability(TRUE);
+ 	len = read(this->tunfd, data.ptr, data.len);
+@@ -468,10 +492,17 @@
+ 			 strerror(errno));
+ 		return FALSE;
+ 	}
+-	data.len = len;
+ #ifdef __APPLE__
+-	/* UTUN's prepend packets with a 32-bit protocol number */
++	if ((size_t)len > capacity)
++	{
++		DBG1(DBG_LIB, "packet larger than MTU from TUN device %s",
++			 this->if_name);
++		return FALSE;
++	}
++	data.len = (size_t)len;
+ 	data = chunk_skip(data, sizeof(uint32_t));
++#else
++	data.len = len;
+ #endif
+ 	*packet = chunk_clone(data);
+ 	return TRUE;

@@ -1,0 +1,788 @@
+:root {
+  color-scheme: light;
+  --surface: #ffffff;
+  --card: #f2f2f2;
+  --menu: #ffffff;
+  --separator: rgba(0, 0, 0, 0.1);
+  --text: rgba(0, 0, 0, 0.85);
+  --secondary: rgba(0, 0, 0, 0.5);
+  --control: rgba(0, 0, 0, 0.06);
+  --control-hover: rgba(0, 0, 0, 0.1);
+  --menu-hover: rgba(0, 0, 0, 0.06);
+  --field: #ffffff;
+  --switch-off: #d9d9d9;
+  --blue: #007aff;
+  --action: #0066d6;
+  --link: #0062cc;
+  --green: #34c759;
+  --orange: #ff9500;
+  --orange-text: #8f4c00;
+  --red: #ff3b30;
+  --red-text: #b8221a;
+  --red-fill: #c92a20;
+  --gray: #a3a3a3;
+  --warn-bg: #fff1d6;
+  --warn-fg: #7a4a00;
+  --error-bg: #ffe5e3;
+  --error-fg: #a8201a;
+  --info-bg: #e3f0ff;
+  --info-fg: #00529e;
+  --white: #ffffff;
+  --font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --font-body: 13px;
+  --font-label: 13px;
+  --font-control: 12px;
+  --line-height: 16px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --radius-sm: 4px;
+  --radius-control: 6px;
+  --radius-card: 10px;
+  --radius-panel: 12px;
+  --radius-popover: 13px;
+  --shadow-menu:
+    0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  --panel-width: 320px;
+  --control-height: 24px;
+  --control-x: 10px;
+  --switch-width: 24px;
+  --switch-height: 14px;
+  --switch-knob: 10px;
+  --switch-inset: 1px;
+  --dim-opacity: 0.45;
+  --hover-brightness: 1.08;
+  --panel-max-height: 720px;
+  --field-label-width: 92px;
+  --dialog-width: 280px;
+  --dialog-inset: 24px;
+  --log-max-height: 480px;
+  --menu-min-width: 184px;
+  --menu-pad: 5px;
+  --menu-item-x: 8px;
+  --menu-item-y: 5px;
+  --icon-menu: 15px;
+  --icon-inline: 13px;
+  --border-width: 1px;
+  --focus-width: 2px;
+  --scrim: rgb(0 0 0 / 24%);
+  --spinner-duration: 1s;
+}
+.dark {
+  color-scheme: dark;
+  --surface: #1e1e1e;
+  --card: #292929;
+  --menu: #2b2b2b;
+  --separator: rgba(255, 255, 255, 0.1);
+  --text: rgba(255, 255, 255, 0.85);
+  --secondary: rgba(255, 255, 255, 0.55);
+  --control: rgba(255, 255, 255, 0.08);
+  --control-hover: rgba(255, 255, 255, 0.14);
+  --menu-hover: rgba(255, 255, 255, 0.1);
+  --field: #1e1e1e;
+  --switch-off: #454545;
+  --blue: #0a84ff;
+  --action: #0a69d1;
+  --link: #5cadff;
+  --green: #30d158;
+  --orange: #ff9f0a;
+  --orange-text: #ffb340;
+  --red: #ff453a;
+  --red-text: #ff8f87;
+  --gray: #7a7a7a;
+  --warn-bg: #3b2c12;
+  --warn-fg: #ffc266;
+  --error-bg: #3e1f1c;
+  --error-fg: #ff9a91;
+  --info-bg: #14283d;
+  --info-fg: #7cbcff;
+  --shadow-menu:
+    0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -4px rgba(0, 0, 0, 0.3);
+}
+* {
+  box-sizing: border-box;
+}
+html {
+  background: transparent;
+  font-family: var(--font-family);
+  font-size: var(--font-body);
+  line-height: var(--line-height);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+body {
+  margin: 0;
+}
+button,
+input,
+select,
+summary,
+.button {
+  font: inherit;
+  color: inherit;
+}
+button,
+select,
+summary,
+.button {
+  cursor: pointer;
+}
+button,
+.button {
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--control);
+  --button-hover: var(--control-hover);
+  min-height: var(--control-height);
+  padding: 0 var(--control-x);
+  font-size: var(--font-control);
+  font-weight: 400;
+  text-decoration: none;
+  text-align: center;
+}
+/* Hover is an explicit fill, never a global brightness filter: a transparent
+   row has nothing to darken, and the filter washed out colored controls. Only
+   the filled primary/danger variants add the reference `hover-brightness`. */
+button:not(:disabled):hover,
+a.button:hover {
+  background: var(--button-hover);
+}
+button:disabled {
+  cursor: default;
+  color: var(--secondary);
+}
+:focus-visible {
+  outline: var(--focus-width) solid var(--blue);
+  outline-offset: var(--focus-width);
+}
+p,
+h1,
+h2,
+pre {
+  margin: 0;
+}
+p {
+  overflow-wrap: anywhere;
+}
+small,
+.hint {
+  font-size: var(--font-body);
+  color: var(--secondary);
+  font-weight: 400;
+}
+strong {
+  font-weight: 600;
+}
+select {
+  max-width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--control);
+  /* Explicit height, not min-height: WebKit rendered the native select 18 px
+     tall when only min-height was set. */
+  height: var(--control-height);
+  padding: 0 var(--control-x);
+  font-size: var(--font-control);
+}
+select:not(:disabled):hover {
+  background: var(--control-hover);
+}
+input {
+  border: var(--border-width) solid var(--separator);
+  border-radius: var(--radius-control);
+  background: var(--field);
+  height: var(--control-height);
+  padding: 0 var(--control-x);
+  font-size: var(--font-control);
+}
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  width: var(--panel-width);
+  max-width: 100%;
+  max-height: var(--panel-max-height);
+  overflow: auto;
+  padding: var(--space-sm);
+  border-radius: var(--radius-popover);
+  background: var(--surface);
+  margin: 0 auto;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--control-height);
+  min-height: var(--control-height);
+  padding-left: var(--space-xs);
+}
+.header.with-back {
+  padding: 0;
+}
+h1 {
+  font-size: var(--font-label);
+  font-weight: 600;
+}
+.with-back h1 {
+  text-align: center;
+  flex: 1;
+}
+h2 {
+  font-size: var(--font-label);
+  font-weight: 600;
+}
+.icon {
+  width: var(--space-lg);
+  height: var(--space-lg);
+  flex: 0 0 auto;
+  vertical-align: middle;
+}
+.icon.large {
+  width: calc(var(--control-height) + var(--space-xs));
+  height: calc(var(--control-height) + var(--space-xs));
+}
+/* Standard select: the real <select> keeps the platform popup, keyboard and
+   disabled semantics; this wrapper only positions the shared chevron. */
+.select-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+}
+.select-control > select {
+  appearance: none;
+  flex: 1;
+  width: 100%;
+  padding-right: calc(var(--control-x) + var(--icon-inline) + var(--space-xs));
+}
+.select-control > .icon {
+  position: absolute;
+  right: var(--control-x);
+  top: 50%;
+  width: var(--icon-inline);
+  height: var(--icon-inline);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.select-control > select:disabled {
+  color: var(--secondary);
+}
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height);
+  padding: var(--space-xs);
+  background: transparent;
+}
+.icon-placeholder {
+  width: var(--control-height);
+}
+.group {
+  padding: var(--space-sm);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.section-title {
+  padding: 0 var(--space-sm);
+  color: var(--secondary);
+  font-size: var(--font-body);
+}
+.setting-row {
+  display: flex;
+  min-height: calc(var(--control-height) + var(--space-xs));
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+.setting-row > span {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--font-label);
+}
+.setting-row small,
+.profile-row small {
+  display: block;
+}
+.setting-row button,
+.setting-row select {
+  flex: 0 0 auto;
+}
+/* The wrapper is the flex item inside a row; the label span keeps the fill. */
+.setting-row > span.select-control {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+.setting-row button {
+  max-width: 52%;
+}
+.switch {
+  --switch-radius: calc(var(--radius-sm) - var(--border-width));
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-start;
+  width: var(--switch-width);
+  height: var(--switch-height);
+  min-height: var(--switch-height);
+  border: var(--border-width) solid var(--separator);
+  border-radius: var(--switch-radius);
+  padding: var(--switch-inset);
+  background: var(--switch-off);
+  --button-hover: var(--switch-off);
+}
+.switch.on {
+  justify-content: flex-end;
+  background: var(--blue);
+  --button-hover: var(--blue);
+}
+.switch > span {
+  display: block;
+  width: var(--switch-knob);
+  height: var(--switch-knob);
+  background: var(--white);
+  border-radius: calc(
+    var(--switch-radius) -
+    var(--border-width) -
+    var(--switch-inset)
+  );
+}
+.dim {
+  opacity: var(--dim-opacity);
+}
+/* Busy is transient: the native control stays blocked but keeps the idle paint
+   and radius, so a host round-trip never reads as permanently unavailable.
+   Permanent `disabled` keeps the dim/secondary treatment. */
+.switch.busy:disabled,
+.select-control.busy > select:disabled {
+  cursor: progress;
+}
+.select-control.busy > select:disabled {
+  color: inherit;
+}
+.primary {
+  background: var(--action);
+  color: var(--white);
+  --button-hover: var(--action);
+}
+.primary:not(:disabled):hover {
+  filter: brightness(var(--hover-brightness));
+}
+.primary:disabled {
+  background: var(--control);
+  color: var(--secondary);
+}
+.danger {
+  color: var(--red-text);
+}
+.danger-fill {
+  background: var(--red-fill);
+  color: var(--white);
+  --button-hover: var(--red-fill);
+}
+.danger-fill:not(:disabled):hover {
+  filter: brightness(var(--hover-brightness));
+}
+.link {
+  color: var(--link);
+  background: transparent;
+  --button-hover: var(--menu-hover);
+}
+.primary-text {
+  color: var(--blue);
+}
+.success-text {
+  color: var(--green);
+}
+.warning-text {
+  color: var(--orange);
+}
+.danger-text {
+  color: var(--red);
+}
+.muted {
+  color: var(--gray);
+}
+.notice {
+  padding: var(--space-sm);
+  border-radius: var(--radius-control);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  align-items: flex-start;
+}
+.notice.info {
+  background: var(--info-bg);
+  color: var(--info-fg);
+}
+.notice.warn {
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+}
+.notice.error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+.actions.end {
+  justify-content: flex-end;
+}
+.actions.fill {
+  width: 100%;
+}
+.actions.fill > button {
+  flex: 1;
+}
+.block {
+  width: 100%;
+}
+.spread,
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+.footer {
+  padding-left: 0;
+}
+/* While the Options menu is open the window is asked for more height (see
+   panelSizing.ts). The panel then fills the window and the footer drops to its
+   bottom edge, so the trigger sits low enough for Radix to put every action
+   above it. Closing removes the marker and the natural height returns. If the
+   screen cannot hold that much, the host clamps the window and the menu scrolls
+   as before. */
+:root[data-menu-reserve] .panel {
+  min-height: min(100vh, var(--panel-max-height));
+}
+:root[data-menu-reserve] .footer {
+  margin-top: auto;
+}
+.vpn-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  background: var(--card);
+  border-radius: var(--radius-card);
+  padding: var(--space-sm);
+}
+.card-toggle {
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  --button-hover: transparent;
+  text-align: left;
+  font-size: var(--font-body);
+  font-weight: 400;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.card-toggle:disabled {
+  color: var(--text);
+}
+.card-heading,
+.card-state {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+}
+.identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.identity strong {
+  font-size: var(--font-label);
+}
+.identity strong,
+.identity small {
+  overflow-wrap: anywhere;
+}
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  text-align: left;
+}
+.status-line .icon {
+  width: var(--space-md);
+  height: var(--space-md);
+}
+.dot {
+  display: block;
+  height: var(--space-sm);
+  width: var(--space-sm);
+  background: currentColor;
+  border-radius: var(--radius-sm);
+}
+.card-state small {
+  flex-shrink: 0;
+}
+.card-cancel {
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-xs);
+}
+.card-cancel:hover {
+  background: var(--menu-hover);
+}
+.empty {
+  background: var(--card);
+  border-radius: var(--radius-card);
+  padding: var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-sm);
+  text-align: center;
+}
+.empty > .icon {
+  color: var(--gray);
+}
+dialog p {
+  color: var(--secondary);
+}
+.empty p {
+  color: var(--secondary);
+}
+.profile-row {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  text-align: left;
+  padding: var(--space-xs) 0;
+  background: transparent;
+  --button-hover: var(--menu-hover);
+  border-radius: var(--radius-control);
+  font-size: var(--font-label);
+  font-weight: 400;
+}
+.add-profile {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding-left: 0;
+}
+.profile-form,
+.secret-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+.field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.field > span {
+  width: var(--field-label-width);
+  flex: 0 0 auto;
+}
+.field > input,
+.field > .select-control {
+  flex: 1;
+  width: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+input[aria-invalid="true"] {
+  border-color: var(--red);
+}
+.tabs {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+.log-lines {
+  font: inherit;
+  padding: var(--space-sm);
+  background: var(--card);
+  border-radius: var(--radius-card);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  max-height: var(--log-max-height);
+  overflow: auto;
+}
+dialog {
+  position: fixed;
+  width: var(--dialog-width);
+  max-width: calc(100% - var(--dialog-inset));
+  max-height: calc(100% - var(--dialog-inset));
+  padding: var(--space-lg);
+  border: var(--border-width) solid var(--separator);
+  border-radius: var(--radius-panel);
+  background: var(--menu);
+  box-shadow: var(--shadow-menu);
+  color: var(--text);
+}
+dialog[open] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+dialog::backdrop {
+  background: var(--scrim);
+}
+/* Native disclosures outside the options menu (demo controls) keep the marker
+   hidden and the control radius; the options menu itself no longer uses one. */
+summary {
+  list-style: none;
+  border-radius: var(--radius-control);
+}
+summary::-webkit-details-marker {
+  display: none;
+}
+/* Options menu: the Radix trigger keeps the classic control surface, and the
+   popover keeps the 5 px inset, 10 px radius, 6 px row radius, icon column and
+   the shared menu shadow. Position comes from the primitive — anchored above the
+   trigger, end-aligned, 6 px gap, 8 px collision padding — so there are no
+   fixed screen coordinates here. */
+.options-trigger {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-height: var(--control-height);
+  padding: 0 var(--control-x);
+  border-radius: var(--radius-control);
+  background: var(--control);
+  font-size: var(--font-control);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.options-trigger:hover,
+.options-trigger[data-state="open"] {
+  background: var(--control-hover);
+}
+.options-trigger .icon {
+  width: var(--icon-inline);
+  height: var(--icon-inline);
+}
+.options-menu {
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: var(--menu-min-width);
+  max-width: calc(100vw - 2 * var(--space-sm));
+  max-height: var(
+    --radix-dropdown-menu-content-available-height,
+    calc(100vh - 2 * var(--space-sm))
+  );
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--menu-pad);
+  border-radius: var(--radius-card);
+  background: var(--menu);
+  box-shadow: var(--shadow-menu);
+  color: var(--text);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  padding: var(--menu-item-y) var(--menu-item-x);
+  border-radius: var(--radius-control);
+  background: transparent;
+  font-size: var(--font-body);
+  font-weight: 400;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.menu-item .icon {
+  width: var(--icon-menu);
+  height: var(--icon-menu);
+  color: var(--secondary);
+}
+.menu-item-label {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+}
+/* Radix marks pointer hover and keyboard focus with the same attribute, so the
+   reference-gray fill covers both paths; the global focus ring stays visible. */
+.menu-item[data-highlighted] {
+  background: var(--menu-hover);
+}
+.menu-item[data-disabled] {
+  color: var(--text);
+  opacity: var(--dim-opacity);
+  background: transparent;
+  pointer-events: none;
+  cursor: default;
+}
+.profile-row:focus-visible,
+.link:focus-visible {
+  background: var(--button-hover);
+}
+/* The Radix separator is a `div role="separator"`, not an `hr`. */
+.menu-separator {
+  height: var(--border-width);
+  margin: var(--space-xs) calc(-1 * var(--menu-pad));
+  background: var(--separator);
+}
+hr {
+  border: 0;
+  height: var(--border-width);
+  background: var(--separator);
+}
+.demo-label {
+  color: var(--info-fg);
+  background: var(--info-bg);
+  border-radius: var(--radius-control);
+  padding: var(--space-xs) var(--space-sm);
+}
+.demo-controls {
+  color: var(--secondary);
+}
+.demo-controls[open] {
+  display: flex;
+  flex-direction: column;
+}
+.demo-controls summary {
+  padding: var(--space-xs);
+}
+.demo-controls summary:hover {
+  background: var(--menu-hover);
+}
+.demo-controls .field,
+.demo-controls .hint {
+  margin-top: var(--space-sm);
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.spin {
+  animation: spin var(--spinner-duration) linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}
