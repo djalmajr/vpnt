@@ -131,8 +131,10 @@ A integração dos testes revisados passou pela campanha completa do Broker
 (`ci6-broker-correction/receipt.json`): 17 mutantes Rust com exit 101, 7 de UI com
 exit 1, 8 execuções positivas com exit 0, 52 testes do Broker passando, fmt e clippy
 passando, fonte inalterada. A prova do caminho afetado foi mantida mesmo depois da
-ligação, sem relação, do menu Editar; não há alegação de grafo inteiro novo e
-nenhum CI remoto posterior à correção foi executado.
+ligação, sem relação, do menu Editar; não há alegação de grafo inteiro novo.
+A nova execução remota está no [CI7](https://github.com/djalmajr/vpnt/actions/runs/43549191576),
+head `5c6c509`; o resultado completo deve ser conferido nesse workflow. A falha
+histórica do CI6 não é reclassificada pela correção local.
 
 [PASS, B10 instalado pelo Installer real, observado] O build B10
 (`ed7d1f977e045f8dd40020be0b8aa00d9dffdb3e16ac8659ed3f542a505f2c95`) agora está
@@ -491,17 +493,22 @@ Installer, senha ou conexão foi executado nessa preparação. (O usuário
 instalou depois manualmente esse build B9; veja o início deste checkpoint.)
 
 [NOT RUN] Store de credencial com username/credencial corretos, Save corrigido
-na R4, tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real
-(Cluster), coexistência operacional, abertura após logout/login, entrega de
-notificações, colar/desfazer/copiar/recortar por teclado nativo real, aceite
-visual nativo final do VPN Tray por captura do popover, pacote final do host e um
-CI remoto verde após a correção do CI6. A instalação, o startup, o Save R3 e a
-persistência acima não alteram o estado desses itens. As provas de fixture,
-nativas, simuladas e de VPN real continuam separadas; o estado geral é parcial.
+após a tentativa R4 incerta, tráfego, conectar/cancelar/reconectar/desligar e
+cleanup de VPN real (Cluster), coexistência operacional, abertura após
+logout/login, entrega de notificações, demais atalhos nativos de edição e aceite
+visual final nos temas e monitores reais. O CI remoto completo após a correção
+do CI6 também permanece pendente. Colar nos dois campos já foi confirmado pelo
+usuário com texto fictício, e o host atualizado já foi empacotado, inspecionado,
+aplicado e observado em modo normal; veja os recibos no início deste checkpoint.
+A instalação, o startup, o Save R3 e a persistência não provam os itens restantes.
+As provas de fixture, nativas, simuladas e de VPN real continuam separadas; o
+estado geral é parcial.
 
 Os recibos atuais não versionados em `output/fixtures/` são
 `vpn-tray-final/{receipt,wk-matrix,package-receipt,r3-native-preflight,normal-ui-opened}.json`,
 `native-edit-integration/receipt.json`, `native-edit-recovery/receipt.json`,
+`native-edit-integration/paste-acceptance.json`,
+`multi-monitor-integration/{receipt,summary,applied-host,native-normal-observation}.json`,
 `ci6-broker-correction/receipt.json`,
 `installation-engine-oracles/receipt.json`, `route-oracles/receipt.json` e, para
 a instalação e o startup, `askpass-parent/{installed-images,startup-native-result,startup-family}.json`.
