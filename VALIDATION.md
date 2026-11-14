@@ -50,10 +50,19 @@ Store de credencial com username/credencial corretos e Save corrigido,
 conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
 Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor e a
 correção do cancelamento real preso em Disconnecting. O CI9 terminou verde em
-`f7f5314`; o CI10 posterior falhou no grupo de instalação. Evidência nativa, simulada,
+`f7f5314`; o CI10 posterior falhou no grupo de instalação; o CI11 terminou verde
+em `73c348f`. Evidência nativa, simulada,
 fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
 VPN real bem-sucedida. Esta atualização documenta somente o checkpoint atual; os demais
 checkpoints do arquivo continuam históricos.
+
+[PASS, décimo primeiro CI remoto completo] O [CI11](https://github.com/djalmajr/vpnt/actions/runs/43618792794),
+head `73c348f28883df53373773e9018bc4e8394f5612`, terminou com sucesso nos seis
+jobs: core, runtime, macOS base e os três grupos de oráculos (instalação,
+controle e rede). O grupo de instalação, que parou na baseline de admissão no
+CI10, passou; a causa remota daquela falha continua sem atribuição. Recibo em
+`output/fixtures/ci11/ci11-terminal-summary.json`. O resultado remoto não
+executou VPN nem instalação real e não cobre os aceites nativos pendentes.
 
 [FAIL, décimo CI remoto completo] O [CI10](https://github.com/djalmajr/vpnt/actions/runs/43609082856),
 head `72afa5680b3d4b1a3540e1c482e0de0c94f2a198`, passou core, runtime, macOS,
