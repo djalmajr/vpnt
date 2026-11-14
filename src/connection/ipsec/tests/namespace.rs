@@ -178,3 +178,53 @@ fn durable_completion_follows_both_observations_and_failure_keeps_the_slot_exclu
         reservation.reqid()
     );
 }
+
+// Mutation: drop the reqid bounds guard from the pre-initiate view only. The
+// full view stays empty so `occupied()` cannot reject these ids on its behalf.
+#[test]
+fn preinitiate_out_of_range_reqids_are_rejected_without_releasing_the_reservation() {
+    #[derive(Default)]
+    struct State {
+        stopped: bool,
+        preinitiate: BTreeSet<u32>,
+    }
+    struct PreInitiate(Arc<Mutex<State>>);
+    impl Observer for PreInitiate {
+        fn occupied(&mut self) -> Result<BTreeSet<u32>, Error> {
+            Ok(BTreeSet::new())
+        }
+        fn producer_stopped(&mut self, _: &Owner) -> Result<bool, Error> {
+            Ok(self.0.lock().unwrap().stopped)
+        }
+        fn occupied_before_initiate(&mut self, _: &Owner, _: u16) -> Result<BTreeSet<u32>, Error> {
+            Ok(self.0.lock().unwrap().preinitiate.clone())
+        }
+    }
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut registry = Registry::new(PreInitiate(state.clone()));
+    let reservation = registry.reserve(owner("Case", 1)).unwrap();
+    assert_eq!(registry.ensure_initiate_clear(&reservation), Ok(()));
+    for wide in [65536, u32::MAX] {
+        state.lock().unwrap().preinitiate = BTreeSet::from([wide]);
+        assert_eq!(
+            registry.ensure_initiate_clear(&reservation),
+            Err(Error::Invalid),
+            "pre-initiate reqid {wide} is outside the kernel range"
+        );
+        assert_eq!(registry.validate(&reservation), Ok(()));
+        assert!(registry.has_reservations());
+        assert!(matches!(
+            registry.reserve(owner("Case", 2)),
+            Err(Error::Busy)
+        ));
+        assert_eq!(registry.ensure_clear(&reservation), Ok(()));
+    }
+    {
+        let mut s = state.lock().unwrap();
+        s.preinitiate.clear();
+        s.stopped = true;
+    }
+    registry.release(&reservation).unwrap();
+    assert_eq!(registry.validate(&reservation), Err(Error::Changed));
+    assert!(!registry.has_reservations());
+}

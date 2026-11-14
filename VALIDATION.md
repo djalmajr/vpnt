@@ -39,19 +39,52 @@ As 20 campanhas originais permanecem, com os mesmos comandos, versões,
 permissões, timeouts e quatro threads de teste; `fail-fast: false` preserva as
 demais expansões quando uma falha. Contratos locais independentes passaram e
 detectaram a omissão de uma campanha e a retirada de `needs: macos`. A revisão
-estrutural passou; a nova distribuição ainda está [NOT RUN] no GitHub. O CI7
-abaixo usa a distribuição serial anterior, não comprova a matriz nova.
+estrutural passou. O CI8 executou os três grupos: instalação e rede passaram;
+controle parou na pré-checagem do namespace IPsec, conforme registrado abaixo.
+O CI7 usava a distribuição serial anterior e foi supersedido pelo envio do CI8.
 
-## Checkpoint atual — 13/11/2026
+## Checkpoint atual — 14/11/2026
 
 [PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
 Store de credencial com username/credencial corretos e Save corrigido,
 conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
 Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor, um
-CI remoto verde (o CI6 falhou; veja abaixo). Evidência nativa, simulada,
+CI remoto verde (o CI8 falhou; veja abaixo). Evidência nativa, simulada,
 fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
 VPN real. Esta atualização documenta somente o checkpoint atual; os demais
 checkpoints do arquivo continuam históricos.
+
+[FAIL, oitavo CI remoto; matriz executada] O [CI8](https://github.com/djalmajr/vpnt/actions/runs/43552915787),
+head `f099690`, terminou em falha. Core, runtime, macOS base, instalação e rede
+passaram. O macOS base registrou 654 testes nativos passados, zero falhas e dois
+ignorados. No grupo controle passaram Broker, administração assíncrona,
+componente, canal do helper e perfis (23 mutantes, baselines/restaurações verdes).
+O checker IPsec parou antes da baseline porque a condição de bounds de reqid
+aparece duas vezes e `base.replace` exige uma ocorrência. Não foi mutante
+sobrevivente nem falha de compilação. VICI deadlines e controle IPsec ficaram
+[NOT RUN] nesse workflow. O log integral e o resumo terminal estão em
+`multi-monitor-integration/ci8-all-jobs.log` e `ci8-terminal-summary.json`.
+O CI7 foi cancelado ao ser supersedido; seus gates parciais não são PASS global.
+
+[PASS local, correção do oráculo; novo CI pendente] A âncora antiga agora
+identifica somente a view full de `occupied()`, e uma mutação separada verifica
+`occupied_before_initiate`. O teste novo usa o Registry real com Observer
+fictício e views independentes: 65536/u32::MAX são inválidos no pre-initiate,
+o token e a exclusividade permanecem até release explícito. As duas variantes
+alteram um guard cada; `namespace.rs` de produção continua byteidêntico.
+A campanha fornecida passou 43 mutantes por assertions funcionais, com 34
+testes em cada baseline/restauração. A revisão independente conferiu fontes,
+variantes, hashes e todos os logs, sem achados e sem reexecutar a campanha.
+
+Na integração passaram clippy `--all-targets --all-features -- -D warnings`,
+VICI deadlines (10 mutantes) e controle IPsec (61 mutantes), com baselines e
+restaurações verdes e fonte estável. O clippy diagnóstico sem desktop falhou
+por dead_code fora da fatia; a execução com `-A dead_code` não foi aceita como
+gate do projeto. A correção foi portada somente para `check-ipsec.py` e o teste
+de namespace; recibos/logs em `output/fixtures/ci9-ipsec-correction/`.
+Os 654 testes completos acima são do checkpoint anterior; não foram repetidos
+localmente para esta mudança de teste. Fmt e a campanha afetada têm sua própria
+evidência. Kernel, charon e VPN reais continuam [NOT RUN] neste escopo.
 
 [PASS, colar nativo confirmado pelo usuário; demais atalhos NOT RUN] O menu Editar
 em `src/desktop/edit_menu.rs` e `src/desktop/mod.rs` usa itens predefinidos do
@@ -509,8 +542,8 @@ após a tentativa R4 incerta, tráfego, conectar/cancelar/reconectar/desligar e
 cleanup de VPN real (Cluster), coexistência operacional, abertura após
 logout/login, entrega de notificações, demais atalhos nativos de edição e aceite
 visual final nos temas e monitores reais. O CI remoto completo após a correção
-do CI6 também permanece pendente. Colar nos dois campos já foi confirmado pelo
-usuário com texto fictício, e o host atualizado já foi empacotado, inspecionado,
+local do oráculo do CI8 também permanece pendente. Colar nos dois campos já foi
+confirmado pelo usuário com texto fictício, e o host atualizado já foi empacotado, inspecionado,
 aplicado e observado em modo normal; veja os recibos no início deste checkpoint.
 A instalação, o startup, o Save R3 e a persistência não provam os itens restantes.
 As provas de fixture, nativas, simuladas e de VPN real continuam separadas; o

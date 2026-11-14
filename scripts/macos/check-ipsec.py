@@ -33,6 +33,7 @@ def main():
     reserve = prefix + 'namespace::reservations_exclude_kernel_ids_and_other_generations_until_the_producer_and_kernel_are_clear'
     tokens = prefix + 'namespace::foreign_and_stale_tokens_cannot_release_a_new_reservation_and_failed_observation_changes_nothing'
     bounds = prefix + 'namespace::exhausted_or_invalid_namespaces_never_truncate_or_admit_an_invalid_owner'
+    preinitiate = prefix + 'namespace::preinitiate_out_of_range_reqids_are_rejected_without_releasing_the_reservation'
     capacity = prefix + 'namespace::the_profile_capacity_is_bounded_without_reusing_dropped_or_unconfirmed_reservations'
     mutations = [
         ('root-owner-accepted', namespace, lambda s: replace(s, 'owner.uid == 0 || ', ''), bounds),
@@ -43,7 +44,8 @@ def main():
         ('generation-overlaps-old-profile', namespace, lambda s: replace(s, '.any(|(_, current)| current.uid == owner.uid && current.profile == owner.profile)', '.any(|_| false)'), reserve),
         ('zero-reqid-issued', namespace, lambda s: replace(s, '(1..=MAX_MANUAL_REQID)', '(0..=MAX_MANUAL_REQID)'), bounds),
         ('kernel-reassigns-out-of-manual-range', namespace, lambda s: replace(s, 'const MAX_MANUAL_REQID: u16 = 0x3fff;', 'const MAX_MANUAL_REQID: u16 = u16::MAX;'), prefix + 'sdk::darwin_sdk_and_allocator_agree_on_the_manual_reqid_limit'),
-        ('wide-reqid-silently-accepted', namespace, lambda s: replace(s, 'occupied.iter().any(|id| *id > u32::from(u16::MAX))', 'false'), bounds),
+        ('wide-reqid-silently-accepted', namespace, lambda s: replace(s, 'let occupied = self.observer.occupied()?;\n        if occupied.iter().any(|id| *id > u32::from(u16::MAX)) {', 'let occupied = self.observer.occupied()?;\n        if false {'), bounds),
+        ('wide-preinitiate-reqid-silently-accepted', namespace, lambda s: replace(s, '.occupied_before_initiate(&reservation.owner, reservation.reqid)?;\n        if occupied.iter().any(|id| *id > u32::from(u16::MAX)) {', '.occupied_before_initiate(&reservation.owner, reservation.reqid)?;\n        if false {'), preinitiate),
         ('foreign-registry-token-accepted', namespace, lambda s: replace(s, '!Arc::ptr_eq(&self.authority, &reservation.authority)', 'false'), tokens),
         ('stale-token-accepted', namespace, lambda s: replace(s, '*serial == reservation.serial && ', ''), tokens),
         ('producer-stop-not-required', namespace, lambda s: replace(s, '!self.observer.producer_stopped(&reservation.owner)?', 'false'), reserve),
