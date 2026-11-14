@@ -281,6 +281,8 @@ interruptor é mais compacto que o clássico: 24 por 14 px, com botão de 10 px 
 1 px de recuo. Ícones grandes e linhas de preferências conservam 28 px,
 independentes da largura do interruptor.
 
+Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como no ai-usagebar: âncora em pontos Cocoa, origens negativas preservadas e limites da área visível ao abrir ou redimensionar; a escala da janela anterior não participa. A colocação nativa usa 0 pt abaixo da barra, 8 pt nas laterais e 24 pt acima da borda inferior, sem novos valores CSS; reabrir recaptura a âncora e remoção da tela recorre à primária.
+
 ### Conflicting visual priorities
 
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
@@ -356,6 +358,16 @@ controle e o ícone `down`; o interruptor conserva `switch-width`,
 adicional é o cursor de progresso — sem texto novo no catálogo, spinner ou
 mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
 vindo do snapshot autoritativo.
+
+### Edição por teclado (menu Editar nativo)
+
+Os atalhos padrão de edição (⌘Z, ⇧⌘Z, ⌘X, ⌘C, ⌘V, ⌘A) vêm do menu Editar nativo
+do aplicativo (Desfazer, Refazer, Recortar, Copiar, Colar, Selecionar Tudo), que
+envia os seletores padrão ao responder em foco, sem alvo explícito. A WebView e
+seus campos de texto continuam sendo o responder; a UI não lê nem escreve a
+área de transferência por JavaScript, não intercepta teclas e não ganha IPC ou
+permissão nova. Os rótulos vêm do catálogo compartilhado pt-BR/en-US e seguem
+o idioma já validado do host. Sem novos tokens nem alteração visual da UI.
 
 ### Ícone da barra de menus
 

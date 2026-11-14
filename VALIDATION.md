@@ -33,12 +33,132 @@ variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 ## Checkpoint atual — 13/11/2026
 
 [PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
-autenticação administrativa real, novo perfil com Save e Store de credencial,
+Store de credencial com username/credencial corretos e Save corrigido,
 conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
-Cluster, aceite visual nativo final e o próximo CI. Evidência nativa, simulada,
+Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor, um
+CI remoto verde (o CI6 falhou; veja abaixo). Evidência nativa, simulada,
 fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
 VPN real. Esta atualização documenta somente o checkpoint atual; os demais
 checkpoints do arquivo continuam históricos.
+
+[PASS, colar nativo confirmado pelo usuário; demais atalhos NOT RUN] O menu Editar
+em `src/desktop/edit_menu.rs` e `src/desktop/mod.rs` usa itens predefinidos do
+AppKit, responder sem alvo explícito, lifetime do event loop e rótulos do catálogo
+compartilhado pt-BR/en-US `ui/src/locales/menus.json`. O locale efetivo vem do
+`Request.locale` já validado. A revisão independente passou; não houve mudança de
+versão, lockfile, HTML, CSS, CSP nem IPC para esse ajuste. O probe do SDK prova
+somente seletores e equivalências de tecla.
+
+A reprodução no host antigo mostrou que colar texto fictício nos dois campos
+não preenchia nenhum deles; digitar um caractere em cada campo habilitava o
+botão. No host corrigido, a tentativa automatizada perdeu a observação quando o
+popover ficou oculto, e não foi classificada como sucesso. Depois, o usuário
+confirmou **“Agora cola nos dois campos”**, no app nativo em demonstração explícita,
+com texto fictício. Recibos: `native-edit-integration/paste-baseline-native.json`,
+`paste-baseline-post-quit.json` e `paste-acceptance.json`; relatórios
+`native-paste.md` e `native-paste-review.md`. O ensaio original de demonstração
+terminou por Sair; uma cópia posterior em modo normal iniciou um helper, sem
+Store ou comando de VPN, e foi encerrada após conferir a identidade. A instância
+corrigida de demonstração também foi encerrada, com ausência de seu PID verificada.
+Os cartões Connected da captura enviada pelo usuário eram simulados. Não houve
+leitura nem gravação de credenciais reais nesse teste. Desfazer/refazer,
+recortar/copiar e selecionar tudo continuam [NOT RUN] em uso nativo real.
+
+[PASS, host atualizado; componente preservado] O host com menu Editar de SHA-256
+`94c10405…7673` foi preparado, inspecionado e aplicado antes da correção
+multimonitor (`native-edit-integration/package-receipt.json` e `applied-host.json`).
+Depois, `target/VPN Tray.app` recebeu o host multimonitor
+`c335bfd0a3aa51a5ed13fb66044c58b3a542e78503cb4a058938d51822455c2b`, também
+empacotado e inspecionado. Os hashes/permissões dos componentes instalados foram
+conferidos antes da troca: o payload B10/ed7 continua o mesmo, sem reinstalação.
+Recibos atuais: `multi-monitor-integration/receipt.json`, `summary.json` e
+`applied-host.json`. Uma prévia HTTP antiga, identificada pelo listener loopback
+4179, foi preservada; ela não é um controlador nativo de VPN.
+
+[PASS local, multimonitor; aceite físico NOT RUN] A colocação agora captura a
+âncora do clique na callback síncrona do tray e aplica o frame em pontos Cocoa,
+sem escala da janela anterior nem clamp global de X a zero. A tela/área visível
+é consultada ao abrir e no Resize, seguindo a referência ai-usagebar; nova
+abertura captura nova âncora. Há 13 testes de geometria, incluindo telas à
+esquerda, acima/abaixo, bordas e dock. A revisão independente
+`multi-monitor-review.md` passou sem achados, executou as 13 fixtures, fmt e
+clippy all-targets/all-features; um harness puro adicional passou 14 casos antes
+e após restauração e detectou três mutantes por assertions funcionais (X a zero,
+só primária, Y invertido). Não é execução AppKit/multimonitor real. A integração
+atual passou `cargo test --locked --offline --all-targets --all-features`, com
+`RUST_TEST_THREADS=4`: **654 passados, zero falhas, dois ignorados**, em 169,28 s,
+seguida de build do host, pacote e inspect passando. Fonte/configuração/assets
+estáveis no recibo. O lockfile ficou inalterado; as únicas features adicionadas
+são NSEvent/NSScreen/NSGeometry das versões já travadas.
+
+[PASS nativo, abertura normal; multimonitor físico pendente] O CUA observou a
+janela atualizada “VPN Tray”, o cartão Cluster em Password required e o rodapé
+0.1.0, sem banner Demonstration, por AX e captura no tema claro atual. O app foi
+aberto sem `--demo`, usando `--show`; nenhum comando de VPN foi enviado. Recibo
+`multi-monitor-integration/native-normal-observation.json`. O teste com cliques
+reais no tray de cada tela está aguardando o usuário; não há medição absoluta do
+frame, teste de retirada física da tela, escala WKWebView ou nova matriz de temas.
+A geometria aprovada em fixtures não substitui esse aceite nativo.
+
+[PASS local, integração do menu Editar; recuperação registrada] O recibo
+`native-edit-integration/receipt.json` registra UI (lint, typecheck, testes, build),
+tokens, classes, fmt e clippy passando. Na mesma rodada, o desktop falhou em dois
+pré-requisitos de fixtures do produtor (handoff não em cache; barreira de bind não
+alcançada), com 533 passados, 2 falhos e 1 ignorado; a falha original está
+preservada em `native-edit-integration/desktop.log`. A recuperação
+(`native-edit-recovery/receipt.json`) usou `RUST_TEST_THREADS=4`, como o CI
+commitado: os dois testes exatos passaram isolados (1/0/0 cada) e o passo
+`cargo test --locked --offline --all-targets --all-features` terminou com exit 0 em
+139,82 s: 641 passados, zero falhas e dois ignorados. A suíte core passou com
+580 testes e dois ignorados; o build do host e o build separado de todos os
+binários também passaram. O resumo está em `native-edit-recovery/summary.json`. A causa
+histórica das duas falhas não é afirmada. O recibo também guarda `sourceUnchanged=true`
+sobre seis arquivos de fonte/configuração (docs excluídos de propósito);
+`realVpn=false`, `clipboardAccess=false`, `privilegedInstall=false`. As contagens
+639/580 abaixo pertencem ao checkpoint anterior, de fonte antiga, e não são
+inferidas para esta fonte.
+
+[FAIL, sexto CI remoto] O [sexto workflow](https://github.com/djalmajr/vpnt/actions/runs/43533075817)
+terminou em falha. Linux core e runtime passaram. No macOS, a suíte nativa teve 639
+passados, 0 falhos e 2 ignorados (biblioteca 533/0/1), e passaram a UI (43 testes,
+443 assertions), askpass e os passos de payload, engine, pacote, componente do app e
+pinentry. O job parou no passo 17, a campanha do Broker: o mutante
+`accepted-substitutes-traffic-proof` deveria terminar com exit 101, obtido 0 (mutante sobreviveu); os passos seguintes foram ignorados.
+Localmente, quatro mutantes causais falham numa assertion funcional em teste
+privado, e os mutantes locais ordinários originais falharam; só uma ordenação
+controlada do recibo reproduziu o falso positivo, sem trace histórico do runner.
+A integração dos testes revisados passou pela campanha completa do Broker
+(`ci6-broker-correction/receipt.json`): 17 mutantes Rust com exit 101, 7 de UI com
+exit 1, 8 execuções positivas com exit 0, 52 testes do Broker passando, fmt e clippy
+passando, fonte inalterada. A prova do caminho afetado foi mantida mesmo depois da
+ligação, sem relação, do menu Editar; não há alegação de grafo inteiro novo e
+nenhum CI remoto posterior à correção foi executado.
+
+[PASS, B10 instalado pelo Installer real, observado] O build B10
+(`ed7d1f977e045f8dd40020be0b8aa00d9dffdb3e16ac8659ed3f542a505f2c95`) agora está
+instalado: o CUA observou o sucesso do Installer real e os três componentes
+instalados (helper, instalador e askpass) conferem com o hash, são root:wheel, modo
+0555 e nlink 1 (`vpn-tray-final/r3-native-preflight.json`). Logs anteriores
+mostram que o usuário abriu duas vezes o caminho antigo do B9; o pacote exato e
+único foi selecionado pelo Installer. Não se alega novo diálogo de autenticação. No
+app normal empacotado, a AX real confirmou a janela VPN Tray, o rodapé 0.1.0 e a
+senha do Cluster como obrigatória (`normal-ui-opened.json`); não é prova de captura
+nem de cores.
+
+[PARCIAL, R3/R4 nativos, sem VPN] O Save de um perfil novo e próprio, de teste,
+foi **confirmado** na R3 (`MissingSecret`, ambos os indicadores de segredo falsos).
+O Store falhou em `SecretRead` antes de qualquer escrita, porque os metadados preparados mantiveram a
+expressão literal de shell do usuário em vez do valor padrão declarado. Depois, os
+metadados das duas contas de origem conferem com o fallback declarado no chaveiro
+padrão, sem leitura dos valores secretos. A continuação privada R4, só com
+username, passou na revisão de segurança alta
+(`native-broker-driver-r4-security-review.md`), mas a correção real do Save expirou
+como `admin_uncertain`; não houve Store nem Connect na R4. Em R3 e R4, depois de
+Quit, as famílias externas estavam ausentes; nenhum comando de VPN foi enviado nem
+valor de credencial foi lido ou gravado. O helper segue instalado e o perfil
+próprio foi mantido, sem exclusão ou mudança em configuração legada. Registros
+em `output/fixtures/vpn-tray-final`. Username/credencial corretos, Store e VPN
+real continuam pendentes.
 
 [PASS, gates locais completos, fonte estável] O recibo
 `output/fixtures/vpn-tray-final/receipt.json` registra `sourceUnchanged=true`,
@@ -49,7 +169,8 @@ com `-D warnings`, 639 testes desktop e 580 core (sem falhas e com dois
 ignorados em cada suíte), as campanhas de engine e de rotas, o gate do askpass
 e o build de todos os binários. As contagens de UI/tokens vêm de `ui-tests.log` e
 `tokens.log` da mesma pasta. 639/580 substituem como contagem atual as 638/579
-do checkpoint de intenções explícitas, agora histórico. O recibo guarda o hash
+do checkpoint de intenções explícitas, agora histórico; elas também são
+anteriores ao menu Editar (veja o início deste checkpoint). O recibo guarda o hash
 de `VALIDATION.md` anterior a esta atualização documental; ela não está coberta
 por ele.
 
@@ -74,14 +195,15 @@ snapshots sintéticos, o parser Rust tipado e `App::demo`; `realVpn=false`.
 Esta matriz não é captura visual nem aceite com CUA: não há afirmação visual
 ou de CUA para o estado atual.
 
-[PASS, novo candidato local, NÃO INSTALADO] `target/VPN Tray.app` foi
+[PASS, candidato local, depois instalado como B10 (acima)] `target/VPN Tray.app` foi
 construído e inspecionado (`vpn-tray-final/package-receipt.json`). O build do
 componente é
 `ed7d1f977e045f8dd40020be0b8aa00d9dffdb3e16ac8659ed3f542a505f2c95`, com 17
 arquivos no payload, macOS mínimo 26.0, paridade de avisos verdadeira e runtime
 verificado sem rebuild; o recibo registra `installed=false`. Esse candidato não
-é a instalação abaixo: os hashes de host, helper, instalador e askpass diferem.
-Nenhum Installer, senha ou conexão foi usado na preparação.
+é a instalação B9 abaixo: os hashes de host, helper, instalador e askpass diferem.
+Nenhum Installer, senha ou conexão foi usado na preparação; a instalação
+posterior do B10 está registrada no início deste checkpoint.
 
 [PASS, instalação manual anterior e startup] O build B9
 `4af16a56397b9f7040b3ce26f41c203ecd9369920b4d3544b97c07d8a1127eb9` foi
@@ -368,15 +490,19 @@ ainda não substitui a prova do componente instalado anteriormente. Nenhum
 Installer, senha ou conexão foi executado nessa preparação. (O usuário
 instalou depois manualmente esse build B9; veja o início deste checkpoint.)
 
-[NOT RUN] Autenticação administrativa real, Save de novo perfil e Store de
-credencial, tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN
-real (Cluster), coexistência operacional, abertura após logout/login, entrega
-de notificações, aceite visual nativo final do VPN Tray por captura do popover
-e o próximo CI. A instalação, o startup e a persistência acima não alteram o
-estado desses itens.
+[NOT RUN] Store de credencial com username/credencial corretos, Save corrigido
+na R4, tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real
+(Cluster), coexistência operacional, abertura após logout/login, entrega de
+notificações, colar/desfazer/copiar/recortar por teclado nativo real, aceite
+visual nativo final do VPN Tray por captura do popover, pacote final do host e um
+CI remoto verde após a correção do CI6. A instalação, o startup, o Save R3 e a
+persistência acima não alteram o estado desses itens. As provas de fixture,
+nativas, simuladas e de VPN real continuam separadas; o estado geral é parcial.
 
 Os recibos atuais não versionados em `output/fixtures/` são
-`vpn-tray-final/{receipt,wk-matrix,package-receipt}.json`,
+`vpn-tray-final/{receipt,wk-matrix,package-receipt,r3-native-preflight,normal-ui-opened}.json`,
+`native-edit-integration/receipt.json`, `native-edit-recovery/receipt.json`,
+`ci6-broker-correction/receipt.json`,
 `installation-engine-oracles/receipt.json`, `route-oracles/receipt.json` e, para
 a instalação e o startup, `askpass-parent/{installed-images,startup-native-result,startup-family}.json`.
 Os recibos locais mais antigos, também não versionados, são

@@ -1,9 +1,11 @@
 /// Product name shown in the window title and the tray tooltip.
 const PRODUCT_NAME: &str = "VPN Tray";
 
+mod edit_menu;
 mod icon;
 mod login_item;
 mod notifications;
+mod placement;
 mod popover;
 mod preferences;
 mod worker;
@@ -14,18 +16,19 @@ use crate::{
     model::Snapshot,
 };
 use tao::{
-    dpi::{LogicalPosition, LogicalSize},
+    dpi::LogicalSize,
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::macos::{ActivationPolicy, EventLoopExtMacOS},
-    window::WindowBuilder,
+    window::{Window, WindowBuilder},
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use wry::{NewWindowResponse, WebViewBuilder, http::Response};
 use zeroize::Zeroizing;
 
 enum UserEvent {
-    Tray(TrayIconEvent),
+    /// The click's cursor anchor is read inside the callback, not here.
+    Tray(TrayIconEvent, placement::Anchor),
     Ipc(Zeroizing<String>, std::time::Instant),
     Reply(Reply),
 }
@@ -36,7 +39,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let tray_proxy = proxy.clone();
     TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = tray_proxy.send_event(UserEvent::Tray(event));
+        let _ = tray_proxy.send_event(UserEvent::Tray(event, placement::capture()));
     }));
     let window = WindowBuilder::new()
         .with_title(PRODUCT_NAME)
@@ -82,34 +85,46 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         let _ = reply_proxy.send_event(UserEvent::Reply(reply));
     })?;
     let mut icons = None;
+    let mut native_edit = None;
     let mut open = false;
+    // Cursor at the last open, and the height the web UI last asked for.
+    let mut anchor = None;
+    let mut height = 360;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) => {
+                // Cmd+V/C/X/A/Z reach the focused field through AppKit's
+                // responder chain only when a main menu binds them.
+                match edit_menu::EditMenu::install(Default::default()) {
+                    Ok(menu) => native_edit = Some(menu),
+                    Err(error) => eprintln!("Could not create edit menu: {error}"),
+                }
                 if let Err(error) = create_tray(&mut icons) {
                     eprintln!("Could not create tray icon: {error}");
                     *control_flow = ControlFlow::Exit;
                 }
                 if show {
+                    anchor = Some(placement::capture());
+                    reposition(&window, anchor, height);
                     window.set_visible(true);
                     window.set_focus();
                     open = true;
                 }
             }
-            Event::UserEvent(UserEvent::Tray(TrayIconEvent::Click {
-                position,
-                button: MouseButton::Left | MouseButton::Right,
-                button_state: MouseButtonState::Up,
-                ..
-            })) => {
+            Event::UserEvent(UserEvent::Tray(
+                TrayIconEvent::Click {
+                    button: MouseButton::Left | MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    ..
+                },
+                click,
+            )) => {
                 open = !open;
                 if open {
-                    let scale = window.scale_factor();
-                    window.set_outer_position(LogicalPosition::new(
-                        (position.x / scale - 160.0).max(0.0),
-                        position.y / scale + 8.0,
-                    ));
+                    // Every open re-reads the clicked screen.
+                    anchor = Some(click);
+                    reposition(&window, anchor, height);
                 }
                 window.set_visible(open);
                 if open {
@@ -118,6 +133,11 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::Ipc(body, received)) => {
                 if let Ok(request) = parse_request(&body) {
+                    // The request carries the UI's effective language; the
+                    // menu relabels only when it changes.
+                    if let (Some(menu), Some(locale)) = (native_edit.as_mut(), request.locale) {
+                        menu.set_locale(locale);
+                    }
                     if matches!(request.command, Command::Quit {}) {
                         *control_flow = ControlFlow::Exit;
                     }
@@ -133,8 +153,9 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                                 .status();
                         });
                     }
-                    if let Command::Resize { height } = request.command {
-                        window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
+                    if let Command::Resize { height: requested } = request.command {
+                        height = requested;
+                        reposition(&window, anchor, height);
                     }
                     let id = request.id.clone();
                     if application.send(request, received).is_err() {
@@ -171,6 +192,18 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     });
+}
+
+/// Places the panel under `anchor` on its screen; without an anchor, or when
+/// AppKit placement fails, only the size follows the request.
+fn reposition(window: &Window, anchor: Option<placement::Anchor>, height: u32) {
+    if let Some(anchor) = anchor {
+        match placement::apply(window, anchor, height) {
+            Ok(()) => return,
+            Err(error) => eprintln!("Could not place popover: {error}"),
+        }
+    }
+    window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
 }
 
 /// Builds the status item at menu-bar size and puts the open lock on it, before

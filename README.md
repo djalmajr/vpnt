@@ -170,6 +170,19 @@ instalado”. A navegação após confirmação tardia foi corrigida e validada 
 WKWebView isolada; não houve segunda instalação real para repetir esse caso.
 Veja os limites e os comandos de reprodução em `VALIDATION.md`.
 
+O `.pkg` instala somente o componente privilegiado. Ele não abre o app nem
+ativa a abertura no login: o ícone da bandeja só aparece depois que o VPN Tray
+é aberto. A opção “Abrir ao iniciar a sessão” (Open at login, em Preferências) controla
+apenas logins futuros e muda somente por ação explícita do usuário.
+
+O app tem um menu Editar nativo com as ações padrão do sistema (desfazer,
+refazer, recortar, copiar, colar e selecionar tudo). Os atalhos usuais de edição
+(⌘Z, ⇧⌘Z, ⌘X, ⌘C, ⌘V, ⌘A) são encaminhados ao responder nativo em foco;
+o host não lê a área de transferência nem cria uma ponte em JavaScript. O usuário
+confirmou colar nos dois campos de segredo no app nativo atualizado, em uma
+demonstração com texto fictício. Os demais atalhos ainda precisam de aceite
+nativo; veja `VALIDATION.md`.
+
 Para incluir esse componente no próprio `.app`, use o payload admitido:
 
 ```bash
