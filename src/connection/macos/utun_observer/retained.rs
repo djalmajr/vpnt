@@ -15,8 +15,25 @@ use std::{
 
 /// A retained, non-serializable interface. Not `Clone`: exactly one owner.
 pub struct RetainedInterface {
-    descriptor: Descriptor,
+    descriptor: RetainedDescriptor,
     observation: InterfaceObservation,
+}
+
+enum RetainedDescriptor {
+    Native(Descriptor),
+    /// Ordinary owned file only. Never present in a production build.
+    #[cfg(test)]
+    Synthetic(std::os::fd::OwnedFd),
+}
+
+impl RetainedDescriptor {
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Native(descriptor) => descriptor.raw_fd(),
+            #[cfg(test)]
+            Self::Synthetic(descriptor) => std::os::fd::AsRawFd::as_raw_fd(descriptor),
+        }
+    }
 }
 
 impl RetainedInterface {
@@ -30,7 +47,7 @@ impl RetainedInterface {
     ) -> Result<Self, Error> {
         check(expires, cancel)?;
         let retained = Self {
-            descriptor,
+            descriptor: RetainedDescriptor::Native(descriptor),
             observation,
         };
         retained.validate_stamps(expires, cancel)?;
@@ -76,6 +93,21 @@ impl RetainedInterface {
             Ok(())
         } else {
             Err(Error::Changed)
+        }
+    }
+}
+
+#[cfg(test)]
+impl RetainedInterface {
+    /// Synthetic FD/observation for lifecycle tests, NOT kernel admission.
+    /// Real validate() remains unchanged and never accepts this as a UTUN.
+    pub(crate) fn synthetic_for_test(
+        descriptor: std::os::fd::OwnedFd,
+        observation: InterfaceObservation,
+    ) -> Self {
+        Self {
+            descriptor: RetainedDescriptor::Synthetic(descriptor),
+            observation,
         }
     }
 }

@@ -1,10 +1,11 @@
-//! Typed passive absence metadata for a configured or failed retained UTUN.
+//! Typed passive absence metadata for a captured, configured or failed UTUN.
 //!
 //! The value carries only name/index and the whole intended VIP list. It does
 //! not pin a descriptor, borrow the controller, grant alias/route authority or
-//! authorize deletes. Production origins (`ConfiguredUtun`/`VipFailure`) remain
-//! opaque; only the private `cfg(test)` module may build one synthetically.
+//! authorize deletes. Production origins remain opaque retained capabilities;
+//! synthetic views/validation are available only under `cfg(test)`.
 use super::{ConfiguredUtun, VipFailure};
+use crate::connection::macos::utun_observer::RetainedInterface;
 use crate::connection::{
     ipsec::Error,
     macos::{Interfaces, routing::Snapshot},
@@ -92,6 +93,29 @@ fn typed_index(index: u32) -> Result<u16, Error> {
         .ok_or(Error::Invalid)
 }
 
+impl RetainedInterface {
+    /// Capture the entire observed address domain before closing a captured
+    /// pin. Captured has not accepted VIP configuration, so intention is empty.
+    pub(crate) fn retirement(&self) -> Result<RetiredUtun, Error> {
+        captured_from(self, Self::validate, || {
+            Interfaces::read().map_err(|_| Error::Unavailable)
+        })
+    }
+}
+
+fn captured_from(
+    retained: &RetainedInterface,
+    mut validate: impl FnMut(&RetainedInterface) -> Result<(), Error>,
+    read: impl FnOnce() -> Result<Interfaces, Error>,
+) -> Result<RetiredUtun, Error> {
+    validate(retained)?;
+    let index = typed_index(retained.index())?;
+    let interfaces = read()?;
+    let retired = from_view(retained.name(), index, &[], &interfaces)?;
+    validate(retained)?;
+    Ok(retired)
+}
+
 impl RetiredUtun {
     pub fn name(&self) -> &str {
         &self.name
@@ -106,13 +130,48 @@ impl RetiredUtun {
     pub fn gone(&self) -> Result<bool, Error> {
         let interfaces = Interfaces::read().map_err(|_| Error::Unavailable)?;
         let table = Snapshot::read().map_err(|_| Error::Unavailable)?;
-        Ok(observed(
-            self.name(),
-            self.index(),
-            &self.vips,
-            &interfaces,
-            &table,
-        ))
+        Ok(self.gone_in(&interfaces, &table))
+    }
+
+    fn gone_in(&self, interfaces: &Interfaces, table: &Snapshot) -> bool {
+        observed(self.name(), self.index(), &self.vips, interfaces, table)
+    }
+}
+
+#[cfg(test)]
+impl RetiredUtun {
+    /// Uses the production capture logic with synthetic validation/views only.
+    pub(crate) fn captured_for_test(
+        retained: &RetainedInterface,
+        validate: impl FnMut(&RetainedInterface) -> Result<(), Error>,
+        read: impl FnOnce() -> Result<Interfaces, Error>,
+    ) -> Result<Self, Error> {
+        captured_from(retained, validate, read)
+    }
+
+    pub(crate) fn gone_for_test(&self, interfaces: &Interfaces, table: &Snapshot) -> bool {
+        self.gone_in(interfaces, table)
+    }
+
+    /// Construct passive test views, never a RetiredUtun or admission token.
+    pub(crate) fn view_for_test(entries: &[(&str, u32, u32, &[&str])]) -> Interfaces {
+        use crate::connection::macos::interfaces::Interface;
+        Interfaces {
+            entries: entries
+                .iter()
+                .map(|(name, index, flags, addresses)| {
+                    (
+                        name.to_string(),
+                        Interface {
+                            name: name.to_string(),
+                            index: *index,
+                            flags: *flags,
+                            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
