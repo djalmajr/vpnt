@@ -179,11 +179,11 @@ describe("intenção explícita do cartão de VPN", () => {
 
   test("o cartão sem segredo continua abrindo o diálogo de segredo", () => {
     const s = card("missing_secret");
-    const matches = buttons(s.tree).filter(
-      (button) => textOf(props(button).children) === t("providePassword"),
-    );
-    expect(matches).toHaveLength(1);
-    click(matches[0]);
+    const text = textOf(s.tree);
+    expect(text).toContain(t("state.missing_secret"));
+    expect(text).not.toContain(t("secretHint"));
+    expect(text).not.toContain(t("providePassword"));
+    click(principal(s.tree));
     expect(s.secretRequests()).toBe(1);
     expect(s.commands).toHaveLength(0);
   });

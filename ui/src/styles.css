@@ -477,9 +477,6 @@ h2 {
   flex-direction: column;
   gap: var(--space-sm);
 }
-.card-toggle:not(:disabled):hover {
-  background-image: linear-gradient(var(--menu-hover), var(--menu-hover));
-}
 .card-toggle:disabled {
   color: var(--text);
 }
@@ -522,6 +519,13 @@ h2 {
 }
 .card-state small {
   flex-shrink: 0;
+}
+.card-cancel {
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-xs);
+}
+.card-cancel:hover {
+  background: var(--menu-hover);
 }
 .empty {
   background: var(--card);

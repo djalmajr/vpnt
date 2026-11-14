@@ -321,6 +321,13 @@ Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles t�
 nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
 nativo `dialog`, com foco contido e Escape para cancelar.
 
+Por indicação do Djalma em 2026-11-14, falta de senha aparece apenas no
+indicador do cartão; clicar na conexão continua abrindo o diálogo de segredos,
+sem aviso ou botão adicional abaixo dele. O corpo do cartão não ganha fundo
+interno no hover. Durante conexão ou reconexão, somente a área de Cancelar
+recebe `menu-hover`, com o raio de controle e recuo horizontal `space-xs`.
+A ação principal e o foco por teclado do cartão inteiro permanecem os mesmos.
+
 O menu de opções é um componente compartilhado (`Menu`, `MenuItem`,
 `MenuSeparator`) sobre o mesmo primitivo Radix da referência
 (`@radix-ui/react-dropdown-menu` 2.1.24, MIT): `Root` não modal, `Trigger` como

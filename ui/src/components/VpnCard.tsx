@@ -54,11 +54,9 @@ export function VpnCard({
           ? "credentialsHint"
           : state === "gateway_timeout"
             ? "timeoutHint"
-            : state === "missing_secret"
-              ? "secretHint"
-              : state === "missing_program"
-                ? "programHint"
-                : null;
+            : state === "missing_program"
+              ? "programHint"
+              : null;
   const principal = () => {
     if (state === "missing_secret") {
       secrets();
@@ -105,7 +103,7 @@ export function VpnCard({
             <span>{t(`state.${state}`)}</span>
           </span>
           {["connecting", "reconnecting"].includes(state) && (
-            <small>{t("cancel")}</small>
+            <small className="card-cancel">{t("cancel")}</small>
           )}
         </span>
       </button>
@@ -113,11 +111,7 @@ export function VpnCard({
         <Notice tone={danger ? "error" : "warn"}>
           <p>{t(hint)}</p>
           <div className="actions">
-            {state === "missing_secret" ? (
-              <button type="button" className="primary" onClick={secrets}>
-                {t("providePassword")}
-              </button>
-            ) : state === "missing_program" ? (
+            {state === "missing_program" ? (
               <button
                 type="button"
                 onClick={() => void run({ type: "probe", id: profile.id })}
