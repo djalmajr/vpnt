@@ -72,8 +72,32 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
     assert_eq!(loads.load(Ordering::Relaxed), 0);
     let s = dispatch(&mut broker, Command::Toggle { id: "one".into() });
     assert_eq!(s.vpns[0].state, State::Connecting);
-    std::thread::sleep(Duration::from_millis(30));
-    let waiting = broker.snapshot();
+    // Observe the real Broker consumer, not elapsed time or a peer send marker.
+    // Keep the request identity so another acceptance cannot satisfy the barrier.
+    let request = broker.connections["one"]
+        .pending
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let waiting = loop {
+        let snapshot = broker.snapshot();
+        if broker.connections["one"]
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.id == request && pending.accepted)
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Broker did not consume the connect Accepted receipt"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Changed(Connecting) may overwrite a transient invented Connected state;
+    // the retained history must also remain free of fabricated traffic proof.
     assert_eq!(waiting.vpns[0].state, State::Connecting);
     assert!(
         !waiting.vpns[0]
@@ -90,7 +114,8 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
     dispatch(&mut broker, Command::Toggle { id: "one".into() });
     wait(&mut broker, |s| s.vpns[0].state == State::Connected);
     dispatch(&mut broker, Command::Probe { id: "one".into() });
-    wait(&mut broker, |s| s.vpns[0].state == State::Unresponsive);
+    wait(&mut broker, |s| s.vpns[0].state != State::Connected);
+    assert_eq!(broker.snapshot().vpns[0].state, State::Unresponsive);
     dispatch(&mut broker, Command::Toggle { id: "two".into() });
     wait(&mut broker, |s| {
         s.vpns
@@ -99,8 +124,9 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
     });
     dispatch(&mut broker, Command::DisconnectAll {});
     wait(&mut broker, |s| {
-        s.vpns.iter().all(|v| v.state == State::Off)
+        s.vpns.iter().all(|v| v.state != State::Disconnecting)
     });
+    assert!(broker.snapshot().vpns.iter().all(|v| v.state == State::Off));
     assert_eq!(loads.load(Ordering::Relaxed), 3);
     assert!(
         !serde_json::to_string(&broker.snapshot())
