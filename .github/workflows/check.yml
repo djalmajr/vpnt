@@ -53,74 +53,10 @@ jobs:
         run: python3 scripts/macos/package-app.py
       - name: Validate graphical askpass adapter without elevation
         run: python3 scripts/macos/check-askpass.py
-      - name: Verify installation payload and preparation oracles
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-installation.py
-      - name: Verify installation transactions and crash recovery without elevation
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-installation-engine.py
-      - name: Verify unsigned component packages without installation
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-installation-package.py
-      - name: Verify packaged host and component binding without Installer
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-app-component.py
       - name: Validate native pinentry password reader
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
         run: python3 scripts/macos/check-pinentry-consumer.py
-      - name: Verify application broker negative oracles
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-broker.py
-      - name: Verify asynchronous administration negative oracles
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-admin-client.py
-      - name: Verify component operations without Installer or elevation
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-component-client.py
-      - name: Verify helper channel negative oracles
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-helper-channel.py
-      - name: Verify profile administration isolation
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-profile-administration.py
-      - name: Verify route policy negative oracles
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-route-policy.py
-      - name: Verify IPsec namespace and request contracts without charon
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-ipsec.py
-      - name: Verify VICI deadlines and cancellation with independent peers
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-vici-deadlines.py
-      - name: Verify IPsec VICI lifecycle and complete candidate snapshots
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-ipsec-control.py
-      - name: Verify native IPsec producer admission with owned C fixtures
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-ipsec-producer.py
-      - name: Verify Darwin PF_KEY metadata with SDK and original NAT-T consumer
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-pfkey.py
-      - name: Verify PF_KEY read transport with independent datagram peers
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
-        run: python3 scripts/macos/check-pfkey-reader.py
       - name: Verify PPP subprocess supervision
         env:
           RUSTUP_TOOLCHAIN: 1.99.0
@@ -133,6 +69,116 @@ jobs:
         run: |
           brew install openssl@4
           python3 scripts/macos/check-transport-consumer.py
+
+  macos-oracles:
+    needs: macos
+    runs-on: macos-15
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [installation, control, network]
+    env:
+      RUST_TEST_THREADS: 4
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+      - name: Fetch locked Rust dependencies for offline oracles
+        run: cargo +1.99.0 fetch --locked
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: matrix.group == 'control' || matrix.group == 'network'
+        with:
+          bun-version: 1.4.4
+      - name: Build UI for control and network oracles
+        if: matrix.group == 'control' || matrix.group == 'network'
+        working-directory: ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - name: Verify installation payload and preparation oracles
+        if: matrix.group == 'installation'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation.py
+      - name: Verify installation transactions and crash recovery without elevation
+        if: matrix.group == 'installation'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation-engine.py
+      - name: Verify unsigned component packages without installation
+        if: matrix.group == 'installation'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-installation-package.py
+      - name: Verify packaged host and component binding without Installer
+        if: matrix.group == 'installation'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-app-component.py
+      - name: Verify application broker negative oracles
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-broker.py
+      - name: Verify asynchronous administration negative oracles
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-admin-client.py
+      - name: Verify component operations without Installer or elevation
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-component-client.py
+      - name: Verify helper channel negative oracles
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-helper-channel.py
+      - name: Verify profile administration isolation
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-profile-administration.py
+      - name: Verify IPsec namespace and request contracts without charon
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ipsec.py
+      - name: Verify VICI deadlines and cancellation with independent peers
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-vici-deadlines.py
+      - name: Verify IPsec VICI lifecycle and complete candidate snapshots
+        if: matrix.group == 'control'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ipsec-control.py
+      - name: Verify route policy negative oracles
+        if: matrix.group == 'network'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-route-policy.py
+      - name: Verify native IPsec producer admission with owned C fixtures
+        if: matrix.group == 'network'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-ipsec-producer.py
+      - name: Verify Darwin PF_KEY metadata with SDK and original NAT-T consumer
+        if: matrix.group == 'network'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-pfkey.py
+      - name: Verify PF_KEY read transport with independent datagram peers
+        if: matrix.group == 'network'
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-pfkey-reader.py
 
   runtime-handoff:
     runs-on: macos-15

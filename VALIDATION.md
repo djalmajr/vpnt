@@ -30,6 +30,18 @@ O gate de classes ainda não tem classes proibidas configuradas; sua execução
 não representa cobertura de estilos. O teste de CSS rejeita ciclos diretos em
 variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
+O workflow mantém a validação nativa, o pacote e o askpass no job `macos`,
+seguidos por pinentry, PPP, mutações de PPP e transporte, em série no mesmo
+checkout. Depois desse gate, `macos-oracles` distribui as campanhas em três
+runners isolados: instalação, controle e rede. Todos preparam o registry Rust
+com `cargo +1.99.0 fetch --locked`; controle e rede também compilam `ui/dist`.
+As 20 campanhas originais permanecem, com os mesmos comandos, versões,
+permissões, timeouts e quatro threads de teste; `fail-fast: false` preserva as
+demais expansões quando uma falha. Contratos locais independentes passaram e
+detectaram a omissão de uma campanha e a retirada de `needs: macos`. A revisão
+estrutural passou; a nova distribuição ainda está [NOT RUN] no GitHub. O CI7
+abaixo usa a distribuição serial anterior, não comprova a matriz nova.
+
 ## Checkpoint atual — 13/11/2026
 
 [PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
