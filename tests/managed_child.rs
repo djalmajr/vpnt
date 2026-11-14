@@ -26,21 +26,37 @@ fn inherited_environment_and_relative_programs_do_not_reach_the_child() {
     assert!(child.stop(Duration::from_secs(1)).unwrap().status.success());
 }
 
+/// Deterministic peer: the SIGTERM handler is registered before `ready`, runs
+/// the cleanup callback (marker on stdout) and exits 0, and the wait is
+/// `signal.pause()` (no blocking read, no external process to fork or sleep).
+const CLEANUP_PEER: &str = "\
+import os, signal, sys
+def cleanup(signum, frame):
+    os.write(1, b'cleanup\\n')
+    os._exit(0)
+signal.signal(signal.SIGTERM, cleanup)
+sys.stdout.write('ready\\n')
+sys.stdout.flush()
+while True:
+    signal.pause()
+";
+
 #[test]
 fn graceful_stop_allows_the_owned_child_to_run_its_cleanup_handler() {
-    let mut command = Command::new("/bin/sh");
-    command.args([
-        "-c",
-        "trap 'exit 0' TERM; printf 'ready\\n'; while read line; do :; done",
-    ]);
+    let mut command = Command::new("/usr/bin/python3");
+    command.args(["-I", "-S", "-c", CLEANUP_PEER]);
     let mut child = ManagedChild::spawn(&mut command).unwrap();
     let mut reader = BufReader::new(child.take_stdout().unwrap());
     let mut ready = String::new();
     reader.read_line(&mut ready).unwrap();
     assert_eq!(ready, "ready\n");
-    let stopped = child.stop(Duration::from_secs(1)).unwrap();
+    let stopped = child.stop(Duration::from_secs(5)).unwrap();
     assert!(!stopped.escalated);
     assert!(stopped.status.success());
+    // Only the handler can emit this marker; spontaneous exit or EOF cannot.
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "cleanup\n");
 }
 
 #[test]
