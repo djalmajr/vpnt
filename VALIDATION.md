@@ -48,12 +48,24 @@ O CI7 usava a distribuição serial anterior e foi supersedido pelo envio do CI8
 [PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
 Store de credencial com username/credencial corretos e Save corrigido,
 conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
-Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor, um
+Cluster, demais atalhos nativos do menu Editar, aceite visual e multimonitor e a
 correção do cancelamento real preso em Disconnecting. O CI9 terminou verde em
-`f7f5314`, antes das mudanças locais posteriores de UI. Evidência nativa, simulada,
+`f7f5314`; o CI10 posterior falhou no grupo de instalação. Evidência nativa, simulada,
 fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
 VPN real bem-sucedida. Esta atualização documenta somente o checkpoint atual; os demais
 checkpoints do arquivo continuam históricos.
+
+[FAIL, décimo CI remoto completo] O [CI10](https://github.com/djalmajr/vpnt/actions/runs/43609082856),
+head `72afa5680b3d4b1a3540e1c482e0de0c94f2a198`, passou core, runtime, macOS,
+controle e rede. Instalação parou na baseline de admissão, antes dos mutantes.
+O checker não mostrava o erro interno do Cargo; não há evidência suficiente
+para atribuir a causa remota. Agora ele imprime uma cauda limitada e sanitizada
+antes das recusas, preservando logs brutos, seletores, timeouts, exits esperados
+e oráculos. Oito casos de falsocargo e o controle que suprime o diagnóstico
+passaram em fixture; a revisão independente não encontrou problemas no delta.
+A mesma baseline do head72 passou no host local (40/0/1), enquanto a execução
+privada observou duas falhas de modo setuid: essa diferença local não explica
+o CI remoto. Recibos em `output/fixtures/ci10-ui-menu/`.
 
 [PASS, nono CI remoto completo] O [CI9](https://github.com/djalmajr/vpnt/actions/runs/43560166115),
 head `f7f53141a7974cdee23667ddb1c746f604cef388`, terminou com sucesso nos seis
@@ -71,21 +83,56 @@ navegar libera a reserva. Radix continua responsável pela posição e pela rola
 quando falta espaço físico. O baseline reproduziu a falha no WebKit: conteúdo
 de 182 px limitado a 106 px apesar de teto 720. A correção passou 16 casos (dois
 idiomas/temas, larguras 280/320/640 e teto curto 180). Nos casos com espaço, a
-janela passa de 180 para 228 px, com seis ações visíveis e menu de 182 px sem rolagem;
+janela final passa de 180 para 230 px, com seis ações visíveis e menu de 184 px sem rolagem;
 fechar restaura a altura. Foco/Escape, navegação, limite de tela e convergência
 dos pedidos foram exercitados. Quatro capturas do próprio WKWebView invisível
 foram conferidas nos temas claro/escuro e larguras menor/maior. São assets reais
 com snapshots/eventos DOM sintéticos e janela própria, sem backend ou VPN real.
 Recibos: `output/fixtures/popover-menu-fit-validation/`.
 
+Uma segunda reprodução encontrou os dois separadores comprimidos a zero pelo
+flex. `flex-shrink: 0` preserva as linhas de 1 px, incluídas na medida intrínseca.
+Os 16 casos e quatro capturas finais com prefixo `separator-` passaram; o teto
+físico de 180 px continua exigindo rolagem com todas as ações alcançáveis.
+Os recibos anteriores de 228/182 px permanecem históricos, sem sobrescrita.
+
 A revisão independente não encontrou regressões na fatia. A integração passou
 lint, typecheck, 46 testes/459 assertions, build UI, 94 tokens, build do host,
-pacote e inspect, com fonte estável e assets idênticos aos exercitados. O gate
-de classes segue sem regras proibidas. O candidato é
-`target/VPN Tray UI Review.app`, com o mesmo componente B10; não substituiu o app
-que mantém a tentativa real em diagnóstico. A aplicação no app corrente e o
-teste físico de abertura do menu permanecem pendentes. A suíte Rust completa
-não foi repetida para essa mudança exclusiva da UI.
+pacote e inspect. A correção adicional de CSS teve lint, build, tokens e nova
+verificação WebKit; a lógica TypeScript e seus 46 testes foram reaproveitados.
+O gate de classes segue sem regras proibidas. O candidato somente de UI foi
+supersedido pelo candidato Captured abaixo. Nenhum substituiu o app que mantém
+a tentativa real em diagnóstico. A aplicação no app corrente e o teste físico
+de abertura do menu permanecem pendentes.
+
+[PASS local, descarte Captured; aplicação real NOT RUN] O ledger conserva a
+metadata de interface e seus endereços antes de liberar o descriptor capturado.
+A aposentadoria exige validações e observações frescas; erro ou ausência não
+demonstrada conservam a reserva. Os caminhos de owner, stop e fence permanecem.
+Quatro testes da transição compartilhada e nove negativos de aposentadoria
+passaram com arquivos comuns e views sintéticas. Seis mutantes funcionais foram
+detectados no teste R1; a revisão posterior do oráculo de FD teve um controle
+adicional de vazamento detectado e quatro testes restaurados. Os seis controles
+anteriores não foram repetidos contra o novo oráculo. As duas revisões de
+segurança não encontraram achados pendentes; não são prova de UTUN/VPN real.
+
+A integração desktop passou 659 testes, zero falhas e dois ignorados. Depois
+dela mudaram somente a fixture managed_child, o diagnóstico Python e CSS/DESIGN;
+essa evidência foi reaproveitada com os deltas registrados. A retomada passou
+clippy estrito all-targets/all-features, os quatro managed_child com desktop,
+core completo (585/0/2), produtor (32 mutantes, baselines/restaurações verdes),
+tokens, classes, build dos binários, runtime verify, prepare, package e inspect,
+com fontes estáveis. A fixture agora instala seu handler antes do sinal e exige
+o marcador de cleanup; os controles SIG_IGN e sem marcador falham por assertions.
+Isso não estabelece a causa da falha transitória do shell anterior nem altera
+o comportamento de encerramento em produção.
+
+Recibos: `output/fixtures/captured-retirement-integrated/` e
+`captured-retirement-resume/`. Candidato local não instalado:
+`target/VPN Tray Captured Review.app`, payload `6cb39d09…cf1e5`, host
+`8c09e359…92614` e helper `8eb653d5…383af`. O app em uso e o helper B10
+permaneceram byteidênticos. A correção não recupera metadata já perdida pela
+instância antiga e não certifica o cleanup da tentativa real presa.
 
 [FAIL real, cancelamento em investigação] O usuário iniciou o Cluster e clicou
 Cancelar. O log mostrado registra Disconnected e Connecting às10:30:38, seguido

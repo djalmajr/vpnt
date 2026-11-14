@@ -732,6 +732,7 @@ summary::-webkit-details-marker {
 }
 /* The Radix separator is a `div role="separator"`, not an `hr`. */
 .menu-separator {
+  flex-shrink: 0;
   height: var(--border-width);
   margin: var(--space-xs) calc(-1 * var(--menu-pad));
   background: var(--separator);

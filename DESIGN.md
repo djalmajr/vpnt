@@ -292,6 +292,10 @@ interruptor é mais compacto que o clássico: 24 por 14 px, com botão de 10 px 
 1 px de recuo. Ícones grandes e linhas de preferências conservam 28 px,
 independentes da largura do interruptor.
 
+Os separadores conservam `border-width` mesmo quando o menu está limitado:
+não encolhem no flex. A medida intrínseca usada para aumentar o popover deve
+incluir suas linhas; comprimi-las a zero subestima a altura necessária.
+
 Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como no ai-usagebar: âncora em pontos Cocoa, origens negativas preservadas e limites da área visível ao abrir ou redimensionar; a escala da janela anterior não participa. A colocação nativa usa 0 pt abaixo da barra, 8 pt nas laterais e 24 pt acima da borda inferior, sem novos valores CSS; reabrir recaptura a âncora e remoção da tela recorre à primária.
 
 ### Conflicting visual priorities
