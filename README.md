@@ -1,4 +1,4 @@
-# vpnt
+# VPN Tray
 
 Ícone de bandeja (tray) para ligar, desligar e acompanhar VPNs no macOS, no
 Windows e no Linux, com a mesma interface nos três.
@@ -20,7 +20,7 @@ Windows e no Linux, com a mesma interface nos três.
   Unidos (`en-US`). O protótipo visual permanece em português.
 - **Perfis de VPN** configuráveis. Os primeiros tipos previstos são IPsec IKEv2
   (strongSwan) e SSL VPN da Fortinet (openfortivpn).
-- **Estado real do túnel**: além de saber se o cliente está rodando, o vpnt
+- **Estado real do túnel**: além de saber se o cliente está rodando, o VPN Tray
   testa se o tráfego passa. Um túnel que parece ligado mas não responde
   aparece como "sem resposta", com a opção de reconectar.
 - **Segredos só no chaveiro do sistema**, nunca em arquivo nem em argumento de
@@ -72,8 +72,8 @@ open target/vpnt.app --args --demo --show
 ```
 
 O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
-`--replace` para substituir um pacote anterior do vpnt nesse destino. Isso não
-instala programas de VPN, componentes privilegiados ou regras do sudoers.
+`--replace` para substituir um pacote anterior do VPN Tray nesse destino. Isso
+não instala programas de VPN, componentes privilegiados ou regras do sudoers.
 O askpass é produzido separadamente em `target/debug/vpnt-askpass`, sem instalar
 ou executar sudo. O build verifica sua recusa a um pai não autorizado. O gate adicional
 `python3 scripts/macos/check-askpass.py` compila esse adaptador e exercita a

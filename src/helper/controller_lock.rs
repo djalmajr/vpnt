@@ -95,6 +95,16 @@ impl ControllerLock {
     }
 }
 
+impl Drop for ControllerLock {
+    fn drop(&mut self) {
+        // Release our authority even if a concurrent fork retains this open
+        // file description until exec. Never unlink the persistent lock inode.
+        // SAFETY: self owns this live descriptor. A failed acquisition has a
+        // distinct open file description and cannot release another owner's lock.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn check_lock(metadata: &Metadata, owner: u32) -> Result<(), LockError> {
     if !metadata.is_file()
         || metadata.uid() != owner

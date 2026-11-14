@@ -69,7 +69,7 @@ check_file() {
 
 def distribution(summary):
     root = ET.Element('installer-gui-script', minSpecVersion='2')
-    ET.SubElement(root, 'title').text = 'vpnt'
+    ET.SubElement(root, 'title').text = 'VPN Tray'
     ET.SubElement(root, 'options', customize='never', **{'require-scripts': 'false', 'allow-external-scripts': 'false', 'rootVolumeOnly': 'true', 'hostArchitectures': platform.machine()})
     ET.SubElement(root, 'domains', enable_anywhere='false', enable_currentUserHome='false', enable_localSystem='true')
     versions = ET.SubElement(ET.SubElement(root, 'volume-check'), 'allowed-os-versions')

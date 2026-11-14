@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent)
     if args.component_payload:
         minimum = include_component(args.component_payload.resolve(), resources, executable)
     with (bundle / "Contents/Info.plist").open("wb") as handle:
-        plistlib.dump({"CFBundleIdentifier": "dev.vpnt.app", "CFBundleName": "vpnt", "CFBundleDisplayName": "vpnt", "CFBundleExecutable": "vpnt", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": minimum, "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
+        plistlib.dump({"CFBundleIdentifier": "dev.vpnt.app", "CFBundleName": "VPN Tray", "CFBundleDisplayName": "VPN Tray", "CFBundleExecutable": "vpnt", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": minimum, "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
     if args.output.exists():
         shutil.rmtree(args.output)
     shutil.move(str(bundle), str(args.output))

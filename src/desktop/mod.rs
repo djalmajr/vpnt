@@ -1,3 +1,6 @@
+/// Product name shown in the window title and the tray tooltip.
+const PRODUCT_NAME: &str = "VPN Tray";
+
 mod icon;
 mod login_item;
 mod notifications;
@@ -36,7 +39,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         let _ = tray_proxy.send_event(UserEvent::Tray(event));
     }));
     let window = WindowBuilder::new()
-        .with_title("vpnt")
+        .with_title(PRODUCT_NAME)
         .with_inner_size(LogicalSize::new(320.0, 360.0))
         .with_visible(false)
         .with_transparent(true)

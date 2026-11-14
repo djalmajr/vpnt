@@ -32,6 +32,73 @@ variáveis, que podem anular medidas mesmo quando os nomes coincidem.
 
 ## Checkpoint atual — 13/11/2026
 
+[PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
+autenticação administrativa real, novo perfil com Save e Store de credencial,
+conectar/cancelar/reconectar/desligar, tráfego, coexistência e cleanup do
+Cluster, aceite visual nativo final e o próximo CI. Evidência nativa, simulada,
+fixture e VPN real são relatadas separadamente abaixo; nenhuma delas prova uma
+VPN real. Esta atualização documenta somente o checkpoint atual; os demais
+checkpoints do arquivo continuam históricos.
+
+[PASS, gates locais completos, fonte estável] O recibo
+`output/fixtures/vpn-tray-final/receipt.json` registra `sourceUnchanged=true`,
+`changedSources` vazio, `realVpn=false` e `privilegedInstall=false`. Passaram
+com exit 0: lint, typecheck, build e 43 testes da UI (443 assertions), 94
+tokens, gate de classes (ainda sem regras), fmt, clippy all-targets/all-features
+com `-D warnings`, 639 testes desktop e 580 core (sem falhas e com dois
+ignorados em cada suíte), as campanhas de engine e de rotas, o gate do askpass
+e o build de todos os binários. As contagens de UI/tokens vêm de `ui-tests.log` e
+`tokens.log` da mesma pasta. 639/580 substituem como contagem atual as 638/579
+do checkpoint de intenções explícitas, agora histórico. O recibo guarda o hash
+de `VALIDATION.md` anterior a esta atualização documental; ela não está coberta
+por ele.
+
+[PASS, campanhas negativas, contagens do recibo] Engine
+(`installation-engine-oracles/receipt.json`): 33 mutantes terminaram com exit
+101, cada um com o teste que falhou registrado, e as duas baselines e as duas
+restaurações (`install::engine::tests` e `install_preparation`) terminaram com
+exit 0. Rotas (`route-oracles/receipt.json`): 67 mutantes com exit 101 e
+quatro baselines e quatro restaurações com exit 0; esse recibo registra o exit,
+mas não o nome da assertion por mutante. Os limites do recibo de engine seguem
+valendo: fixtures de usuário comum, sem ativação root, política efetiva de sudo,
+instalação ou VPN. Askpass: 26 casos, dois mutantes rejeitados e 26 casos
+restaurados; o passo de askpass do recibo combinado terminou com exit 0.
+
+[PASS, nome do produto] O produto exibido é VPN Tray nos dois catálogos, na
+janela nativa, na bandeja, em `CFBundleName`/`CFBundleDisplayName` e no título do
+Installer. Identificadores técnicos e caminhos permanecem inalterados
+(`dev.vpnt.app`, executável `vpnt`, `dev.vpnt.*`). A matriz WKWebView
+(`vpn-tray-final/wk-matrix.json`) passou 36 casos novos de frontend (nove
+cenários × pt-BR/en-US × claro/escuro), todos com exit 0, usando entradas DOM e
+snapshots sintéticos, o parser Rust tipado e `App::demo`; `realVpn=false`.
+Esta matriz não é captura visual nem aceite com CUA: não há afirmação visual
+ou de CUA para o estado atual.
+
+[PASS, novo candidato local, NÃO INSTALADO] `target/VPN Tray.app` foi
+construído e inspecionado (`vpn-tray-final/package-receipt.json`). O build do
+componente é
+`ed7d1f977e045f8dd40020be0b8aa00d9dffdb3e16ac8659ed3f542a505f2c95`, com 17
+arquivos no payload, macOS mínimo 26.0, paridade de avisos verdadeira e runtime
+verificado sem rebuild; o recibo registra `installed=false`. Esse candidato não
+é a instalação abaixo: os hashes de host, helper, instalador e askpass diferem.
+Nenhum Installer, senha ou conexão foi usado na preparação.
+
+[PASS, instalação manual anterior e startup] O build B9
+`4af16a56397b9f7040b3ce26f41c203ecd9369920b4d3544b97c07d8a1127eb9` foi
+instalado manualmente pelo usuário. `askpass-parent/installed-images.json`
+registra que os três componentes instalados (helper, instalador e askpass)
+conferem com os hashes desse build, são regulares, de proprietário/grupo root e
+modo `0555`. Em execução posterior limitada a startup, snapshot e saída
+(`startup-native-result.json` e `startup-family.json`), o Broker/runtime real
+admitiu o componente instalado em modo não-demo e recebeu catálogo
+autoritativo vazio, com as chaves-alvo ausentes. Foram enviados somente os
+comandos `snapshot` e `quit`; depois, todas as identidades originais da família
+(driver, sudo e helper instalado) estavam ausentes externamente, a rota seguia
+por `en0` e os metadados permaneceram inalterados. Não houve leitura de valores
+reais de segredos legados, `adminSave`, Store nem VPN. A inicialização privada do
+runtime pode gravar o próprio estado: não há alegação de zero escrita. Isso não
+significa que o helper instalado foi removido nem prova uma conexão.
+
 [PASS, execução local] A UI passou lint, typecheck, build e 43 testes
 (443 assertions), com 94 tokens conferidos. O popover usa cantos de 13 pt na
 janela e na WebView, menu compartilhado Radix e os símbolos nativos da bandeja.
@@ -72,12 +139,12 @@ preservando as escolhas e a chave de preferências do usuário, sem alterar essa
 preferências para o ensaio. São amostras de CSS e entradas DOM, sem captura de
 pixels nem execução de uma nova operação nativa de preferência nessa prova.
 
-[PASS, integração local atual] As suítes completas foram executadas novamente
-após integrar as intenções explícitas de conexão: 638 testes desktop e 579 core,
-sem falhas e com dois ignorados em cada suíte. Os hashes atuais de todos os
-inputs registrados coincidem com o recibo `explicit-intent-integrated/receipt.json`.
-Fmt e clippy all-targets/all-features com `-D warnings` passaram. As contagens
-627/568 das rodadas anteriores permanecem históricas; não substituem esta execução.
+[PASS, histórico, integração das intenções explícitas] As suítes completas foram
+executadas após integrar as intenções explícitas de conexão: 638 testes desktop
+e 579 core, sem falhas e com dois ignorados em cada suíte, conforme o recibo
+`explicit-intent-integrated/receipt.json`. Fmt e clippy all-targets/all-features
+com `-D warnings` passaram nessa rodada. Essas contagens e as 627/568 anteriores
+são históricas; a execução atual (639/580) está no início deste checkpoint.
 
 [PASS, direção da ação] Os cartões enviam `connect` ou `disconnect` conforme
 a ação apresentada. Um clique para cancelar/desligar não vira uma nova conexão
@@ -89,7 +156,7 @@ legado; as mutações da direção explícita falharam nas assertions funcionais
 O comando legado `toggle` continua aceito para compatibilidade, sem uso nesses
 novos caminhos de cartão e de salvar senha/conectar.
 
-[PASS, consumidor da interface] A WKWebView privada carregou os assets atuais,
+[PASS, consumidor da interface, rodada anterior ao nome VPN Tray] A WKWebView privada carregou os assets atuais,
 o hook real e o parser tipado Rust, despachando apenas para `App::demo`.
 Passaram 36 casos de pt-BR/en-US × claro/escuro: cancelar em Connecting,
 Verifying e Reconnecting; desligar Connected; iniciar Off; reconectar/desligar
@@ -115,12 +182,14 @@ da CSP. Um probe do SDK conferiu camadas com raio 13 pt, curva contínua e recor
 em três alturas; desabilitar o recorte no probe fez sua asserção falhar e a
 restauração passou. Essas provas não são captura visual nem mouse real no app.
 
-[PASS, artefato preparado] O host e o componente atuais foram preparados e
-inspecionados novamente após a correção VICI: askpass, dez arquivos do runtime,
+[PASS, histórico, artefato preparado] O host e o componente então atuais foram
+preparados e inspecionados novamente após a correção VICI: askpass, dez arquivos do runtime,
 payload de 17 arquivos, vínculo de hashes e licenças. O runtime local requer
 macOS 26.0. As 59 mutações de instalação passaram num checkpoint anterior; não
 foram repetidas localmente após as novas arestas opcionais de dependências
-nativas e não são apresentadas como campanha fresca desse grafo Cargo.
+nativas e não são apresentadas como campanha fresca desse grafo Cargo. As
+campanhas atuais de engine (33 mutantes) e rotas (67), no início deste
+checkpoint, são recibos separados e não se somam a essa contagem.
 
 [PASS, instalação e admissão nativas] O Installer real concluiu a instalação
 após a autenticação do usuário. Helper e instalador em
@@ -246,6 +315,27 @@ pelo seu match arm. Passaram as campanhas completas de perfis (23 mutações,
 10 baselines/restaurações), administração (17 e 6) e rotas (67 e 8), sem deriva
 dos inputs. O próximo workflow ainda precisa confirmar o head com essas mudanças.
 
+[FAIL, quinto CI, falha terminal] O [quinto workflow](https://github.com/djalmajr/vpnt/actions/runs/43526110810),
+no commit `af213178456d6be948331c0565870951f89b116b`, terminou em falha. Os
+jobs core e runtime passaram. A biblioteca macOS terminou com 531 passados, um
+falho e um ignorado: a invariante de remoção do instalador (referência 602)
+retornou `Busy` inesperado. Os passos posteriores de askpass, mutações e
+pacote foram ignorados. O teste isolado passou depois, mas não há trace da
+causa histórica; esta falha permanece registrada como falha e não é
+reclassificada.
+
+[PASS local, correção do ControllerLock, prova remota pendente] O `Drop` de
+`ControllerLock` agora chama `flock(LOCK_UN)` no próprio descritor, sem alterar
+caminhos, permissões ou o inode persistente. A regressão, com uma duplicata do
+descritor retida, reproduz a classe de defeito em que a mesma descrição de
+arquivo do kernel segue mantendo o lock: o teste vermelho terminou com exit 101; depois da correção,
+os seis testes do lock e o teste do instalador passaram; o mutante sem o
+desbloqueio voltou a exit 101 e a restauração passou. Uma revisão estática
+independente passou sem achados. Isso não demonstra a causa histórica do CI5, e
+o resultado do próximo workflow remoto continua pendente. Relatórios:
+`.soho/vpnt-parallel-20261112/reports/controller-lock-release.md` e
+`controller-lock-release-review.md`.
+
 [FAIL, salvamento nativo ainda não confirmado] O formulário real foi preenchido
 e validado após polling, mas a tentativa de SaveProfile retornou alteração não
 confirmada sem abrir diálogo de senha. Depois, a lista atual do app permaneceu
@@ -275,14 +365,21 @@ binários, verificação do runtime sem rebuild, preparação do payload, pacote
 app e inspeção do vínculo host/componente. Licenças e inputs foram conferidos.
 A saída separada `target/vpnt-askpass-parent.app` contém o adaptador corrigido;
 ainda não substitui a prova do componente instalado anteriormente. Nenhum
-Installer, senha ou conexão foi executado nessa preparação.
+Installer, senha ou conexão foi executado nessa preparação. (O usuário
+instalou depois manualmente esse build B9; veja o início deste checkpoint.)
 
-[NOT RUN] Tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN real,
-coexistência operacional, abertura após logout/login, entrega de notificações e
-aceite visual por captura do popover. A instalação e a persistência acima não
-alteram o estado desses itens.
+[NOT RUN] Autenticação administrativa real, Save de novo perfil e Store de
+credencial, tráfego, conectar/cancelar/reconectar/desligar e cleanup de VPN
+real (Cluster), coexistência operacional, abertura após logout/login, entrega
+de notificações, aceite visual nativo final do VPN Tray por captura do popover
+e o próximo CI. A instalação, o startup e a persistência acima não alteram o
+estado desses itens.
 
-Os recibos locais não versionados em `output/fixtures/` são
+Os recibos atuais não versionados em `output/fixtures/` são
+`vpn-tray-final/{receipt,wk-matrix,package-receipt}.json`,
+`installation-engine-oracles/receipt.json`, `route-oracles/receipt.json` e, para
+a instalação e o startup, `askpass-parent/{installed-images,startup-native-result,startup-family}.json`.
+Os recibos locais mais antigos, também não versionados, são
 `vici-startup-final/receipt.json`, `vici-startup-final-r1/receipt.json`,
 `rounded-popover-final/wk-ui-matrix.json` e
 `native-current-package-receipt.json`, `late-installed-ui/canonical-receipt.json`

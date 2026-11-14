@@ -78,6 +78,38 @@ fn independent_process_cannot_enter_until_the_owned_guard_is_closed() {
 }
 
 #[test]
+fn owner_drop_releases_authority_despite_a_retained_duplicate() {
+    let fixture = Fixture::new();
+    let path = fixture.directory.join(NAME);
+    let before = fs::metadata(&path).unwrap();
+    let guard = fixture.acquire().unwrap();
+    // dup retains the same open file description as a fork before exec.
+    // RAII closes both descriptors before fixture removal, even on assertion failure.
+    let duplicate = guard.file.try_clone().unwrap();
+    assert!(matches!(fixture.acquire(), Err(LockError::Busy)));
+    assert_eq!(fixture.contender(), "busy");
+    guard.validate().unwrap();
+    drop(guard);
+
+    let successor = fixture.acquire().expect(
+        "owner drop must release controller authority even while a duplicate descriptor survives",
+    );
+    successor.validate().unwrap();
+    assert_eq!(fixture.contender(), "busy");
+    assert!(matches!(fixture.acquire(), Err(LockError::Busy)));
+    drop(duplicate);
+    successor.validate().unwrap();
+    assert_eq!(fixture.contender(), "busy");
+    assert!(matches!(fixture.acquire(), Err(LockError::Busy)));
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(fs::read(&path).unwrap(), b"persistent inode");
+    drop(successor);
+    fixture.acquire().unwrap().validate().unwrap();
+    assert_eq!(fixture.contender(), "acquired");
+}
+
+#[test]
 fn replaced_inode_and_changed_permissions_invalidate_a_live_guard() {
     let fixture = Fixture::new();
     let guard = fixture.acquire().unwrap();

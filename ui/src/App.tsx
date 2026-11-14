@@ -48,7 +48,7 @@ export function App() {
       )}
       {!snapshot ? (
         <>
-          <Header title="vpnt" t={t} />
+          <Header title={t("appName")} t={t} />
           <p className="hint">{t("loading")}</p>
         </>
       ) : (

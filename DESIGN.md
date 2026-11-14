@@ -1,5 +1,5 @@
 ---
-name: vpnt
+name: VPN Tray
 description: Visual contract derived from the approved vpnt.fig flow and the classic ai-usagebar theme.
 colors:
   surface: "#ffffff"
@@ -210,7 +210,7 @@ x-parity:
 
 ## Overview
 
-O vpnt usa o tema clássico do ai-usagebar, aplicado por indicação explícita do
+O VPN Tray usa o tema clássico do ai-usagebar, aplicado por indicação explícita do
 Djalma em 2026-11-13: superfícies opacas, cartões preenchidos, menu branco com
 linha destacada em cinza e controles compactos. O fluxo continua sendo o de
 `vpnt.fig` (referência aprovada); os valores de tema e espaçamento abaixo são os

@@ -26,7 +26,7 @@ const SYMBOL_HEIGHT: f64 = 18.0;
 
 /// The status item's tooltip, and the one string re-applied to make the tray
 /// library refresh its click target after the image changes.
-pub(crate) const TOOLTIP: &str = "vpnt";
+pub(crate) const TOOLTIP: &str = super::PRODUCT_NAME;
 
 /// Side of the transparent placeholder, in pixels and in points: the same
 /// 18 pt the symbols are fitted to.

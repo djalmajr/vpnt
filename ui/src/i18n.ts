@@ -5,6 +5,7 @@ export type LocalePreference = Locale | "system";
 
 const en = {
   ...nativeCatalogs["en-US"],
+  appName: "VPN Tray",
   vpns: "VPNs",
   componentInstallTitle: "Install the VPN component?",
   componentRemoveTitle: "Remove the VPN component?",
@@ -24,7 +25,7 @@ const en = {
   componentUnconfirmed:
     "The component change could not be confirmed. Check its status before trying again.",
   componentIncompatible:
-    "This app cannot use its component package or the installed component. Reopen a complete, compatible vpnt app.",
+    "This app cannot use its component package or the installed component. Reopen a complete, compatible VPN Tray app.",
   adminPending:
     "Waiting for authorization and confirmation. To cancel, use the macOS authorization dialog.",
   adminBusy: "Another administrative change is still pending.",
@@ -66,7 +67,7 @@ const en = {
   aboutText:
     "Connect and monitor VPNs from the menu bar. Open source, MIT license.",
   projectPage: "Project page",
-  version: "vpnt {version}",
+  version: "VPN Tray {version}",
   addVpn: "Add VPN",
   newVpn: "New VPN",
   chooseType: "Choose a type",
@@ -119,7 +120,7 @@ const en = {
     "Install the component that starts tunnels. It requires your administrator password once.",
   welcomeTitle: "One step to go",
   welcomeHint:
-    "Starting a tunnel requires administrator access. vpnt installs a small component so you do not need to enter your password every time.",
+    "Starting a tunnel requires administrator access. VPN Tray installs a small component so you do not need to enter your password every time.",
   details: "View details",
   component: "Component",
   installDetails:
@@ -152,11 +153,13 @@ const en = {
   demo: "Demonstration",
   demoHint: "Fictional profiles. No VPN connection is made.",
   demoState: "Demonstration state",
-  backendUnavailable: "Could not reach vpnt. Reopen the panel to try again.",
+  backendUnavailable:
+    "Could not reach VPN Tray. Reopen the panel to try again.",
   preferencesNotConfirmed:
     "The change was not confirmed. It may still be applied.",
   preferencesUnavailable: "Could not save the preferences.",
-  startupRequiresApproval: "Allow vpnt to open at login in System Settings.",
+  startupRequiresApproval:
+    "Allow VPN Tray to open at login in System Settings.",
   startupUnavailable: "Opening at login is not available in this version.",
   invalidName: "Enter a name.",
   invalidGateway: "Enter a valid gateway.",
@@ -195,6 +198,7 @@ const en = {
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
   ...nativeCatalogs["pt-BR"],
+  appName: "VPN Tray",
   vpns: "VPNs",
   componentInstallTitle: "Instalar o componente de VPN?",
   componentRemoveTitle: "Remover o componente de VPN?",
@@ -214,7 +218,7 @@ const pt: Record<MessageKey, string> = {
   componentUnconfirmed:
     "Não foi possível confirmar a alteração do componente. Confira o estado dele antes de tentar novamente.",
   componentIncompatible:
-    "Este app não pode usar seu pacote ou o componente instalado. Abra novamente um app vpnt completo e compatível.",
+    "Este app não pode usar seu pacote ou o componente instalado. Abra novamente um app VPN Tray completo e compatível.",
   adminPending:
     "Aguardando autorização e confirmação. Para cancelar, use o diálogo de autorização do macOS.",
   adminBusy: "Outra alteração administrativa ainda está pendente.",
@@ -256,7 +260,7 @@ const pt: Record<MessageKey, string> = {
   aboutText:
     "Liga, desliga e acompanha VPNs pela barra de menus. Código aberto, licença MIT.",
   projectPage: "Página do projeto",
-  version: "vpnt {version}",
+  version: "VPN Tray {version}",
   addVpn: "Adicionar VPN",
   newVpn: "Nova VPN",
   chooseType: "Escolha o tipo",
@@ -310,7 +314,7 @@ const pt: Record<MessageKey, string> = {
     "Falta instalar o componente que liga os túneis. É uma vez só, com a senha de administrador.",
   welcomeTitle: "Falta um passo",
   welcomeHint:
-    "Ligar um túnel exige acesso de administrador. O vpnt instala um componente pequeno para não pedir a senha toda vez.",
+    "Ligar um túnel exige acesso de administrador. O VPN Tray instala um componente pequeno para não pedir a senha toda vez.",
   details: "Ver detalhes",
   component: "Componente",
   installDetails:
@@ -343,7 +347,7 @@ const pt: Record<MessageKey, string> = {
   demoHint: "Perfis fictícios. Nenhuma conexão de VPN é feita.",
   demoState: "Estado da demonstração",
   backendUnavailable:
-    "Não foi possível falar com o vpnt. Abra o painel de novo para tentar.",
+    "Não foi possível falar com o VPN Tray. Abra o painel de novo para tentar.",
   preferencesNotConfirmed:
     "A alteração não foi confirmada. Ela ainda pode ser aplicada.",
   preferencesUnavailable: "Não foi possível salvar as preferências.",
