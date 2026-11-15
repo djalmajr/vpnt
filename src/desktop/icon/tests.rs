@@ -76,12 +76,12 @@ fn every_connection_state_has_one_expected_icon() {
     // tray reading here instead of falling through to a closed lock.
     let table = [
         (ConnectionState::Off, Icon::Open),
-        (ConnectionState::Connecting, Icon::Warning),
-        (ConnectionState::Verifying, Icon::Warning),
+        (ConnectionState::Connecting, Icon::Open),
+        (ConnectionState::Verifying, Icon::Open),
         (ConnectionState::Connected, Icon::Ipsec),
         (ConnectionState::Unresponsive, Icon::Warning),
-        (ConnectionState::Reconnecting, Icon::Warning),
-        (ConnectionState::Disconnecting, Icon::Warning),
+        (ConnectionState::Reconnecting, Icon::Open),
+        (ConnectionState::Disconnecting, Icon::Open),
         (ConnectionState::Dropped, Icon::Warning),
         (ConnectionState::CredentialsRejected, Icon::Warning),
         (ConnectionState::GatewayTimeout, Icon::Warning),
@@ -151,9 +151,16 @@ fn attention_outranks_a_connected_profile() {
     // Even the kind that is still up does not get a closed lock.
     let connected_first = ready(vec![
         view("a", SSL, ConnectionState::Connected),
-        view("b", IPSEC, ConnectionState::Connecting),
+        view("b", IPSEC, ConnectionState::Dropped),
     ]);
     assert_eq!(icon_for(Some(&connected_first), false), Icon::Warning);
+    // Work in progress on another profile is not attention: the verified kind
+    // keeps its lock and the one still connecting adds nothing.
+    let in_progress = ready(vec![
+        view("a", SSL, ConnectionState::Connected),
+        view("b", IPSEC, ConnectionState::Connecting),
+    ]);
+    assert_eq!(icon_for(Some(&in_progress), false), Icon::Ssl);
 }
 
 #[test]

@@ -43,7 +43,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     }));
     let window = WindowBuilder::new()
         .with_title(PRODUCT_NAME)
-        .with_inner_size(LogicalSize::new(320.0, 360.0))
+        .with_inner_size(LogicalSize::new(
+            320.0,
+            f64::from(placement::DEFAULT_HEIGHT),
+        ))
         .with_visible(false)
         .with_transparent(true)
         .with_decorations(false)
@@ -89,7 +92,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut open = false;
     // Cursor at the last open, and the height the web UI last asked for.
     let mut anchor = None;
-    let mut height = 360;
+    let mut height = placement::DEFAULT_HEIGHT;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {

@@ -58,6 +58,7 @@ x-layout:
   switch-height: "14px"
   switch-knob: "10px"
   switch-inset: "1px"
+  panel-min-height: "640px"
   panel-max-height: "720px"
   field-label-width: "92px"
   dialog-width: "280px"
@@ -163,6 +164,7 @@ x-parity:
     x-layout.switch-height: { selector: ":root", var: "--switch-height" }
     x-layout.switch-knob: { selector: ":root", var: "--switch-knob" }
     x-layout.switch-inset: { selector: ":root", var: "--switch-inset" }
+    x-layout.panel-min-height: { selector: ":root", var: "--panel-min-height" }
     x-layout.panel-max-height: { selector: ":root", var: "--panel-max-height" }
     x-layout.field-label-width: { selector: ":root", var: "--field-label-width" }
     x-layout.dialog-width: { selector: ":root", var: "--dialog-width" }
@@ -300,6 +302,12 @@ Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como n
 
 ### Conflicting visual priorities
 
+Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
+(`panel-min-height`, 640 px) e a conserva entre telas, para não haver
+deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
+com a mesma medida. Conteúdo mais alto cresce até `panel-max-height`; tela mais
+baixa limita a janela e o painel rola.
+
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
 320 px quando há espaço; em viewport menor, ocupa a largura disponível. Em
 viewport fisicamente baixo, o menu rola e continua alcançável; nenhuma ação é
@@ -400,7 +408,10 @@ o idioma já validado do host. Sem novos tokens nem alteração visual da UI.
 Usar SF Symbols nativos como imagens de template, acompanhando a aparência da
 barra: `lock.shield.fill` para IPsec conectado, `lock.fill` para SSL conectado,
 `lock.square.stack.fill` para ambos e `lock.open` quando nenhum está conectado.
-`exclamationmark.triangle.fill` indica estado incerto, transitório ou com erro.
+`exclamationmark.triangle.fill` indica erro, túnel sem resposta ou componente
+não verificado. Por correção do Djalma em 2026-11-14, estados em andamento
+(conectando, verificando, reconectando, desconectando) não são alerta: leem como
+desligado e não fecham o cadeado.
 Somente o snapshot autoritativo do helper instalado pode fechar o cadeado;
 demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de altura.
 

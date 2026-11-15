@@ -22,6 +22,9 @@ use tao::{platform::macos::WindowExtMacOS, window::Window};
 /// Desired panel width; only narrowed when the screen cannot hold it.
 const PANEL_WIDTH: f64 = 320.0;
 /// Bounds of the height the web UI may request (`Command::Resize`).
+/// Height the window opens with, before the web UI reports its own; equals the
+/// `panel-min-height` design token so the first report does not move it.
+pub(super) const DEFAULT_HEIGHT: u32 = 640;
 const MIN_HEIGHT: f64 = 180.0;
 const MAX_HEIGHT: f64 = 720.0;
 /// Inset from the left and right edges of the visible screen.

@@ -54,6 +54,7 @@
   --switch-inset: 1px;
   --dim-opacity: 0.45;
   --hover-brightness: 1.08;
+  --panel-min-height: 640px;
   --panel-max-height: 720px;
   --field-label-width: 92px;
   --dialog-width: 280px;
@@ -149,6 +150,12 @@ button:not(:disabled):hover,
 a.button:hover {
   background: var(--button-hover);
 }
+/* A link has no native button box: center its label in the control height. */
+a.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
 button:disabled {
   cursor: default;
   color: var(--secondary);
@@ -204,6 +211,10 @@ input {
   gap: var(--space-sm);
   width: var(--panel-width);
   max-width: 100%;
+  /* Predefined height: the window opens at this size and keeps it across
+     pages, so nothing shifts. Taller content grows up to the limit; a shorter
+     screen clamps the window and the panel scrolls. */
+  min-height: min(100vh, var(--panel-min-height));
   max-height: var(--panel-max-height);
   overflow: auto;
   padding: var(--space-sm);
@@ -456,6 +467,8 @@ h2 {
 }
 .footer {
   padding-left: 0;
+  /* The panel has a predefined height: keep the footer on its bottom edge. */
+  margin-top: auto;
 }
 /* While the Options menu is open the window is asked for more height (see
    panelSizing.ts). The panel then fills the window and the footer drops to its
@@ -465,9 +478,6 @@ h2 {
    as before. */
 :root[data-menu-reserve] .panel {
   min-height: min(100vh, var(--panel-max-height));
-}
-:root[data-menu-reserve] .footer {
-  margin-top: auto;
 }
 .vpn-card {
   display: flex;

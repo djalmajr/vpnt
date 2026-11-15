@@ -44,21 +44,26 @@ export function menuNeed({
 }
 
 /**
- * Height to ask the host for: the content height, raised to the reservation,
- * never above the panel limit. The host still clamps to the screen.
+ * Height to ask the host for: the content height, raised to the predefined
+ * panel height and to the reservation, never above the panel limit. The host still clamps to the screen.
  */
 export function requestedHeight({
   natural,
   reserve,
+  min = 0,
   max = Number.POSITIVE_INFINITY,
 }: {
   natural: number;
   reserve: number;
+  /** Predefined panel height; the window never asks for less. */
+  min?: number;
   max?: number;
 }): number {
   const limit =
     Number.isFinite(max) && max > 0 ? max : Number.POSITIVE_INFINITY;
-  return Math.ceil(Math.min(limit, Math.max(natural, reserve)));
+  return Math.ceil(
+    Math.min(limit, Math.max(natural, reserve, min > 0 ? min : 0)),
+  );
 }
 
 /** Reservations by owner; the largest one wins and `0` means none. */
@@ -106,9 +111,15 @@ export function observePanelHeight(
     const max = panel
       ? Number.parseFloat(getComputedStyle(panel).maxHeight)
       : 0;
+    // The token, not the computed `min-height`: that one follows the current
+    // window (`100vh`) and would keep a small window small.
+    const min = Number.parseFloat(
+      getComputedStyle(root).getPropertyValue("--panel-min-height"),
+    );
     const height = requestedHeight({
       natural,
       reserve: reserve.value(),
+      min: Number.isFinite(min) ? min : 0,
       max,
     });
     if (height !== previous) {
