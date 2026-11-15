@@ -35,9 +35,6 @@ export function VpnCard({
     );
   const cancelable = state === "connecting" || state === "reconnecting";
   const missingSecret = state === "missing_secret";
-  const staticBody = cancelable || missingSecret;
-  const CardBody = staticBody ? "div" : "button";
-  const Switch = missingSecret ? "button" : "span";
   const on = active(state);
   const warning = [
     "unresponsive",
@@ -67,28 +64,27 @@ export function VpnCard({
             : state === "missing_program"
               ? "programHint"
               : null;
-  const principal = () => {
-    if (staticBody) return;
-    if (state === "unresponsive") {
-      void run({ type: "reconnect", id: profile.id });
+  const toggle = () => {
+    if (disabled || cancelable) return;
+    if (missingSecret) {
+      secrets();
       return;
     }
-    // The user clicked what the card shows, so the command names the direction
-    // instead of re-reading the latest snapshot (which may already be off).
+    // Preserve the direction shown by this snapshot, even if the host has
+    // already changed state by the time it receives the command.
     void run({ type: on ? "disconnect" : "connect", id: profile.id });
   };
   return (
-    <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
-      <CardBody
-        type={staticBody ? undefined : "button"}
-        className="card-toggle"
-        disabled={staticBody ? undefined : disabled}
-        onClick={staticBody ? undefined : principal}
-        aria-label={
-          staticBody ? undefined : `${profile.name}: ${t(`state.${state}`)}`
-        }
-        aria-pressed={staticBody ? undefined : on}
-      >
+    // biome-ignore lint/a11y/useKeyWithClickEvents: The Details button owns keyboard navigation; the card is not a second tab stop.
+    <article
+      className="vpn-card"
+      data-testid={`vpn-card-${profile.id}`}
+      onClick={(event) => {
+        if ((event.target as Element).closest("button, .notice")) return;
+        navigate({ page: "profile", id: profile.id });
+      }}
+    >
+      <div className="card-body">
         <span className="card-heading">
           <span className="identity">
             <strong>{profile.name}</strong>
@@ -97,19 +93,27 @@ export function VpnCard({
               {profile.networks.join(", ") || t("fullTunnel")}
             </small>
           </span>
-          <Switch
-            type={missingSecret ? "button" : undefined}
-            onClick={missingSecret ? secrets : undefined}
-            aria-label={
-              missingSecret
-                ? `${profile.name}: ${t("providePassword")}`
-                : undefined
-            }
-            aria-hidden={missingSecret ? undefined : true}
-            className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
-          >
-            <span />
-          </Switch>
+          <span className="card-controls">
+            <button
+              type="button"
+              onClick={toggle}
+              disabled={!!disabled || cancelable}
+              aria-label={`${profile.name}: ${t(`state.${state}`)}`}
+              aria-pressed={on}
+              className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
+            >
+              <span />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={t("profileDetails", { name: profile.name })}
+              title={t("profileDetails", { name: profile.name })}
+              onClick={() => navigate({ page: "profile", id: profile.id })}
+            >
+              <Icon name="chevron" />
+            </button>
+          </span>
         </span>
         <span className="card-state">
           <span className="status-line">
@@ -129,7 +133,7 @@ export function VpnCard({
             </button>
           )}
         </span>
-      </CardBody>
+      </div>
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>
           <p>{t(hint)}</p>

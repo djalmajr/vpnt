@@ -6,11 +6,13 @@ import { Menu, MenuItem, MenuSeparator } from "./Menu";
 export function Footer({
   snapshot,
   navigate,
+  navigationBlocked = false,
   run,
   t,
 }: {
   snapshot: Snapshot;
   navigate: Navigate;
+  navigationBlocked?: boolean;
   run: Run;
   t: T;
 }) {
@@ -36,21 +38,34 @@ export function Footer({
         >
           {t("testNow")}
         </MenuItem>
-        <MenuItem icon="log" onSelect={() => navigate({ page: "log" })}>
+        <MenuItem
+          icon="log"
+          disabled={navigationBlocked}
+          onSelect={() => navigate({ page: "log" })}
+        >
           {t("viewLog")}
         </MenuItem>
         <MenuSeparator />
         <MenuItem
           icon="settings"
+          disabled={navigationBlocked}
           onSelect={() => navigate({ page: "preferences" })}
         >
           {t("preferences")}
         </MenuItem>
-        <MenuItem icon="info" onSelect={() => navigate({ page: "about" })}>
+        <MenuItem
+          icon="info"
+          disabled={navigationBlocked}
+          onSelect={() => navigate({ page: "about" })}
+        >
           {t("about")}
         </MenuItem>
         <MenuSeparator />
-        <MenuItem icon="quit" onSelect={() => void run({ type: "quit" })}>
+        <MenuItem
+          icon="quit"
+          disabled={navigationBlocked}
+          onSelect={() => void run({ type: "quit" })}
+        >
           {t("quit")}
         </MenuItem>
       </Menu>

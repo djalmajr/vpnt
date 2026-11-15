@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { Snapshot } from "../model";
 import type { Run } from "../navigation";
-import { Dialog, Notice, type T } from "./common";
+import { Dialog, Icon, Notice, type T } from "./common";
 
 export function ComponentStatus({ snapshot, t }: { snapshot: Snapshot; t: T }) {
   const state = snapshot.componentOperation;
@@ -43,7 +43,8 @@ export function ComponentDialog({
       busy={pending}
       t={t}
     >
-      <p role="status">
+      <p role="status" className={pending ? "status-line" : undefined}>
+        {pending && <Icon name="loader" />}
         {t(
           pending
             ? install

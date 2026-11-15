@@ -88,6 +88,11 @@ const en = {
   type: "Type",
   gateway: "Gateway",
   username: "Username",
+  profileDetails: "Details for {name}",
+  usernameShellError:
+    "This looks like a shell expression; enter the literal username.",
+  secretShellWarning:
+    "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
   probeHost: "Address",
@@ -286,6 +291,11 @@ const pt: Record<MessageKey, string> = {
   type: "Tipo",
   gateway: "Gateway",
   username: "Usuário",
+  profileDetails: "Detalhes de {name}",
+  usernameShellError:
+    "Isto parece uma expressão de shell; informe o nome de usuário literal.",
+  secretShellWarning:
+    "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
   probeHost: "Endereço",

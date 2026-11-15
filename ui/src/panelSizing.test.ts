@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { createReserve, menuNeed, requestedHeight } from "./panelSizing";
+import {
+  createReserve,
+  menuNeed,
+  observePanelHeight,
+  requestedHeight,
+} from "./panelSizing";
 
 // Mutation captured: sizing only the viewport and leaving the trigger where it
 // was keeps the menu clipped. The need must include the distance below the
@@ -75,4 +80,117 @@ test("a altura predefinida é o piso do pedido e respeita o teto", () => {
   // A reserva do menu soma-se ao piso só quando o ultrapassa.
   expect(requestedHeight({ natural: 300, reserve: 400, min: 480 })).toBe(480);
   expect(requestedHeight({ natural: 300, reserve: 600, min: 480 })).toBe(600);
+});
+
+test("conteúdo limitado pelo viewport cresce até o teto e é observado por dentro", () => {
+  const keys = [
+    "document",
+    "getComputedStyle",
+    "ResizeObserver",
+    "MutationObserver",
+  ] as const;
+  const originals = keys.map((key) =>
+    Object.getOwnPropertyDescriptor(globalThis, key),
+  );
+  let contentHeight = 600;
+  const child = {};
+  const content = {
+    get scrollHeight() {
+      return contentHeight;
+    },
+    offsetHeight: 432,
+    clientHeight: 432,
+    getBoundingClientRect: () => ({ height: 432 }),
+    children: [child],
+  };
+  const panel = {
+    getBoundingClientRect: () => ({ height: 480 }),
+    querySelector: () => content,
+    children: [content],
+  };
+  const root = { toggleAttribute() {}, removeAttribute() {} };
+  const target = {};
+  const observed = new Set<unknown>();
+  let resize = () => {};
+  let mutate = () => {};
+  let disconnected = 0;
+  const mocks = [
+    {
+      documentElement: root,
+      getElementById: (id: string) => (id === "panel" ? panel : target),
+    },
+    () => ({
+      getPropertyValue: (key: string) =>
+        key === "--panel-max-height" ? "720px" : "480px",
+    }),
+    class {
+      constructor(callback: () => void) {
+        resize = callback;
+      }
+      observe(element: unknown) {
+        observed.add(element);
+      }
+      unobserve(element: unknown) {
+        observed.delete(element);
+      }
+      disconnect() {
+        observed.clear();
+      }
+    },
+    class {
+      constructor(callback: () => void) {
+        mutate = callback;
+      }
+      observe() {}
+      disconnect() {
+        disconnected++;
+      }
+    },
+  ];
+  try {
+    keys.forEach((key, index) => {
+      Object.defineProperty(globalThis, key, {
+        configurable: true,
+        value: mocks[index],
+      });
+    });
+    const requests: number[] = [];
+    const reserve = createReserve();
+    const stop = observePanelHeight((height) => requests.push(height), reserve);
+    expect(requests).toEqual([648]);
+    expect(observed.has(content)).toBe(true);
+    expect(observed.has(child)).toBe(true);
+    contentHeight = 650;
+    resize();
+    expect(requests).toEqual([648, 698]);
+    contentHeight = 900;
+    resize();
+    expect(requests.at(-1)).toBe(720);
+    expect(content.scrollHeight).toBeGreaterThan(content.clientHeight);
+    resize();
+    expect(requests).toEqual([648, 698, 720]);
+    const added = {};
+    content.children.push(added);
+    contentHeight = 432;
+    mutate();
+    expect(observed.has(added)).toBe(true);
+    expect(requests.at(-1)).toBe(480);
+    content.children.pop();
+    mutate();
+    expect(observed.has(added)).toBe(false);
+    const owner = Symbol();
+    reserve.hold(owner, 700);
+    expect(requests.at(-1)).toBe(700);
+    reserve.release(owner);
+    expect(requests.at(-1)).toBe(480);
+    stop();
+    expect(observed.size).toBe(0);
+    expect(disconnected).toBe(1);
+  } finally {
+    keys.forEach((key, index) => {
+      const original = originals[index];
+      if (original) Object.defineProperty(globalThis, key, original);
+      else Reflect.deleteProperty(globalThis, key);
+    });
+  }
 });

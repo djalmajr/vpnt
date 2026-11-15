@@ -50,7 +50,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(pending).toContain(t("cleanupHint"));
       expect(pending).not.toContain(t("state.disconnecting"));
       expect(pending).not.toContain(`>${t("disconnect")}<`);
-      expect(pending).toMatch(/class="card-toggle" disabled=""/);
+      expect(pending).toMatch(/disabled=""[^>]*class="switch[^"]*"/);
       // The Notice action stays in the tab order, inert and described by the
       // cleanup status instead of natively disabled.
       const id = pending.match(/<p id="([^"]+)" role="status">/)?.[1];
@@ -63,7 +63,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(ready).toContain(t(`state.${state}`));
       expect(ready).not.toContain(t("cleanupHint"));
       if (state !== "missing_program")
-        expect(ready).not.toMatch(/class="card-toggle" disabled=""/);
+        expect(ready).not.toMatch(/disabled=""[^>]*class="switch[^"]*"/);
       expect(ready).not.toMatch(/class="primary" disabled=""/);
       expect(ready).not.toContain("aria-disabled");
     });

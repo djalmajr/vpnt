@@ -95,9 +95,9 @@ export function createReserve() {
 export const menuReserve = createReserve();
 
 /**
- * Reports the height the host window should have: the panel's own height, raised
- * to the active reservation. Without a reservation this is exactly the previous
- * behavior. Returns a cleanup that stops observing and removes the marker.
+ * Reports intrinsic content plus the fixed panel structure, raised to the active
+ * reservation. The viewport may clip the rendered panel, but must not cap this
+ * request: the host decides how much physical screen space is available.
  */
 export function observePanelHeight(
   send: (height: number) => void,
@@ -107,9 +107,22 @@ export function observePanelHeight(
   let previous = 0;
   const report = () => {
     const panel = document.getElementById("panel");
-    const natural = panel?.getBoundingClientRect().height ?? 360;
+    const content = panel?.querySelector<HTMLElement>(".panel-content");
+    const panelHeight = panel?.getBoundingClientRect().height ?? 360;
+    // Replace the clipped scroll box with its full content. The remaining panel
+    // height includes padding, gap and footer; preserve scroll box borders too.
+    const natural = content
+      ? panelHeight -
+        content.getBoundingClientRect().height +
+        content.scrollHeight +
+        (content.offsetHeight - content.clientHeight)
+      : panelHeight;
+    // max-height now combines viewport and token with min(); parse the token
+    // directly, since parseFloat on the computed min() expression is NaN.
     const max = panel
-      ? Number.parseFloat(getComputedStyle(panel).maxHeight)
+      ? Number.parseFloat(
+          getComputedStyle(panel).getPropertyValue("--panel-max-height"),
+        )
       : 0;
     // The token, not the computed `min-height`: that one follows the current
     // window (`100vh`) and would keep a small window small.
@@ -129,7 +142,42 @@ export function observePanelHeight(
   };
   const observer = new ResizeObserver(report);
   const target = document.getElementById("root");
-  if (target) observer.observe(target);
+  const observed = new Set<Element>();
+  const observeContent = () => {
+    const panel = document.getElementById("panel");
+    const content = panel?.querySelector(".panel-content");
+    const targets = new Set<Element>([
+      ...(target ? [target] : []),
+      ...(panel ? [panel, ...panel.children] : []),
+      ...(content ? [content, ...content.children] : []),
+    ]);
+    for (const element of observed) {
+      if (!targets.has(element)) {
+        observer.unobserve(element);
+        observed.delete(element);
+      }
+    }
+    for (const element of targets) {
+      if (!observed.has(element)) {
+        observer.observe(element);
+        observed.add(element);
+      }
+    }
+  };
+  // A fixed outer box does not resize when its scrollHeight grows. Observe its
+  // children, and refresh the observed set on route/content changes as well.
+  const mutations = new MutationObserver(() => {
+    observeContent();
+    report();
+  });
+  if (target)
+    mutations.observe(target, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+    });
+  observeContent();
   const mark = () => {
     root.toggleAttribute(RESERVE_ATTRIBUTE, reserve.value() > 0);
     report();
@@ -138,6 +186,7 @@ export function observePanelHeight(
   mark();
   return () => {
     unsubscribe();
+    mutations.disconnect();
     observer.disconnect();
     root.removeAttribute(RESERVE_ATTRIBUTE);
   };

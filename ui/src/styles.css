@@ -218,14 +218,31 @@ input {
   max-width: 100%;
   /* Predefined height: the window opens at this size and keeps it across
      pages, so nothing shifts. Taller content grows up to the limit; a shorter
-     screen clamps the window and the panel scrolls. */
+     screen clamps the window and the content scrolls above the footer. */
   min-height: min(100vh, var(--panel-min-height));
-  max-height: var(--panel-max-height);
-  overflow: auto;
+  max-height: min(100vh, var(--panel-max-height));
+  overflow: hidden;
   padding: var(--space-sm);
   border-radius: var(--radius-popover);
   background: var(--surface);
   margin: 0 auto;
+}
+.panel-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.panel-content > * {
+  flex-shrink: 0;
+}
+.field:has(.field-error) {
+  flex-wrap: wrap;
+}
+.field-error {
+  flex-basis: 100%;
 }
 .header {
   display: flex;
@@ -514,6 +531,10 @@ h2 {
   padding-left: 0;
   /* The panel has a predefined height: keep the footer on its bottom edge. */
   margin-top: auto;
+  flex-shrink: 0;
+}
+.footer > small {
+  font-size: var(--font-control);
 }
 /* While the Options menu is open the window is asked for more height (see
    panelSizing.ts). The panel then fills the window and the footer drops to its
@@ -532,7 +553,7 @@ h2 {
   border-radius: var(--radius-card);
   padding: var(--space-sm);
 }
-.card-toggle {
+.card-body {
   width: 100%;
   padding: 0;
   background: transparent;
@@ -544,9 +565,6 @@ h2 {
   flex-direction: column;
   gap: var(--space-sm);
 }
-.card-toggle:disabled {
-  color: var(--text);
-}
 .card-heading,
 .card-state {
   display: flex;
@@ -554,6 +572,12 @@ h2 {
   align-items: center;
   gap: var(--space-sm);
   width: 100%;
+}
+.card-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
 }
 .identity {
   display: flex;

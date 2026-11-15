@@ -11,3 +11,21 @@ test("tokens geométricos não podem formar referências diretas a si mesmos", (
     );
   }
 });
+
+// The scrolling surface must stop above the footer, including short windows.
+test("rodapé reserva espaço fora da superfície rolável e usa texto pequeno", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const block = (selector: string) => {
+    const declarations = css.split(`${selector} {`).slice(1);
+    expect(declarations.length, selector).toBeGreaterThan(0);
+    return declarations.map((part) => part.split("}")[0]).join("\n");
+  };
+  expect(block(".panel")).toContain(
+    "max-height: min(100vh, var(--panel-max-height))",
+  );
+  expect(block(".panel")).toContain("overflow: hidden");
+  expect(block(".panel-content")).toContain("overflow: auto");
+  expect(block(".panel-content")).toContain("min-height: 0");
+  expect(block(".footer")).toContain("flex-shrink: 0");
+  expect(block(".footer > small")).toContain("font-size: var(--font-control)");
+});

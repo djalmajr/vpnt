@@ -315,6 +315,8 @@ Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
 deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
 com a mesma medida. Conteúdo mais alto cresce até `panel-max-height`; tela mais
 baixa limita a janela e o painel rola.
+O pedido ao host soma a estrutura fixa ao `scrollHeight` de panel-content,
+independentemente do viewport atual; mudanças internas também são observadas.
 
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
 320 px quando há espaço; em viewport menor, ocupa a largura disponível. Em
@@ -348,26 +350,41 @@ nas preferências, em ambos os temas.
 
 ## Components
 
-O cartão inteiro oferece a ação principal fora de conexão, reconexão e senha
-pendente. Durante conexão e reconexão, o corpo é estático e somente o botão
-Cancelar cancela; com senha pendente, somente o interruptor abre o diálogo de senha.
-Sem resposta oferece Reconectar como ação principal e Desligar separadamente.
-Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
-nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
-nativo `dialog`, com foco contido e Escape para cancelar.
+Por indicação do Djalma em 2026-11-15, só o interruptor do cartão liga ou
+desliga, emitindo connect/disconnect explícitos conforme o snapshot. É um
+botão com aria-pressed e nome acessível formado por nome do perfil e estado
+traduzido. Sem resposta, o interruptor desliga; Reconectar continua no aviso.
+Com senha pendente, o interruptor abre o diálogo de segredos, sem aviso extra.
+Durante conexão e reconexão, o interruptor fica indisponível e só Cancelar
+cancela; limpeza e estados desabilitados também bloqueiam o interruptor.
+O estado continua vindo do snapshot autoritativo, sem atualização otimista.
 
-Por indicação do Djalma em 2026-11-14, falta de senha aparece apenas no
-indicador do cartão, sem aviso ou botão adicional abaixo dele. Por indicação
-de 2026-11-15, nesse estado o corpo do cartão é estático e só o interruptor,
-um botão real com nome acessível formado pelo nome do perfil e pela ação
-traduzida de fornecer senha, abre o diálogo de segredos. O corpo do cartão não ganha fundo
-interno no hover. Durante conexão ou reconexão, somente a área de Cancelar
-recebe `menu-hover`, com o raio de controle e recuo horizontal `space-xs`.
-Durante conexão e reconexão, Cancelar é um botão real com foco próprio; o
-corpo do cartão não envia comandos e não entra na ordem de foco. O mesmo vale
-para o corpo com senha pendente, cujo interruptor tem foco próprio. Nos demais
-estados, a ação principal e o foco por teclado do cartão inteiro permanecem.
-O interruptor continua vindo do snapshot autoritativo, sem atualização otimista.
+O corpo deixa de ser botão: clicar no cartão abre o perfil, exceto nos
+controles e no aviso. Um icon-button com chevron à direita do interruptor
+oferece a mesma navegação por teclado, com nome traduzido “Detalhes de {name}”.
+Não há botões aninhados nem segundo foco no corpo. Cancelar é um botão real
+com foco próprio, menu-hover, raio de controle e recuo horizontal space-xs.
+
+A seção Segredos do perfil conserva uma linha de status por segredo e usa
+um único botão no cabeçalho: Trocar quando algum segredo aplicável existe,
+Informar quando nenhum existe. O mesmo diálogo atende IPsec (PSK e senha) e
+SSL (senha).
+
+Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
+nome acessível, foco visível e caminho por teclado. Diálogos usam dialog nativo,
+com foco contido e Escape para cancelar. As confirmações de instalar/remover o
+componente mostram o Icon loader girando ao lado do texto de espera anunciado
+como status; enquanto pending, expõem aria-busy e bloqueiam as ações.
+
+O rodapé fica sempre visível na base do painel, inclusive em perfil e log,
+fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
+altura real do rodapé, sem sobrepor o conteúdo; a janela curta limita o painel ao viewport.
+A versão usa font-control (12 px), o token pequeno existente. O menu conserva
+seu portal e a reserva temporária de altura.
+Voltar e as rotas do rodapé usam a mesma guarda de alterações pendentes do
+perfil, inclusive na criação: confirmar descarte segue ao destino escolhido;
+continuar editando preserva o formulário. Durante salvar, essas saídas ficam
+indisponíveis.
 
 As quatro linhas não triviais das Preferências usam o componente compartilhado
 `Help`: ícone de interrogação ao lado do rótulo, com tamanho `icon-help` de
