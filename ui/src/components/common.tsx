@@ -55,6 +55,24 @@ export function Icon({
     </svg>
   );
 }
+/**
+ * Escape while a hint is open closes only the hint. Registered in the capture
+ * phase on the window, so it runs before the document listener that hides the
+ * native popover on Escape, and stops the event from reaching it.
+ */
+export function helpEscape(close: () => void) {
+  return (
+    event: Pick<
+      KeyboardEvent,
+      "key" | "preventDefault" | "stopImmediatePropagation"
+    >,
+  ) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    close();
+  };
+}
 export function Help({ text }: { text: string }) {
   const id = useId();
   const trigger = useRef<HTMLSpanElement>(null);
@@ -79,21 +97,19 @@ export function Help({ text }: { text: string }) {
         ),
       );
     };
-    const onEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
+    const onEscape = helpEscape(() => setOpen(false));
     place();
     const observer = new ResizeObserver(place);
     if (trigger.current) observer.observe(trigger.current);
     if (content.current) observer.observe(content.current);
     window.addEventListener("resize", place);
     document.addEventListener("scroll", place, true);
-    document.addEventListener("keydown", onEscape);
+    window.addEventListener("keydown", onEscape, true);
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", place);
       document.removeEventListener("scroll", place, true);
-      document.removeEventListener("keydown", onEscape);
+      window.removeEventListener("keydown", onEscape, true);
     };
   }, [open]);
   const leave = (target: EventTarget | null, keepFocus = false) => {

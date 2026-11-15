@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { Help, type T } from "./components/common";
+import { Help, helpEscape, type T } from "./components/common";
 import { translate } from "./i18n";
 import type { Snapshot, VpnView } from "./model";
 import { Log } from "./screens/Log";
@@ -132,3 +132,19 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     });
   });
 }
+
+// Mutation captured: letting Escape reach the document listener hid the whole
+// native popover when the user only wanted to dismiss the hint.
+test("Escape com a dica aberta fecha só a dica e não chega ao atalho global", () => {
+  const calls: string[] = [];
+  const event = (key: string) => ({
+    key,
+    preventDefault: () => calls.push(`prevent:${key}`),
+    stopImmediatePropagation: () => calls.push(`stop:${key}`),
+  });
+  const handler = helpEscape(() => calls.push("close"));
+  handler(event("Tab"));
+  expect(calls).toEqual([]);
+  handler(event("Escape"));
+  expect(calls).toEqual(["prevent:Escape", "stop:Escape", "close"]);
+});
