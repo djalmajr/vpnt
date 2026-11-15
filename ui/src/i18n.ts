@@ -61,7 +61,6 @@ const en = {
   helperMissing: "Component not installed",
   helperHint: "Required to start tunnels",
   install: "Install",
-  removeHelper: "Remove component",
   installedHint: "Connect without entering your password",
   about: "About",
   aboutText:
@@ -121,10 +120,7 @@ const en = {
   welcomeTitle: "One step to go",
   welcomeHint:
     "Starting a tunnel requires administrator access. VPN Tray installs a small component so you do not need to enter your password every time.",
-  details: "View details",
   component: "Component",
-  installDetails:
-    "The component can only manage registered VPN profiles. Installing or removing it requires administrator confirmation.",
   installing: "Installing…",
   installConfirm:
     "Confirm with your administrator password in the system dialog.",
@@ -254,7 +250,6 @@ const pt: Record<MessageKey, string> = {
   helperMissing: "Componente não instalado",
   helperHint: "Sem ele não dá para ligar túneis",
   install: "Instalar",
-  removeHelper: "Remover componente",
   installedHint: "Liga e desliga sem pedir senha",
   about: "Sobre",
   aboutText:
@@ -315,10 +310,7 @@ const pt: Record<MessageKey, string> = {
   welcomeTitle: "Falta um passo",
   welcomeHint:
     "Ligar um túnel exige acesso de administrador. O VPN Tray instala um componente pequeno para não pedir a senha toda vez.",
-  details: "Ver detalhes",
   component: "Componente",
-  installDetails:
-    "O componente só gerencia perfis de VPN cadastrados. Instalar ou remover exige confirmação de administrador.",
   installing: "Instalando…",
   installConfirm: "Confirme com a senha de administrador na janela do sistema.",
   installFailed: "Não foi possível instalar",

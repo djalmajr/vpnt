@@ -149,7 +149,17 @@ export function Preferences({
           )}
         >
           {snapshot.helper === "installed" ? (
-            <small>{snapshot.version}</small>
+            <div className="actions">
+              <small>{snapshot.version}</small>
+              <button
+                type="button"
+                className="danger"
+                disabled={!!snapshot.componentOperation}
+                onClick={removeComponent}
+              >
+                {t("remove")}
+              </button>
+            </div>
           ) : (
             <button
               type="button"
@@ -161,18 +171,6 @@ export function Preferences({
             </button>
           )}
         </Row>
-        {snapshot.helper === "installed" && (
-          <Row label={t("removeHelper")}>
-            <button
-              type="button"
-              className="danger"
-              disabled={!!snapshot.componentOperation}
-              onClick={removeComponent}
-            >
-              {t("remove")}
-            </button>
-          </Row>
-        )}
       </Group>
     </>
   );

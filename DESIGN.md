@@ -393,6 +393,11 @@ adicional é o cursor de progresso — sem texto novo no catálogo, spinner ou
 mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
 vindo do snapshot autoritativo.
 
+Por indicação do Djalma em 2026-11-15, o acesso de administrador instalado
+usa uma única linha com estado, explicação, versão e botão Remover; não há
+rótulo separado de remoção. O onboarding oferece um único botão Instalar de
+largura total, sem botão Ver detalhes nem estado alternativo de detalhes.
+
 ### Edição por teclado (menu Editar nativo)
 
 Os atalhos padrão de edição (⌘Z, ⇧⌘Z, ⌘X, ⌘C, ⌘V, ⌘A) vêm do menu Editar nativo

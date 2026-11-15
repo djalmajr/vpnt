@@ -331,7 +331,7 @@ h2 {
   flex: 0 0 auto;
   max-width: 100%;
 }
-.setting-row button {
+.setting-row > button {
   max-width: 52%;
 }
 .switch {
@@ -445,6 +445,10 @@ h2 {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-sm);
+}
+.setting-row > .actions {
+  align-items: center;
+  flex-shrink: 0;
 }
 .actions.end {
   justify-content: flex-end;

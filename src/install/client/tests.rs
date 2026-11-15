@@ -250,3 +250,95 @@ fn component_launches_have_fixed_programs_arguments_and_no_shell_or_saved_state_
         ["-A", "-k", "--", crate::helper::paths::INSTALLER, "remove"]
     );
 }
+
+#[test]
+fn removal_reply_wait_keeps_the_absolute_deadline_and_cancellation() {
+    for cancel in [false, true] {
+        let f = Fixture::new();
+        let mut command = f.command(
+            r#"import json,pathlib,socket,sys,time
+p=pathlib.Path(sys.argv[1]);s=socket.socket(fileno=0)
+s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
+r=json.loads(s.makefile('rb').read())
+(p/'waiting').touch()
+time.sleep(1)
+try:
+ s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
+except BrokenPipeError:
+ pass
+s.close()
+"#,
+        );
+        command.arg(env!("CARGO_PKG_VERSION"));
+        let mut op = Operation::fixture(
+            Kind::Remove,
+            command,
+            "bounded-removal".into(),
+            Locale::EnUs,
+            Instant::now() + Duration::from_millis(700),
+        )
+        .unwrap();
+        until(|| op.prepared());
+        op.proceed();
+        until(|| f.root.join("waiting").exists());
+        if cancel {
+            op.close();
+        }
+        let mut result = None;
+        until(|| {
+            result = op.poll();
+            result.is_some()
+        });
+        assert_eq!(
+            result,
+            Some(Err(if cancel {
+                Error::Canceled
+            } else {
+                Error::Expired
+            }))
+        );
+        assert!(
+            !op.finished(),
+            "a live child must retain exclusion after an error"
+        );
+        until(|| op.finished());
+        assert!(op.poll().is_none(), "a late reply cannot publish success");
+    }
+}
+
+#[test]
+fn removal_terminal_eof_can_arrive_after_the_request_write_budget() {
+    let f = Fixture::new();
+    let mut command = f.command(
+        r#"import json,socket,sys,time
+s=socket.socket(fileno=0)
+s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
+r=json.loads(s.makefile('rb').read())
+s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
+time.sleep(5.3)
+s.shutdown(socket.SHUT_WR);s.close()
+"#,
+    );
+    command.arg(env!("CARGO_PKG_VERSION"));
+    let mut op = Operation::fixture(
+        Kind::Remove,
+        command,
+        "delayed-eof".into(),
+        Locale::EnUs,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    until(|| op.prepared());
+    op.proceed();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !op.finished() {
+        assert!(Instant::now() < deadline, "remover did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        op.poll(),
+        Some(Ok(Receipt::Removed {
+            component_present: false
+        }))
+    );
+}
