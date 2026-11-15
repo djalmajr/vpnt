@@ -28,6 +28,49 @@ Windows e no Linux, com a mesma interface nos três.
 
 ## Desenvolvimento no macOS
 
+O canal é fixado no build por `VPNT_CHANNEL`: sem a variável, Cargo e todos
+os scripts macOS usam `dev`; produção exige `VPNT_CHANNEL=prd`. Valores vazios
+ou diferentes de `dev`/`prd` são recusados. A fonte comum é
+`native/identifier-channels.conf`, lida por `build.rs` e
+`scripts/macos/identifiers.py`:
+
+| Canal | Domínio | Base DNS reversa |
+| --- | --- | --- |
+| `dev` (padrão) | `vpnt-dev.djalmajr.dev` | `dev.djalmajr.vpnt-dev` |
+| `prd` (explícito) | `vpnt.djalmajr.dev` | `dev.djalmajr.vpnt` |
+
+App, helper, runtime, staging, adaptadores, pacote do componente, serviço de
+credenciais e domínio de preferências derivam dessa base, preservando seus
+sufixos. Login e notificações admitem o bundle do canal compilado. Os arquivos
+sudoers normalizam pontos/hífens da base para `_` (sudo ignora arquivos com
+ponto); seus aliases usam a mesma base normalizada em maiúsculas. O nome
+visível do aplicativo permanece VPN Tray. Não há migração de instalações
+anteriores.
+
+Para preparar produção futuramente, use a mesma seleção em toda a cadeia:
+
+```bash
+VPNT_CHANNEL=prd cargo build --locked --bins
+VPNT_CHANNEL=prd python3 scripts/macos/build-askpass.py
+VPNT_CHANNEL=prd python3 scripts/macos/build-runtime.py
+VPNT_CHANNEL=prd python3 scripts/macos/prepare-installation.py
+VPNT_CHANNEL=prd python3 scripts/macos/package-installation.py --payload "target/vpnt-installation/ID_DO_PAYLOAD"
+VPNT_CHANNEL=prd python3 scripts/macos/package-app.py --output target/prd/vpnt.app
+```
+
+Os empacotadores leem uma seção Mach-O gravada no build para recusar binários
+de outro canal, sem executá-los. Recompile também o runtime ao trocar o canal;
+um manifesto do outro canal é recusado. As saídas locais padrão continuam em
+`target/`; use `--output`/`--binary` no empacotador do app para conservar builds
+dos dois canais. `build-askpass.py` respeita `CARGO_TARGET_DIR`, e o preparador
+aceita `--build-dir CAMINHO/debug` para os adaptadores de um build isolado.
+
+**Limite de coexistência:** o estado privilegiado em
+`/Library/Application Support/vpnt` (perfis, locks, admissões, recibo e journal)
+continua compartilhado e exige uma decisão separada antes de instalar os dois
+canais juntos. Os testes de separação cobrem identificadores, ferramentas,
+serviço de credenciais e política, sem afirmar isolamento desse estado.
+
 Requer Rust 1.99, Bun 1.4.4, Xcode Command Line Tools e Python 3.11 ou superior
 para empacotar. Compile a interface antes do Rust: seus arquivos entram no binário.
 
@@ -45,7 +88,7 @@ Os cadastros e as senhas de demonstração ficam apenas na memória; não use da
 reais nele. Idioma e tema persistem como preferências locais da interface.
 Sem `--demo`, um worker separado atende a UI, consulta o helper e usa o chaveiro
 do usuário. O cliente preparado verifica o executável fixo e invoca somente
-`sudo -n -- /Library/PrivilegedHelperTools/dev.vpnt.helper runtime`, com canal
+`sudo -n -- /Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.helper runtime`, com canal
 duplex anônimo herdado em FD 0. Sem o componente ele apresenta o primeiro uso.
 Instalar/remover exige ação e confirmação explícitas; nunca ocorre ao abrir o
 app. Cadastro/remoção de perfis usa o canal administrativo separado descrito
@@ -203,7 +246,7 @@ preparada valida o pacote incluído, aguarda o controlador anterior encerrar e
 abre somente esse pacote no Installer. Conclua ou cancele lá e feche sua janela:
 o app aguarda o processo, confere o helper esperado e exige uma sessão nova
 compatível antes de confirmar sucesso. A remoção preparada usa somente
-`sudo -A -k -- /Library/PrivilegedHelperTools/dev.vpnt.install remove`, com canal
+`sudo -A -k -- /Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.install remove`, com canal
 anônimo, recibo e saída confirmados. Perfis e credenciais são mantidos.
 Prazo vencido não encerra o Installer/helper à força nem repete a operação;
 enquanto o filho vive, o app mostra a espera e recusa outra alteração. Sair
@@ -358,7 +401,7 @@ novo com intervalo crescente de um a 30 segundos. Exige novo snapshot e uma
 nova ação para conectar, sem repetir operações ou recarregar credenciais.
 O lock do helper continua exigido: saída do launcher não prova cleanup de rede.
 Salvar/remover perfis usa outro worker e um único comando fixo:
-`sudo -A -k -- /Library/PrivilegedHelperTools/dev.vpnt.helper admin`.
+`sudo -A -k -- /Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.helper admin`.
 O cliente valida helper e askpass em paths root fixos. O adaptador gráfico
 AppKit usa os mesmos catálogos pt-BR/en-US da UI; a senha da conta só vai para
 o pipe privado do sudo. O protocolo 3 exige AdminReady compatível antes de enviar

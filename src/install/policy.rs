@@ -16,9 +16,10 @@ pub fn sudoers(uid: u32, helper: &str, installer: &str) -> Result<String, Error>
     if !valid_hash(helper) || !valid_hash(installer) {
         return Err(Error::InvalidManifest);
     }
-    let runtime = format!("VPNT_{uid}_RUNTIME");
-    let admin = format!("VPNT_{uid}_ADMIN");
-    let remove = format!("VPNT_{uid}_REMOVE");
+    let namespace = crate::identifiers::POLICY_ALIAS;
+    let runtime = format!("{namespace}_{uid}_RUNTIME");
+    let admin = format!("{namespace}_{uid}_ADMIN");
+    let remove = format!("{namespace}_{uid}_REMOVE");
     Ok(format!(
         "# Managed by vpnt for numeric uid {uid}. No other command is authorized.\n\
 Cmnd_Alias {runtime} = sha256:{helper} {} runtime\n\
@@ -45,11 +46,18 @@ mod tests {
             .filter(|line| line.starts_with("#601 ALL="))
             .collect::<Vec<_>>();
         assert_eq!(grants.len(), 2);
-        assert!(grants[0].contains("NOPASSWD:") && grants[0].ends_with("VPNT_601_RUNTIME"));
+        assert!(
+            grants[0].contains("NOPASSWD:")
+                && grants[0]
+                    .ends_with(&format!("{}_601_RUNTIME", crate::identifiers::POLICY_ALIAS))
+        );
         assert!(
             grants[1].contains(" PASSWD:")
                 && !grants[1].contains("NOPASSWD")
-                && grants[1].ends_with("VPNT_601_ADMIN, VPNT_601_REMOVE")
+                && grants[1].ends_with(&format!(
+                    "{0}_601_ADMIN, {0}_601_REMOVE",
+                    crate::identifiers::POLICY_ALIAS
+                ))
         );
         for grant in grants {
             for tag in [

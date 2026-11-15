@@ -153,6 +153,7 @@ fn removal(f: &Fixture, case: &str) -> Operation {
     command
         .arg(env!("CARGO_PKG_VERSION"))
         .arg(case)
+        .arg(crate::helper::paths::ASKPASS)
         .env("VPNT_TEST_UNTRUSTED", "not inherited");
     let op = Operation::fixture(
         Kind::Remove,

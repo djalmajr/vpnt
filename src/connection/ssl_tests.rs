@@ -44,6 +44,7 @@ impl Fixture {
                     paths::runtime_directory().display()
                 ),
             ])
+            .arg(format!("-DPINENTRY_PATH=\"{}\"", paths::PINENTRY))
             .arg(root.join("tests/fixtures/ssl_client.c"))
             .arg("-o")
             .arg(&program)

@@ -130,7 +130,11 @@ impl Tree {
             if !version_ok(version) || (name != "manifest.json" && !runtime::valid_name(name)) {
                 return Err(Error::InvalidManifest);
             }
-            return Ok(self.tools.join("dev.vpnt.runtime").join(version).join(name));
+            return Ok(self
+                .tools
+                .join(crate::identifiers::RUNTIME)
+                .join(version)
+                .join(name));
         }
         if let Some(value) = key.strip_prefix("policy/") {
             let uid = value.parse::<u32>().map_err(|_| Error::InvalidManifest)?;
@@ -138,7 +142,9 @@ impl Tree {
                 return Err(Error::InvalidManifest);
             }
             policy::account(uid)?;
-            return Ok(self.policies.join(format!("dev_vpnt_{uid}")));
+            return Ok(self
+                .policies
+                .join(format!("{}_{uid}", crate::identifiers::POLICY_PREFIX)));
         }
         if key == "receipt" {
             return Ok(self.state.join(".installation.json"));

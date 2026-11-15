@@ -16,7 +16,7 @@ use crate::notifications::{Notice, Notifier};
 use objc2_foundation::NSBundle;
 use std::sync::atomic::Ordering;
 
-const BUNDLE_ID: &str = "dev.vpnt.app";
+const BUNDLE_ID: &str = crate::identifiers::APP;
 const MAX_ID: usize = 128;
 const MAX_TITLE: usize = 128;
 const MAX_BODY: usize = 512;

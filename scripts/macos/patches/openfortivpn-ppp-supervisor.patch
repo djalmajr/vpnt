@@ -5,7 +5,7 @@
  #endif
  
 +#ifdef __APPLE__
-+	static const char ppp_path[] = "/Library/PrivilegedHelperTools/dev.vpnt.pppd";
++	static const char ppp_path[] = VPNT_PPP_SUPERVISOR;
 +#else
  	static const char ppp_path[] = PPP_PATH;
 +#endif

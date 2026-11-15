@@ -16,7 +16,7 @@ static void exact(int fd, void *value, size_t count) {
 }
 int main(int argc,char **argv) {
     assert(argc==15 || argc==16);
-    const char *fixed[]={"--config=/dev/null","--no-routes","--no-dns","--pppd-no-peerdns","--pppd-accept-remote=0","--persistent=0","--username=fixture-user","--pinentry=/Library/PrivilegedHelperTools/dev.vpnt.pinentry"};
+    const char *fixed[]={"--config=/dev/null","--no-routes","--no-dns","--pppd-no-peerdns","--pppd-accept-remote=0","--persistent=0","--username=fixture-user","--pinentry=" PINENTRY_PATH};
     for (int i=0;i<8;i++) assert(strcmp(argv[i+1],fixed[i])==0);
     assert(strncmp(argv[9],"--ca-file=",10)==0);
     assert(strcmp(argv[10],"--ifname=lo0")==0);

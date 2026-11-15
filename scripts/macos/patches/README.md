@@ -53,7 +53,10 @@ O hash deste patch também é obrigatório na admissão do runtime.
 
 `openfortivpn-ppp-supervisor.patch` modifica o `pppd_run` Apple em `tunnel.c`
 da mesma versão: executa somente o caminho fixo
-`/Library/PrivilegedHelperTools/dev.vpnt.pppd`, sem fallback para pppd direto.
+derivado do canal (`/Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.pppd`
+no desenvolvimento), sem fallback para pppd direto. O patch exige a macro
+`VPNT_PPP_SUPERVISOR`; `runtime_sources.py` gera seu header a partir da mesma
+base usada no build Rust e o fornece ao compilador, sem opção de runtime.
 Registra PID/PTY próprios antes de uma possível falha de fcntl. O supervisor
 recebe o FD 4 herdado; seu receptor e o canal de senha FD 3 são preparados
 juntos pelo driver. O hash deste terceiro patch do openfortivpn é obrigatório

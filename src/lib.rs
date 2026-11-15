@@ -12,6 +12,7 @@ pub mod desktop;
 #[cfg(unix)]
 mod fs_permissions;
 pub mod helper;
+pub mod identifiers;
 #[cfg(unix)]
 pub mod install;
 #[cfg(target_os = "macos")]
