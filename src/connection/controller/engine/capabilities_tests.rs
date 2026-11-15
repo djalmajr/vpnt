@@ -77,6 +77,7 @@ fn capability_harness(
         connect: Duration::from_secs(5),
         probe: Duration::from_secs(1),
         interval: Duration::from_secs(60),
+        health: Duration::from_millis(2),
         poll: Duration::from_millis(2),
     };
     let worker = thread::spawn(move || run(factory, 501, profiles, requests, output, timing));

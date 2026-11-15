@@ -275,6 +275,7 @@ impl Harness {
             connect: Duration::from_secs(5),
             probe: Duration::from_secs(1),
             interval: Duration::from_secs(60),
+            health: Duration::from_millis(2),
             poll: Duration::from_millis(2),
         };
         let worker = thread::spawn(move || run(fixture, 501, profiles, requests, output, timing));
@@ -792,6 +793,7 @@ fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_e
                     connect: Duration::from_secs(5),
                     probe: Duration::from_secs(1),
                     interval: Duration::from_secs(60),
+                    health: Duration::from_millis(2),
                     poll: Duration::from_millis(2),
                 },
             )

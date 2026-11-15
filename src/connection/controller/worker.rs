@@ -100,12 +100,18 @@ pub(super) fn run(
         }
         send(ConnectionState::Verifying, 0, false);
         let mut last_probe: Option<Instant> = None;
+        let mut last_health: Option<Instant> = None;
         let mut failures = 0_u32;
         loop {
             if canceled() {
                 return Ok(());
             }
-            attempt.healthy()?;
+            // Keep command/cancel polling responsive without revalidating the
+            // native link and route leases on every poll. The first is immediate.
+            if last_health.is_none_or(|last| last.elapsed() >= timing.health) {
+                attempt.healthy()?;
+                last_health = Some(Instant::now());
+            }
             if canceled() {
                 return Ok(());
             }
@@ -123,6 +129,7 @@ pub(super) fn run(
                 // Revalidate leases and the owned link after the asynchronous
                 // traffic test. A successful, now-stale probe proves nothing.
                 attempt.healthy()?;
+                last_health = Some(Instant::now());
                 if canceled() {
                     return Ok(());
                 }

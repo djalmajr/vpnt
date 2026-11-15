@@ -1,7 +1,7 @@
 use super::*;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, atomic::AtomicUsize},
+    sync::{Arc, Mutex, atomic::AtomicUsize, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -77,11 +77,244 @@ fn timing(connect: Duration) -> Timing {
         connect,
         probe: Duration::from_secs(1),
         interval: Duration::from_secs(1),
+        health: Duration::from_millis(100),
         poll: Duration::from_millis(5),
     }
 }
 fn clock(seconds: u64) -> ProbeClock {
     ProbeClock::new(Duration::from_secs(seconds))
+}
+
+#[derive(Debug)]
+enum HealthEvent {
+    Healthy(Instant),
+    Probe,
+    Cleanup(Progress),
+}
+
+struct HealthAttempt {
+    events: mpsc::Sender<HealthEvent>,
+    state: Arc<Mutex<Option<Progress>>>,
+    calls: usize,
+    fail_on: usize,
+}
+impl Attempt for HealthAttempt {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn ready(&mut self) -> Result<bool, Failure> {
+        Ok(true)
+    }
+    fn healthy(&mut self) -> Result<(), Failure> {
+        self.calls += 1;
+        self.events
+            .send(HealthEvent::Healthy(Instant::now()))
+            .unwrap();
+        if self.calls == self.fail_on {
+            Err(Failure::unavailable())
+        } else {
+            Ok(())
+        }
+    }
+    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+        self.events.send(HealthEvent::Probe).unwrap();
+        Ok(true)
+    }
+    fn cleanup(&mut self) -> bool {
+        self.events
+            .send(HealthEvent::Cleanup(self.state.lock().unwrap().unwrap()))
+            .unwrap();
+        true
+    }
+}
+
+struct HealthRun {
+    canceled: Arc<AtomicBool>,
+    probe: Arc<AtomicBool>,
+    state: Arc<Mutex<Option<Progress>>>,
+    events: mpsc::Receiver<HealthEvent>,
+    worker: Option<thread::JoinHandle<Finished>>,
+    /// Bound for a check that must follow its trigger at once (initial and
+    /// post-probe), kept well below `health` so the next periodic check can
+    /// never stand in for a missing mandatory revalidation.
+    prompt: Duration,
+}
+impl HealthRun {
+    fn start(poll: Duration, health: Duration, fail_on: usize) -> Self {
+        let signals = signals(Arc::new(AtomicBool::new(false)));
+        let (events, receiver) = mpsc::channel();
+        let attempt = HealthAttempt {
+            events,
+            state: signals.state.clone(),
+            calls: 0,
+            fail_on,
+        };
+        let mut run = Self {
+            canceled: signals.canceled.clone(),
+            probe: signals.probe.clone(),
+            state: signals.state.clone(),
+            events: receiver,
+            worker: None,
+            prompt: (poll * 4).max(Duration::from_millis(50)).min(health / 4),
+        };
+        let timing = Timing {
+            poll,
+            health,
+            ..timing(Duration::from_secs(1))
+        };
+        run.worker = Some(thread::spawn(move || {
+            super::run(attempt, signals, timing, clock(3600))
+        }));
+        run
+    }
+    fn event(&self) -> HealthEvent {
+        self.events.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+    fn healthy(&self) -> Instant {
+        match self.event() {
+            HealthEvent::Healthy(at) => at,
+            other => panic!("expected health check, received {other:?}"),
+        }
+    }
+    fn healthy_promptly(&self) -> Instant {
+        match self.events.recv_timeout(self.prompt) {
+            Ok(HealthEvent::Healthy(at)) => at,
+            other => panic!("expected an immediate health check, received {other:?}"),
+        }
+    }
+    fn initial_probe(&self) -> Instant {
+        self.healthy_promptly(); // The first connected-loop health check is immediate.
+        assert!(matches!(self.event(), HealthEvent::Probe));
+        // A separate mandatory revalidation follows the probe at once; the
+        // periodic check is at least `health` away and cannot satisfy this.
+        self.healthy_promptly()
+    }
+    fn quiet_for(&self, duration: Duration) {
+        assert!(matches!(
+            self.events.recv_timeout(duration),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+    }
+    fn finish(&mut self) -> Finished {
+        self.worker.take().unwrap().join().unwrap()
+    }
+    fn assert_dropped(&mut self) {
+        match self.event() {
+            HealthEvent::Cleanup(progress) => assert_eq!(
+                progress,
+                Progress {
+                    state: ConnectionState::Dropped,
+                    failures: 0,
+                    cleaning: true,
+                }
+            ),
+            other => panic!("expected failure cleanup, received {other:?}"),
+        }
+        let finished = self.finish();
+        assert_eq!(finished.state, ConnectionState::Dropped);
+        assert_eq!(finished.error, Some(ErrorCode::BackendFailure));
+        assert!(self.canceled.load(Ordering::Acquire));
+        assert_eq!(
+            *self.state.lock().unwrap(),
+            Some(Progress {
+                state: ConnectionState::Dropped,
+                failures: 0,
+                cleaning: false,
+            })
+        );
+    }
+}
+impl Drop for HealthRun {
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[test]
+fn connected_health_is_immediate_then_counted_by_health_cadence_not_poll() {
+    let health = Duration::from_millis(400);
+    let run = HealthRun::start(Duration::from_millis(5), health, 0);
+    let last = run.initial_probe();
+    // Exactly two health calls (initial + post-probe), despite at least forty
+    // poll periods in this observation window. Then periodic health must resume.
+    run.quiet_for(health / 2);
+    let next = run.healthy();
+    assert!(next.duration_since(last) >= health);
+    run.quiet_for(health / 2);
+}
+
+#[test]
+fn connected_health_wait_keeps_cancellation_within_one_poll() {
+    let poll = Duration::from_millis(200);
+    let mut run = HealthRun::start(poll, Duration::from_secs(1), 0);
+    run.initial_probe();
+    // Observe the worker waiting between polls before canceling. This leaves
+    // scheduling margin while still bounding the actual response by one poll.
+    run.quiet_for(poll / 2);
+    let canceled_at = Instant::now();
+    run.canceled.store(true, Ordering::Release);
+    let finished = run.finish();
+    assert!(canceled_at.elapsed() <= poll);
+    assert_eq!(finished.state, ConnectionState::Off);
+    assert_eq!(finished.error, None);
+    assert!(matches!(
+        run.event(),
+        HealthEvent::Cleanup(Progress {
+            state: ConnectionState::Disconnecting,
+            cleaning: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn connected_health_command_probe_is_prompt_revalidated_and_resets_health_clock() {
+    let poll = Duration::from_millis(10);
+    let health = Duration::from_millis(400);
+    let run = HealthRun::start(poll, health, 0);
+    run.initial_probe();
+    run.quiet_for(health / 2);
+    run.probe.store(true, Ordering::Release);
+    assert!(matches!(
+        run.events.recv_timeout(poll * 4).unwrap(),
+        HealthEvent::Probe
+    ));
+    let revalidated = run.healthy_promptly();
+    // Cross the old deadline without another check; only the post-probe
+    // revalidation's new deadline should trigger the next periodic check.
+    run.quiet_for(health * 3 / 4);
+    assert!(run.healthy().duration_since(revalidated) >= health);
+}
+
+#[test]
+fn connected_health_initial_or_periodic_failure_preserves_dropped_and_cleanup() {
+    for fail_on in [1, 3] {
+        let mut run = HealthRun::start(
+            Duration::from_millis(5),
+            Duration::from_millis(400),
+            fail_on,
+        );
+        if fail_on == 3 {
+            run.initial_probe();
+        }
+        run.healthy();
+        run.assert_dropped();
+    }
+}
+
+#[test]
+fn connected_health_post_command_probe_failure_preserves_dropped_and_cleanup() {
+    let mut run = HealthRun::start(Duration::from_millis(5), Duration::from_secs(1), 3);
+    run.initial_probe();
+    run.probe.store(true, Ordering::Release);
+    assert!(matches!(run.event(), HealthEvent::Probe));
+    // The failing third call must be the immediate post-probe revalidation,
+    // which precedes any Connected publication for that probe.
+    run.healthy_promptly();
+    run.assert_dropped();
 }
 
 #[test]
