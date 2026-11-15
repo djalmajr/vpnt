@@ -66,12 +66,16 @@
   --menu-item-y: 5px;
   --icon-menu: 15px;
   --icon-inline: 13px;
+  --icon-help: 12px;
+  --hint-max-width: 200px;
+  --hint-bg: #4a4a4a;
   --border-width: 1px;
   --focus-width: 2px;
   --scrim: rgb(0 0 0 / 24%);
   --spinner-duration: 1s;
 }
 .dark {
+  --hint-bg: #383838;
   color-scheme: dark;
   --surface: #1e1e1e;
   --card: #292929;
@@ -318,6 +322,41 @@ h2 {
   min-width: 0;
   font-size: var(--font-label);
 }
+.setting-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+.help-trigger {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--secondary);
+}
+.help-trigger .icon {
+  width: var(--icon-help);
+  height: var(--icon-help);
+}
+.help-tooltip {
+  position: fixed;
+  z-index: 2;
+  width: max-content;
+  max-width: min(var(--hint-max-width), calc(100vw - 2 * var(--space-md)));
+  max-height: calc(100vh - 2 * var(--space-md));
+  overflow: auto;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--hint-bg);
+  color: var(--white);
+  font-size: var(--font-control);
+  line-height: var(--line-height);
+  font-weight: 400;
+  text-align: left;
+  box-shadow: var(--shadow-menu);
+}
+.dark .help-tooltip {
+  color: var(--text);
+}
 .setting-row small,
 .profile-row small {
   display: block;
@@ -547,6 +586,13 @@ h2 {
   flex-shrink: 0;
 }
 .card-cancel {
+  flex-shrink: 0;
+  background: transparent;
+  --button-hover: var(--menu-hover);
+  min-height: 0;
+  font-size: var(--font-body);
+  line-height: inherit;
+  color: var(--secondary);
   border-radius: var(--radius-control);
   padding: 0 var(--space-xs);
 }

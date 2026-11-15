@@ -28,6 +28,8 @@ export function VpnCard({
     "missing_program",
     "disconnecting",
   ].includes(state);
+  const cancelable = state === "connecting" || state === "reconnecting";
+  const CardBody = cancelable ? "div" : "button";
   const on = active(state);
   const warning = [
     "unresponsive",
@@ -58,6 +60,7 @@ export function VpnCard({
               ? "programHint"
               : null;
   const principal = () => {
+    if (cancelable) return;
     if (state === "missing_secret") {
       secrets();
       return;
@@ -72,13 +75,15 @@ export function VpnCard({
   };
   return (
     <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
-      <button
-        type="button"
+      <CardBody
+        type={cancelable ? undefined : "button"}
         className="card-toggle"
-        disabled={disabled}
-        onClick={principal}
-        aria-label={`${profile.name}: ${t(`state.${state}`)}`}
-        aria-pressed={on}
+        disabled={cancelable ? undefined : disabled}
+        onClick={cancelable ? undefined : principal}
+        aria-label={
+          cancelable ? undefined : `${profile.name}: ${t(`state.${state}`)}`
+        }
+        aria-pressed={cancelable ? undefined : on}
       >
         <span className="card-heading">
           <span className="identity">
@@ -102,11 +107,18 @@ export function VpnCard({
             </span>
             <span>{t(`state.${state}`)}</span>
           </span>
-          {["connecting", "reconnecting"].includes(state) && (
-            <small className="card-cancel">{t("cancel")}</small>
+          {cancelable && (
+            <button
+              type="button"
+              className="card-cancel"
+              onClick={() => void run({ type: "disconnect", id: profile.id })}
+              aria-label={t("cancel")}
+            >
+              {t("cancel")}
+            </button>
           )}
         </span>
-      </button>
+      </CardBody>
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>
           <p>{t(hint)}</p>

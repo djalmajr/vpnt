@@ -1,9 +1,13 @@
 import {
   type ReactNode,
   type SelectHTMLAttributes,
+  useId,
   useLayoutEffect,
   useRef,
+  useState,
 } from "react";
+import { createPortal } from "react-dom";
+import { helpPosition } from "../helpPosition";
 import type { MessageKey } from "../i18n";
 
 export type T = (
@@ -23,6 +27,7 @@ const paths = {
   refresh:
     "M3 12a9 9 0 0 1 15-6.7L21 8 M21 3v5h-5 M21 12a9 9 0 0 1-15 6.7L3 16 M3 21v-5h5",
   log: "M4 17l6-5-6-5 M12 19h8",
+  help: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z M9.5 9a2.5 2.5 0 1 1 4.3 1.7C12.6 11.5 12 12 12 13.5 M12 17v.01",
   info: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z M12 11v5 M12 7.5v.01",
   power: "M12 3v9 M18.36 6.64a9 9 0 1 1-12.73 0",
   quit: "M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4 M10 17l5-5-5-5 M15 12H3",
@@ -48,6 +53,90 @@ export function Icon({
     >
       <path d={paths[name]} />
     </svg>
+  );
+}
+export function Help({ text }: { text: string }) {
+  const id = useId();
+  const trigger = useRef<HTMLSpanElement>(null);
+  const content = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ left: 0, top: 0 });
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const anchor = trigger.current;
+      const tip = content.current;
+      if (!anchor || !tip) return;
+      const padding = Number.parseFloat(
+        getComputedStyle(tip).getPropertyValue("--space-md"),
+      );
+      setPosition(
+        helpPosition(
+          anchor.getBoundingClientRect(),
+          tip.getBoundingClientRect(),
+          { width: window.innerWidth, height: window.innerHeight },
+          padding,
+        ),
+      );
+    };
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    if (trigger.current) observer.observe(trigger.current);
+    if (content.current) observer.observe(content.current);
+    window.addEventListener("resize", place);
+    document.addEventListener("scroll", place, true);
+    document.addEventListener("keydown", onEscape);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", place);
+      document.removeEventListener("scroll", place, true);
+      document.removeEventListener("keydown", onEscape);
+    };
+  }, [open]);
+  const leave = (target: EventTarget | null, keepFocus = false) => {
+    if (keepFocus && document.activeElement === trigger.current) return;
+    if (
+      target instanceof Node &&
+      (trigger.current?.contains(target) || content.current?.contains(target))
+    )
+      return;
+    setOpen(false);
+  };
+  return (
+    <>
+      <span
+        ref={trigger}
+        className="help-trigger"
+        role="img"
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: The reference help icon must reveal its tooltip to keyboard users.
+        tabIndex={0}
+        aria-label={text}
+        aria-describedby={open ? id : undefined}
+        onPointerEnter={() => setOpen(true)}
+        onPointerLeave={(event) => leave(event.relatedTarget, true)}
+        onFocus={() => setOpen(true)}
+        onBlur={(event) => leave(event.relatedTarget)}
+      >
+        <Icon name="help" />
+      </span>
+      {open &&
+        createPortal(
+          <span
+            ref={content}
+            id={id}
+            role="tooltip"
+            className="help-tooltip"
+            style={position}
+            onPointerLeave={(event) => leave(event.relatedTarget, true)}
+          >
+            {text}
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 /* A real native <select>: the platform popup and keyboard semantics stay with
@@ -139,16 +228,21 @@ export function Toggle({
 export function Row({
   label,
   hint,
+  help,
   children,
 }: {
   label: string;
   hint?: string;
+  help?: string;
   children?: ReactNode;
 }) {
   return (
     <div className="setting-row">
       <span>
-        {label}
+        <span className="setting-label">
+          {label}
+          {help && <Help text={help} />}
+        </span>
         {hint && <small>{hint}</small>}
       </span>
       {children}

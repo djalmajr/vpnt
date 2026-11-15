@@ -50,6 +50,14 @@ const en = {
   light: "Light",
   dark: "Dark",
   startAtLogin: "Open at login",
+  testEveryHelp:
+    "How often VPN Tray checks that each connected tunnel still carries traffic.",
+  notifyStaleHelp:
+    "Shows a notification when a connected tunnel stops carrying traffic.",
+  autoReconnectHelp:
+    "After 3 failed checks in a row, VPN Tray disconnects the tunnel and connects it again.",
+  componentHelp:
+    "A small privileged component starts and stops tunnels only for the registered VPN profiles. Installing or removing it asks for an administrator password.",
   tunnelTest: "Tunnel test",
   testEvery: "Test every",
   seconds: "{count} s",
@@ -239,6 +247,14 @@ const pt: Record<MessageKey, string> = {
   light: "Claro",
   dark: "Escuro",
   startAtLogin: "Abrir ao iniciar a sessão",
+  testEveryHelp:
+    "Intervalo em que o VPN Tray verifica se cada túnel conectado ainda passa tráfego.",
+  notifyStaleHelp:
+    "Mostra uma notificação quando um túnel conectado para de passar tráfego.",
+  autoReconnectHelp:
+    "Depois de 3 testes seguidos com falha, o VPN Tray desliga o túnel e conecta de novo.",
+  componentHelp:
+    "Um pequeno componente privilegiado inicia e encerra túneis somente dos perfis de VPN cadastrados. Instalar ou remover pede a senha de administrador.",
   tunnelTest: "Teste do túnel",
   testEvery: "Testar a cada",
   seconds: "{count} s",

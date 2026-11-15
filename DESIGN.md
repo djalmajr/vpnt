@@ -31,6 +31,7 @@ colors:
   info-fg: "#00529e"
   white: "#ffffff"
   scrim: "rgb(0 0 0 / 24%)"
+  hint-bg: "#4a4a4a"
 typography:
   font-family: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
   font-body: "13px"
@@ -70,6 +71,8 @@ x-layout:
   menu-item-y: "5px"
   icon-menu: "15px"
   icon-inline: "13px"
+  icon-help: "12px"
+  hint-max-width: "200px"
   border-width: "1px"
   focus-width: "2px"
 x-opacity:
@@ -78,6 +81,7 @@ x-opacity:
 x-motion:
   spinner-duration: "1s"
 darkColors:
+  hint-bg: "#383838"
   surface: "#1e1e1e"
   card: "#292929"
   menu: "#2b2b2b"
@@ -142,6 +146,7 @@ x-parity:
     colors.info-fg: { selector: ":root", var: "--info-fg" }
     colors.white: { selector: ":root", var: "--white" }
     colors.scrim: { selector: ":root", var: "--scrim" }
+    colors.hint-bg: { selector: ":root", var: "--hint-bg" }
     typography.font-family: { selector: ":root", var: "--font-family" }
     typography.font-body: { selector: ":root", var: "--font-body" }
     typography.font-label: { selector: ":root", var: "--font-label" }
@@ -176,11 +181,14 @@ x-parity:
     x-layout.menu-item-y: { selector: ":root", var: "--menu-item-y" }
     x-layout.icon-menu: { selector: ":root", var: "--icon-menu" }
     x-layout.icon-inline: { selector: ":root", var: "--icon-inline" }
+    x-layout.icon-help: { selector: ":root", var: "--icon-help" }
+    x-layout.hint-max-width: { selector: ":root", var: "--hint-max-width" }
     x-layout.border-width: { selector: ":root", var: "--border-width" }
     x-layout.focus-width: { selector: ":root", var: "--focus-width" }
     x-opacity.dim-opacity: { selector: ":root", var: "--dim-opacity" }
     x-opacity.hover-brightness: { selector: ":root", var: "--hover-brightness" }
     x-motion.spinner-duration: { selector: ":root", var: "--spinner-duration" }
+    darkColors.hint-bg: { selector: ".dark", var: "--hint-bg" }
     darkColors.surface: { selector: ".dark", var: "--surface" }
     darkColors.card: { selector: ".dark", var: "--card" }
     darkColors.menu: { selector: ".dark", var: "--menu" }
@@ -340,7 +348,8 @@ nas preferências, em ambos os temas.
 
 ## Components
 
-O cartão inteiro oferece a ação principal. Durante conexão, clicar cancela.
+O cartão inteiro oferece a ação principal fora de conexão e reconexão. Durante
+esses dois estados, o corpo é estático e somente o botão Cancelar cancela.
 Sem resposta oferece Reconectar como ação principal e Desligar separadamente.
 Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
 nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
@@ -351,7 +360,23 @@ indicador do cartão; clicar na conexão continua abrindo o diálogo de segredos
 sem aviso ou botão adicional abaixo dele. O corpo do cartão não ganha fundo
 interno no hover. Durante conexão ou reconexão, somente a área de Cancelar
 recebe `menu-hover`, com o raio de controle e recuo horizontal `space-xs`.
-A ação principal e o foco por teclado do cartão inteiro permanecem os mesmos.
+Durante conexão e reconexão, Cancelar é um botão real com foco próprio; o
+corpo do cartão não envia comandos e não entra na ordem de foco. Nos demais
+estados, a ação principal e o foco por teclado do cartão inteiro permanecem.
+O interruptor continua vindo do snapshot autoritativo, sem atualização otimista.
+
+As quatro linhas não triviais das Preferências usam o componente compartilhado
+`Help`: ícone de interrogação ao lado do rótulo, com tamanho `icon-help` de
+12 px e cor `secondary`, como na referência ai-usagebar. A dica abre por
+ponteiro e foco, fecha com Escape e usa o texto traduzido como nome acessível,
+sem `title`. O portal no `body` acompanha rolagem e resize; o posicionamento
+colide com o viewport com margem `space-md`, invertendo o lado quando preciso.
+A largura máxima `hint-max-width` de 200 px e o fundo `hint-bg` vêm da
+referência, pois não havia papéis equivalentes. O texto reutiliza `white` no
+claro e `text` no escuro. Reutiliza texto de controle, raio pequeno, sombra
+de menu e recuo `space-sm`/`space-md`.
+A altura e a largura também respeitam o viewport menos duas margens; a dica
+rola se não couber. Não há seta nem token de deslocamento adicional.
 
 O menu de opções é um componente compartilhado (`Menu`, `MenuItem`,
 `MenuSeparator`) sobre o mesmo primitivo Radix da referência

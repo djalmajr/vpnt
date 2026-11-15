@@ -75,7 +75,7 @@ export function Preferences({
       </Group>
       <h2 className="section-title">{t("tunnelTest")}</h2>
       <Group>
-        <Row label={t("testEvery")}>
+        <Row label={t("testEvery")} help={t("testEveryHelp")}>
           <Select
             aria-label={t("testEvery")}
             value={settings.interval}
@@ -94,7 +94,7 @@ export function Preferences({
             ))}
           </Select>
         </Row>
-        <Row label={t("notifyStale")}>
+        <Row label={t("notifyStale")} help={t("notifyStaleHelp")}>
           <Toggle
             label={t("notifyStale")}
             checked={settings.notify}
@@ -102,7 +102,11 @@ export function Preferences({
             onChange={(value) => set("notify", value)}
           />
         </Row>
-        <Row label={t("autoReconnect")} hint={t("afterThree")}>
+        <Row
+          label={t("autoReconnect")}
+          hint={t("afterThree")}
+          help={t("autoReconnectHelp")}
+        >
           <Toggle
             label={t("autoReconnect")}
             checked={settings.reconnect}
@@ -139,6 +143,7 @@ export function Preferences({
       <h2 className="section-title">{t("administrator")}</h2>
       <Group>
         <Row
+          help={t("componentHelp")}
           label={t(
             snapshot.helper === "installed"
               ? "helperInstalled"

@@ -25,6 +25,7 @@ export function Log({
     snapshot.vpns.find((vpn) => vpn.profile.id === selected) ??
     snapshot.vpns[0];
   const selectedId = vpn?.profile.id;
+  const multiple = snapshot.vpns.length > 1;
   const tabId = (id: string) => `${panelId}-${id}`;
   const lines =
     vpn?.log.map(
@@ -48,52 +49,57 @@ export function Log({
         }
         t={t}
       />
-      <div className="tabs" role="tablist" aria-label={t("vpns")}>
-        {snapshot.vpns.map((vpn) => (
-          <button
-            type="button"
-            key={vpn.profile.id}
-            role="tab"
-            id={tabId(vpn.profile.id)}
-            aria-controls={panelId}
-            aria-selected={vpn.profile.id === selectedId}
-            tabIndex={vpn.profile.id === selectedId ? 0 : -1}
-            className={vpn.profile.id === selectedId ? "primary" : ""}
-            onKeyDown={(event) => {
-              const tabs = Array.from(
-                event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
-                  "[role=tab]",
-                ) ?? [],
-              );
-              const index = tabs.indexOf(event.currentTarget);
-              const next =
-                event.key === "ArrowRight"
-                  ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft"
-                    ? (index - 1 + tabs.length) % tabs.length
-                    : event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? tabs.length - 1
-                        : -1;
-              if (next < 0) return;
-              event.preventDefault();
-              tabs[next]?.focus();
-              tabs[next]?.click();
-            }}
-            onClick={() => {
-              setSelected(vpn.profile.id);
-              setCopied(false);
-            }}
-          >
-            {vpn.profile.name}
-          </button>
-        ))}
-      </div>
+      {multiple ? (
+        <div className="tabs" role="tablist" aria-label={t("vpns")}>
+          {snapshot.vpns.map((vpn) => (
+            <button
+              type="button"
+              key={vpn.profile.id}
+              role="tab"
+              id={tabId(vpn.profile.id)}
+              aria-controls={panelId}
+              aria-selected={vpn.profile.id === selectedId}
+              tabIndex={vpn.profile.id === selectedId ? 0 : -1}
+              className={vpn.profile.id === selectedId ? "primary" : ""}
+              onKeyDown={(event) => {
+                const tabs = Array.from(
+                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                    "[role=tab]",
+                  ) ?? [],
+                );
+                const index = tabs.indexOf(event.currentTarget);
+                const next =
+                  event.key === "ArrowRight"
+                    ? (index + 1) % tabs.length
+                    : event.key === "ArrowLeft"
+                      ? (index - 1 + tabs.length) % tabs.length
+                      : event.key === "Home"
+                        ? 0
+                        : event.key === "End"
+                          ? tabs.length - 1
+                          : -1;
+                if (next < 0) return;
+                event.preventDefault();
+                tabs[next]?.focus();
+                tabs[next]?.click();
+              }}
+              onClick={() => {
+                setSelected(vpn.profile.id);
+                setCopied(false);
+              }}
+            >
+              {vpn.profile.name}
+            </button>
+          ))}
+        </div>
+      ) : vpn ? (
+        <strong id={tabId(vpn.profile.id)}>{vpn.profile.name}</strong>
+      ) : null}
       <div
         id={panelId}
         role="tabpanel"
         aria-labelledby={vpn ? tabId(vpn.profile.id) : undefined}
+        aria-label={vpn ? undefined : t("log")}
         // biome-ignore lint/a11y/noNoninteractiveTabindex: Static log panels need keyboard focus for scrolling (ARIA APG tabs pattern).
         tabIndex={0}
       >

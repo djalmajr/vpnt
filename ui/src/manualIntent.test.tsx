@@ -73,18 +73,17 @@ function buttons(tree: ReactNode): ReactElement[] {
 }
 
 function principal(tree: ReactNode): ReactElement {
-  const matches = buttons(tree).filter(
-    (button) => props(button).className === "card-toggle",
-  );
+  const matches: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (props(element).className === "card-toggle") matches.push(element);
+  });
   expect(matches).toHaveLength(1);
   return matches[0];
 }
 
 function click(element: ReactElement) {
   const handler = props(element).onClick;
-  if (typeof handler !== "function")
-    throw new Error("element has no onClick handler");
-  (handler as () => void)();
+  if (typeof handler === "function") (handler as () => void)();
 }
 
 function card(state: ConnectionState) {
@@ -128,6 +127,12 @@ describe("intenção explícita do cartão de VPN", () => {
       const expected = intent(state);
       // Disabled states are unreachable through the DOM; the handler contract
       // still has to name the user's direction, not the latest snapshot.
+      if (state === "connecting" || state === "reconnecting") {
+        expect(props(principal(s.tree)).onClick).toBeUndefined();
+        click(principal(s.tree));
+        expect(s.commands).toHaveLength(0);
+        continue;
+      }
       click(principal(s.tree));
       if (expected === "secrets") {
         expect(s.commands).toHaveLength(0);
@@ -143,6 +148,11 @@ describe("intenção explícita do cartão de VPN", () => {
   test("cartões desabilitados seguem desabilitados e o rótulo/pressed continuam", () => {
     for (const state of states) {
       const button = principal(card(state).tree);
+      if (state === "connecting" || state === "reconnecting") {
+        expect(button.type).toBe("div");
+        expect(props(button)["aria-pressed"]).toBeUndefined();
+        continue;
+      }
       expect(props(button).disabled).toBe(
         [
           "offline",
@@ -155,6 +165,39 @@ describe("intenção explícita do cartão de VPN", () => {
       expect(props(button)["aria-label"]).toBe(
         `${profile.name}: ${t(`state.${state}`)}`,
       );
+    }
+  });
+
+  // Regression: the whole connecting card used to cancel; Cancel was only text.
+  test("só Cancelar desliga durante conexão e reconexão", () => {
+    for (const state of ["connecting", "reconnecting"] as const) {
+      const s = card(state);
+      const body = principal(s.tree);
+      expect(body.type).toBe("div");
+      expect(props(body).onClick).toBeUndefined();
+      expect(props(body).tabIndex).toBeUndefined();
+      click(body);
+      expect(s.commands).toEqual([]);
+      const cancel = buttons(s.tree);
+      expect(cancel).toHaveLength(1);
+      expect(props(cancel[0]).type).toBe("button");
+      expect(props(cancel[0])["aria-label"]).toBe(t("cancel"));
+      expect(props(cancel[0]).disabled).not.toBe(true);
+      expect(props(cancel[0]).tabIndex).not.toBe(-1);
+      click(cancel[0]);
+      expect(s.commands).toEqual([{ type: "disconnect", id: profile.id }]);
+    }
+  });
+
+  test("fora da espera o cartão preserva connect e disconnect", () => {
+    for (const state of ["off", "connected"] as const) {
+      const s = card(state);
+      expect(principal(s.tree).type).toBe("button");
+      click(principal(s.tree));
+      expect(s.commands).toEqual([
+        { type: state === "off" ? "connect" : "disconnect", id: profile.id },
+      ]);
+      expect(buttons(s.tree)).toHaveLength(1);
     }
   });
 
