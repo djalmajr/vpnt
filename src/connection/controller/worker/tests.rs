@@ -13,6 +13,7 @@ struct Counters {
     probe: usize,
     cleanup: usize,
     cleanup_failures: usize,
+    cleanup_times: Vec<Instant>,
     start_expires: Option<Instant>,
 }
 
@@ -54,6 +55,7 @@ impl Attempt for Scripted {
     fn cleanup(&mut self) -> bool {
         let mut counters = self.counters.lock().unwrap();
         counters.cleanup += 1;
+        counters.cleanup_times.push(Instant::now());
         if counters.cleanup_failures > 0 {
             counters.cleanup_failures -= 1;
             return false;
@@ -196,6 +198,51 @@ fn timeout_waits_for_cleanup_success() {
         counters.lock().unwrap().cleanup >= 3,
         "cleanup was skipped or not retried"
     );
+}
+
+#[test]
+fn cleanup_retries_back_off_and_cap_at_one_second() {
+    for delays in [
+        vec![
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ],
+        vec![
+            Duration::from_millis(600),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ],
+    ] {
+        let counters = Arc::new(Mutex::new(Counters {
+            cleanup_failures: delays.len(),
+            ..Counters::default()
+        }));
+        let canceled = Arc::new(AtomicBool::new(true));
+        let attempt = Scripted {
+            canceled: canceled.clone(),
+            counters: counters.clone(),
+            start_delay: Duration::ZERO,
+            ready_delay: Duration::ZERO,
+            ready: true,
+            cancel_on_start: false,
+            fail_healthy: false,
+        };
+        let mut timing = timing(Duration::from_secs(1));
+        timing.poll = delays[0];
+        let finished = run(attempt, signals(canceled), timing, clock(1));
+        assert_eq!(finished.state, ConnectionState::Off);
+        let counters = counters.lock().unwrap();
+        assert_eq!(counters.cleanup, delays.len() + 1);
+        for (pair, expected) in counters.cleanup_times.windows(2).zip(delays) {
+            let elapsed = pair[1].duration_since(pair[0]);
+            assert!(elapsed >= expected, "cleanup retried before {expected:?}");
+            assert!(
+                elapsed < expected + Duration::from_millis(400),
+                "cleanup backoff exceeded its cap: {elapsed:?}"
+            );
+        }
+    }
 }
 
 /// Scripted traffic probe outcomes, consumed in order; an exhausted script
@@ -347,4 +394,99 @@ fn shortening_the_live_clock_makes_the_next_timer_probe_due_from_the_last_probe(
     signal.progress(3, |progress| progress.state == ConnectionState::Connected);
     canceled.store(true, Ordering::Release);
     assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+}
+
+/// Read the published slot from inside cleanup, so no scheduler can skip the
+/// pre-cleanup status; after run returns the same slot must hold the finish.
+#[test]
+fn cleanup_publications_preserve_failure_and_only_user_cancel_disconnects() {
+    struct Observe {
+        state: Arc<Mutex<Option<Progress>>>,
+        observed: Arc<Mutex<Vec<Progress>>>,
+        failure: Option<ConnectionState>,
+    }
+    impl Attempt for Observe {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            Err(Failure {
+                state: self.failure.unwrap(),
+                error: ErrorCode::BackendFailure,
+            })
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            unreachable!()
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            unreachable!()
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            unreachable!()
+        }
+        fn cleanup(&mut self) -> bool {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(self.state.lock().unwrap().unwrap());
+            self.observed.lock().unwrap().len() == 3
+        }
+    }
+    for failure in [
+        Some(ConnectionState::GatewayTimeout),
+        Some(ConnectionState::CredentialsRejected),
+        Some(ConnectionState::Dropped),
+        Some(ConnectionState::MissingProgram),
+        None,
+    ] {
+        let signals = signals(Arc::new(AtomicBool::new(failure.is_none())));
+        let state = signals.state.clone();
+        let observed = Arc::new(Mutex::new(vec![]));
+        let result = run(
+            Observe {
+                state: state.clone(),
+                observed: observed.clone(),
+                failure,
+            },
+            signals,
+            timing(Duration::from_secs(1)),
+            clock(1),
+        );
+        let before = Progress {
+            state: failure.unwrap_or(ConnectionState::Disconnecting),
+            failures: 0,
+            cleaning: failure.is_some(),
+        };
+        assert_eq!(*observed.lock().unwrap(), vec![before; 3]);
+        assert_eq!(result.state, failure.unwrap_or(ConnectionState::Off));
+        if failure.is_some() {
+            assert_eq!(
+                *state.lock().unwrap(),
+                Some(Progress {
+                    cleaning: false,
+                    ..before
+                })
+            );
+        }
+    }
+}
+#[test]
+fn cleanup_backoff_switches_caps_at_thirty_seconds_without_a_terminal_deadline() {
+    assert_eq!(
+        cleanup_delay(Duration::from_secs(1), Duration::from_secs(29)),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        cleanup_delay(Duration::from_secs(1), Duration::from_secs(30)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        cleanup_delay(Duration::from_secs(2), Duration::from_secs(32)),
+        Duration::from_secs(4)
+    );
+    assert_eq!(
+        cleanup_delay(Duration::from_secs(4), Duration::from_secs(36)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        cleanup_delay(Duration::from_secs(5), Duration::from_secs(3600)),
+        Duration::from_secs(5)
+    );
 }

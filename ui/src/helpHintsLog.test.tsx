@@ -23,6 +23,7 @@ const vpn = (id: string): VpnView => ({
     probeMethod: "ping_tcp",
   },
   state: "off",
+  cleaning: false,
   hasPassword: false,
   hasPsk: false,
   log: [{ timestamp: 1, state: "off" }],

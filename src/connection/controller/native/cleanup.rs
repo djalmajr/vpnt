@@ -1,4 +1,5 @@
 use super::*;
+use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
 
 impl NativeAttempt<'_> {
     pub(super) fn cleanup_network(&mut self) -> bool {
@@ -14,17 +15,20 @@ impl NativeAttempt<'_> {
                 .is_none_or(|client| client.stop().is_ok());
         }
         self.credentials = None;
-        if !self.stopped || self.uncertain_cleanup {
-            return false;
+        if self.uncertain_cleanup {
+            return diagnostic::refuse(Reason::UncertainCleanup);
+        }
+        if !self.stopped {
+            return diagnostic::refuse(Reason::ProducerNotStopped);
         }
         if !self.spawn_attempted {
             return true;
         }
         let Some(client) = &mut self.client else {
-            return false;
+            return diagnostic::refuse(Reason::ProducerMissing);
         };
         if !client.children_complete().unwrap_or(false) {
-            return false;
+            return diagnostic::refuse(Reason::ChildrenIncomplete);
         }
         // A birth grant predates configd/address discovery. Process receipts
         // alone cannot prove that implicit network resources were removed.
@@ -35,36 +39,44 @@ impl NativeAttempt<'_> {
             let (Some(before), Some(routes), Some(proof)) =
                 (&self.before, &self.before_routes, client.supervised_ppp())
             else {
-                return false;
+                return diagnostic::refuse(Reason::LinkEvidence);
             };
-            return ppp_early_cleanup::complete(before, routes, proof.child()).unwrap_or(false);
+            return ppp_early_cleanup::complete(before, routes, proof.child()).unwrap_or(false)
+                || diagnostic::refuse(Reason::EarlyAbsence);
         };
         let Ok(mut routes) = self.routes.lock() else {
-            return false;
+            return diagnostic::refuse(Reason::RouteLock);
         };
         if let Some(lease) = self.lease.take()
             && routes.release(lease).is_err()
         {
             self.uncertain_cleanup = true;
-            return false;
+            return diagnostic::refuse(Reason::RouteRelease);
         }
         if let Some(token) = &self.token {
             if !routes.backend_mut().begin_cleanup(token).unwrap_or(false) {
-                return false;
+                return diagnostic::refuse(Reason::RouteBegin);
             }
             routes.retry_cleanup();
-            if routes.has_owner(&self.owner) || routes.backend_mut().finish_cleanup(token).is_err()
-            {
-                return false;
+            if routes.has_owner(&self.owner) {
+                return diagnostic::refuse(Reason::RouteOwner);
+            }
+            if routes.backend_mut().finish_cleanup(token).is_err() {
+                return diagnostic::refuse(Reason::RouteFinish);
             }
             self.token = None;
         }
         routes.retry_cleanup();
-        !routes.has_owner(&self.owner)
-            && routes.backend_mut().reap_retired().is_ok()
-            && routes
-                .backend_mut()
-                .ppp_cleanup_complete(link)
-                .unwrap_or(false)
+        if routes.has_owner(&self.owner) {
+            return diagnostic::refuse(Reason::RouteOwner);
+        }
+        if routes.backend_mut().reap_retired().is_err() {
+            return diagnostic::refuse(Reason::RetiredResources);
+        }
+        routes
+            .backend_mut()
+            .ppp_cleanup_complete(link)
+            .unwrap_or(false)
+            || diagnostic::refuse(Reason::EarlyAbsence)
     }
 }

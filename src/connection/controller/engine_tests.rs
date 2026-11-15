@@ -395,6 +395,7 @@ impl Harness {
                     generation: s.generation,
                     state: s.state,
                     failures: s.failures,
+                    cleaning: s.cleaning,
                 })
                 .collect()
         } else {
@@ -729,6 +730,7 @@ fn coalesced_changes_keep_the_third_failure_and_a_responsive_probe_resets_it() {
             generation: 1,
             state: ConnectionState::Unresponsive,
             failures: 3,
+            cleaning: false,
         } if profile_id == "one"
     )));
     h.control("one", 1, |c| c.responsive = true);
@@ -746,6 +748,7 @@ fn coalesced_changes_keep_the_third_failure_and_a_responsive_probe_resets_it() {
                     generation: 1,
                     state: ConnectionState::Connected,
                     failures: 0,
+                    cleaning: false,
                 } if profile_id == "one"
             )
         })

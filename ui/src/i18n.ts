@@ -4,6 +4,7 @@ export type Locale = "pt-BR" | "en-US";
 export type LocalePreference = Locale | "system";
 
 const en = {
+  cleanupHint: "Cleaning up the previous attempt…",
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
@@ -201,6 +202,7 @@ const en = {
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
+  cleanupHint: "Limpando a tentativa anterior…",
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",

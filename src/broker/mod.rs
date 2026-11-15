@@ -195,6 +195,7 @@ impl<S: SecretStore> Broker<S> {
                 generation,
                 state,
                 failures,
+                cleaning,
             } => {
                 if !self.ready {
                     return Err(());
@@ -208,6 +209,7 @@ impl<S: SecretStore> Broker<S> {
                 }
                 set_state(c, state);
                 c.failures = failures;
+                c.view.cleaning = cleaning;
                 self.refresh_actions();
             }
             Message::Accepted { id } => {
@@ -252,6 +254,7 @@ impl<S: SecretStore> Broker<S> {
 }
 
 fn set_state(c: &mut Connection, state: State) {
+    c.view.cleaning = false;
     c.policy.state(c.generation, state);
     if state != State::Unresponsive {
         c.failures = 0;

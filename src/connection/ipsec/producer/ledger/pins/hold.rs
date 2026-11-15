@@ -34,6 +34,17 @@ impl<T, M> Hold<T, M> {
         }
     }
 
+    pub(super) fn absence_reason(&self) -> crate::helper::runtime::cleanup::Reason {
+        use crate::helper::runtime::cleanup::Reason;
+        if !self.released || self.strong.is_some() || self.weak.strong_count() > 0 {
+            Reason::PinStillOwned
+        } else if self.metadata.is_some() {
+            Reason::AbsenceKnownUtun
+        } else {
+            Reason::AbsenceFallback
+        }
+    }
+
     #[cfg(test)]
     pub(in crate::connection::ipsec::producer) fn metadata(&self) -> Option<&M> {
         self.metadata.as_ref()

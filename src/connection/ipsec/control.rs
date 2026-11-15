@@ -173,6 +173,10 @@ impl<N: Observer, P: Peer> Control<N, P> {
         let retired = self.peer.retire(self.reservation.owner())?;
         admission?;
         if !retired {
+            #[cfg(target_os = "macos")]
+            crate::helper::runtime::cleanup::mark(
+                crate::helper::runtime::cleanup::Reason::ProducerNotStopped,
+            );
             return Ok(false);
         }
         match self

@@ -73,6 +73,61 @@ fn real_control_cleanup_marks_draining_and_releases_durable_claim() {
 }
 
 #[test]
+fn stopped_child_with_residual_socket_releases_only_after_fresh_absence() {
+    let fixture = Fixture::new();
+    let context = fixture.context();
+    let ledger = NativeLedger::scripted(
+        context.clone(),
+        Scripted::new(vec![Ok(false), Ok(false), Ok(false), Ok(true)]),
+    );
+    let registry = Arc::new(Mutex::new(Registry::new(
+        context.userspace_observer(ledger.clone()),
+    )));
+    let reservation = registry
+        .lock()
+        .unwrap()
+        .reserve(owner("residual", 75))
+        .unwrap();
+    let profile = profile("residual");
+    let (config, mut admission) =
+        prepared(&ledger, &registry.lock().unwrap(), &reservation, &profile);
+    let opened = admission
+        .open(reservation.owner(), until(), token())
+        .unwrap();
+    opened.command("version", Message::new(), &[]).unwrap();
+    let raw = admission.raw_peer_for_test();
+    let directory = raw
+        .lock()
+        .unwrap()
+        .producer
+        .lock()
+        .unwrap()
+        .lease
+        .directory
+        .path
+        .clone();
+    let mut control = Control::new(registry.clone(), reservation, config, admission).unwrap();
+    for _ in 0..3 {
+        assert_eq!(control.cleanup(until()), Ok(false));
+        let peer = raw.lock().unwrap();
+        let mut producer = peer.producer.lock().unwrap();
+        assert!(producer.child_exited());
+        assert_eq!(
+            producer.lease.record.stage,
+            super::super::record::Stage::Stopped
+        );
+        assert!(directory.join("v").exists());
+        assert!(directory.join("claim.json").exists());
+        assert!(registry.lock().unwrap().has_reservations());
+    }
+    assert_eq!(control.cleanup(until()), Ok(true));
+    assert!(!directory.exists());
+    assert!(context.store.records().unwrap().is_empty());
+    assert!(!ledger.has_resources());
+    assert!(!registry.lock().unwrap().has_reservations());
+}
+
+#[test]
 fn draining_admission_refuses_new_pin_work_without_manual_begin_cleanup() {
     let fixture = Fixture::new();
     let context = fixture.context();

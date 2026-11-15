@@ -29,6 +29,7 @@ fn profile(id: &str, kind: VpnKind) -> Profile {
 
 fn view(id: &str, kind: VpnKind, state: ConnectionState) -> VpnView {
     VpnView {
+        cleaning: false,
         profile: profile(id, kind),
         state,
         has_password: true,

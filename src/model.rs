@@ -112,6 +112,7 @@ fn valid_network(value: &str) -> bool {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VpnView {
+    pub cleaning: bool,
     pub profile: Profile,
     pub state: ConnectionState,
     pub has_password: bool,

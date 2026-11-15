@@ -22,3 +22,7 @@ pub fn user_directory(uid: u32) -> Option<PathBuf> {
 pub(crate) fn charon_log(state: &Path) -> PathBuf {
     state.join("logs").join("charon.log")
 }
+
+pub(crate) fn cleanup_log(state: &Path) -> PathBuf {
+    state.join("logs").join("cleanup.log")
+}

@@ -93,6 +93,8 @@ pub struct TunnelStatus {
     pub state: ConnectionState,
     /// Consecutive failed traffic probes. Only `Unresponsive` carries 1..=3.
     pub failures: u32,
+    #[serde(default)]
+    pub cleaning: bool,
 }
 
 /// No variant contains credentials or raw client output.
@@ -122,6 +124,8 @@ pub enum Message {
         generation: u64,
         state: ConnectionState,
         failures: u32,
+        #[serde(default)]
+        cleaning: bool,
     },
     Fatal {
         error: ErrorCode,
@@ -239,7 +243,7 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
                 || connections.iter().any(|status| {
                     !ids.contains(&status.id)
                         || !running.insert(&status.id)
-                        || !coherent_progress(status.state, status.failures)
+                        || !coherent_progress(status.state, status.failures, status.cleaning)
                 })
             {
                 return Err(ProtocolError::InvalidRequest);
@@ -253,9 +257,10 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
             generation,
             state,
             failures,
+            cleaning,
         } => {
             validate_operation(profile_id, *generation)?;
-            if !coherent_progress(*state, *failures) {
+            if !coherent_progress(*state, *failures, *cleaning) {
                 return Err(ProtocolError::InvalidRequest);
             }
         }
@@ -289,7 +294,18 @@ fn validate_operation(id: &str, generation: u64) -> Result<(), ProtocolError> {
 /// Every state except `Unresponsive` means zero consecutive traffic failures.
 /// `Unresponsive` always follows at least one actual failed probe, so a counter
 /// outside 1..=3 (including zero) is an incoherent wire payload.
-fn coherent_progress(state: ConnectionState, failures: u32) -> bool {
+fn coherent_progress(state: ConnectionState, failures: u32, cleaning: bool) -> bool {
+    if cleaning
+        && !matches!(
+            state,
+            ConnectionState::Dropped
+                | ConnectionState::CredentialsRejected
+                | ConnectionState::GatewayTimeout
+                | ConnectionState::MissingProgram
+        )
+    {
+        return false;
+    }
     match state {
         ConnectionState::Unresponsive => (1..=3).contains(&failures),
         _ => failures == 0,
@@ -361,4 +377,54 @@ fn write_frame(
         .write_all(&bytes)
         .and_then(|()| writer.flush())
         .map_err(|_| ProtocolError::Io)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[test]
+    fn cleanup_status_round_trips_and_refuses_cleaning_on_active_states() {
+        for state in [
+            ConnectionState::GatewayTimeout,
+            ConnectionState::CredentialsRejected,
+            ConnectionState::Dropped,
+            ConnectionState::MissingProgram,
+        ] {
+            for cleaning in [true, false] {
+                let message = Message::Changed {
+                    profile_id: "fixture".into(),
+                    generation: 1,
+                    state,
+                    failures: 0,
+                    cleaning,
+                };
+                let mut bytes = vec![];
+                write_message(&mut bytes, &message).unwrap();
+                assert!(
+                    matches!(read_message(&mut &bytes[..]).unwrap(), Some(Message::Changed { state: actual, cleaning: c, .. }) if actual == state && c == cleaning)
+                );
+            }
+        }
+        for state in [
+            ConnectionState::Off,
+            ConnectionState::Connected,
+            ConnectionState::Disconnecting,
+            ConnectionState::Connecting,
+            ConnectionState::Unresponsive,
+        ] {
+            assert!(!coherent_progress(
+                state,
+                if state == ConnectionState::Unresponsive {
+                    1
+                } else {
+                    0
+                },
+                true
+            ));
+        }
+        let status: TunnelStatus =
+            serde_json::from_str(r#"{"id":"fixture","generation":1,"state":"off","failures":0}"#)
+                .unwrap();
+        assert!(!status.cleaning);
+    }
 }

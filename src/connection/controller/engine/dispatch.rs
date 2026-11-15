@@ -44,6 +44,7 @@ pub(super) fn dispatch<F: Factory>(
                         generation: slot.generation,
                         state: slot.state,
                         failures: slot.failures,
+                        cleaning: slot.cleaning,
                     })
                     .collect(),
             });
@@ -91,6 +92,7 @@ pub(super) fn dispatch<F: Factory>(
             });
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if replacing {
                 ConnectionState::Reconnecting
             } else {
@@ -102,6 +104,7 @@ pub(super) fn dispatch<F: Factory>(
             slot.pending = None;
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if slot.worker.is_some() {
                 ConnectionState::Disconnecting
             } else {

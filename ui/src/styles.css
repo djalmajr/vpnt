@@ -150,7 +150,7 @@ button,
 /* Hover is an explicit fill, never a global brightness filter: a transparent
    row has nothing to darken, and the filter washed out colored controls. Only
    the filled primary/danger variants add the reference `hover-brightness`. */
-button:not(:disabled):hover,
+button:not(:disabled):not([aria-disabled="true"]):hover,
 a.button:hover {
   background: var(--button-hover);
 }
@@ -160,7 +160,8 @@ a.button {
   align-items: center;
   justify-content: center;
 }
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   cursor: default;
   color: var(--secondary);
 }
@@ -422,10 +423,11 @@ h2 {
   color: var(--white);
   --button-hover: var(--action);
 }
-.primary:not(:disabled):hover {
+.primary:not(:disabled):not([aria-disabled="true"]):hover {
   filter: brightness(var(--hover-brightness));
 }
-.primary:disabled {
+.primary:disabled,
+.primary[aria-disabled="true"] {
   background: var(--control);
   color: var(--secondary);
 }

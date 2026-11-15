@@ -75,6 +75,7 @@ O charon grava nesse estado `logs/charon.log` (só root, 0600, nível máximo 2,
 a tentativa anterior em `logs/charon.previous.log`, com teto de 8 MiB por arquivo.
 O limite de escrita do processo interrompe o crescimento do log sem encerrar o
 charon; identidades, endereços e mensagens do peer podem aparecer no diagnóstico.
+O helper registra recusas de limpeza em `logs/cleanup.log` (só root, 0600, até 8 MiB), com motivo estável, id interno do perfil e número da tentativa, quando o motivo muda ou a cada 30 s.
 
 Requer Rust 1.99, Bun 1.4.4, Xcode Command Line Tools e Python 3.11 ou superior
 para empacotar. Compile a interface antes do Rust: seus arquivos entram no binário.

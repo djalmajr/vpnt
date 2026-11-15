@@ -34,6 +34,7 @@ const t: T = (key, values) => translate("pt-BR", key, values);
 const view = (state: ConnectionState): VpnView => ({
   profile,
   state,
+  cleaning: false,
   hasPassword: true,
   hasPsk: true,
   log: [],

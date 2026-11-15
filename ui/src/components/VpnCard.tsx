@@ -15,19 +15,24 @@ export function VpnCard({
   navigate: Navigate;
   secrets: () => void;
 }) {
-  const { state, profile } = vpn;
+  const { state, profile, cleaning } = vpn;
+  const cleanupId = `cleanup-${profile.id}`;
+  // While cleaning, the Notice action stays focusable (aria-disabled, inert
+  // click) so the keyboard reaches it and hears why it is unavailable.
+  const pending = cleaning
+    ? { "aria-disabled": true as const, "aria-describedby": cleanupId }
+    : {};
   const busy = [
     "connecting",
     "reconnecting",
     "disconnecting",
     "verifying",
   ].includes(state);
-  const disabled = [
-    "offline",
-    "helper_missing",
-    "missing_program",
-    "disconnecting",
-  ].includes(state);
+  const disabled =
+    cleaning ||
+    ["offline", "helper_missing", "missing_program", "disconnecting"].includes(
+      state,
+    );
   const cancelable = state === "connecting" || state === "reconnecting";
   const missingSecret = state === "missing_secret";
   const staticBody = cancelable || missingSecret;
@@ -128,11 +133,19 @@ export function VpnCard({
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>
           <p>{t(hint)}</p>
+          {cleaning && (
+            <p id={cleanupId} role="status">
+              {t("cleanupHint")}
+            </p>
+          )}
           <div className="actions">
             {state === "missing_program" ? (
               <button
                 type="button"
-                onClick={() => void run({ type: "probe", id: profile.id })}
+                {...pending}
+                onClick={() => {
+                  if (!cleaning) void run({ type: "probe", id: profile.id });
+                }}
               >
                 {t("refresh")}
               </button>
@@ -141,9 +154,11 @@ export function VpnCard({
                 <button
                   type="button"
                   className="primary"
-                  onClick={() =>
-                    void run({ type: "reconnect", id: profile.id })
-                  }
+                  {...pending}
+                  onClick={() => {
+                    if (!cleaning)
+                      void run({ type: "reconnect", id: profile.id });
+                  }}
                 >
                   {t(
                     state === "credentials_rejected" ||

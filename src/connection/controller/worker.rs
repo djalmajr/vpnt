@@ -5,6 +5,19 @@ use std::{
     time::Instant,
 };
 
+const CLEANUP_MAX_POLL: Duration = Duration::from_secs(1);
+const CLEANUP_SLOW_AFTER: Duration = Duration::from_secs(30);
+const CLEANUP_SLOW_MAX_POLL: Duration = Duration::from_secs(5);
+
+fn cleanup_delay(previous: Duration, elapsed: Duration) -> Duration {
+    let cap = if elapsed >= CLEANUP_SLOW_AFTER {
+        CLEANUP_SLOW_MAX_POLL
+    } else {
+        CLEANUP_MAX_POLL
+    };
+    previous.saturating_mul(2).min(cap)
+}
+
 pub(super) struct Finished {
     pub state: ConnectionState,
     pub error: Option<ErrorCode>,
@@ -16,6 +29,7 @@ pub(super) struct Finished {
 pub(super) struct Progress {
     pub state: ConnectionState,
     pub failures: u32,
+    pub cleaning: bool,
 }
 pub(super) struct Signals {
     pub canceled: Arc<AtomicBool>,
@@ -34,13 +48,17 @@ pub(super) fn run(
     timing: Timing,
     interval: ProbeClock,
 ) -> Finished {
-    let send = |state, failures| {
+    let send = |state, failures, cleaning| {
         // One coalesced status per worker. A slow pipe reader never blocks
         // traffic/cleanup or loses the latest state to a full progress queue.
         *signals
             .state
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(Progress { state, failures });
+            .unwrap_or_else(|error| error.into_inner()) = Some(Progress {
+            state,
+            failures,
+            cleaning,
+        });
     };
     let canceled = || signals.canceled.load(Ordering::Acquire);
     let result = (|| {
@@ -80,7 +98,7 @@ pub(super) fn run(
         if canceled() {
             return Ok(());
         }
-        send(ConnectionState::Verifying, 0);
+        send(ConnectionState::Verifying, 0, false);
         let mut last_probe: Option<Instant> = None;
         let mut failures = 0_u32;
         loop {
@@ -116,16 +134,27 @@ pub(super) fn run(
                         ConnectionState::Unresponsive
                     },
                     failures,
+                    false,
                 );
             }
             thread::sleep(timing.poll);
         }
     })();
-    send(ConnectionState::Disconnecting, 0);
+    let cleanup_state = match &result {
+        Ok(()) => ConnectionState::Disconnecting,
+        Err(failure) => failure.state,
+    };
+    send(cleanup_state, 0, result.is_err());
     // Cancel all outstanding network operations before releasing resources.
     signals.canceled.store(true, Ordering::Release);
+    let cleanup_started = Instant::now();
+    let mut cleanup_poll = timing.poll.min(CLEANUP_MAX_POLL);
     while !attempt.cleanup() {
-        thread::sleep(timing.poll);
+        thread::sleep(cleanup_poll);
+        cleanup_poll = cleanup_delay(cleanup_poll, cleanup_started.elapsed());
+    }
+    if result.is_err() {
+        send(cleanup_state, 0, false);
     }
     match result {
         Ok(()) => Finished {
