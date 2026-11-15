@@ -80,7 +80,13 @@ impl<'a> Producer<'a> {
         self.lease
             .stage_bounded(record::Stage::Starting, None, expires, cancel)?;
         Self::call(expires, cancel)?;
+        diagnostic::prepare(
+            self.context.controller.directory(),
+            self.context.runtime.owner(),
+        )?;
+        Self::call(expires, cancel)?;
         let mut command = Command::new(self.context.runtime.program(Program::Charon));
+        diagnostic::limit_file_size(&mut command);
         for group in [
             "dmn", "mgr", "ike", "chd", "job", "cfg", "knl", "net", "asn", "enc", "tnc", "imc",
             "imv", "pts", "tls", "esp", "lib",

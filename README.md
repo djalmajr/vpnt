@@ -70,6 +70,11 @@ aceita `--build-dir CAMINHO/debug` para os adaptadores de um build isolado.
 continua compartilhado e exige uma decisão separada antes de instalar os dois
 canais juntos. Os testes de separação cobrem identificadores, ferramentas,
 serviço de credenciais e política, sem afirmar isolamento desse estado.
+O charon grava nesse estado `logs/charon.log` (só root, 0600, nível máximo 2,
+`enc = 0` para suprimir o dump de payload decifrado no erro de padding) e conserva
+a tentativa anterior em `logs/charon.previous.log`, com teto de 8 MiB por arquivo.
+O limite de escrita do processo interrompe o crescimento do log sem encerrar o
+charon; identidades, endereços e mensagens do peer podem aparecer no diagnóstico.
 
 Requer Rust 1.99, Bun 1.4.4, Xcode Command Line Tools e Python 3.11 ou superior
 para empacotar. Compile a interface antes do Rust: seus arquivos entram no binário.

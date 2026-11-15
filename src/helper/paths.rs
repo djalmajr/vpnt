@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const HELPER: &str = env!("VPNT_HELPER_PATH");
 pub const ASKPASS: &str = env!("VPNT_ASKPASS_PATH");
@@ -15,4 +15,10 @@ pub fn runtime_directory() -> PathBuf {
 
 pub fn user_directory(uid: u32) -> Option<PathBuf> {
     (uid != 0).then(|| PathBuf::from(USERS).join(uid.to_string()))
+}
+
+/// Production callers pass the controller's validated STATE directory;
+/// fixtures pass their own controller root without touching installed state.
+pub(crate) fn charon_log(state: &Path) -> PathBuf {
+    state.join("logs").join("charon.log")
 }

@@ -18,6 +18,7 @@ use std::{
 mod bound;
 mod child;
 mod config;
+mod diagnostic;
 mod files;
 mod ledger;
 mod record;
