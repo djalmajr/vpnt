@@ -35,7 +35,7 @@ impl Config {
         profile.validate().map_err(|_| Error::Invalid)?;
         if profile.kind != VpnKind::Ipsec
             || profile.id != reservation.owner().profile
-            || profile.username.is_empty()
+            || !text_identity_username(&profile.username)
             || !endpoint(local)
             || !endpoint(remote)
             || local.is_ipv4() != remote.is_ipv4()
@@ -69,7 +69,7 @@ impl Config {
             name,
             reqid: reservation.reqid(),
             gateway: profile.gateway.clone(),
-            identity: format!("keyid:#{}", hex(&profile.username)?),
+            identity: text_identity(&profile.username)?,
             port: profile.port,
             local,
             remote,
@@ -103,6 +103,15 @@ impl Config {
             .value("dpd_action", b"clear")
             .value("close_action", b"none");
         child
+            .list(
+                "esp_proposals",
+                [
+                    b"aes256-sha256-ecp384".as_slice(),
+                    b"aes256-sha1-ecp384",
+                    b"aes256-sha256",
+                    b"aes256-sha1",
+                ],
+            )
             .list("local_ts", [b"dynamic".as_slice()])
             .list("remote_ts", self.networks.iter().map(|n| n.as_bytes()));
         let mut children = Message::new();
@@ -111,12 +120,22 @@ impl Config {
         connection
             .value("version", b"2")
             .value("mobike", b"no")
+            .value("dpd_delay", b"30s")
             .value("local_port", b"0")
             .value("remote_port", self.port.to_string().as_bytes());
         connection
             .list("local_addrs", [self.local.to_string().as_bytes()])
             .list("remote_addrs", [self.remote.to_string().as_bytes()])
-            .list("vips", [b"0.0.0.0".as_slice(), b"::"]);
+            .list("vips", [b"0.0.0.0".as_slice()])
+            .list(
+                "proposals",
+                [
+                    b"aes256-sha256-ecp384".as_slice(),
+                    b"aes256-sha256-modp2048",
+                    b"aes256-sha256-modp1536",
+                    b"aes128-sha1-modp1536",
+                ],
+            );
         connection
             .section("local", local)
             .section("remote", remote)
@@ -174,6 +193,31 @@ impl Config {
         Ok(message)
     }
 }
+// VICI refuses values with bytes outside printable ASCII (chunk_printable), so
+// any other username keeps its text type and travels as '#'-prefixed hex,
+// which strongSwan decodes without changing the identity type.
+fn text_identity(username: &str) -> Result<String, Error> {
+    let kind = if username.contains('@') {
+        "email"
+    } else {
+        "fqdn"
+    };
+    if username.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+        Ok(format!("{kind}:{username}"))
+    } else {
+        Ok(format!("{kind}:#{}", hex(username)?))
+    }
+}
+fn text_identity_username(username: &str) -> bool {
+    // strongSwan's typed identities still decode a leading '#' and recognize
+    // '^...$' as regex; '*' also makes FQDN/email secret owners wildcarded.
+    !username.is_empty()
+        && !username.starts_with('#')
+        && !(username.starts_with('^') && username.ends_with('$'))
+        && !username.contains('*')
+        && !username.chars().any(char::is_control)
+}
+
 fn endpoint(ip: IpAddr) -> bool {
     !ip.is_unspecified()
         && !ip.is_multicast()
