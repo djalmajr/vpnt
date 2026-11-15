@@ -66,10 +66,13 @@ test("reserva: libera ao fechar, é idempotente e separa os donos", () => {
 });
 
 test("a altura predefinida é o piso do pedido e respeita o teto", () => {
-  expect(requestedHeight({ natural: 300, reserve: 0, min: 640 })).toBe(640);
-  expect(requestedHeight({ natural: 700, reserve: 0, min: 640 })).toBe(700);
+  expect(requestedHeight({ natural: 300, reserve: 0, min: 480 })).toBe(480);
+  expect(requestedHeight({ natural: 700, reserve: 0, min: 480 })).toBe(700);
   expect(
-    requestedHeight({ natural: 300, reserve: 0, min: 640, max: 500 }),
-  ).toBe(500);
+    requestedHeight({ natural: 300, reserve: 0, min: 480, max: 400 }),
+  ).toBe(400);
   expect(requestedHeight({ natural: 300, reserve: 0 })).toBe(300);
+  // A reserva do menu soma-se ao piso só quando o ultrapassa.
+  expect(requestedHeight({ natural: 300, reserve: 400, min: 480 })).toBe(480);
+  expect(requestedHeight({ natural: 300, reserve: 600, min: 480 })).toBe(600);
 });

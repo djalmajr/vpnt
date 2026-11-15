@@ -58,7 +58,7 @@ x-layout:
   switch-height: "14px"
   switch-knob: "10px"
   switch-inset: "1px"
-  panel-min-height: "640px"
+  panel-min-height: "480px"
   panel-max-height: "720px"
   field-label-width: "92px"
   dialog-width: "280px"
@@ -283,8 +283,8 @@ pede ao host a altura que comporta o conteúdo intrínseco do menu (`scrollHeigh
 mais bordas, mesmo quando o menu está limitado), mais `sideOffset`,
 `collisionPadding` e a distância do gatilho à borda inferior do painel, e o
 rodapé desce para essa borda; o Radix então coloca todas as ações acima do
-gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura natural
-anterior volta. A reserva é temporária, nunca vai além de `panel-max-height`
+gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura
+anterior volta, nunca abaixo de `panel-min-height`. A reserva é temporária, nunca vai além de `panel-max-height`
 (720 px) e o host ainda limita à tela; só quando a tela não comporta o menu ele
 rola. Não é aberta exceção de CSS para o menu: o dimensionamento fica em
 `ui/src/panelSizing.ts`. O `sideOffset` de 6 px
@@ -303,7 +303,7 @@ Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como n
 ### Conflicting visual priorities
 
 Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
-(`panel-min-height`, 640 px) e a conserva entre telas, para não haver
+(`panel-min-height`, 480 px) e a conserva entre telas, para não haver
 deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
 com a mesma medida. Conteúdo mais alto cresce até `panel-max-height`; tela mais
 baixa limita a janela e o painel rola.
@@ -428,9 +428,10 @@ demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de alt
 - Não deixar o menu crescer além do viewport: largura e altura vêm do espaço
   disponível, com rolagem interna e 8 px de borda; a rolagem só vale quando a
   tela não comporta o menu, pois a janela cresce temporariamente para ele.
-- Não fixar permanentemente uma altura grande para o painel, nem calcular a
-  posição do menu: só o tamanho da janela é dimensionado, e a reserva é liberada
-  ao fechar, navegar ou desmontar.
+- Não manter permanentemente a altura extra reservada para o menu, nem calcular
+  a posição do menu: só o tamanho da janela é dimensionado, e a reserva é
+  liberada ao fechar, navegar ou desmontar. A altura predefinida
+  `panel-min-height` é o piso aprovado do painel e não é essa reserva.
 - Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
   `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
   do host nativo, não do CSS.
