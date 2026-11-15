@@ -56,7 +56,11 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(lastGroup).toContain(t("helperInstalled"));
       expect(lastGroup).toContain(t("installedHint"));
       expect(lastGroup).toContain(snapshot.version);
-      expect(lastGroup).toContain(t("remove"));
+      expect(lastGroup).toContain(`aria-label="${t("remove")}"`);
+      expect(lastGroup).toContain(`title="${t("remove")}"`);
+      expect(lastGroup).toContain('class="icon-button danger"');
+      expect(lastGroup).toContain('viewBox="0 0 24 24"');
+      expect(lastGroup).not.toContain(`>${t("remove")}<`);
       expect(lastGroup).not.toContain(
         locale === "en-US" ? "Remove component" : "Remover componente",
       );
@@ -64,7 +68,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     test("Remove requests confirmation without sending a command", () => {
       let confirmations = 0;
       const remove = buttons(preferences(() => confirmations++)).find(
-        (button) => button.children === t("remove"),
+        (button) => button["aria-label"] === t("remove"),
       );
       expect(remove).toBeDefined();
       expect(confirmations).toBe(0);
@@ -73,7 +77,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(confirmations).toBe(1);
       expect(
         buttons(preferences(() => {}, true)).find(
-          (button) => button.children === t("remove"),
+          (button) => button["aria-label"] === t("remove"),
         )?.disabled,
       ).toBe(true);
     });

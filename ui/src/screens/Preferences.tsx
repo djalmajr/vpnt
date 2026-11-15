@@ -158,11 +158,13 @@ export function Preferences({
               <small>{snapshot.version}</small>
               <button
                 type="button"
-                className="danger"
+                className="icon-button danger"
+                aria-label={t("remove")}
+                title={t("remove")}
                 disabled={!!snapshot.componentOperation}
                 onClick={removeComponent}
               >
-                {t("remove")}
+                <Icon name="trash" />
               </button>
             </div>
           ) : (

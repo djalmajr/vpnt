@@ -49,52 +49,70 @@ export function Log({
         }
         t={t}
       />
-      {multiple ? (
-        <div className="tabs" role="tablist" aria-label={t("vpns")}>
-          {snapshot.vpns.map((vpn) => (
-            <button
-              type="button"
-              key={vpn.profile.id}
-              role="tab"
-              id={tabId(vpn.profile.id)}
-              aria-controls={panelId}
-              aria-selected={vpn.profile.id === selectedId}
-              tabIndex={vpn.profile.id === selectedId ? 0 : -1}
-              className={vpn.profile.id === selectedId ? "primary" : ""}
-              onKeyDown={(event) => {
-                const tabs = Array.from(
-                  event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
-                    "[role=tab]",
-                  ) ?? [],
-                );
-                const index = tabs.indexOf(event.currentTarget);
-                const next =
-                  event.key === "ArrowRight"
-                    ? (index + 1) % tabs.length
-                    : event.key === "ArrowLeft"
-                      ? (index - 1 + tabs.length) % tabs.length
-                      : event.key === "Home"
-                        ? 0
-                        : event.key === "End"
-                          ? tabs.length - 1
-                          : -1;
-                if (next < 0) return;
-                event.preventDefault();
-                tabs[next]?.focus();
-                tabs[next]?.click();
-              }}
-              onClick={() => {
-                setSelected(vpn.profile.id);
-                setCopied(false);
-              }}
-            >
-              {vpn.profile.name}
-            </button>
-          ))}
-        </div>
-      ) : vpn ? (
-        <strong id={tabId(vpn.profile.id)}>{vpn.profile.name}</strong>
-      ) : null}
+      <div className="log-heading">
+        {multiple ? (
+          <div className="tabs" role="tablist" aria-label={t("vpns")}>
+            {snapshot.vpns.map((vpn) => (
+              <button
+                type="button"
+                key={vpn.profile.id}
+                role="tab"
+                id={tabId(vpn.profile.id)}
+                aria-controls={panelId}
+                aria-selected={vpn.profile.id === selectedId}
+                tabIndex={vpn.profile.id === selectedId ? 0 : -1}
+                className={vpn.profile.id === selectedId ? "primary" : ""}
+                onKeyDown={(event) => {
+                  const tabs = Array.from(
+                    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                      "[role=tab]",
+                    ) ?? [],
+                  );
+                  const index = tabs.indexOf(event.currentTarget);
+                  const next =
+                    event.key === "ArrowRight"
+                      ? (index + 1) % tabs.length
+                      : event.key === "ArrowLeft"
+                        ? (index - 1 + tabs.length) % tabs.length
+                        : event.key === "Home"
+                          ? 0
+                          : event.key === "End"
+                            ? tabs.length - 1
+                            : -1;
+                  if (next < 0) return;
+                  event.preventDefault();
+                  tabs[next]?.focus();
+                  tabs[next]?.click();
+                }}
+                onClick={() => {
+                  setSelected(vpn.profile.id);
+                  setCopied(false);
+                }}
+              >
+                {vpn.profile.name}
+              </button>
+            ))}
+          </div>
+        ) : vpn ? (
+          <strong id={tabId(vpn.profile.id)}>{vpn.profile.name}</strong>
+        ) : null}
+        {!!lines.length && (
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={t(copied ? "copied" : "copy")}
+            title={t(copied ? "copied" : "copy")}
+            onClick={() => {
+              void navigator.clipboard
+                .writeText(lines.join("\n"))
+                .then(() => setCopied(true))
+                .catch(() => setCopied(false));
+            }}
+          >
+            <Icon name={copied ? "check" : "copy"} />
+          </button>
+        )}
+      </div>
       <div
         id={panelId}
         role="tabpanel"
@@ -116,17 +134,6 @@ export function Log({
       {!!lines.length && (
         <div className="spread">
           <small>{t("lastLines")}</small>
-          <button
-            type="button"
-            onClick={() => {
-              void navigator.clipboard
-                .writeText(lines.join("\n"))
-                .then(() => setCopied(true))
-                .catch(() => setCopied(false));
-            }}
-          >
-            {t(copied ? "copied" : "copy")}
-          </button>
         </div>
       )}
     </>

@@ -25,7 +25,7 @@ const vpn = (id: string): VpnView => ({
   state: "off",
   hasPassword: false,
   hasPsk: false,
-  log: [],
+  log: [{ timestamp: 1, state: "off" }],
 });
 const snapshot: Snapshot = {
   version: "0.1.0",
@@ -77,7 +77,10 @@ for (const locale of ["pt-BR", "en-US"] as const) {
           expect(row).toBeDefined();
           expect(row).not.toContain('class="help-trigger"');
         }
-        expect(html).not.toContain('title="');
+        for (const hint of html.matchAll(
+          /<span[^>]*class="help-trigger"[^>]*>/g,
+        ))
+          expect(hint[0]).not.toContain('title="');
       }
     });
     test("Help expõe a dica inteira como nome e não usa title", () => {
@@ -123,6 +126,48 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         `id="${selected?.[2]}" role="tabpanel" aria-labelledby="${selected?.[1]}"`,
       );
       expect(html).toContain('aria-selected="false" tabindex="-1"');
+    });
+    test("copiar fica na linha do perfil ou abas, fora do tablist e do rodapé", () => {
+      for (const count of [1, 2]) {
+        const html = log(count, "two");
+        const headingStart = html.indexOf('<div class="log-heading">');
+        const panelStart = html.lastIndexOf(
+          "<div",
+          html.indexOf('role="tabpanel"'),
+        );
+        expect(headingStart).toBeGreaterThan(-1);
+        const heading = html.slice(headingStart, panelStart);
+        const copy = heading
+          .match(/<button[^>]*aria-label="([^"]+)"[^>]*>[\s\S]*?<\/button>/g)
+          ?.find((button) => button.includes(`aria-label="${t("copy")}"`));
+        expect(copy).toBeDefined();
+        expect(copy).toContain('class="icon-button"');
+        expect(copy).toContain(`title="${t("copy")}"`);
+        expect(copy).toContain('viewBox="0 0 24 24"');
+        expect(copy).not.toContain(`>${t("copy")}<`);
+        expect(
+          html.match(new RegExp(`aria-label="${t("copy")}"`, "g")),
+        ).toHaveLength(1);
+        if (count === 1) {
+          expect(heading).toContain(">Fixture one</strong>");
+          expect(heading.indexOf("</strong>")).toBeLessThan(
+            heading.indexOf(`aria-label="${t("copy")}"`),
+          );
+        } else {
+          const tablist = heading.slice(
+            heading.indexOf('role="tablist"'),
+            heading.indexOf("</div>"),
+          );
+          expect(tablist.match(/role="tab"/g)).toHaveLength(2);
+          expect(tablist).not.toContain(`aria-label="${t("copy")}"`);
+          expect(heading.indexOf("</div>")).toBeLessThan(
+            heading.indexOf(`aria-label="${t("copy")}"`),
+          );
+        }
+        const footer = html.slice(html.indexOf('<div class="spread">'));
+        expect(footer).toContain(t("lastLines"));
+        expect(footer).not.toContain("<button");
+      }
     });
     test("sem VPN o painel conserva um nome acessível", () => {
       const html = log(0);

@@ -29,7 +29,10 @@ export function VpnCard({
     "disconnecting",
   ].includes(state);
   const cancelable = state === "connecting" || state === "reconnecting";
-  const CardBody = cancelable ? "div" : "button";
+  const missingSecret = state === "missing_secret";
+  const staticBody = cancelable || missingSecret;
+  const CardBody = staticBody ? "div" : "button";
+  const Switch = missingSecret ? "button" : "span";
   const on = active(state);
   const warning = [
     "unresponsive",
@@ -60,11 +63,7 @@ export function VpnCard({
               ? "programHint"
               : null;
   const principal = () => {
-    if (cancelable) return;
-    if (state === "missing_secret") {
-      secrets();
-      return;
-    }
+    if (staticBody) return;
     if (state === "unresponsive") {
       void run({ type: "reconnect", id: profile.id });
       return;
@@ -76,14 +75,14 @@ export function VpnCard({
   return (
     <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
       <CardBody
-        type={cancelable ? undefined : "button"}
+        type={staticBody ? undefined : "button"}
         className="card-toggle"
-        disabled={cancelable ? undefined : disabled}
-        onClick={cancelable ? undefined : principal}
+        disabled={staticBody ? undefined : disabled}
+        onClick={staticBody ? undefined : principal}
         aria-label={
-          cancelable ? undefined : `${profile.name}: ${t(`state.${state}`)}`
+          staticBody ? undefined : `${profile.name}: ${t(`state.${state}`)}`
         }
-        aria-pressed={cancelable ? undefined : on}
+        aria-pressed={staticBody ? undefined : on}
       >
         <span className="card-heading">
           <span className="identity">
@@ -93,12 +92,19 @@ export function VpnCard({
               {profile.networks.join(", ") || t("fullTunnel")}
             </small>
           </span>
-          <span
-            aria-hidden="true"
+          <Switch
+            type={missingSecret ? "button" : undefined}
+            onClick={missingSecret ? secrets : undefined}
+            aria-label={
+              missingSecret
+                ? `${profile.name}: ${t("providePassword")}`
+                : undefined
+            }
+            aria-hidden={missingSecret ? undefined : true}
             className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
           >
             <span />
-          </span>
+          </Switch>
         </span>
         <span className="card-state">
           <span className="status-line">

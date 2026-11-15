@@ -348,20 +348,24 @@ nas preferências, em ambos os temas.
 
 ## Components
 
-O cartão inteiro oferece a ação principal fora de conexão e reconexão. Durante
-esses dois estados, o corpo é estático e somente o botão Cancelar cancela.
+O cartão inteiro oferece a ação principal fora de conexão, reconexão e senha
+pendente. Durante conexão e reconexão, o corpo é estático e somente o botão
+Cancelar cancela; com senha pendente, somente o interruptor abre o diálogo de senha.
 Sem resposta oferece Reconectar como ação principal e Desligar separadamente.
 Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
 nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
 nativo `dialog`, com foco contido e Escape para cancelar.
 
 Por indicação do Djalma em 2026-11-14, falta de senha aparece apenas no
-indicador do cartão; clicar na conexão continua abrindo o diálogo de segredos,
-sem aviso ou botão adicional abaixo dele. O corpo do cartão não ganha fundo
+indicador do cartão, sem aviso ou botão adicional abaixo dele. Por indicação
+de 2026-11-15, nesse estado o corpo do cartão é estático e só o interruptor,
+um botão real com nome acessível formado pelo nome do perfil e pela ação
+traduzida de fornecer senha, abre o diálogo de segredos. O corpo do cartão não ganha fundo
 interno no hover. Durante conexão ou reconexão, somente a área de Cancelar
 recebe `menu-hover`, com o raio de controle e recuo horizontal `space-xs`.
 Durante conexão e reconexão, Cancelar é um botão real com foco próprio; o
-corpo do cartão não envia comandos e não entra na ordem de foco. Nos demais
+corpo do cartão não envia comandos e não entra na ordem de foco. O mesmo vale
+para o corpo com senha pendente, cujo interruptor tem foco próprio. Nos demais
 estados, a ação principal e o foco por teclado do cartão inteiro permanecem.
 O interruptor continua vindo do snapshot autoritativo, sem atualização otimista.
 
@@ -419,9 +423,19 @@ mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
 vindo do snapshot autoritativo.
 
 Por indicação do Djalma em 2026-11-15, o acesso de administrador instalado
-usa uma única linha com estado, explicação, versão e botão Remover; não há
+usa uma única linha com estado, explicação, versão e botão de ícone de lixeira;
+o botão reutiliza `icon-button` e o tom de perigo, com nome acessível e `title`
+traduzidos de Remover. O clique abre a mesma confirmação de remoção; não há
 rótulo separado de remoção. O onboarding oferece um único botão Instalar de
 largura total, sem botão Ver detalhes nem estado alternativo de detalhes.
+
+Por indicação do Djalma em 2026-11-15, a ação de copiar o Log usa `icon-button`
+à direita na mesma linha do nome do perfil ou das abas. O botão fica fora do
+`tablist`, com nome acessível e `title` traduzidos; após copiar, o ícone muda
+para check e o nome traduzido informa que foi copiado. Sem linhas de log, não
+há ação de cópia. O rodapé conserva apenas o texto das últimas 60 linhas.
+Reutiliza o alvo de clique dos ícones de cabeçalho (`control-height`), sem novos
+tokens, e mantém o fluxo atual de cópia e de seleção das abas.
 
 ### Edição por teclado (menu Editar nativo)
 

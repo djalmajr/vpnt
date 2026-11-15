@@ -667,6 +667,23 @@ input[aria-invalid="true"] {
   gap: var(--space-sm);
   flex-wrap: wrap;
 }
+.log-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+.log-heading > .tabs,
+.log-heading > strong {
+  flex: 1;
+  min-width: 0;
+}
+.log-heading > strong {
+  overflow-wrap: anywhere;
+}
+.log-heading > .icon-button {
+  flex-shrink: 0;
+}
 .log-lines {
   font: inherit;
   padding: var(--space-sm);

@@ -133,7 +133,20 @@ describe("intenção explícita do cartão de VPN", () => {
         expect(s.commands).toHaveLength(0);
         continue;
       }
-      click(principal(s.tree));
+      if (expected === "secrets") {
+        click(principal(s.tree));
+        expect(s.secretRequests()).toBe(0);
+        const button = buttons(s.tree).find(
+          (button) =>
+            props(button)["aria-label"] ===
+            `${profile.name}: ${t("providePassword")}`,
+        );
+        expect(button).toBeDefined();
+        if (!button) throw new Error("Password switch missing");
+        click(button);
+      } else {
+        click(principal(s.tree));
+      }
       if (expected === "secrets") {
         expect(s.commands).toHaveLength(0);
         expect(s.secretRequests()).toBe(1);
@@ -148,11 +161,16 @@ describe("intenção explícita do cartão de VPN", () => {
   test("cartões desabilitados seguem desabilitados e o rótulo/pressed continuam", () => {
     for (const state of states) {
       const button = principal(card(state).tree);
-      if (state === "connecting" || state === "reconnecting") {
+      if (
+        state === "connecting" ||
+        state === "reconnecting" ||
+        state === "missing_secret"
+      ) {
         expect(button.type).toBe("div");
         expect(props(button)["aria-pressed"]).toBeUndefined();
         continue;
       }
+      expect(button.type).toBe("button");
       expect(props(button).disabled).toBe(
         [
           "offline",
@@ -220,13 +238,36 @@ describe("intenção explícita do cartão de VPN", () => {
     expect(s.commands).toEqual([{ type: "disconnect", id: profile.id }]);
   });
 
-  test("o cartão sem segredo continua abrindo o diálogo de segredo", () => {
+  test("só o interruptor com nome acessível abre o diálogo de senha pendente", () => {
     const s = card("missing_secret");
     const text = textOf(s.tree);
     expect(text).toContain(t("state.missing_secret"));
     expect(text).not.toContain(t("secretHint"));
     expect(text).not.toContain(t("providePassword"));
-    click(principal(s.tree));
+    const body = principal(s.tree);
+    expect(body.type).toBe("div");
+    for (const attribute of [
+      "type",
+      "onClick",
+      "tabIndex",
+      "aria-label",
+      "aria-pressed",
+      "disabled",
+    ])
+      expect(props(body)[attribute]).toBeUndefined();
+    click(body);
+    expect(s.secretRequests()).toBe(0);
+    const controls = buttons(s.tree);
+    expect(controls).toHaveLength(1);
+    const control = props(controls[0]);
+    expect(control.type).toBe("button");
+    expect(control.className).toContain("switch");
+    expect(control["aria-label"]).toBe(
+      `${profile.name}: ${t("providePassword")}`,
+    );
+    expect(control["aria-hidden"]).toBeUndefined();
+    expect(control.disabled).not.toBe(true);
+    click(controls[0]);
     expect(s.secretRequests()).toBe(1);
     expect(s.commands).toHaveLength(0);
   });
