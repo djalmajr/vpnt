@@ -345,6 +345,20 @@ h2 {
   align-items: center;
   gap: var(--space-xs);
 }
+/* The administrator row stacks: version and trash share the title line, the
+   explanation sits on the line below. Every other Row keeps its centered
+   controls. */
+.setting-row.component-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-xs);
+}
+.component-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
 .help-trigger {
   display: inline-flex;
   flex-shrink: 0;
@@ -663,6 +677,26 @@ dialog p {
   gap: var(--space-sm);
   padding-left: 0;
 }
+/* Clickable rows bleed to the group edges: the hover/focus fill spans the
+   full group width, with the card radius on the outer corners of the first
+   and last row. Middle rows stay square so bands meet edge to edge. */
+.group > .profile-row,
+.group > .link {
+  width: auto;
+  margin-inline: calc(-1 * var(--space-sm));
+  padding-inline: var(--space-sm);
+  border-radius: 0;
+}
+.group > .profile-row:first-child,
+.group > .link:first-child {
+  border-top-left-radius: var(--radius-card);
+  border-top-right-radius: var(--radius-card);
+}
+.group > .profile-row:last-child,
+.group > .link:last-child {
+  border-bottom-left-radius: var(--radius-card);
+  border-bottom-right-radius: var(--radius-card);
+}
 .profile-form,
 .secret-form {
   display: flex;
@@ -889,4 +923,12 @@ hr {
   .spin {
     animation: none;
   }
+}
+/* Pending spinners live inside their action button, before the label. */
+.primary > .spin,
+.danger-fill > .spin,
+.card-cancel > .spin {
+  width: var(--icon-inline);
+  height: var(--icon-inline);
+  margin-right: var(--space-xs);
 }

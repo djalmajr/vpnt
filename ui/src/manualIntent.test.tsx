@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
+import { Icon } from "./components/common";
 import { VpnCard } from "./components/VpnCard";
 import { translate } from "./i18n";
 import {
@@ -114,10 +115,27 @@ function card(
 const source = (path: string) =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
-// The simulated DOM fixture also exercises descendants; this invokes the handler.
-function bubble(tree: ReactElement, control = false) {
-  const handler = props(tree).onClick as (event: unknown) => void;
-  handler({ target: { closest: () => (control ? {} : null) } });
+function classOf(element: ReactElement): string {
+  return String(props(element).className ?? "");
+}
+
+function loaders(tree: ReactNode): ReactElement[] {
+  const found: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (element.type === Icon && props(element).name === "loader")
+      found.push(element);
+  });
+  return found;
+}
+
+function statusLine(tree: ReactNode): ReactElement {
+  const matches: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (classOf(element).split(" ").includes("status-line"))
+      matches.push(element);
+  });
+  expect(matches).toHaveLength(1);
+  return matches[0];
 }
 
 for (const locale of ["pt-BR", "en-US"] as const) {
@@ -144,7 +162,6 @@ for (const locale of ["pt-BR", "en-US"] as const) {
             `${profile.name}: ${translate(locale, `state.${state}`)}`,
           );
           click(control);
-          bubble(s.tree, true);
           expect(s.routes).toEqual([]);
           expect(s.commands).toEqual(
             disabled || state === "missing_secret"
@@ -162,11 +179,10 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         }
       }
     });
-    test("corpo e chevron abrem detalhes sem conectar, inclusive durante espera", () => {
+    test("só o chevron abre detalhes; o corpo não é clicável", () => {
       for (const state of states) {
         const s = card(state, false, locale);
-        bubble(s.tree);
-        expect(s.routes).toEqual([{ page: "profile", id: profile.id }]);
+        expect(props(s.tree).onClick).toBeUndefined();
         const details = buttons(s.tree).find(
           (button) =>
             props(button)["aria-label"] ===
@@ -175,13 +191,38 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         expect(details).toBeDefined();
         if (!details) throw new Error("Details button missing");
         click(details);
-        bubble(s.tree, true);
-        expect(s.routes).toEqual([
-          { page: "profile", id: profile.id },
-          { page: "profile", id: profile.id },
-        ]);
+        expect(s.routes).toEqual([{ page: "profile", id: profile.id }]);
         expect(s.commands).toEqual([]);
         expect(s.secretRequests()).toBe(0);
+      }
+    });
+    test("status usa sempre o ponto; o spinner do conectar fica dentro do Cancel", () => {
+      for (const state of states) {
+        const s = card(state, false, locale);
+        const status = statusLine(s.tree);
+        expect(loaders(status)).toHaveLength(0);
+        const dots: ReactElement[] = [];
+        walk(status, (element) => {
+          if (
+            element.type === "span" &&
+            classOf(element).split(" ").includes("dot")
+          )
+            dots.push(element);
+        });
+        expect(dots).toHaveLength(1);
+        const cancelable = state === "connecting" || state === "reconnecting";
+        const cancel = buttons(s.tree).find(
+          (button) =>
+            props(button)["aria-label"] === translate(locale, "cancel"),
+        );
+        if (cancelable) {
+          expect(cancel).toBeDefined();
+          if (!cancel) throw new Error("Cancel missing");
+          expect(loaders(cancel)).toHaveLength(1);
+        } else {
+          expect(cancel).toBeUndefined();
+        }
+        expect(loaders(s.tree)).toHaveLength(cancelable ? 1 : 0);
       }
     });
     test("só Cancelar cancela conexão/reconexão, sem navegar", () => {
@@ -196,7 +237,6 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         expect(cancel).toBeDefined();
         if (!cancel) throw new Error("Cancel missing");
         click(cancel);
-        bubble(s.tree, true);
         expect(s.commands).toEqual([{ type: "disconnect", id: profile.id }]);
         expect(s.routes).toEqual([]);
       }
@@ -210,7 +250,6 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(reconnect).toBeDefined();
       if (!reconnect) throw new Error("Reconnect missing");
       click(reconnect);
-      bubble(s.tree, true);
       expect(s.commands).toEqual([{ type: "reconnect", id: profile.id }]);
       expect(s.routes).toEqual([]);
     });

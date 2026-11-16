@@ -2,13 +2,34 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createElement, isValidElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ComponentDialog } from "./components/ComponentDialog";
+import {
+  ComponentDialog,
+  ComponentDialogBody,
+} from "./components/ComponentDialog";
 import type { T } from "./components/common";
+import { RemoveDialogBody } from "./components/RemoveDialog";
 import { translate } from "./i18n";
 import type { Snapshot } from "./model";
 import { Onboarding } from "./screens/Onboarding";
 import { Preferences } from "./screens/Preferences";
 import { defaultPreferences } from "./settings";
+
+/** The spinner must live inside the busy primary button: nowhere else. */
+function expectSpinnerOnlyInPrimary(html: string, cls: string, label: string) {
+  const button = html.match(
+    new RegExp(`<button[^>]*class="${cls}"[^>]*>[\\s\\S]*?</button>`),
+  )?.[0];
+  expect(button).toBeDefined();
+  const primary = button ?? "";
+  const open = primary.slice(0, primary.indexOf(">") + 1);
+  expect(open).toContain("disabled");
+  expect(open).toContain('aria-busy="true"');
+  expect(primary).toContain(' spin"');
+  expect(primary.indexOf("<svg")).toBeLessThan(primary.indexOf(`>${label}<`));
+  expect(html.split("<svg").length - 1).toBe(1);
+  expect(html.replace(primary, "")).not.toContain("<svg");
+  expect(html.replace(primary, "")).not.toContain("aria-busy");
+}
 
 const snapshot: Snapshot = {
   version: "0.1.0",
@@ -52,7 +73,8 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     test("installed version and Remove share one administrator row", () => {
       const html = renderToStaticMarkup(preferences());
       const lastGroup = html.slice(html.lastIndexOf('<section class="group">'));
-      expect(lastGroup.match(/class="setting-row"/g)).toHaveLength(1);
+      expect(lastGroup.match(/setting-row/g)).toHaveLength(1);
+      expect(lastGroup).toContain('class="setting-row component-row"');
       expect(lastGroup).toContain(t("helperInstalled"));
       expect(lastGroup).toContain(t("installedHint"));
       expect(lastGroup).toContain(snapshot.version);
@@ -64,6 +86,91 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(lastGroup).not.toContain(
         locale === "en-US" ? "Remove component" : "Remover componente",
       );
+    });
+    test("versão e lixeira dividem a linha do título; a dica fica embaixo", () => {
+      const html = renderToStaticMarkup(preferences());
+      const lastGroup = html.slice(html.lastIndexOf('<section class="group">'));
+      const head = lastGroup.indexOf("component-head");
+      expect(head).toBeGreaterThan(-1);
+      const version = lastGroup.indexOf(snapshot.version);
+      const trash = lastGroup.indexOf(`aria-label="${t("remove")}"`);
+      const hint = lastGroup.indexOf(t("installedHint"));
+      expect(version).toBeGreaterThan(head);
+      expect(trash).toBeGreaterThan(head);
+      expect(version).toBeLessThan(hint);
+      expect(trash).toBeLessThan(hint);
+    });
+    for (const kind of ["install", "remove"] as const) {
+      test(`ComponentDialog ${kind}: espera com spinner dentro do primário`, () => {
+        const pending = renderToStaticMarkup(
+          createElement(ComponentDialogBody, {
+            kind,
+            pending: true,
+            confirm: () => {},
+            close: () => {},
+            t,
+          }),
+        );
+        const [text, actions] = pending.split('<div class="actions end">');
+        expect(text).toContain(
+          t(
+            kind === "install"
+              ? "componentInstallPending"
+              : "componentRemovePending",
+          ),
+        );
+        expect(text).not.toContain("<svg");
+        expect(actions).toBeDefined();
+        expectSpinnerOnlyInPrimary(
+          pending,
+          kind === "install" ? "primary" : "danger-fill",
+          t(kind === "install" ? "install" : "remove"),
+        );
+        const idle = renderToStaticMarkup(
+          createElement(ComponentDialogBody, {
+            kind,
+            pending: false,
+            confirm: () => {},
+            close: () => {},
+            t,
+          }),
+        );
+        expect(idle).toContain(
+          t(
+            kind === "install" ? "componentInstallHint" : "componentRemoveHint",
+          ),
+        );
+        expect(idle).not.toContain("<svg");
+        expect(idle).not.toContain("aria-busy");
+        expect(idle).not.toContain("disabled");
+      });
+    }
+    test("RemoveDialog: espera com spinner dentro do Remover", () => {
+      const saving = renderToStaticMarkup(
+        createElement(RemoveDialogBody, {
+          saving: true,
+          confirm: () => {},
+          close: () => {},
+          t,
+        }),
+      );
+      const [text, actions] = saving.split('<div class="actions end">');
+      expect(text).toContain(t("adminPending"));
+      expect(text).not.toContain("<svg");
+      expect(actions).toBeDefined();
+      expectSpinnerOnlyInPrimary(saving, "danger-fill", t("remove"));
+      const idle = renderToStaticMarkup(
+        createElement(RemoveDialogBody, {
+          saving: false,
+          confirm: () => {},
+          close: () => {},
+          t,
+        }),
+      );
+      expect(idle).toContain(t("removeHint"));
+      expect(idle).not.toContain("<svg");
+      expect(idle).not.toContain("aria-busy");
+      expect(idle).not.toContain("disabled");
     });
     test("Remove requests confirmation without sending a command", () => {
       let confirmations = 0;

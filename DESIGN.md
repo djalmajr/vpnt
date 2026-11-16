@@ -359,11 +359,14 @@ Durante conexão e reconexão, o interruptor fica indisponível e só Cancelar
 cancela; limpeza e estados desabilitados também bloqueiam o interruptor.
 O estado continua vindo do snapshot autoritativo, sem atualização otimista.
 
-O corpo deixa de ser botão: clicar no cartão abre o perfil, exceto nos
-controles e no aviso. Um icon-button com chevron à direita do interruptor
-oferece a mesma navegação por teclado, com nome traduzido “Detalhes de {name}”.
-Não há botões aninhados nem segundo foco no corpo. Cancelar é um botão real
-com foco próprio, menu-hover, raio de controle e recuo horizontal space-xs.
+O corpo não é clicável: só o icon-button com chevron à direita do
+interruptor abre o perfil, com nome traduzido “Detalhes de {name}”.
+Não há botões aninhados nem segundo foco no corpo. A linha de status mostra
+sempre o ponto, na cor do tom do estado, ocupando a mesma caixa e o mesmo
+centro em todos os estados; durante conexão e reconexão, o spinner fica
+dentro do botão Cancelar, antes do rótulo, e há um único spinner por cartão.
+Cancelar é um botão real com foco próprio, menu-hover, raio de controle e
+recuo horizontal space-xs.
 
 A seção Segredos do perfil conserva uma linha de status por segredo e usa
 um único botão no cabeçalho: Trocar quando algum segredo aplicável existe,
@@ -372,9 +375,11 @@ SSL (senha).
 
 Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
 nome acessível, foco visível e caminho por teclado. Diálogos usam dialog nativo,
-com foco contido e Escape para cancelar. As confirmações de instalar/remover o
-componente mostram o Icon loader girando ao lado do texto de espera anunciado
-como status; enquanto pending, expõem aria-busy e bloqueiam as ações.
+com foco contido e Escape para cancelar. As confirmações de instalar/remover
+o componente (e a de remover o perfil) mostram o Icon loader girando dentro
+do botão primário, antes do rótulo, com o botão indisponível e `aria-busy`;
+o texto de espera anunciado como status continua, sem spinner. O Cancelar
+segue bloqueado porque a operação do helper não pode ser cancelada por ali.
 
 O rodapé fica sempre visível na base do painel, inclusive em perfil e log,
 fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
@@ -439,12 +444,19 @@ adicional é o cursor de progresso — sem texto novo no catálogo, spinner ou
 mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
 vindo do snapshot autoritativo.
 
+Por indicação do Djalma em 2026-11-15, toda linha clicável com hover dentro
+de grupos (perfis em Preferências, tipos na criação) preenche a linha inteira
+até as bordas do grupo, com o raio do cartão acompanhando o contêiner nos
+cantos da primeira e da última linha. O foco visível continua visível.
+
 Por indicação do Djalma em 2026-11-15, o acesso de administrador instalado
-usa uma única linha com estado, explicação, versão e botão de ícone de lixeira;
-o botão reutiliza `icon-button` e o tom de perigo, com nome acessível e `title`
-traduzidos de Remover. O clique abre a mesma confirmação de remoção; não há
-rótulo separado de remoção. O onboarding oferece um único botão Instalar de
-largura total, sem botão Ver detalhes nem estado alternativo de detalhes.
+usa uma única linha: versão e botão de ícone de lixeira ficam na linha do
+título, alinhados a ele, e a explicação ocupa a linha de baixo; as demais
+`Row` continuam como estão. O botão reutiliza `icon-button` e o tom de
+perigo, com nome acessível e `title` traduzidos de Remover. O clique abre a
+mesma confirmação de remoção; não há rótulo separado de remoção.
+O onboarding oferece um único botão Instalar de largura total, sem botão Ver
+detalhes nem estado alternativo de detalhes.
 
 Por indicação do Djalma em 2026-11-15, a ação de copiar o Log usa `icon-button`
 à direita na mesma linha do nome do perfil ou das abas. O botão fica fora do

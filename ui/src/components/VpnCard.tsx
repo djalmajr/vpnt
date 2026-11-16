@@ -75,15 +75,9 @@ export function VpnCard({
     void run({ type: on ? "disconnect" : "connect", id: profile.id });
   };
   return (
-    // biome-ignore lint/a11y/useKeyWithClickEvents: The Details button owns keyboard navigation; the card is not a second tab stop.
-    <article
-      className="vpn-card"
-      data-testid={`vpn-card-${profile.id}`}
-      onClick={(event) => {
-        if ((event.target as Element).closest("button, .notice")) return;
-        navigate({ page: "profile", id: profile.id });
-      }}
-    >
+    // Only the chevron icon-button navigates: the body is not clickable and
+    // carries no keyboard or pointer affordance of its own.
+    <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
       <div className="card-body">
         <span className="card-heading">
           <span className="identity">
@@ -117,8 +111,11 @@ export function VpnCard({
         </span>
         <span className="card-state">
           <span className="status-line">
+            {/* The indicator is always the dot, in the tone of the state, so
+                every state shares one box and one center; the spinner for an
+                in-flight connect/reconnect lives inside Cancel instead. */}
             <span className={color}>
-              {busy ? <Icon name="loader" /> : <span className="dot" />}
+              <span className="dot" />
             </span>
             <span>{t(`state.${state}`)}</span>
           </span>
@@ -129,6 +126,7 @@ export function VpnCard({
               onClick={() => void run({ type: "disconnect", id: profile.id })}
               aria-label={t("cancel")}
             >
+              <Icon name="loader" />
               {t("cancel")}
             </button>
           )}
