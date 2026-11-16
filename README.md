@@ -76,7 +76,7 @@ a tentativa anterior em `logs/charon.previous.log`, com teto de 8 MiB por arquiv
 O openfortivpn grava `logs/openfortivpn.log` (só root, 0600, mesma rotação para `logs/openfortivpn.previous.log` e mesmo teto de 8 MiB), com cada linha redigida para `[linha redigida]` quando contiver possível segredo e linhas longas registradas como `[linha longa descartada]`.
 O limite de escrita do processo interrompe o crescimento do log sem encerrar o
 charon; identidades, endereços e mensagens do peer podem aparecer no diagnóstico.
-O helper registra recusas de limpeza em `logs/cleanup.log` (só root, 0600, até 8 MiB), com motivo estável, id interno do perfil e número da tentativa, quando o motivo muda ou a cada 30 s.
+O helper registra recusas de limpeza em `logs/cleanup.log` (só root, 0600, até 8 MiB), com motivo estável, id interno do perfil e número da tentativa, quando o motivo muda ou a cada 30 s. Ao terminar uma tentativa, o app tenta gravar as caudas redigidas em `~/Library/Application Support/<bundle id>/diagnostics.txt`; o helper só lê esses logs quando o recibo verificado registra exclusivamente o usuário conectado. Logs antigos não têm proveniência por usuário; uma instalação antes compartilhada pode conter histórico de outro usuário.
 
 Requer Rust 1.99, Bun 1.4.4, Xcode Command Line Tools e Python 3.11 ou superior
 para empacotar. Compile a interface antes do Rust: seus arquivos entram no binário.

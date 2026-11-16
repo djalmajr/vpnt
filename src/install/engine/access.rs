@@ -43,15 +43,19 @@ pub unsafe fn remove_inherited() -> Result<(), Error> {
         Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) }).map_err(|_| Error::PermissionDenied)?;
     channel::serve(caller, &mut system())
 }
-pub(crate) fn admit_uid(uid: u32) -> Result<String, Error> {
+pub(crate) fn admit_uid(uid: u32) -> Result<(String, bool), Error> {
     root()?;
-    admitted_build(&Tree::system(), uid)
+    admitted_details(&Tree::system(), uid)
 }
 #[cfg(test)]
 pub(super) fn admit(tree: &Tree, uid: u32) -> Result<(), Error> {
     admitted_build(tree, uid).map(|_| ())
 }
+#[cfg(test)]
 pub(super) fn admitted_build(tree: &Tree, uid: u32) -> Result<String, Error> {
+    admitted_details(tree, uid).map(|(build, _)| build)
+}
+pub(super) fn admitted_details(tree: &Tree, uid: u32) -> Result<(String, bool), Error> {
     payload::files::directory(&tree.state, tree.owner, true)?;
     if Journal::pending(tree)? {
         return Err(Error::RecoveryRequired);
@@ -61,7 +65,8 @@ pub(super) fn admitted_build(tree: &Tree, uid: u32) -> Result<String, Error> {
         return Err(Error::PermissionDenied);
     }
     receipt.verify(tree)?;
-    Ok(receipt.build)
+    let sole_owner = receipt.users.len() == 1 && receipt.users.contains_key(&uid);
+    Ok((receipt.build, sole_owner))
 }
 fn account(uid: u32) -> Result<(), Error> {
     policy::account(uid)?;

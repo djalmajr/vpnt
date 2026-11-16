@@ -76,7 +76,7 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
         let lock = mode_lock(mode, ControllerLock::acquire)?;
-        let build = crate::install::engine::admit_uid(caller.uid)
+        let (build, _) = crate::install::engine::admit_uid(caller.uid)
             .map_err(|_| ErrorCode::UntrustedConfiguration)?;
         Ok((store, lock, build))
     })();
@@ -177,6 +177,37 @@ fn runtime_with_build(
     build: Option<String>,
     run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
 ) -> Result<(), ErrorCode> {
+    runtime_with_diagnostics(caller, build, Arc::new(system_diagnostics), run)
+}
+
+type Diagnostics =
+    Arc<dyn Fn(u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) + Send + Sync>;
+fn system_diagnostics(uid: u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) {
+    gated_diagnostics(
+        || crate::install::engine::admit_uid(uid).map(|(_, sole)| sole),
+        || super::diagnostics::collect(std::path::Path::new(super::paths::STATE), 0, || true),
+    )
+}
+pub(crate) fn gated_diagnostics(
+    admit: impl FnOnce() -> Result<bool, crate::install::Error>,
+    read: impl FnOnce() -> Option<Vec<super::diagnostics::Log>>,
+) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) {
+    use protocol::DiagnosticsStatus as Status;
+    match admit() {
+        Ok(false) => (Status::Shared, vec![]),
+        Ok(true) => match read() {
+            Some(logs) => (Status::Ready, logs),
+            None => (Status::Unavailable, vec![]),
+        },
+        Err(_) => (Status::Unavailable, vec![]),
+    }
+}
+fn runtime_with_diagnostics(
+    caller: Caller,
+    build: Option<String>,
+    diagnostics: Diagnostics,
+    run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
+) -> Result<(), ErrorCode> {
     let stop = Arc::new(AtomicBool::new(false));
     let input = caller
         .stream
@@ -195,10 +226,18 @@ fn runtime_with_build(
         let guard = Stop(stop.clone());
         let reader_output = output.clone();
         let reader_stop = stop.clone();
+        let uid = caller.uid;
         let reader = thread::Builder::new()
             .name("vpnt-input".into())
             .spawn_scoped(scope, move || {
-                read_requests(input, requests, reader_output, &reader_stop);
+                read_requests(
+                    input,
+                    requests,
+                    reader_output,
+                    &reader_stop,
+                    uid,
+                    diagnostics,
+                );
             })
             .map_err(|_| ErrorCode::Unavailable)?;
         let mut stream = caller.stream;
@@ -234,6 +273,8 @@ fn read_requests(
     requests: SyncSender<Request>,
     output: SyncSender<Message>,
     stop: &AtomicBool,
+    uid: u32,
+    diagnostics: Diagnostics,
 ) {
     let mut reader = input;
     loop {
@@ -250,6 +291,26 @@ fn read_requests(
                 return;
             }
         };
+        if matches!(request.command, protocol::Command::Diagnostics {}) {
+            let (status, logs) = diagnostics(uid);
+            let mut message = Message::Diagnostics {
+                id: request.id,
+                status,
+                logs,
+            };
+            loop {
+                if stop.load(Ordering::Acquire) || interrupted() {
+                    return;
+                }
+                match output.try_send(message) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(value)) => message = value,
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            continue;
+        }
         let mut pending = request;
         loop {
             if stop.load(Ordering::Acquire) || interrupted() {

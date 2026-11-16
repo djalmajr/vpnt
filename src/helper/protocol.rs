@@ -36,6 +36,8 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Snapshot {},
+    #[cfg(unix)]
+    Diagnostics {},
     Connect {
         id: String,
         generation: u64,
@@ -114,6 +116,12 @@ pub enum Message {
         profiles: Vec<Profile>,
         connections: Vec<TunnelStatus>,
     },
+    #[cfg(unix)]
+    Diagnostics {
+        id: String,
+        status: DiagnosticsStatus,
+        logs: Vec<super::diagnostics::Log>,
+    },
     Accepted {
         id: String,
     },
@@ -134,6 +142,15 @@ pub enum Message {
     },
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsStatus {
+    Ready,
+    Shared,
+    Unavailable,
+}
+
 pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(ProtocolError::TooLarge);
@@ -145,6 +162,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
     }
     match &request.command {
         Command::Snapshot {} => {}
+        #[cfg(unix)]
+        Command::Diagnostics {} => {}
         Command::SetProbeInterval { .. } => {}
         Command::Connect {
             id,
@@ -251,6 +270,33 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
                         || !running.insert(&status.id)
                         || !coherent_progress(status.state, status.failures, status.cleaning)
                 })
+            {
+                return Err(ProtocolError::InvalidRequest);
+            }
+        }
+        #[cfg(unix)]
+        Message::Diagnostics { id, status, logs } => {
+            use super::diagnostics::Status;
+            let names = [
+                "openfortivpn.log",
+                "openfortivpn.previous.log",
+                "charon.log",
+                "charon.previous.log",
+            ];
+            if !valid_profile_id(id)
+                || (*status != DiagnosticsStatus::Ready && !logs.is_empty())
+                || (*status == DiagnosticsStatus::Ready
+                    && (logs.len() != names.len()
+                        || logs.iter().zip(names).any(|(log, name)| {
+                            log.name != name
+                                || log.text.len() > 65_536
+                                || log.lines > 200
+                                || log.text.lines().count() != log.lines
+                                || (log.status != Status::Present
+                                    && (!log.text.is_empty()
+                                        || log.modified.is_some()
+                                        || log.lines != 0))
+                        })))
             {
                 return Err(ProtocolError::InvalidRequest);
             }
@@ -405,6 +451,61 @@ mod cleanup_tests {
                 "field {field}"
             );
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_request_never_accepts_a_path_or_uid_override() {
+        assert!(parse_request(br#"{"id":"x","command":{"type":"diagnostics"}}"#).is_ok());
+        for body in [
+            r#"{"id":"x","command":{"type":"diagnostics","path":"/tmp/log"}}"#,
+            r#"{"id":"x","command":{"type":"diagnostics","uid":501}}"#,
+            r#"{"id":"x","command":{"type":"diagnostics","profile":"another"}}"#,
+            r#"{"id":"x","uid":501,"command":{"type":"diagnostics"}}"#,
+        ] {
+            assert!(parse_request(body.as_bytes()).is_err(), "{body}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_reply_rejects_wrong_order_duplicate_oversize_and_partial_items() {
+        let names = [
+            "openfortivpn.log",
+            "openfortivpn.previous.log",
+            "charon.log",
+            "charon.previous.log",
+        ];
+        let logs: Vec<_> = names
+            .iter()
+            .map(|name| super::super::diagnostics::Log {
+                name: (*name).into(),
+                status: super::super::diagnostics::Status::Present,
+                modified: Some(1),
+                lines: 1,
+                text: "safe\n".into(),
+            })
+            .collect();
+        fn roundtrip(
+            logs: Vec<super::super::diagnostics::Log>,
+        ) -> Result<Option<Message>, ProtocolError> {
+            let message = Message::Diagnostics {
+                id: "diag-1".into(),
+                status: DiagnosticsStatus::Ready,
+                logs,
+            };
+            let mut bytes = vec![];
+            write_message(&mut bytes, &message).unwrap();
+            read_message(&mut &bytes[..])
+        }
+        assert!(roundtrip(logs.clone()).is_ok());
+        let mut duplicate = logs.clone();
+        duplicate[1].name = duplicate[0].name.clone();
+        assert!(roundtrip(duplicate).is_err());
+        let mut oversize = logs.clone();
+        oversize[0].text = "x".repeat(65_537);
+        assert!(roundtrip(oversize).is_err());
+        let mut missing = logs;
+        missing[0].status = super::super::diagnostics::Status::Missing;
+        assert!(roundtrip(missing).is_err());
     }
     #[test]
     fn cleanup_status_round_trips_and_refuses_cleaning_on_active_states() {

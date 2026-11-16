@@ -4,7 +4,12 @@
 //! time with secret-bearing lines redacted. Nothing raw reaches snapshots,
 //! IPC, error values, app logs or the UI.
 use super::ssl::{InterfaceName, SslFailure};
-use crate::helper::paths;
+#[cfg(test)]
+use crate::helper::redaction::SECRET_KEYWORDS;
+use crate::helper::{
+    paths,
+    redaction::{REDACTED_LINE, contains_secret_keyword},
+};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -27,23 +32,9 @@ use zeroize::{Zeroize, Zeroizing};
 /// Same ceiling as the charon diagnostic: once reached, logging stops and the
 /// connection continues without its diagnostic tail.
 pub(crate) const OPENFORTIVPN_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
-pub(crate) const REDACTED_LINE: &str = "[linha redigida]";
 pub(crate) const LONG_LINE: &str = "[linha longa descartada]";
 const CURRENT_NAME: &str = "openfortivpn.log";
 const PREVIOUS_NAME: &str = "openfortivpn.previous.log";
-// Substring match, ASCII case-insensitive: any of these turns the whole line
-// into the redacted placeholder. `set-cookie` is listed even though it already
-// contains `cookie`, so a future cleanup cannot drop it by accident.
-const SECRET_KEYWORDS: [&str; 8] = [
-    "cookie",
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "otp",
-    "authorization",
-    "set-cookie",
-];
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Observation {
@@ -460,24 +451,6 @@ fn timestamp() -> String {
         }
         format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
     }
-}
-
-fn contains_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    // ASCII-only fold, like the exact byte matches in `parse` below.
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && (0..=haystack.len() - needle.len()).any(|start| {
-            haystack[start..start + needle.len()]
-                .iter()
-                .zip(needle.iter())
-                .all(|(hay, pin)| hay.to_ascii_lowercase() == *pin)
-        })
-}
-
-fn contains_secret_keyword(line: &[u8]) -> bool {
-    SECRET_KEYWORDS
-        .iter()
-        .any(|keyword| contains_case_insensitive(line, keyword.as_bytes()))
 }
 
 fn observe(line: &[u8], discarded: bool, observed: &Mutex<Observation>, log: &Option<LogSender>) {

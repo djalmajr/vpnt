@@ -31,6 +31,11 @@ pub(super) fn dispatch<F: Factory>(
         return;
     }
     let (id, generation) = match &request.command {
+        Command::Diagnostics {} => {
+            // The authenticated helper handles this before forwarding requests.
+            fail(output, ErrorCode::Unavailable);
+            return;
+        }
         Command::Snapshot {} => {
             output.push_back(Message::Snapshot {
                 id: request.id,
@@ -129,7 +134,9 @@ pub(super) fn dispatch<F: Factory>(
                 return;
             }
         }
-        Command::Snapshot {} | Command::SetProbeInterval { .. } => unreachable!(),
+        Command::Snapshot {} | Command::Diagnostics {} | Command::SetProbeInterval { .. } => {
+            unreachable!()
+        }
     }
     output.push_back(Message::Accepted { id: request.id });
     output.push_back(slot.changed());
