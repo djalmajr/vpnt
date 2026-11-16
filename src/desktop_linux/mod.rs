@@ -1,4 +1,6 @@
 const PRODUCT_NAME: &str = "VPN Tray";
+// DESIGN.md, Conflicting visual priorities: --panel-min-height: 480px.
+const DEFAULT_HEIGHT: u32 = 480;
 /// StatusNotifierItem Id. Trays such as Omarchy's pin items by this Id, so it
 /// must not change between runs (tray-icon's default embeds the process id).
 const TRAY_ID: &str = "vpnt";
@@ -60,9 +62,9 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
-        Some(omarchy::start(omarchy::Paths::new(&home), move |theme| {
+        omarchy::start(omarchy::Paths::new(&home), move |theme| {
             let _ = theme_proxy.send_event(UserEvent::Theme(theme));
-        })?)
+        })?
     } else {
         None
     };
@@ -95,7 +97,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     }));
     let window = WindowBuilder::new()
         .with_title(PRODUCT_NAME)
-        .with_inner_size(LogicalSize::new(320.0, 360.0))
+        .with_inner_size(LogicalSize::new(320, DEFAULT_HEIGHT))
         .with_visible(false)
         .with_transparent(true)
         .with_decorations(false)
@@ -105,7 +107,14 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         .with_rgba_visual(true)
         .build(&event_loop)?;
     let mut webview_builder = WebViewBuilder::new();
-    let initial_script = initial_theme.as_ref().map(omarchy::script);
+    let initial_script = if detected {
+        Some(initial_theme.as_ref().map_or_else(
+            || "document.documentElement.dataset.desktop='omarchy';".to_owned(),
+            omarchy::script,
+        ))
+    } else {
+        None
+    };
     if let Some(script) = initial_script.as_deref() {
         webview_builder = webview_builder.with_initialization_script(script);
     }
@@ -146,7 +155,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut open = false;
     let mut opening = 0;
     let mut anchor = None;
-    let mut height = 360;
+    let mut height = DEFAULT_HEIGHT;
     let mut last_focus_hide = None;
     let mut deadline: Option<Instant> = None;
     let mut visible = false;

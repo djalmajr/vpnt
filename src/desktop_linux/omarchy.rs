@@ -263,47 +263,106 @@ fn load(paths: &Paths, rounding: impl FnOnce() -> u32) -> Result<(Fingerprint, T
     if before[2].is_some() {
         merge(&mut shell, read_toml(&paths.user)?);
     }
+    for key in ["background", "foreground", "accent"] {
+        if colors
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .and_then(color)
+            .is_none()
+        {
+            return Err(format!("incomplete theme: {key}"));
+        }
+    }
     let theme = resolve(&colors, &shell, rounding());
     if before != fingerprint(paths)? {
         return Err("theme changed during read".into());
     }
     Ok((before, theme))
 }
-fn update(
-    paths: &Paths,
-    previous: &mut Option<(Fingerprint, Theme)>,
-    rounding: impl FnOnce() -> u32,
-) -> Option<Theme> {
-    let current = fingerprint(paths).ok()?;
-    if previous.as_ref().is_some_and(|(old, _)| *old == current) {
-        return None;
-    }
-    let (fp, theme) = load(paths, rounding).ok()?;
-    let different = previous.as_ref().is_none_or(|(_, old)| *old != theme);
-    *previous = Some((fp, theme.clone()));
-    different.then_some(theme)
+#[derive(Default)]
+struct WatchState {
+    applied: Option<Theme>,
+    pending: Option<Theme>,
+    observed: Option<Fingerprint>,
+    radius: u32,
 }
 
-pub(super) fn start(paths: Paths, reply: impl Fn(Theme) + Send + 'static) -> Result<Theme, String> {
+impl WatchState {
+    fn initial(result: Result<(Fingerprint, Theme), String>) -> Self {
+        match result {
+            Ok((fp, theme)) => Self {
+                radius: theme_radius(&theme),
+                applied: Some(theme),
+                observed: Some(fp),
+                pending: None,
+            },
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+fn theme_radius(theme: &Theme) -> u32 {
+    theme
+        .vars
+        .get("--omarchy-radius")
+        .and_then(|value| value.strip_suffix("px"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn update(paths: &Paths, state: &mut WatchState, rounding: impl FnOnce() -> u32) -> Option<Theme> {
+    let current = match fingerprint(paths) {
+        Ok(current) => current,
+        Err(_) => {
+            state.pending = None;
+            state.observed = None;
+            return None;
+        }
+    };
+    let changed = state.observed.as_ref() != Some(&current);
+    if !changed && state.pending.is_none() {
+        return None;
+    }
+    let radius = if changed { rounding() } else { state.radius };
+    let (fp, theme) = match load(paths, || radius) {
+        Ok(result) => result,
+        Err(_) => {
+            state.pending = None;
+            state.observed = None;
+            return None;
+        }
+    };
+    state.radius = radius;
+    state.observed = Some(fp);
+    if state.applied.as_ref() == Some(&theme) {
+        state.pending = None;
+        return None;
+    }
+    if state.pending.as_ref() == Some(&theme) {
+        state.applied = Some(theme.clone());
+        state.pending = None;
+        Some(theme)
+    } else {
+        state.pending = Some(theme);
+        None
+    }
+}
+
+pub(super) fn start(
+    paths: Paths,
+    reply: impl Fn(Theme) + Send + 'static,
+) -> Result<Option<Theme>, String> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("vpnt-desktop-theme".into())
         .spawn(move || {
-            let first = load(&paths, super::placement::rounding);
-            let mut previous = first.as_ref().ok().cloned();
-            let initial = first.map(|(_, theme)| theme).unwrap_or_else(|_| {
-                resolve(
-                    &toml::Value::Table(Default::default()),
-                    &toml::Value::Table(Default::default()),
-                    0,
-                )
-            });
-            if tx.send(initial).is_err() {
+            let mut state = WatchState::initial(load(&paths, super::placement::rounding));
+            if tx.send(state.applied.clone()).is_err() {
                 return;
             }
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if let Some(theme) = update(&paths, &mut previous, super::placement::rounding) {
+                if let Some(theme) = update(&paths, &mut state, super::placement::rounding) {
                     reply(theme);
                 }
             }
@@ -339,7 +398,7 @@ mod tests {
         fs::create_dir_all(p.user.parent().unwrap()).unwrap();
         fs::write(
             &p.colors,
-            "mode='light'\nbackground='#1a1b26'\naccent='#ABCDEF'\n",
+            "mode='light'\nbackground='#1a1b26'\nforeground='#eeeeee'\naccent='#ABCDEF'\n",
         )
         .unwrap();
         fs::write(&p.shell,"[popups]\nbackground='#1a1b26'\nbackground-alpha=0.9\ntext='#a9b1d6'\nborder='hyprland.active-border'\n[hyprland]\nactive-border='rgba(7aa2f7ff) rgba(112233ff) 45deg'\n").unwrap();
@@ -398,22 +457,48 @@ mod tests {
     #[test]
     fn watcher_ignores_equal_and_invalid_updates_then_emits_change() {
         let (_t, p) = fixture();
-        let (fp, t) = load(&p, || 0).unwrap();
-        let mut prev = Some((fp, t.clone()));
+        let mut state = WatchState::initial(load(&p, || 0));
+        let good = state.applied.clone().unwrap();
+        fs::write(&p.colors, "mode='light'\n").unwrap();
+        assert_eq!(update(&p, &mut state, || 0), None);
+        assert_eq!(state.applied.as_ref(), Some(&good));
+        fs::write(&p.colors, "mode='dark'\nbackground='#111111'\nforeground='#eeeeee'\naccent='#abcdef'\norange='#ff0000'\n").unwrap();
+        assert_eq!(update(&p, &mut state, || 0), None);
+        let b = update(&p, &mut state, || 0).unwrap();
+        assert_eq!(b.vars["--omarchy-orange"], "#ff0000");
         fs::write(
             &p.colors,
-            "mode='light'\nbackground='#1a1b26'\naccent='#ABCDEF'\n# unchanged\n",
+            "mode='light'\nbackground='#222222'\nforeground='#eeeeee'\naccent='#abcdef'\n",
         )
         .unwrap();
-        assert_eq!(update(&p, &mut prev, || 0), None);
-        fs::write(&p.colors, "mode = [broken").unwrap();
-        assert_eq!(update(&p, &mut prev, || 0), None);
-        assert_eq!(prev.as_ref().unwrap().1, t);
+        assert_eq!(update(&p, &mut state, || 0), None);
         fs::write(
             &p.colors,
-            "mode='dark'\nbackground='#1a1b26'\naccent='#ABCDEF'\n",
+            "mode='dark'\nbackground='#333333'\nforeground='#eeeeee'\naccent='#abcdef'\n",
         )
         .unwrap();
-        assert_eq!(update(&p, &mut prev, || 0).unwrap().mode, "dark");
+        assert_eq!(update(&p, &mut state, || 0), None);
+        assert_eq!(state.applied.as_ref(), Some(&b));
+        let c = update(&p, &mut state, || 0).unwrap();
+        assert_eq!(c.vars["--omarchy-background"], "#333333");
+        assert!(!c.vars.contains_key("--omarchy-orange"));
+        assert!(script(&c).contains("removeProperty"));
+        fs::write(&p.colors, "mode=[broken").unwrap();
+        assert_eq!(update(&p, &mut state, || 0), None);
+        assert_eq!(state.applied.as_ref(), Some(&c));
+    }
+    #[test]
+    fn incomplete_start_waits_for_two_complete_reads() {
+        let (_t, p) = fixture();
+        fs::write(&p.colors, "mode='light'\n").unwrap();
+        let mut state = WatchState::initial(load(&p, || 0));
+        assert!(state.applied.is_none());
+        fs::write(
+            &p.colors,
+            "mode='light'\nbackground='#111111'\nforeground='#eeeeee'\naccent='#abcdef'\n",
+        )
+        .unwrap();
+        assert_eq!(update(&p, &mut state, || 0), None);
+        assert!(update(&p, &mut state, || 0).is_some());
     }
 }

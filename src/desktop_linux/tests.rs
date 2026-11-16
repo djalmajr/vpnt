@@ -753,3 +753,8 @@ fn omarchy_gap_and_frame_examples() {
         1605
     );
 }
+
+#[test]
+fn initial_height_matches_design_contract() {
+    assert_eq!(super::DEFAULT_HEIGHT, 480);
+}
