@@ -5,6 +5,7 @@ impl<S: SecretStore> Broker<S> {
         &mut self,
         id: String,
         version: String,
+        build: Option<String>,
         profiles: Vec<Profile>,
         statuses: Vec<TunnelStatus>,
     ) -> Result<(), ()> {
@@ -122,7 +123,10 @@ impl<S: SecretStore> Broker<S> {
         self.connections = current;
         self.refresh_actions();
         self.ready = true;
-        self.helper = "installed";
+        self.helper = match (self.expected_build.as_deref(), build.as_deref()) {
+            (Some(expected), Some(installed)) if expected == installed => "installed",
+            _ => "outdated",
+        };
         if initial {
             if let Some(retry) = &mut self.retry {
                 retry.ready();

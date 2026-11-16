@@ -76,11 +76,11 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
         let lock = mode_lock(mode, ControllerLock::acquire)?;
-        crate::install::engine::admit_uid(caller.uid)
+        let build = crate::install::engine::admit_uid(caller.uid)
             .map_err(|_| ErrorCode::UntrustedConfiguration)?;
-        Ok((store, lock))
+        Ok((store, lock, build))
     })();
-    let (store, lock) = match admitted {
+    let (store, lock, build) = match admitted {
         Ok(value) => value,
         Err(error) => {
             let mut stream = caller.stream;
@@ -89,7 +89,7 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         }
     };
     match mode {
-        Mode::Runtime => runtime(caller, |uid, requests, output| {
+        Mode::Runtime => runtime_with_build(caller, Some(build), |uid, requests, output| {
             crate::connection::controller::run_ssl(
                 lock.as_ref().ok_or(ErrorCode::Unavailable)?,
                 uid,
@@ -164,8 +164,17 @@ fn admin(
     }
 }
 
+#[cfg(test)]
 fn runtime(
     caller: Caller,
+    run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
+) -> Result<(), ErrorCode> {
+    runtime_with_build(caller, None, run)
+}
+
+fn runtime_with_build(
+    caller: Caller,
+    build: Option<String>,
     run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
 ) -> Result<(), ErrorCode> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -197,7 +206,10 @@ fn runtime(
         let writer = thread::Builder::new()
             .name("vpnt-output".into())
             .spawn_scoped(scope, move || {
-                for message in outgoing {
+                for mut message in outgoing {
+                    if let Message::Snapshot { build: field, .. } = &mut message {
+                        *field = build.clone();
+                    }
                     if send(&mut stream, &message).is_err() {
                         writer_stop.store(true, Ordering::Release);
                         return Err(ErrorCode::Unavailable);

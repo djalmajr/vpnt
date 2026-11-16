@@ -98,7 +98,13 @@ do usuário. O cliente preparado verifica o executável fixo e invoca somente
 `sudo -n -- /Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.helper runtime`, com canal
 duplex anônimo herdado em FD 0. Sem o componente ele apresenta o primeiro uso.
 Instalar/remover exige ação e confirmação explícitas; nunca ocorre ao abrir o
-app. Cadastro/remoção de perfis usa o canal administrativo separado descrito
+app. O snapshot do helper informa o build verificado do recibo; o app o compara
+com o componente embutido e oferece Atualizar se diferir ou faltar no helper
+antigo. A atualização usa o mesmo Installer, sem remoção prévia. O broker recusa
+o pedido quando observa túnel ativo ou limpeza, e volta a verificar antes de
+entregar o controller; a observação não é uma barreira atômica contra eventos
+que ainda não chegaram. O motor conserva o lock e o veto de reservas IPsec.
+Cadastro/remoção de perfis usa o canal administrativo separado descrito
 abaixo. A integração do componente tem provas com processos fictícios; seu
 caminho instalado ainda precisa de validação privilegiada.
 Essa ligação está compilada e testada com um subprocesso fictício, sem execução

@@ -58,7 +58,9 @@ while True:
                     current=states.get(p["id"],dict(generation=0))
                     states[p["id"]]=dict(id=p["id"],generation=current["generation"]+1,state="off",failures=0)
             profiles=new_profiles
-        send(dict(type="snapshot",id=request["id"],protocol_version=999 if mode=="protocol" else (2 if mode=="old" else 3),version="old" if mode=="version" else "0.1.0",profiles=profiles,connections=[dict(id=p["id"],generation=0,state="connected",failures=0) if mode=="unearned" else states.get(p["id"],dict(id=p["id"],generation=0,state="off",failures=0)) for p in profiles]))
+        snapshot=dict(type="snapshot",id=request["id"],protocol_version=999 if mode=="protocol" else (2 if mode=="old" else 3),version="old" if mode=="version" else "0.1.0",profiles=profiles,connections=[dict(id=p["id"],generation=0,state="connected",failures=0) if mode=="unearned" else states.get(p["id"],dict(id=p["id"],generation=0,state="off",failures=0)) for p in profiles])
+        if mode!="build-missing":snapshot["build"]=("b" if mode=="build-different" else "a")*64
+        send(snapshot)
     elif command["type"]=="connect":
         assert command["credentials"]["password"]=="fictional-client-secret"
         with open(marker+".intervals","a") as out:out.write(json.dumps(dict(type="connect",id=command["id"],generation=command["generation"],interval=command["interval"]))+"\n")

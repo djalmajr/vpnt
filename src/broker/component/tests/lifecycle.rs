@@ -193,6 +193,17 @@ fn an_incompatible_new_session_cannot_turn_installer_exit_into_installation_succ
 }
 
 #[test]
+fn successful_installer_is_not_confirmed_if_reconnected_build_differs() {
+    let mut h = Harness::new("build-different", HELD);
+    h.begin(Command::InstallHelper {}, 2);
+    h.release();
+    let (_, result) = h.result();
+    assert_eq!(result.unwrap_err(), "component_expired");
+    assert_eq!(h.broker.snapshot().helper, "outdated");
+    assert!(h.root.join("finished").exists());
+}
+
+#[test]
 fn artifact_admission_failure_does_not_disconnect_the_existing_runtime() {
     let mut old = Peer::new("flow");
     let mut broker = Broker::new(Some(old.take()), Secrets(Arc::new(AtomicUsize::new(0))));

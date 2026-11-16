@@ -36,6 +36,8 @@ pub(super) fn dispatch<F: Factory>(
                 id: request.id,
                 protocol_version: VERSION,
                 version: env!("CARGO_PKG_VERSION").into(),
+                // The authenticated server attaches the verified installed receipt.
+                build: None,
                 profiles: slots.values().map(|slot| slot.profile.clone()).collect(),
                 connections: slots
                     .values()

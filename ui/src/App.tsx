@@ -219,6 +219,7 @@ export function App() {
                 navigate={navigate}
                 install={() => setComponentAction("install")}
                 busy={!!snapshot.componentOperation}
+                outdated={snapshot.helper === "outdated"}
                 t={t}
               />
             )}
@@ -309,6 +310,7 @@ export function App() {
             {componentAction && (
               <ComponentDialog
                 kind={componentAction}
+                updating={snapshot.helper === "outdated"}
                 run={run}
                 close={() => setComponentAction(undefined)}
                 installed={componentInstalled}

@@ -125,6 +125,41 @@ fn only_closed_modes_and_connected_unix_stream_capabilities_are_admitted() {
     assert!(Caller::from_fd(tcp.into()).is_err());
 }
 #[test]
+fn runtime_attaches_admitted_build_to_controller_snapshots() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let task = thread::spawn(move || {
+        runtime_with_build(caller(a), Some("a".repeat(64)), |_, requests, output| {
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            output
+                .send(Message::Snapshot {
+                    id: request.id,
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build: Some("b".repeat(64)),
+                    profiles: vec![],
+                    connections: vec![],
+                })
+                .unwrap();
+            Ok(())
+        })
+    });
+    let mut c = client(b);
+    protocol::write_request(
+        c.get_mut(),
+        &Request {
+            id: "first".into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(protocol::read_message(&mut c), Ok(Some(Message::Snapshot { build: Some(build), .. })) if build == "a".repeat(64))
+    );
+    drop(c);
+    assert!(task.join().unwrap().is_ok());
+}
+
+#[test]
 fn runtime_carries_fragmented_requests_and_replies_and_closes_on_injection() {
     let (a, b) = UnixStream::pair().unwrap();
     let task = thread::spawn(move || {

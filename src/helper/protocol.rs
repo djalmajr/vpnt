@@ -109,6 +109,8 @@ pub enum Message {
         id: String,
         protocol_version: u32,
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
         profiles: Vec<Profile>,
         connections: Vec<TunnelStatus>,
     },
@@ -226,6 +228,7 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
             id,
             protocol_version,
             version,
+            build,
             profiles,
             connections,
         } => {
@@ -236,6 +239,9 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
             let mut running = HashSet::new();
             if !valid_profile_id(id)
                 || version.len() > 64
+                || build
+                    .as_ref()
+                    .is_some_and(|value| !crate::install::valid_hash(value))
                 || profiles.len() > 64
                 || profiles
                     .iter()
@@ -382,6 +388,24 @@ fn write_frame(
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn snapshot_build_accepts_legacy_and_valid_hash_but_rejects_malformed_identity() {
+        for (field, expected) in [
+            (String::new(), true),
+            (format!(",\"build\":\"{}\"", "a".repeat(64)), true),
+            (format!(",\"build\":\"{}\"", "G".repeat(64)), false),
+            (String::from(",\"build\":\"short\""), false),
+        ] {
+            let body = format!(
+                "{{\"type\":\"snapshot\",\"id\":\"x\",\"protocol_version\":{VERSION},\"version\":\"0.1.0\",\"profiles\":[],\"connections\":[]{field}}}\n"
+            );
+            assert_eq!(
+                read_message(&mut body.as_bytes()).is_ok(),
+                expected,
+                "field {field}"
+            );
+        }
+    }
     #[test]
     fn cleanup_status_round_trips_and_refuses_cleaning_on_active_states() {
         for state in [

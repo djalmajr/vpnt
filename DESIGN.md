@@ -462,7 +462,9 @@ e lixeira à direita centralizada verticalmente nas duas linhas; as demais
 tema e nome acessível e `title` traduzidos de Remover. O clique abre a
 mesma confirmação de remoção; não há rótulo separado de remoção.
 O onboarding oferece um único botão Instalar de largura total, sem botão Ver
-detalhes nem estado alternativo de detalhes.
+detalhes nem estado alternativo de detalhes. Quando o componente está
+desatualizado, o mesmo fluxo usa Atualizar, avisa que túneis ativos devem ser
+desligados e mantém a confirmação antes de abrir o Instalador.
 
 Por indicação do Djalma em 2026-11-15, a ação de copiar o Log usa `icon-button`
 à direita na mesma linha do nome do perfil ou das abas. O botão fica fora do

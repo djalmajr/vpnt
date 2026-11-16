@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { Snapshot } from "../model";
 import type { Run } from "../navigation";
 import { Dialog, Icon, Notice, type T } from "./common";
@@ -27,12 +27,14 @@ export function ComponentStatus({ snapshot, t }: { snapshot: Snapshot; t: T }) {
    helper operation itself cannot be cancelled from this dialog. */
 export function ComponentDialogBody({
   kind,
+  updating = false,
   pending,
   confirm,
   close,
   t,
 }: {
   kind: "install" | "remove";
+  updating?: boolean;
   pending: boolean;
   confirm: () => void;
   close: () => void;
@@ -48,7 +50,9 @@ export function ComponentDialogBody({
               ? "componentInstallPending"
               : "componentRemovePending"
             : install
-              ? "componentInstallHint"
+              ? updating
+                ? "componentUpdateHint"
+                : "componentInstallHint"
               : "componentRemoveHint",
         )}
       </p>
@@ -64,7 +68,7 @@ export function ComponentDialogBody({
           onClick={confirm}
         >
           {pending && <Icon name="loader" />}
-          {t(install ? "install" : "remove")}
+          {t(install ? (updating ? "update" : "install") : "remove")}
         </button>
       </div>
     </>
@@ -73,12 +77,14 @@ export function ComponentDialogBody({
 
 export function ComponentDialog({
   kind,
+  updating = false,
   run,
   close,
   installed,
   t,
 }: {
   kind: "install" | "remove";
+  updating?: boolean;
   run: Run;
   close: () => void;
   installed: () => void;
@@ -86,15 +92,25 @@ export function ComponentDialog({
 }) {
   const [pending, setPending] = useState(false);
   const install = kind === "install";
+  // The helper becomes temporarily missing during handoff; retain the action
+  // the user confirmed instead of relabelling an in-flight update as Install.
+  const updateAction = useRef(install && updating).current;
   return (
     <Dialog
-      title={t(install ? "componentInstallTitle" : "componentRemoveTitle")}
+      title={t(
+        install
+          ? updateAction
+            ? "componentUpdateTitle"
+            : "componentInstallTitle"
+          : "componentRemoveTitle",
+      )}
       close={close}
       busy={pending}
       t={t}
     >
       <ComponentDialogBody
         kind={kind}
+        updating={updateAction}
         pending={pending}
         close={close}
         t={t}

@@ -70,6 +70,49 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       t,
     });
   describe(`component UI: ${locale}`, () => {
+    test("outdated onboarding and confirmation use the update action", () => {
+      let opens = 0;
+      const onboarding = Onboarding({
+        navigate: () => {},
+        install: () => {
+          opens += 1;
+        },
+        busy: false,
+        outdated: true,
+        t,
+      });
+      expect(renderToStaticMarkup(onboarding)).toContain(t("helperOutdated"));
+      const action = buttons(onboarding).find(
+        (button) => button.children === t("update"),
+      );
+      expect(action).toBeDefined();
+      if (typeof action?.onClick !== "function")
+        throw new Error("missing update action");
+      action.onClick();
+      expect(opens).toBe(1);
+      let confirms = 0;
+      const body = ComponentDialogBody({
+        kind: "install",
+        updating: true,
+        pending: false,
+        confirm: () => {
+          confirms += 1;
+        },
+        close: () => {},
+        t,
+      });
+      expect(renderToStaticMarkup(body)).toContain(t("componentUpdateHint"));
+      const confirm = buttons(body).find(
+        (button) =>
+          Array.isArray(button.children) &&
+          button.children.includes(t("update")),
+      );
+      expect(confirm).toBeDefined();
+      if (typeof confirm?.onClick !== "function")
+        throw new Error("missing confirmation action");
+      confirm.onClick();
+      expect(confirms).toBe(1);
+    });
     test("installed version and Remove share one administrator row", () => {
       const html = renderToStaticMarkup(preferences());
       const lastGroup = html.slice(html.lastIndexOf('<section class="group">'));

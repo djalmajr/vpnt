@@ -26,7 +26,7 @@ pub enum Error {
     InvalidRequest,
 }
 
-fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

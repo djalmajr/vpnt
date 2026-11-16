@@ -41,6 +41,7 @@ pub struct Broker<S: SecretStore> {
     secrets: S,
     connections: BTreeMap<String, Connection>,
     helper: &'static str,
+    expected_build: Option<String>,
     ready: bool,
     dead: bool,
     next: u64,
@@ -72,12 +73,25 @@ impl<S: SecretStore> Broker<S> {
         result
     }
     fn new(client: Option<Client>, secrets: S) -> Self {
+        #[cfg(test)]
+        let fixture_build = client
+            .as_ref()
+            .and_then(Client::fixture_build)
+            .map(str::to_owned);
+        #[cfg(not(test))]
+        let fixture_build: Option<String> = None;
+        let expected_build = fixture_build.or_else(|| {
+            crate::install::bundle::Component::current()
+                .ok()
+                .map(|component| component.metadata().build.clone())
+        });
         let mut result = Self {
             client,
             retry: None,
             secrets,
             connections: BTreeMap::new(),
             helper: "missing",
+            expected_build,
             ready: false,
             dead: false,
             next: 1,
@@ -113,6 +127,10 @@ impl<S: SecretStore> Broker<S> {
             .and_then(|r| r.attempt(self.client.as_ref()));
         match attempt {
             Some(Ok(client)) => {
+                #[cfg(test)]
+                if self.expected_build.is_none() {
+                    self.expected_build = client.fixture_build().map(str::to_owned);
+                }
                 self.epoch = self
                     .epoch
                     .checked_add(1)
@@ -186,10 +204,11 @@ impl<S: SecretStore> Broker<S> {
             Message::Snapshot {
                 id,
                 version,
+                build,
                 profiles,
                 connections,
                 ..
-            } => self.receive_snapshot(id, version, profiles, connections)?,
+            } => self.receive_snapshot(id, version, build, profiles, connections)?,
             Message::Changed {
                 profile_id,
                 generation,

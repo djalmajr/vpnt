@@ -43,11 +43,15 @@ pub unsafe fn remove_inherited() -> Result<(), Error> {
         Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) }).map_err(|_| Error::PermissionDenied)?;
     channel::serve(caller, &mut system())
 }
-pub(crate) fn admit_uid(uid: u32) -> Result<(), Error> {
+pub(crate) fn admit_uid(uid: u32) -> Result<String, Error> {
     root()?;
-    admit(&Tree::system(), uid)
+    admitted_build(&Tree::system(), uid)
 }
+#[cfg(test)]
 pub(super) fn admit(tree: &Tree, uid: u32) -> Result<(), Error> {
+    admitted_build(tree, uid).map(|_| ())
+}
+pub(super) fn admitted_build(tree: &Tree, uid: u32) -> Result<String, Error> {
     payload::files::directory(&tree.state, tree.owner, true)?;
     if Journal::pending(tree)? {
         return Err(Error::RecoveryRequired);
@@ -56,7 +60,8 @@ pub(super) fn admit(tree: &Tree, uid: u32) -> Result<(), Error> {
     if receipt.app_version != env!("CARGO_PKG_VERSION") || !receipt.users.contains_key(&uid) {
         return Err(Error::PermissionDenied);
     }
-    receipt.verify(tree)
+    receipt.verify(tree)?;
+    Ok(receipt.build)
 }
 fn account(uid: u32) -> Result<(), Error> {
     policy::account(uid)?;

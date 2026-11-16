@@ -112,6 +112,9 @@ impl<S: SecretStore> Broker<S> {
             Command::RemoveHelper {} => Kind::Remove,
             _ => return Err("invalid_request"),
         };
+        if kind == Kind::Install && self.component_connections_busy() {
+            return Err("component_busy");
+        }
         let token = self.next.checked_add(1).ok_or("backend_unavailable")?;
         let client = (self.component.connect)(kind, format!("component-{token}"), locale, expires)
             .map_err(map_error)?;
@@ -127,6 +130,13 @@ impl<S: SecretStore> Broker<S> {
             reported: false,
         });
         Ok(token)
+    }
+    fn component_connections_busy(&self) -> bool {
+        self.connections.values().any(|connection| {
+            connection.view.state.active()
+                || connection.view.state == State::Disconnecting
+                || connection.view.cleaning
+        })
     }
     pub fn take_component_result(&mut self) -> Option<(u64, Result<Snapshot, &'static str>)> {
         let (token, result) = self.component.completion.take()?;
@@ -153,6 +163,15 @@ impl<S: SecretStore> Broker<S> {
             && !op.reported
         {
             self.component.completion = Some((op.token, Err(map_error(error))));
+            op.reported = true;
+        }
+        if !op.reported
+            && op.kind == Kind::Install
+            && op.phase == Phase::Admitting
+            && self.component_connections_busy()
+        {
+            op.client.close();
+            self.component.completion = Some((op.token, Err("component_busy")));
             op.reported = true;
         }
         if op.reported {
@@ -200,7 +219,11 @@ impl<S: SecretStore> Broker<S> {
                     _ => {}
                 }
             }
-            if op.phase == Phase::Verifying && self.ready && self.epoch > op.epoch {
+            if op.phase == Phase::Verifying
+                && self.ready
+                && self.helper == "installed"
+                && self.epoch > op.epoch
+            {
                 self.component.completion = Some((op.token, Ok(())));
                 return;
             }

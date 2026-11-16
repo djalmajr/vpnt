@@ -60,6 +60,14 @@ fn update_refreshes_digests_for_registered_users_and_removing_one_preserves_the_
     assert_ne!(fs::read(f.policy(601)).unwrap(), original);
     let receipt = Receipt::load(&f.executor.tree).unwrap().unwrap();
     receipt.verify(&f.executor.tree).unwrap();
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 601).unwrap(),
+        receipt.build
+    );
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 603),
+        Err(Error::PermissionDenied)
+    );
     access::admit(&f.executor.tree, 601).unwrap();
     access::admit(&f.executor.tree, 602).unwrap();
     assert_eq!(f.executor.remove(601).unwrap().users, vec![602]);

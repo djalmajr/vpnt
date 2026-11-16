@@ -63,6 +63,44 @@ fn dispatch(b: &mut Broker<Secrets>, c: Command) -> Snapshot {
         .unwrap()
 }
 #[test]
+fn build_identity_marks_old_helpers_outdated_without_disabling_tunnels() {
+    for (mode, expected, packaged) in [
+        ("flow", "installed", true),
+        ("build-different", "outdated", true),
+        ("build-missing", "outdated", true),
+        ("flow", "outdated", false),
+    ] {
+        let mut peer = Peer::new(mode);
+        let root = peer.root().to_owned();
+        let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+        if !packaged {
+            broker.expected_build = None;
+        }
+        let until = Instant::now() + Duration::from_secs(4);
+        while !broker.ready {
+            broker.poll();
+            assert!(
+                Instant::now() < until,
+                "{mode} did not produce an initial snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(broker.snapshot().helper, expected, "mode: {mode}");
+        dispatch(&mut broker, Command::Connect { id: "one".into() });
+        peer.advance();
+        wait(&mut broker, |s| s.vpns[0].state == State::Connected);
+        assert_eq!(broker.snapshot().helper, expected);
+        assert!(!peer.retiring(), "{mode} must keep its helper alive");
+        dispatch(&mut broker, Command::Disconnect { id: "one".into() });
+        wait(&mut broker, |s| s.vpns[0].state == State::Off);
+        assert_eq!(broker.snapshot().helper, expected);
+        drop(broker);
+        drop(peer);
+        assert!(!root.exists(), "fixture {mode} did not clean up");
+    }
+}
+
+#[test]
 fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_generations() {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
