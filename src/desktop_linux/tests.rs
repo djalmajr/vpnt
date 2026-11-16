@@ -195,6 +195,7 @@ fn worker_discards_stale_work_and_coalesces_requests() {
         placement::worker_loop(
             requests,
             &worker_generation,
+            || None,
             |request| {
                 let _ = processed_tx.send(request.generation);
                 if request.generation == 1 {
@@ -207,7 +208,7 @@ fn worker_discards_stale_work_and_coalesces_requests() {
                 })?;
                 Ok(Some(request.requested))
             },
-            |generation, height| {
+            |generation, height, _| {
                 let _ = reply_tx.send((generation, height));
             },
         );
@@ -255,13 +256,14 @@ fn applied_height_discards_stale_and_uses_short_monitor() {
     placement::worker_loop(
         requests,
         &generation,
+        || None,
         |request| {
             Ok(
                 placement::frame(request.anchor.unwrap(), &monitors, request.requested)
                     .map(|f| f.height),
             )
         },
-        |generation, height| {
+        |generation, height, _| {
             let _ = reply_tx.send((generation, height));
         },
     );
@@ -271,6 +273,162 @@ fn applied_height_discards_stale_and_uses_short_monitor() {
     assert_eq!(
         placement::applied_height(current, placed, height),
         Some(550)
+    );
+}
+
+#[test]
+fn show_resize_keeps_the_opening_anchor_after_cursor_moves() {
+    use std::cell::Cell;
+    let generation = placement::Generation::default();
+    let monitors =
+        monitors(r#"[{"x":0,"y":0,"width":1920,"height":1080,"scale":1,"reserved":[0,26,0,0]}]"#);
+    let pointer = Cell::new(placement::Anchor { x: 100.0, y: 10.0 });
+    let captures = Cell::new(0);
+    let moves = std::cell::RefCell::new(Vec::new());
+    let mut stored_anchor = None;
+    let mut opening = 0;
+    for height in [360, 500] {
+        let current = placement::advance(&generation);
+        let (tx, rx) = mpsc::channel();
+        let request = if opening == 0 {
+            opening = current;
+            placement::click_request(current, None, height)
+        } else {
+            placement::resize_request(current, opening, stored_anchor, height)
+        };
+        tx.send(request).unwrap();
+        drop(tx);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        placement::worker_loop(
+            rx,
+            &generation,
+            || {
+                captures.set(captures.get() + 1);
+                Some(pointer.get())
+            },
+            |request| {
+                let frame = placement::frame(request.anchor.unwrap(), &monitors, request.requested)
+                    .unwrap();
+                moves.borrow_mut().push((frame.x, frame.y));
+                Ok(Some(frame.height))
+            },
+            |generation, height, anchor| {
+                let _ = reply_tx.send((generation, height, anchor));
+            },
+        );
+        let (placed, height, anchor) = reply_rx.recv().unwrap();
+        assert_eq!(
+            super::accept_placement(current, placed, height, &mut stored_anchor, anchor),
+            Some(height)
+        );
+        assert_eq!(stored_anchor, Some(placement::Anchor { x: 100.0, y: 10.0 }));
+        pointer.set(placement::Anchor { x: 250.0, y: 10.0 });
+    }
+    assert_eq!(*moves.borrow(), [(8, 26), (8, 26)]);
+    assert_eq!(captures.get(), 1);
+}
+
+#[test]
+fn placed_anchor_ignores_stale_events_and_never_replaces_click_anchor() {
+    let first = Some(placement::Anchor { x: 100.0, y: 10.0 });
+    let second = Some(placement::Anchor { x: 250.0, y: 10.0 });
+    let mut saved = None;
+    assert_eq!(super::accept_placement(2, 1, 360, &mut saved, first), None);
+    assert_eq!(saved, None);
+    assert_eq!(
+        super::accept_placement(2, 2, 360, &mut saved, first),
+        Some(360)
+    );
+    assert_eq!(saved, first);
+    assert_eq!(
+        super::accept_placement(2, 2, 400, &mut saved, second),
+        Some(400)
+    );
+    assert_eq!(saved, first);
+    saved = second;
+    assert_eq!(super::accept_placement(3, 2, 360, &mut saved, first), None);
+    assert_eq!(saved, second);
+    assert_eq!(
+        super::accept_placement(3, 3, 360, &mut saved, first),
+        Some(360)
+    );
+    assert_eq!(saved, second);
+}
+
+#[test]
+fn resize_before_first_placed_reuses_capture_but_new_opening_recaptures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let generation = Arc::new(placement::Generation::default());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (input, requests) = mpsc::channel();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (moves_tx, moves_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let worker_gen = Arc::clone(&generation);
+    let worker_count = Arc::clone(&count);
+    let first = placement::advance(&generation);
+    let worker = std::thread::spawn(move || {
+        let screens = monitors(
+            r#"[{"x":0,"y":0,"width":1920,"height":1080,"scale":1,"reserved":[0,26,0,0]}]"#,
+        );
+        placement::worker_loop(
+            requests,
+            &worker_gen,
+            || {
+                let n = worker_count.fetch_add(1, Ordering::SeqCst);
+                Some(placement::Anchor {
+                    x: if n == 0 { 100.0 } else { 250.0 },
+                    y: 10.0,
+                })
+            },
+            |req| {
+                let frame = placement::frame(req.anchor.unwrap(), &screens, req.requested).unwrap();
+                if req.generation == first {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                }
+                placement::dispatch_if_current(&worker_gen, req.generation, || {
+                    let _ = moves_tx.send((frame.x, frame.y));
+                    Ok(())
+                })?;
+                Ok(Some(frame.height))
+            },
+            |generation, height, anchor| {
+                let _ = reply_tx.send((generation, height, anchor));
+            },
+        );
+    });
+    input
+        .send(placement::click_request(first, None, 360))
+        .unwrap();
+    let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+    let second = placement::advance(&generation);
+    input
+        .send(placement::resize_request(second, first, None, 500))
+        .unwrap();
+    let _ = release_tx.send(());
+    let resized = reply_rx.recv_timeout(Duration::from_secs(2));
+    let third = placement::advance(&generation);
+    input
+        .send(placement::click_request(third, None, 360))
+        .unwrap();
+    let reopened = reply_rx.recv_timeout(Duration::from_secs(2));
+    drop(input);
+    worker.join().unwrap();
+    assert!(entered.is_ok());
+    assert_eq!(
+        resized.unwrap(),
+        (second, 500, Some(placement::Anchor { x: 100.0, y: 10.0 }))
+    );
+    assert_eq!(
+        reopened.unwrap(),
+        (third, 360, Some(placement::Anchor { x: 250.0, y: 10.0 }))
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        moves_rx.into_iter().collect::<Vec<_>>(),
+        [(8, 26), (90, 26)]
     );
 }
 

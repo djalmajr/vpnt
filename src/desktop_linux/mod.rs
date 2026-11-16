@@ -1,4 +1,7 @@
 const PRODUCT_NAME: &str = "VPN Tray";
+/// StatusNotifierItem Id. Trays such as Omarchy's pin items by this Id, so it
+/// must not change between runs (tray-icon's default embeds the process id).
+const TRAY_ID: &str = "vpnt";
 
 mod backend;
 mod icon;
@@ -29,7 +32,11 @@ enum UserEvent {
     Tray(TrayIconEvent, Option<placement::Anchor>),
     Ipc(Zeroizing<String>, Instant),
     Reply(Reply),
-    Placed { generation: u64, height: u32 },
+    Placed {
+        generation: u64,
+        height: u32,
+        anchor: Option<placement::Anchor>,
+    },
 }
 
 pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -37,10 +44,16 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
     let generation = Arc::new(placement::Generation::default());
     let placement_proxy = event_loop.create_proxy();
-    let positioner =
-        placement::Positioner::new(Arc::clone(&generation), move |generation, height| {
-            let _ = placement_proxy.send_event(UserEvent::Placed { generation, height });
-        })?;
+    let positioner = placement::Positioner::new(
+        Arc::clone(&generation),
+        move |generation, height, anchor| {
+            let _ = placement_proxy.send_event(UserEvent::Placed {
+                generation,
+                height,
+                anchor,
+            });
+        },
+    )?;
     let tray_proxy = proxy.clone();
     TrayIconEvent::set_event_handler(Some(move |event| {
         let _ = tray_proxy.send_event(UserEvent::Tray(event, placement::capture()));
@@ -91,6 +104,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let mut tray = None;
     let mut open = false;
+    let mut opening = 0;
     let mut anchor = None;
     let mut height = 360;
     let mut last_focus_hide = None;
@@ -102,6 +116,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|error| error.to_string())
                     .and_then(|icon| {
                         TrayIconBuilder::new()
+                            .with_id(TRAY_ID)
                             .with_icon(icon)
                             .with_tooltip(PRODUCT_NAME)
                             .with_title(PRODUCT_NAME)
@@ -120,6 +135,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if show {
                     let current = placement::advance(&generation);
+                    opening = current;
                     reposition(
                         &window,
                         &positioner,
@@ -144,6 +160,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 open = !open;
                 let current = placement::advance(&generation);
                 if open {
+                    opening = current;
                     anchor = click;
                     reposition(
                         &window,
@@ -181,7 +198,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                             reposition(
                                 &window,
                                 &positioner,
-                                placement::click_request(current, anchor, height),
+                                placement::resize_request(current, opening, anchor, height),
                             );
                         } else {
                             window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
@@ -205,9 +222,12 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
             Event::UserEvent(UserEvent::Placed {
                 generation: placed,
                 height,
+                anchor: used_anchor,
             }) => {
                 let current = placement::current(&generation);
-                if let Some(height) = placement::applied_height(current, placed, height) {
+                if let Some(height) =
+                    accept_placement(current, placed, height, &mut anchor, used_anchor)
+                {
                     fix_bounds(&window, height);
                 }
             }
@@ -226,6 +246,20 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = &tray;
     });
+}
+
+fn accept_placement(
+    current: u64,
+    placed: u64,
+    height: u32,
+    anchor: &mut Option<placement::Anchor>,
+    used_anchor: Option<placement::Anchor>,
+) -> Option<u32> {
+    let height = placement::applied_height(current, placed, height)?;
+    if anchor.is_none() {
+        *anchor = used_anchor;
+    }
+    Some(height)
 }
 
 fn reposition(

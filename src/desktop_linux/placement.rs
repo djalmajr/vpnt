@@ -51,6 +51,7 @@ pub(super) struct Client {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PlacementRequest {
     pub(super) generation: u64,
+    opening: u64,
     pub(super) anchor: Option<Anchor>,
     pub(super) requested: u32,
 }
@@ -62,6 +63,21 @@ pub(super) fn click_request(
 ) -> PlacementRequest {
     PlacementRequest {
         generation,
+        opening: generation,
+        anchor,
+        requested,
+    }
+}
+
+pub(super) fn resize_request(
+    generation: u64,
+    opening: u64,
+    anchor: Option<Anchor>,
+    requested: u32,
+) -> PlacementRequest {
+    PlacementRequest {
+        generation,
+        opening,
         anchor,
         requested,
     }
@@ -276,7 +292,7 @@ pub(super) struct Positioner {
 impl Positioner {
     pub(super) fn new(
         generation: Arc<Generation>,
-        reply: impl Fn(u64, u32) + Send + 'static,
+        reply: impl Fn(u64, u32, Option<Anchor>) + Send + 'static,
     ) -> std::io::Result<Self> {
         let supported = hyprland() && Path::new(HYPRCTL).is_file();
         let (input, requests) = mpsc::channel();
@@ -297,6 +313,7 @@ impl Positioner {
                 worker_loop(
                     requests,
                     &generation,
+                    || if ready { capture() } else { None },
                     |request| {
                         if ready {
                             apply(request, &generation)
@@ -322,15 +339,26 @@ impl Positioner {
 pub(super) fn worker_loop(
     requests: Receiver<PlacementRequest>,
     generation: &Generation,
+    mut capture_anchor: impl FnMut() -> Option<Anchor>,
     mut process: impl FnMut(PlacementRequest) -> Result<Option<u32>, String>,
-    reply: impl Fn(u64, u32),
+    reply: impl Fn(u64, u32, Option<Anchor>),
 ) {
+    let mut opening_anchor: Option<(u64, Anchor)> = None;
     while let Ok(mut request) = requests.recv() {
         while let Ok(latest) = requests.try_recv() {
             request = latest;
         }
         if !is_current(generation, request.generation) {
             continue;
+        }
+        if request.anchor.is_none() {
+            request.anchor = opening_anchor
+                .filter(|(opening, _)| *opening == request.opening)
+                .map(|(_, anchor)| anchor)
+                .or_else(&mut capture_anchor);
+        }
+        if let Some(anchor) = request.anchor {
+            opening_anchor = Some((request.opening, anchor));
         }
         let height = match process(request) {
             Ok(Some(height)) => height,
@@ -341,7 +369,7 @@ pub(super) fn worker_loop(
             }
         };
         if is_current(generation, request.generation) {
-            reply(request.generation, height);
+            reply(request.generation, height, request.anchor);
         }
     }
 }
@@ -354,7 +382,7 @@ fn own_client() -> Result<Option<Client>, String> {
 }
 
 fn apply(request: PlacementRequest, generation: &Generation) -> Result<Option<u32>, String> {
-    let Some(anchor) = request.anchor.or_else(capture) else {
+    let Some(anchor) = request.anchor else {
         return Ok(None);
     };
     let monitors = parse_monitors(&command(&["monitors", "-j"])?).map_err(|e| e.to_string())?;
