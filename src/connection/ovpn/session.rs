@@ -51,13 +51,31 @@ pub enum SignError {
 pub struct Launch {
     pub openvpn: PathBuf,
     pub config: PathBuf,
-    /// Also advertise RSA-PSS, which TLS 1.3 requires. openvpn does not limit
-    /// TLS to what is advertised: a server that picks PSS fails the handshake
-    /// when this is off.
-    pub pss: bool,
+    pub signatures: Signatures,
     pub extra: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
 }
+
+/// Signature schemes the token may be asked for in the TLS handshake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Signatures {
+    /// PKCS#1 v1.5 or RSA-PSS, so TLS 1.3 can be negotiated.
+    Any,
+    /// PKCS#1 v1.5 only, which caps TLS at 1.2: for tokens whose PSS
+    /// signatures servers do not accept (seen with the SerproID cloud token).
+    Pkcs1Only,
+}
+
+/// openvpn does not limit TLS to the paddings it advertises: a server that
+/// offers PSS gets picked and the handshake fails before any signature is
+/// requested. OpenSSL itself is therefore told to offer only PKCS#1 v1.5.
+/// This replaces the system OpenSSL configuration (and its policy) for
+/// openvpn alone; `SignatureAlgorithms` also limits the server's own
+/// signature, which suits the RSA servers this is meant for.
+const PKCS1_ONLY: &str = "openssl_conf = vpnt\n[vpnt]\nssl_conf = vpnt_ssl\n\
+    [vpnt_ssl]\nsystem_default = vpnt_tls\n[vpnt_tls]\nMaxProtocol = TLSv1.2\n\
+    SignatureAlgorithms = RSA+SHA256:RSA+SHA384:RSA+SHA512\n\
+    ClientSignatureAlgorithms = RSA+SHA256:RSA+SHA384:RSA+SHA512\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Progress {
@@ -89,25 +107,37 @@ impl Session {
         let directory = PrivateDir::create(Path::new("/tmp"))?;
         let socket = directory.path.join("management");
         let listener = UnixListener::bind(&socket)?;
-        let mut openvpn = Openvpn(
-            Command::new(&launch.openvpn)
-                .arg("--config")
-                .arg(&launch.config)
-                .arg("--management")
-                .arg(&socket)
-                .arg("unix")
-                .args(["--management-client", "--management-hold"])
-                .args(["--management-external-key", "pkcs1"])
-                .args(launch.pss.then_some("pss"))
-                .args(["--management-external-cert", "vpnt"])
-                .args(["--route-noexec", "--ifconfig-noexec"])
-                .args(&launch.extra)
-                .envs(launch.env.iter().map(|(key, value)| (key, value)))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        );
+        let mut command = Command::new(&launch.openvpn);
+        command
+            .arg("--config")
+            .arg(&launch.config)
+            .arg("--management")
+            .arg(&socket)
+            .arg("unix")
+            .args(["--management-client", "--management-hold"])
+            .args(["--management-external-cert", "vpnt"])
+            .args(["--route-noexec", "--ifconfig-noexec"])
+            .args(&launch.extra)
+            .envs(launch.env.iter().map(|(key, value)| (key, value)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match launch.signatures {
+            Signatures::Any => {
+                command.args(["--management-external-key", "pkcs1", "pss"]);
+            }
+            Signatures::Pkcs1Only => {
+                let config = directory.path.join("openssl.cnf");
+                fs::write(&config, PKCS1_ONLY)?;
+                // After the profile and the extras, so a profile asking for
+                // TLS 1.3 cannot bring back the PSS handshake.
+                command
+                    .args(["--management-external-key", "pkcs1"])
+                    .args(["--tls-version-max", "1.2"])
+                    .env("OPENSSL_CONF", config);
+            }
+        }
+        let mut openvpn = Openvpn(command.spawn()?);
         let stream = accept(&listener, &mut openvpn.0)?;
         drop(listener);
         let _ = fs::remove_file(&socket);

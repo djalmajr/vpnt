@@ -108,9 +108,8 @@ impl Fixture {
         assert!(status.success(), "openssl {args:?}");
     }
 
-    /// `pkcs1_only` makes the server offer only PKCS#1 v1.5 signature
-    /// algorithms over TLS 1.2; openvpn has no option for that, OpenSSL does.
-    pub fn server(&self, ports: (u16, u16), pkcs1_only: bool) -> Server {
+    /// A default server: it offers TLS 1.3 and RSA-PSS, like the real ones.
+    pub fn server(&self, ports: (u16, u16)) -> Server {
         let mut command = Command::new(&self.openvpn);
         command
             .current_dir(&self.directory)
@@ -147,32 +146,19 @@ impl Fixture {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if pkcs1_only {
-            let config = self.path("server-openssl.cnf");
-            fs::write(
-                &config,
-                "openssl_conf = default_conf\n[default_conf]\nssl_conf = ssl_sect\n[ssl_sect]\n\
-                 system_default = tls\n[tls]\nMaxProtocol = TLSv1.2\n\
-                 SignatureAlgorithms = RSA+SHA256:RSA+SHA384:RSA+SHA512\n",
-            )
-            .unwrap();
-            command.env("OPENSSL_CONF", config);
-        }
         Server(command.spawn().unwrap())
     }
 
-    pub fn client_config(&self, ports: (u16, u16), tls_max: Option<&str>) -> PathBuf {
+    /// `extra` lines are appended to the profile.
+    pub fn client_config(&self, ports: (u16, u16), extra: &str) -> PathBuf {
         let path = self.path("client.ovpn");
-        let mut config = format!(
+        let config = format!(
             "tls-client\npull\ndev null\nproto udp4\nlocal 127.0.0.1\nlport {}\nremote 127.0.0.1 {}\n\
-             ca {}\nremote-cert-tls server\nverb 1\n",
+             ca {}\nremote-cert-tls server\nverb 1\n{extra}",
             ports.1,
             ports.0,
             self.path("ca.crt").display()
         );
-        if let Some(version) = tls_max {
-            config.push_str(&format!("tls-version-max {version}\n"));
-        }
         fs::write(&path, config).unwrap();
         path
     }

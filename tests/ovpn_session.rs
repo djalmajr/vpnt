@@ -19,7 +19,7 @@ use std::{
 };
 use vpnt::connection::ovpn::{
     management::Phase,
-    session::{Launch, Progress, Session},
+    session::{Launch, Progress, Session, Signatures},
     signing::{Hash, Padding},
 };
 
@@ -27,15 +27,15 @@ use vpnt::connection::ovpn::{
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Connects, then stops; returns the paddings the token was asked for.
-fn connect_and_stop(fixture: &Fixture, pss: bool, tls_max: Option<&str>) -> Vec<Padding> {
+fn connect_and_stop(fixture: &Fixture, signatures: Signatures, profile: &str) -> Vec<Padding> {
     let ports = free_udp_ports();
-    let _server = fixture.server(ports, !pss);
+    let _server = fixture.server(ports);
     let signer = fixture.signer();
     let paddings = Arc::clone(&signer.paddings);
     let launch = Launch {
         openvpn: fixture.openvpn.clone(),
-        config: fixture.client_config(ports, tls_max),
-        pss,
+        config: fixture.client_config(ports, profile),
+        signatures,
         extra: Vec::new(),
         env: Vec::new(),
     };
@@ -72,7 +72,7 @@ fn tls13_handshake_is_signed_with_pss_through_the_management_channel() {
     let Some(fixture) = Fixture::new("pss") else {
         return;
     };
-    let paddings = connect_and_stop(&fixture, true, None);
+    let paddings = connect_and_stop(&fixture, Signatures::Any, "");
     assert!(
         paddings.contains(&Padding::Pss(Hash::Sha256)),
         "{paddings:?}"
@@ -80,14 +80,17 @@ fn tls13_handshake_is_signed_with_pss_through_the_management_channel() {
 }
 
 #[test]
-fn tls12_without_pss_is_signed_with_pkcs1() {
-    // Mutation captured: sending a DigestInfo to a PSS mechanism (or the
-    // reverse), or refusing the real DigestInfo, fails the CertificateVerify.
+fn pkcs1_only_holds_when_the_server_offers_pss_and_tls13() {
+    // The case of the SerproID token against a real server, with a profile
+    // that asks for TLS 1.3. Mutation captured: without the OpenSSL override
+    // or the trailing --tls-version-max, the server's PSS offer is taken,
+    // openvpn refuses to ask for it and the handshake fails; sending a
+    // DigestInfo to a PSS mechanism, or refusing it, fails as well.
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let Some(fixture) = Fixture::new("pkcs1") else {
         return;
     };
-    let paddings = connect_and_stop(&fixture, false, Some("1.2"));
+    let paddings = connect_and_stop(&fixture, Signatures::Pkcs1Only, "tls-version-max 1.3\n");
     assert_eq!(paddings, [Padding::Pkcs1]);
 }
 
@@ -100,7 +103,7 @@ fn the_private_socket_directory_is_gone_after_the_session() {
         return;
     };
     let before = leftover_directories();
-    connect_and_stop(&fixture, true, None);
+    connect_and_stop(&fixture, Signatures::Any, "");
     assert_eq!(leftover_directories(), before);
 }
 

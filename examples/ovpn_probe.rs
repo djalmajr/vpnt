@@ -4,7 +4,7 @@
 //!
 //! cargo run --example ovpn_probe -- --openvpn PATH --config PROFILE.ovpn \
 //!     --module /usr/lib/libserproidp11.so --key-id HEX [--hold SECONDS] \
-//!     [--log FILE] [--no-pss] [-- extra openvpn arguments]
+//!     [--log FILE] [--pkcs1-only] [-- extra openvpn arguments]
 #[cfg(unix)]
 fn main() -> Result<(), String> {
     use std::{
@@ -16,12 +16,16 @@ fn main() -> Result<(), String> {
     use vpnt::connection::ovpn::{
         management::Phase,
         pkcs11::TokenKey,
-        session::{Launch, Progress, Session},
+        session::{Launch, Progress, Session, Signatures},
     };
 
     let mut args = std::env::args_os().skip(1);
     let (mut openvpn, mut config, mut module, mut key_id) = (None, None, None, None);
-    let (mut hold, mut pss, mut extra) = (Duration::from_secs(5), true, Vec::<OsString>::new());
+    let (mut hold, mut signatures, mut extra) = (
+        Duration::from_secs(5),
+        Signatures::Any,
+        Vec::<OsString>::new(),
+    );
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg:?} needs a value"));
         match arg.to_str() {
@@ -38,7 +42,7 @@ fn main() -> Result<(), String> {
                 )
             }
             Some("--log") => extra.extend([OsString::from("--log"), value()?]),
-            Some("--no-pss") => pss = false,
+            Some("--pkcs1-only") => signatures = Signatures::Pkcs1Only,
             Some("--") => extra.extend(args.by_ref()),
             _ => return Err(format!("unknown argument {arg:?}")),
         }
@@ -63,7 +67,7 @@ fn main() -> Result<(), String> {
     let launch = Launch {
         openvpn: openvpn.ok_or("--openvpn is required")?,
         config: config.ok_or("--config is required")?,
-        pss,
+        signatures,
         extra,
         env: Vec::new(),
     };

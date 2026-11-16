@@ -245,7 +245,7 @@ fn launch(openvpn: &Path) -> Launch {
     Launch {
         openvpn: openvpn.to_path_buf(),
         config: PathBuf::from("/dev/null"),
-        pss: true,
+        signatures: Signatures::Any,
         extra: Vec::new(),
         env: Vec::new(),
     }
