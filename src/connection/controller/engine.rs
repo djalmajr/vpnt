@@ -36,6 +36,7 @@ struct Slot<'scope> {
     generation: u64,
     state: ConnectionState,
     failures: u32,
+    cleaning: bool,
     interval: ProbeClock,
     worker: Option<Worker<'scope>>,
     pending: Option<Pending>,
@@ -52,6 +53,7 @@ impl Slot<'_> {
             generation: self.generation,
             state: self.state,
             failures: self.failures,
+            cleaning: self.cleaning,
         }
     }
 }
@@ -126,6 +128,7 @@ pub(super) fn run<F: Factory>(
                         generation: 0,
                         state: ConnectionState::Off,
                         failures: 0,
+                        cleaning: false,
                         interval: ProbeClock::new(interval.get()),
                         worker: None,
                         pending: None,
@@ -183,6 +186,7 @@ pub(super) fn run<F: Factory>(
                 {
                     slot.state = progress.state;
                     slot.failures = progress.failures;
+                    slot.cleaning = progress.cleaning;
                     outgoing.push_back(slot.changed());
                 }
                 if closing {
@@ -213,6 +217,7 @@ pub(super) fn run<F: Factory>(
                             ConnectionState::Off
                         };
                         slot.failures = 0;
+                        slot.cleaning = false;
                         if !closing {
                             outgoing.push_back(slot.changed());
                         }
@@ -241,11 +246,13 @@ pub(super) fn run<F: Factory>(
                     generation,
                     state,
                     failures,
+                    cleaning,
                 } = &message
                     && !slots.get(profile_id).is_some_and(|slot| {
                         slot.generation == *generation
                             && slot.state == *state
                             && slot.failures == *failures
+                            && slot.cleaning == *cleaning
                     })
                 {
                     continue;

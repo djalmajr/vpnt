@@ -125,6 +125,107 @@ fn only_closed_modes_and_connected_unix_stream_capabilities_are_admitted() {
     assert!(Caller::from_fd(tcp.into()).is_err());
 }
 #[test]
+fn runtime_attaches_admitted_build_to_controller_snapshots() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let task = thread::spawn(move || {
+        runtime_with_build(caller(a), Some("a".repeat(64)), |_, requests, output| {
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            output
+                .send(Message::Snapshot {
+                    id: request.id,
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build: Some("b".repeat(64)),
+                    profiles: vec![],
+                    connections: vec![],
+                })
+                .unwrap();
+            Ok(())
+        })
+    });
+    let mut c = client(b);
+    protocol::write_request(
+        c.get_mut(),
+        &Request {
+            id: "first".into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(protocol::read_message(&mut c), Ok(Some(Message::Snapshot { build: Some(build), .. })) if build == "a".repeat(64))
+    );
+    drop(c);
+    assert!(task.join().unwrap().is_ok());
+}
+
+#[test]
+fn diagnostics_receipt_gate_refuses_before_reading_and_allows_only_verified_single_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = AtomicUsize::new(0);
+    for (admission, expected) in [
+        (Ok(false), protocol::DiagnosticsStatus::Shared),
+        (
+            Err(crate::install::Error::PermissionDenied),
+            protocol::DiagnosticsStatus::Unavailable,
+        ),
+    ] {
+        let (status, logs) = gated_diagnostics(
+            || admission,
+            || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Some(vec![])
+            },
+        );
+        assert_eq!(status, expected);
+        assert!(logs.is_empty());
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+    let (status, _) = gated_diagnostics(
+        || Ok(true),
+        || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Some(vec![])
+        },
+    );
+    assert_eq!(status, protocol::DiagnosticsStatus::Ready);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn diagnostics_request_uses_the_authenticated_peer_uid_and_stays_out_of_controller() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (a, b) = UnixStream::pair().unwrap();
+    let seen = Arc::new(AtomicU32::new(0));
+    let observed = seen.clone();
+    let task = thread::spawn(move || {
+        let diagnostics: Diagnostics = Arc::new(move |uid| {
+            observed.store(uid, Ordering::Release);
+            (protocol::DiagnosticsStatus::Shared, vec![])
+        });
+        runtime_with_diagnostics(caller(a), None, diagnostics, |_, requests, _| {
+            assert!(requests.recv_timeout(Duration::from_secs(2)).is_err());
+            Ok(())
+        })
+    });
+    let mut c = client(b);
+    protocol::write_request(
+        c.get_mut(),
+        &Request {
+            id: "diagnostic-1".into(),
+            command: protocol::Command::Diagnostics {},
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(protocol::read_message(&mut c), Ok(Some(Message::Diagnostics { id, status: protocol::DiagnosticsStatus::Shared, logs })) if id == "diagnostic-1" && logs.is_empty())
+    );
+    assert_eq!(seen.load(Ordering::Acquire), unsafe { libc::geteuid() });
+    c.get_mut().shutdown(Shutdown::Write).unwrap();
+    assert!(task.join().unwrap().is_ok());
+}
+
+#[test]
 fn runtime_carries_fragmented_requests_and_replies_and_closes_on_injection() {
     let (a, b) = UnixStream::pair().unwrap();
     let task = thread::spawn(move || {

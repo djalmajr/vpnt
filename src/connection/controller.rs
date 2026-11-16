@@ -68,14 +68,17 @@ struct Timing {
     connect: Duration,
     probe: Duration,
     interval: Duration,
+    health: Duration,
     poll: Duration,
 }
+const CONNECTED_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 impl Default for Timing {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(60),
             probe: Duration::from_secs(5),
             interval: Duration::from_secs(10),
+            health: CONNECTED_HEALTH_INTERVAL,
             poll: Duration::from_millis(50),
         }
     }

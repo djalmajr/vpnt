@@ -33,6 +33,8 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     state: Arc<State>,
     failed: bool,
+    #[cfg(test)]
+    fixture_build: Option<String>,
 }
 impl Client {
     pub fn runtime() -> Result<Self, Error> {
@@ -49,7 +51,13 @@ impl Client {
     }
     #[cfg(test)]
     pub(crate) fn fixture(command: Command) -> Result<Self, Error> {
-        Self::spawn(command)
+        let mut client = Self::spawn(command)?;
+        client.fixture_build = Some("a".repeat(64));
+        Ok(client)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_build(&self) -> Option<&str> {
+        self.fixture_build.as_deref()
     }
     fn spawn(command: Command) -> Result<Self, Error> {
         if !std::path::Path::new(command.get_program()).is_absolute() {
@@ -76,6 +84,8 @@ impl Client {
             stop,
             state,
             failed: false,
+            #[cfg(test)]
+            fixture_build: None,
         })
     }
     pub fn send(&self, request: Request) -> Result<(), Error> {

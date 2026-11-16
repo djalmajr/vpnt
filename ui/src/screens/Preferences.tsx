@@ -1,6 +1,8 @@
+import { InstallButton } from "../components/ComponentDialog";
 import {
   Group,
   Header,
+  Help,
   Icon,
   Row,
   Select,
@@ -17,6 +19,12 @@ export function Preferences({
   update,
   navigate,
   removeComponent,
+  install,
+  installPending,
+  installBusy,
+  installBlocked,
+  updating,
+  installFailed,
   t,
 }: {
   snapshot: Snapshot;
@@ -24,9 +32,16 @@ export function Preferences({
   update: (settings: Settings) => void;
   navigate: Navigate;
   removeComponent: () => void;
+  install: () => void;
+  installPending: boolean;
+  installBusy: boolean;
+  installBlocked: boolean;
+  updating: boolean;
+  installFailed: boolean;
   t: T;
 }) {
   const pending = settings.preferencesPending;
+  const installed = snapshot.helper === "installed" && !installPending;
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     update({ ...settings, [key]: value });
   return (
@@ -75,7 +90,7 @@ export function Preferences({
       </Group>
       <h2 className="section-title">{t("tunnelTest")}</h2>
       <Group>
-        <Row label={t("testEvery")}>
+        <Row label={t("testEvery")} help={t("testEveryHelp")}>
           <Select
             aria-label={t("testEvery")}
             value={settings.interval}
@@ -94,7 +109,7 @@ export function Preferences({
             ))}
           </Select>
         </Row>
-        <Row label={t("notifyStale")}>
+        <Row label={t("notifyStale")} help={t("notifyStaleHelp")}>
           <Toggle
             label={t("notifyStale")}
             checked={settings.notify}
@@ -102,7 +117,11 @@ export function Preferences({
             onChange={(value) => set("notify", value)}
           />
         </Row>
-        <Row label={t("autoReconnect")} hint={t("afterThree")}>
+        <Row
+          label={t("autoReconnect")}
+          hint={t("afterThree")}
+          help={t("autoReconnectHelp")}
+        >
           <Toggle
             label={t("autoReconnect")}
             checked={settings.reconnect}
@@ -118,7 +137,13 @@ export function Preferences({
             type="button"
             className="profile-row"
             key={vpn.profile.id}
-            onClick={() => navigate({ page: "profile", id: vpn.profile.id })}
+            onClick={() =>
+              navigate({
+                page: "profile",
+                id: vpn.profile.id,
+                origin: "preferences",
+              })
+            }
           >
             <span>
               {vpn.profile.name}
@@ -130,7 +155,7 @@ export function Preferences({
         <button
           type="button"
           className="link add-profile"
-          onClick={() => navigate({ page: "new" })}
+          onClick={() => navigate({ page: "new", origin: "preferences" })}
         >
           <Icon name="plus" />
           {t("addVpn")}
@@ -138,41 +163,54 @@ export function Preferences({
       </Group>
       <h2 className="section-title">{t("administrator")}</h2>
       <Group>
-        <Row
-          label={t(
-            snapshot.helper === "installed"
-              ? "helperInstalled"
-              : "helperMissing",
-          )}
-          hint={t(
-            snapshot.helper === "installed" ? "installedHint" : "helperHint",
-          )}
-        >
-          {snapshot.helper === "installed" ? (
-            <small>{snapshot.version}</small>
+        <div className="setting-row component-row">
+          <span className="setting-label component-title">
+            {t(
+              installed
+                ? "helperInstalled"
+                : updating
+                  ? "helperOutdated"
+                  : "helperMissing",
+            )}
+            <Help text={t("componentHelp")} />
+          </span>
+          {installed ? (
+            <>
+              <small className="component-version">{snapshot.version}</small>
+              <button
+                type="button"
+                className="icon-button component-remove"
+                aria-label={t("remove")}
+                title={t("remove")}
+                disabled={!!snapshot.componentOperation}
+                onClick={removeComponent}
+              >
+                <Icon name="trash" />
+              </button>
+            </>
           ) : (
-            <button
-              type="button"
-              className="primary"
-              disabled={!!snapshot.componentOperation}
-              onClick={() => navigate({ page: "onboarding" })}
-            >
-              {t("install")}
-            </button>
+            <InstallButton
+              className="primary component-install"
+              install={install}
+              pending={installPending}
+              disabled={installBusy || installBlocked}
+              updating={updating}
+              failed={installFailed}
+              t={t}
+            />
           )}
-        </Row>
-        {snapshot.helper === "installed" && (
-          <Row label={t("removeHelper")}>
-            <button
-              type="button"
-              className="danger"
-              disabled={!!snapshot.componentOperation}
-              onClick={removeComponent}
-            >
-              {t("remove")}
-            </button>
-          </Row>
-        )}
+          <small className="component-hint">
+            {t(
+              installBlocked && !installed
+                ? updating
+                  ? "componentUpdateBlocked"
+                  : "componentInstallBlocked"
+                : installed
+                  ? "installedHint"
+                  : "helperHint",
+            )}
+          </small>
+        </div>
       </Group>
     </>
   );

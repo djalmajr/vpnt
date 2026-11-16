@@ -2,6 +2,8 @@
 //! Draining entry stays pending until its original peer is confirmed stopped
 //! and a fresh passive absence read succeeds. No empty answer is cached.
 use super::NativeLedger;
+use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
+
 use super::resource::Entry;
 use crate::connection::{ipsec::Error, ipsec::ResourceClaims, routes::Owner};
 use std::sync::{Arc, atomic::Ordering};
@@ -60,6 +62,7 @@ impl ResourceClaims for NativeLedger<'_> {
                 }
             }
             if !entry.state.stopped() {
+                diagnostic::mark(Reason::ProducerNotStopped);
                 owners.push(entry.owner.clone());
                 continue;
             }
@@ -71,6 +74,7 @@ impl ResourceClaims for NativeLedger<'_> {
                 }
             };
             if !fences_complete {
+                diagnostic::mark(Reason::FenceIncomplete);
                 owners.push(entry.owner.clone());
                 continue;
             }
@@ -82,6 +86,7 @@ impl ResourceClaims for NativeLedger<'_> {
                 }
             };
             if !absent {
+                diagnostic::mark(Reason::PinStillOwned);
                 owners.push(entry.owner.clone());
             }
         }
@@ -90,6 +95,8 @@ impl ResourceClaims for NativeLedger<'_> {
             self.inner.version.fetch_add(1, Ordering::Release);
         }
         if self.inner.version.load(Ordering::Acquire) != version {
+            diagnostic::begin();
+            diagnostic::mark(Reason::LedgerVersionChanged);
             return Err(Error::Changed);
         }
         Ok(owners)

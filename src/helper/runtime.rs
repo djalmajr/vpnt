@@ -1,5 +1,7 @@
 //! Admission of the fixed private client runtime. Production always requires
 //! root ownership; fixture ownership is explicit and never comes from IPC.
+#[path = "runtime_cleanup.rs"]
+pub(crate) mod cleanup;
 use super::paths;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -9,6 +11,7 @@ use std::{
     io::{ErrorKind, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
+    sync::Mutex,
 };
 
 const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -103,6 +106,40 @@ pub struct Runtime {
     directory: PathBuf,
     owner: u32,
     manifest: Manifest,
+    verified: Mutex<Option<BTreeMap<String, FileStamp>>>,
+    #[cfg(test)]
+    hash_passes: std::sync::atomic::AtomicUsize,
+}
+
+/// ctime is included even when a writer restores the original mtime/length.
+/// Production ancestors and files remain root-owned and deny non-root writes;
+/// this is not a fence against a hostile root changing timestamps or code.
+#[derive(Eq, PartialEq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    links: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl FileStamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            links: meta.nlink(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
 }
 
 impl Runtime {
@@ -172,8 +209,11 @@ impl Runtime {
             directory,
             owner,
             manifest,
+            verified: Mutex::new(None),
+            #[cfg(test)]
+            hash_passes: std::sync::atomic::AtomicUsize::new(0),
         };
-        runtime.verify()?;
+        runtime.verify_unchanged()?;
         Ok(runtime)
     }
 
@@ -223,6 +263,9 @@ impl Runtime {
     /// Recheck immediately before spawning. Non-root callers cannot replace
     /// admitted files or ancestors in the production tree between check and exec.
     pub fn verify(&self) -> Result<(), RuntimeError> {
+        #[cfg(test)]
+        self.hash_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         check_directory(&self.directory, self.owner)?;
         let mut actual = BTreeSet::new();
         inventory(&self.directory, &self.directory, self.owner, &mut actual)?;
@@ -255,6 +298,54 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    /// Reuse the content verification only while every admitted file is
+    /// unchanged. Inventory, ancestors, POSIX modes and ACLs are always fresh.
+    /// A changed identity/ctime/mtime forces a full hash/Mach-O pass. Failed or
+    /// racing verification is never stored as a successful cache entry.
+    pub(crate) fn verify_unchanged(&self) -> Result<(), RuntimeError> {
+        let mut verified = self.verified.lock().map_err(|_| RuntimeError::Io)?;
+        let before = self.stamps()?;
+        if verified.as_ref() == Some(&before) {
+            return Ok(());
+        }
+        self.verify()?;
+        let after = self.stamps()?;
+        if before != after {
+            return Err(RuntimeError::Integrity);
+        }
+        *verified = Some(after);
+        Ok(())
+    }
+
+    fn stamps(&self) -> Result<BTreeMap<String, FileStamp>, RuntimeError> {
+        check_directory(&self.directory, self.owner)?;
+        let mut actual = BTreeSet::new();
+        inventory(&self.directory, &self.directory, self.owner, &mut actual)?;
+        let expected: BTreeSet<_> = self
+            .manifest
+            .files
+            .keys()
+            .cloned()
+            .chain(std::iter::once("manifest.json".into()))
+            .collect();
+        if actual != expected {
+            return Err(RuntimeError::Integrity);
+        }
+        actual
+            .into_iter()
+            .map(|name| {
+                let executable = matches!(name.as_str(), "bin/charon" | "bin/openfortivpn");
+                let path = self.directory.join(&name);
+                let (_, meta) = open_file(&path, self.owner, executable, MAX_FILE)?;
+                let named = fs::symlink_metadata(&path).map_err(map_io)?;
+                if FileStamp::of(&named) != FileStamp::of(&meta) {
+                    return Err(RuntimeError::Integrity);
+                }
+                Ok((name, FileStamp::of(&meta)))
+            })
+            .collect()
     }
 }
 
@@ -313,6 +404,23 @@ fn read_file(
     executable: bool,
     limit: u64,
 ) -> Result<Vec<u8>, RuntimeError> {
+    let (file, _) = open_file(path, owner, executable, limit)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(map_io)?;
+    if bytes.len() as u64 > limit {
+        return Err(RuntimeError::Untrusted);
+    }
+    Ok(bytes)
+}
+
+fn open_file(
+    path: &Path,
+    owner: u32,
+    executable: bool,
+    limit: u64,
+) -> Result<(fs::File, fs::Metadata), RuntimeError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -329,15 +437,12 @@ fn read_file(
         return Err(RuntimeError::Untrusted);
     }
     crate::fs_permissions::check_file(&file, false).map_err(|_| RuntimeError::Untrusted)?;
-    let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(map_io)?;
-    if bytes.len() as u64 > limit {
-        return Err(RuntimeError::Untrusted);
-    }
-    Ok(bytes)
+    Ok((file, metadata))
 }
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
 
 fn inventory(
     root: &Path,

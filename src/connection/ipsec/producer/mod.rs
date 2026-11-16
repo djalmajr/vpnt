@@ -18,6 +18,7 @@ use std::{
 mod bound;
 mod child;
 mod config;
+mod diagnostic;
 mod files;
 mod ledger;
 mod record;
@@ -52,7 +53,7 @@ impl<'a> NativeContext<'a> {
     }
     fn using(controller: &'a ControllerLock, runtime: Runtime) -> Result<Arc<Self>, Error> {
         controller.validate().map_err(|_| Error::Changed)?;
-        runtime.verify().map_err(|_| Error::Changed)?;
+        runtime.verify_unchanged().map_err(|_| Error::Changed)?;
         let me = Process::read(std::process::id()).map_err(|_| Error::Unavailable)?;
         if !me.running || me.uid != runtime.owner() || me.real_uid != runtime.owner() {
             return Err(Error::Changed);
@@ -78,7 +79,12 @@ impl<'a> NativeContext<'a> {
         {
             return Err(Error::Changed);
         }
-        self.runtime.verify().map_err(|_| Error::Changed)?;
+        self.runtime.verify_unchanged().map_err(|_| {
+            crate::helper::runtime::cleanup::mark(
+                crate::helper::runtime::cleanup::Reason::RuntimeValidation,
+            );
+            Error::Changed
+        })?;
         self.store.root.validate()
     }
     pub fn observer<K: KernelClaims>(self: &Arc<Self>, kernel: K) -> NativeObserver<'a, K> {
@@ -180,6 +186,9 @@ impl<'a> NativeContext<'a> {
                 false
             };
             if !represented {
+                crate::helper::runtime::cleanup::mark(
+                    crate::helper::runtime::cleanup::Reason::UnrepresentedProducer,
+                );
                 result.insert(u32::from(record.reqid));
             }
         }
@@ -190,7 +199,13 @@ impl<'a> NativeContext<'a> {
         if let Some(p) = self.lookup(owner)? {
             return Ok(p.lock().map_err(|_| Error::Unavailable)?.stopped());
         }
-        Ok(!self.store.records()?.iter().any(|r| r.owner() == *owner))
+        let absent = !self.store.records()?.iter().any(|r| r.owner() == *owner);
+        if !absent {
+            crate::helper::runtime::cleanup::mark(
+                crate::helper::runtime::cleanup::Reason::UnrepresentedProducer,
+            );
+        }
+        Ok(absent)
     }
     fn completed(&self, owner: &Owner, reqid: u16) -> Result<(), Error> {
         self.validate()?;

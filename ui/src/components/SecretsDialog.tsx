@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { VpnView } from "../model";
 import type { Run } from "../navigation";
-import { Dialog, type T } from "./common";
+import { hasShellExpression } from "../shellExpression";
+import { Dialog, Notice, type T } from "./common";
 
 export function SecretsDialog({
   vpn,
@@ -74,6 +75,12 @@ export function SecretsDialog({
             autoComplete="new-password"
           />
         </label>
+        {(hasShellExpression(password) ||
+          (ipsec && hasShellExpression(psk))) && (
+          <Notice tone="warn">
+            <p role="status">{t("secretShellWarning")}</p>
+          </Notice>
+        )}
         <div className="actions end">
           <button type="button" onClick={close}>
             {t("cancel")}

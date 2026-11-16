@@ -45,6 +45,34 @@ fn until(mut check: impl FnMut() -> bool) {
 }
 
 #[test]
+fn component_admission_accepts_599_seconds_and_rejects_expired_or_over_600() {
+    for kind in [Kind::Install, Kind::Remove] {
+        let command = || Command::new("/usr/bin/true");
+        let mut admitted = Operation::fixture(
+            kind,
+            command(),
+            "accepted-599".into(),
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(599),
+        )
+        .expect("599 seconds must be admitted");
+        until(|| admitted.prepared());
+        admitted.close();
+        until(|| admitted.finished());
+        assert_eq!(admitted.poll(), Some(Err(Error::Canceled)));
+        for duration in [Duration::ZERO, Duration::from_secs(601)] {
+            let expires = Instant::now() + duration;
+            let rejected =
+                Operation::fixture(kind, command(), "refused".into(), Locale::EnUs, expires);
+            assert!(
+                matches!(rejected, Err(Error::Expired)),
+                "zero or >600 seconds must be refused"
+            );
+        }
+    }
+}
+
+#[test]
 fn admitted_component_process_cannot_start_before_the_controller_releases_its_gate() {
     let f = Fixture::new();
     let mut unreleased = Operation::fixture(
@@ -153,6 +181,7 @@ fn removal(f: &Fixture, case: &str) -> Operation {
     command
         .arg(env!("CARGO_PKG_VERSION"))
         .arg(case)
+        .arg(crate::helper::paths::ASKPASS)
         .env("VPNT_TEST_UNTRUSTED", "not inherited");
     let op = Operation::fixture(
         Kind::Remove,
@@ -248,5 +277,97 @@ fn component_launches_have_fixed_programs_arguments_and_no_shell_or_saved_state_
     assert_eq!(
         remove.get_args().collect::<Vec<_>>(),
         ["-A", "-k", "--", crate::helper::paths::INSTALLER, "remove"]
+    );
+}
+
+#[test]
+fn removal_reply_wait_keeps_the_absolute_deadline_and_cancellation() {
+    for cancel in [false, true] {
+        let f = Fixture::new();
+        let mut command = f.command(
+            r#"import json,pathlib,socket,sys,time
+p=pathlib.Path(sys.argv[1]);s=socket.socket(fileno=0)
+s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
+r=json.loads(s.makefile('rb').read())
+(p/'waiting').touch()
+time.sleep(1)
+try:
+ s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
+except BrokenPipeError:
+ pass
+s.close()
+"#,
+        );
+        command.arg(env!("CARGO_PKG_VERSION"));
+        let mut op = Operation::fixture(
+            Kind::Remove,
+            command,
+            "bounded-removal".into(),
+            Locale::EnUs,
+            Instant::now() + Duration::from_millis(700),
+        )
+        .unwrap();
+        until(|| op.prepared());
+        op.proceed();
+        until(|| f.root.join("waiting").exists());
+        if cancel {
+            op.close();
+        }
+        let mut result = None;
+        until(|| {
+            result = op.poll();
+            result.is_some()
+        });
+        assert_eq!(
+            result,
+            Some(Err(if cancel {
+                Error::Canceled
+            } else {
+                Error::Expired
+            }))
+        );
+        assert!(
+            !op.finished(),
+            "a live child must retain exclusion after an error"
+        );
+        until(|| op.finished());
+        assert!(op.poll().is_none(), "a late reply cannot publish success");
+    }
+}
+
+#[test]
+fn removal_terminal_eof_can_arrive_after_the_request_write_budget() {
+    let f = Fixture::new();
+    let mut command = f.command(
+        r#"import json,socket,sys,time
+s=socket.socket(fileno=0)
+s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
+r=json.loads(s.makefile('rb').read())
+s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
+time.sleep(5.3)
+s.shutdown(socket.SHUT_WR);s.close()
+"#,
+    );
+    command.arg(env!("CARGO_PKG_VERSION"));
+    let mut op = Operation::fixture(
+        Kind::Remove,
+        command,
+        "delayed-eof".into(),
+        Locale::EnUs,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    until(|| op.prepared());
+    op.proceed();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !op.finished() {
+        assert!(Instant::now() < deadline, "remover did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        op.poll(),
+        Some(Ok(Receipt::Removed {
+            component_present: false
+        }))
     );
 }

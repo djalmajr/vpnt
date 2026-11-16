@@ -15,19 +15,26 @@ export function VpnCard({
   navigate: Navigate;
   secrets: () => void;
 }) {
-  const { state, profile } = vpn;
+  const { state, profile, cleaning } = vpn;
+  const cleanupId = `cleanup-${profile.id}`;
+  // While cleaning, the Notice action stays focusable (aria-disabled, inert
+  // click) so the keyboard reaches it and hears why it is unavailable.
+  const pending = cleaning
+    ? { "aria-disabled": true as const, "aria-describedby": cleanupId }
+    : {};
   const busy = [
     "connecting",
     "reconnecting",
     "disconnecting",
     "verifying",
   ].includes(state);
-  const disabled = [
-    "offline",
-    "helper_missing",
-    "missing_program",
-    "disconnecting",
-  ].includes(state);
+  const disabled =
+    cleaning ||
+    ["offline", "helper_missing", "missing_program", "disconnecting"].includes(
+      state,
+    );
+  const cancelable = state === "connecting" || state === "reconnecting";
+  const missingSecret = state === "missing_secret";
   const on = active(state);
   const warning = [
     "unresponsive",
@@ -57,29 +64,21 @@ export function VpnCard({
             : state === "missing_program"
               ? "programHint"
               : null;
-  const principal = () => {
-    if (state === "missing_secret") {
+  const toggle = () => {
+    if (disabled || cancelable) return;
+    if (missingSecret) {
       secrets();
       return;
     }
-    if (state === "unresponsive") {
-      void run({ type: "reconnect", id: profile.id });
-      return;
-    }
-    // The user clicked what the card shows, so the command names the direction
-    // instead of re-reading the latest snapshot (which may already be off).
+    // Preserve the direction shown by this snapshot, even if the host has
+    // already changed state by the time it receives the command.
     void run({ type: on ? "disconnect" : "connect", id: profile.id });
   };
   return (
+    // Only the chevron icon-button navigates: the body is not clickable and
+    // carries no keyboard or pointer affordance of its own.
     <article className="vpn-card" data-testid={`vpn-card-${profile.id}`}>
-      <button
-        type="button"
-        className="card-toggle"
-        disabled={disabled}
-        onClick={principal}
-        aria-label={`${profile.name}: ${t(`state.${state}`)}`}
-        aria-pressed={on}
-      >
+      <div className="card-body">
         <span className="card-heading">
           <span className="identity">
             <strong>{profile.name}</strong>
@@ -88,33 +87,68 @@ export function VpnCard({
               {profile.networks.join(", ") || t("fullTunnel")}
             </small>
           </span>
-          <span
-            aria-hidden="true"
-            className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
-          >
-            <span />
+          <span className="card-controls">
+            <button
+              type="button"
+              onClick={toggle}
+              disabled={!!disabled || cancelable}
+              aria-label={`${profile.name}: ${t(`state.${state}`)}`}
+              aria-pressed={on}
+              className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
+            >
+              <span />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={t("profileDetails", { name: profile.name })}
+              title={t("profileDetails", { name: profile.name })}
+              onClick={() =>
+                navigate({ page: "profile", id: profile.id, origin: "home" })
+              }
+            >
+              <Icon name="chevron" />
+            </button>
           </span>
         </span>
-        <span className="card-state">
-          <span className="status-line">
-            <span className={color}>
-              {busy ? <Icon name="loader" /> : <span className="dot" />}
+        {!hint && (
+          <span className="card-state">
+            <span className="status-line">
+              <span className={color}>
+                <span className="dot" />
+              </span>
+              <span>{t(`state.${state}`)}</span>
             </span>
-            <span>{t(`state.${state}`)}</span>
+            {cancelable && (
+              <button
+                type="button"
+                className="card-cancel"
+                onClick={() => void run({ type: "disconnect", id: profile.id })}
+                aria-label={t("cancel")}
+              >
+                <Icon name="loader" />
+                {t("cancel")}
+              </button>
+            )}
           </span>
-          {["connecting", "reconnecting"].includes(state) && (
-            <small className="card-cancel">{t("cancel")}</small>
-          )}
-        </span>
-      </button>
+        )}
+      </div>
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>
           <p>{t(hint)}</p>
+          {cleaning && (
+            <p id={cleanupId} role="status">
+              {t("cleanupHint")}
+            </p>
+          )}
           <div className="actions">
             {state === "missing_program" ? (
               <button
                 type="button"
-                onClick={() => void run({ type: "probe", id: profile.id })}
+                {...pending}
+                onClick={() => {
+                  if (!cleaning) void run({ type: "probe", id: profile.id });
+                }}
               >
                 {t("refresh")}
               </button>
@@ -123,9 +157,11 @@ export function VpnCard({
                 <button
                   type="button"
                   className="primary"
-                  onClick={() =>
-                    void run({ type: "reconnect", id: profile.id })
-                  }
+                  {...pending}
+                  onClick={() => {
+                    if (!cleaning)
+                      void run({ type: "reconnect", id: profile.id });
+                  }}
                 >
                   {t(
                     state === "credentials_rejected" ||

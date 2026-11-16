@@ -14,6 +14,15 @@ static uint64_t monotonic_ns(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
     return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
 }
+// Keep deadline parsing shared with the UI-free fixture. The clock is read
+// after parsing, as in the original entry path, and remains an absolute bound.
+static BOOL valid_deadline(const char *raw, uint64_t (*clock)(void), uint64_t *result) {
+    if (!raw || !*raw || !clock || !result) return NO;
+    for (const char *p=raw;*p;p++) if (*p<'0'||*p>'9') return NO;
+    errno=0;uint64_t until=strtoull(raw,NULL,10),now=clock();
+    if (errno || !now || until<=now || until-now>600000000000ULL) return NO;
+    *result=until;return YES;
+}
 // Fail closed on missing/truncated observations, including a process that exits
 // or is reparented while its identity is being read. Use the public SDK layout.
 static BOOL parent_snapshot(pid_t pid, struct kinfo_proc *info) {
@@ -56,9 +65,8 @@ int main(int argc, const char *argv[]) {
     if (!parent_snapshot(pid,&parent) || !parent_matches(pid,&parent)) return 1;
     const char *raw=getenv("VPNT_AUTH_UNTIL_NS"),*locale=getenv("VPNT_AUTH_LOCALE");
     if (!raw || !*raw || !locale || (strcmp(locale,"pt-BR")!=0 && strcmp(locale,"en-US")!=0)) return 1;
-    for (const char *p=raw;*p;p++) if (*p<'0'||*p>'9') return 1;
-    errno=0;uint64_t until=strtoull(raw,NULL,10),now=monotonic_ns();
-    if (errno || !now || until<=now || until-now>120000000000ULL) return 1;
+    uint64_t until=0;
+    if (!valid_deadline(raw,monotonic_ns,&until)) return 1;
     @autoreleasepool {
         NSData *catalogData=[NSData dataWithBytes:vpnt_native_catalogs length:sizeof(vpnt_native_catalogs)];
         NSDictionary *catalogs=[NSJSONSerialization JSONObjectWithData:catalogData options:0 error:NULL];

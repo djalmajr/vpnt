@@ -12,6 +12,7 @@ use std::{
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture {
     directory: PathBuf,
+    state: PathBuf,
     runtime: Runtime,
 }
 impl Fixture {
@@ -32,9 +33,19 @@ impl Fixture {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        // The diagnostic state lives beside the runtime, like production
+        // STATE lives beside the installed runtime: runtime verification
+        // inventories its own directory, so attempt logs cannot land in it.
+        let state = root.join("output/fixtures").join(format!(
+            "ssl-state-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(directory.join("bin")).unwrap();
         fs::create_dir(directory.join("certs")).unwrap();
+        fs::create_dir_all(&state).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let program = directory.join("bin/openfortivpn");
         let result = Command::new("/usr/bin/cc")
             .args([
@@ -44,6 +55,7 @@ impl Fixture {
                     paths::runtime_directory().display()
                 ),
             ])
+            .arg(format!("-DPINENTRY_PATH=\"{}\"", paths::PINENTRY))
             .arg(root.join("tests/fixtures/ssl_client.c"))
             .arg("-o")
             .arg(&program)
@@ -77,7 +89,11 @@ impl Fixture {
         .unwrap();
         let owner = fs::metadata(&directory).unwrap().uid();
         let runtime = Runtime::inspect(&directory, owner).unwrap();
-        Self { directory, runtime }
+        Self {
+            directory,
+            state,
+            runtime,
+        }
     }
     fn profile(gateway: &str) -> Profile {
         serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","kind":"ssl","gateway":gateway,"username":"fixture-user","port":443,"networks":[],"certificate":"","probeHost":"127.0.0.1","probePort":8443,"probeMethod":"tcp"})).unwrap()
@@ -92,6 +108,9 @@ impl Fixture {
             },
             &Self::binding(),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &self.state,
+            // SAFETY: UID queries have no memory preconditions.
+            unsafe { libc::geteuid() },
         )
         .unwrap()
     }
@@ -99,6 +118,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.directory);
+        let _ = fs::remove_dir_all(&self.state);
     }
 }
 
@@ -148,6 +168,79 @@ fn authentication_and_timeout_messages_survive_process_exit_without_raw_output()
             thread::sleep(Duration::from_millis(2));
         }
     }
+}
+
+#[test]
+fn openfortivpn_log_is_rotated_redacted_private_and_completed() {
+    let fixture = Fixture::new();
+    let log = paths::openfortivpn_log(&fixture.state);
+    let previous = log.with_file_name("openfortivpn.previous.log");
+    assert!(!log.exists());
+    let mut driver = fixture.start("auth.fixture.invalid");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let update = driver.poll().unwrap();
+        assert!(!format!("{update:?}").contains("fixture-driver-password"));
+        if update.exited {
+            assert_eq!(update.failure, Some(SslFailure::CredentialsRejected));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    // The auth error carries the word `password`, so the file keeps only the
+    // placeholder while the typed observation still fires.
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(text.contains("[linha redigida]"));
+    assert!(!text.contains("Could not authenticate"));
+    assert!(text.contains("candidato de interface: não"));
+    assert!(text.contains("código 1"));
+    let meta = fs::symlink_metadata(&log).unwrap();
+    assert!(meta.is_file());
+    assert_eq!(meta.mode() & 0o7777, 0o600);
+    // SAFETY: UID query has no memory preconditions.
+    assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+    let directory = fs::symlink_metadata(log.parent().unwrap()).unwrap();
+    assert!(directory.is_dir());
+    assert_eq!(directory.mode() & 0o7777, 0o700);
+    drop(driver);
+    // A second attempt rotates the first one to previous.
+    let mut driver = fixture.start("ready.fixture.invalid");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let update = driver.poll().unwrap();
+        assert!(!format!("{update:?}").contains("fixture-driver-password"));
+        if let Some(candidate) = update.candidate {
+            assert_eq!(candidate.as_str(), "ppp123");
+            break;
+        }
+        assert!(!update.exited);
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(2));
+    }
+    let stopped = driver.stop().unwrap();
+    assert!(!stopped.escalated);
+    assert!(driver.poll().unwrap().exited);
+    assert!(driver.poll().unwrap().exited);
+    assert!(!driver.stop().unwrap().escalated);
+    assert!(!driver.stop().unwrap().escalated);
+    assert!(
+        fs::read_to_string(&previous)
+            .unwrap()
+            .contains("[linha redigida]")
+    );
+    let current = fs::read_to_string(&log).unwrap();
+    assert!(current.contains("[linha longa descartada]"));
+    assert!(current.contains("candidato de interface: sim"));
+    assert!(current.contains("sinal"));
+    assert_eq!(current.matches("tentativa encerrada:").count(), 1);
+    assert!(
+        current
+            .lines()
+            .last()
+            .unwrap()
+            .contains("candidato de interface: sim")
+    );
 }
 
 #[test]

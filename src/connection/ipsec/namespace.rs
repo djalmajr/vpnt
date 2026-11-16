@@ -149,11 +149,26 @@ impl<N: Observer> Registry<N> {
     pub fn release(&mut self, reservation: &Reservation) -> Result<(), Error> {
         self.validate(reservation)?;
         if !self.observer.producer_stopped(&reservation.owner)? {
+            #[cfg(target_os = "macos")]
+            crate::helper::runtime::cleanup::mark(
+                crate::helper::runtime::cleanup::Reason::ProducerNotStopped,
+            );
             return Err(Error::Busy);
         }
-        self.ensure_clear(reservation)?;
+        self.ensure_clear(reservation).inspect_err(|_| {
+            #[cfg(target_os = "macos")]
+            crate::helper::runtime::cleanup::mark(
+                crate::helper::runtime::cleanup::Reason::NamespaceOccupied,
+            );
+        })?;
         self.observer
-            .completed(&reservation.owner, reservation.reqid)?;
+            .completed(&reservation.owner, reservation.reqid)
+            .inspect_err(|_| {
+                #[cfg(target_os = "macos")]
+                crate::helper::runtime::cleanup::mark(
+                    crate::helper::runtime::cleanup::Reason::DurableCompletion,
+                );
+            })?;
         self.entries.remove(&reservation.reqid);
         Ok(())
     }

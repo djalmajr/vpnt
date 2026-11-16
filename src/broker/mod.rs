@@ -5,6 +5,7 @@ mod automatic;
 mod behavior;
 mod commands;
 mod component;
+mod diagnostics;
 mod retry;
 mod snapshot;
 use crate::{
@@ -41,12 +42,14 @@ pub struct Broker<S: SecretStore> {
     secrets: S,
     connections: BTreeMap<String, Connection>,
     helper: &'static str,
+    expected_build: Option<String>,
     ready: bool,
     dead: bool,
     next: u64,
     startup: Instant,
     administration: admin::Flow,
     component: component::Flow,
+    diagnostics: diagnostics::Flow,
     epoch: u64,
     preferences: Preferences,
     notifier: Box<dyn crate::notifications::Notifier>,
@@ -72,18 +75,32 @@ impl<S: SecretStore> Broker<S> {
         result
     }
     fn new(client: Option<Client>, secrets: S) -> Self {
+        #[cfg(test)]
+        let fixture_build = client
+            .as_ref()
+            .and_then(Client::fixture_build)
+            .map(str::to_owned);
+        #[cfg(not(test))]
+        let fixture_build: Option<String> = None;
+        let expected_build = fixture_build.or_else(|| {
+            crate::install::bundle::Component::current()
+                .ok()
+                .map(|component| component.metadata().build.clone())
+        });
         let mut result = Self {
             client,
             retry: None,
             secrets,
             connections: BTreeMap::new(),
             helper: "missing",
+            expected_build,
             ready: false,
             dead: false,
             next: 1,
             startup: Instant::now() + Duration::from_secs(5),
             administration: admin::Flow::new(),
             component: component::Flow::new(),
+            diagnostics: diagnostics::Flow::new(),
             epoch: 1,
             preferences: Preferences::default(),
             notifier: Box::new(crate::notifications::Noop),
@@ -113,6 +130,10 @@ impl<S: SecretStore> Broker<S> {
             .and_then(|r| r.attempt(self.client.as_ref()));
         match attempt {
             Some(Ok(client)) => {
+                #[cfg(test)]
+                if self.expected_build.is_none() {
+                    self.expected_build = client.fixture_build().map(str::to_owned);
+                }
                 self.epoch = self
                     .epoch
                     .checked_add(1)
@@ -137,6 +158,8 @@ impl<S: SecretStore> Broker<S> {
         self.ready = false;
         self.sent_interval = None;
         self.automatic.clear();
+        self.diagnostics.pending = None;
+        self.diagnostics.dirty = false;
         self.helper = if outdated { "outdated" } else { "missing" };
         if let Some(client) = &mut self.client {
             client.close();
@@ -150,6 +173,7 @@ impl<S: SecretStore> Broker<S> {
         !self.component.busy() && !self.dead && !self.ready && self.client.is_some()
     }
     pub fn poll(&mut self) {
+        self.diagnostics.tick();
         if (self.dead || self.client.is_none()) && !self.component.blocks_retry() {
             self.resume();
         }
@@ -186,15 +210,17 @@ impl<S: SecretStore> Broker<S> {
             Message::Snapshot {
                 id,
                 version,
+                build,
                 profiles,
                 connections,
                 ..
-            } => self.receive_snapshot(id, version, profiles, connections)?,
+            } => self.receive_snapshot(id, version, build, profiles, connections)?,
             Message::Changed {
                 profile_id,
                 generation,
                 state,
                 failures,
+                cleaning,
             } => {
                 if !self.ready {
                     return Err(());
@@ -206,9 +232,14 @@ impl<S: SecretStore> Broker<S> {
                 if generation != c.generation {
                     return Err(());
                 }
+                let ended = diagnostics::ended(c.view.state, c.view.cleaning, state, cleaning);
                 set_state(c, state);
                 c.failures = failures;
+                c.view.cleaning = cleaning;
                 self.refresh_actions();
+                if ended {
+                    self.request_diagnostics();
+                }
             }
             Message::Accepted { id } => {
                 for c in self.connections.values_mut() {
@@ -220,6 +251,13 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Message::Failed { id, .. } => {
+                if self.diagnostics.pending.as_deref() == Some(id.as_str()) {
+                    self.diagnostics.pending = None;
+                    if std::mem::take(&mut self.diagnostics.dirty) {
+                        self.request_diagnostics();
+                    }
+                    return Ok(());
+                }
                 if self.fail_admin_query(&id) {
                     return Ok(());
                 }
@@ -231,6 +269,16 @@ impl<S: SecretStore> Broker<S> {
                             set_state(c, pending.previous.1);
                         }
                     }
+                }
+            }
+            Message::Diagnostics { id, status, logs } => {
+                if self.diagnostics.pending.as_deref() != Some(id.as_str()) {
+                    return Err(());
+                }
+                self.diagnostics.pending = None;
+                self.diagnostics.enqueue(diagnostics::render(status, &logs));
+                if std::mem::take(&mut self.diagnostics.dirty) {
+                    self.request_diagnostics();
                 }
             }
             Message::Fatal { .. } => self.lost(false),
@@ -252,6 +300,7 @@ impl<S: SecretStore> Broker<S> {
 }
 
 fn set_state(c: &mut Connection, state: State) {
+    c.view.cleaning = false;
     c.policy.state(c.generation, state);
     if state != State::Unresponsive {
         c.failures = 0;

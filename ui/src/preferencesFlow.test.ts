@@ -467,6 +467,12 @@ describe("preferências nativas da UI", () => {
           update: () => {},
           navigate: () => {},
           removeComponent: () => {},
+          install: () => {},
+          installPending: false,
+          installBusy: false,
+          installBlocked: false,
+          updating: false,
+          installFailed: false,
           t,
         }),
       );

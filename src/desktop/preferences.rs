@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2_foundation::{NSBundle, NSString, NSUserDefaults};
 
 const KEY: &str = "vpnt.native.preferences.v1";
-const BUNDLE: &str = "dev.vpnt.app";
+const BUNDLE: &str = crate::identifiers::APP;
 struct Native {
     defaults: Retained<NSUserDefaults>,
     login: Option<login_item::Adapter>,

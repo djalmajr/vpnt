@@ -1,4 +1,5 @@
 """Closed development package contract. This module never installs anything."""
+from identifiers import identifier as channel_identifier, tool
 import hashlib
 from pathlib import Path
 import platform
@@ -7,12 +8,12 @@ import stat
 import subprocess
 import xml.etree.ElementTree as ET
 
-STAGING = '/Library/PrivilegedHelperTools/dev.vpnt.staging'
+STAGING = tool('staging')
 COMPONENT = 'Component.pkg'
 
 
 def identifier(summary):
-    return f"dev.vpnt.component.{summary['uid']}"
+    return channel_identifier(f"component.{summary['uid']}")
 
 
 def inventory(payload, exact=False):

@@ -31,6 +31,7 @@ colors:
   info-fg: "#00529e"
   white: "#ffffff"
   scrim: "rgb(0 0 0 / 24%)"
+  hint-bg: "#4a4a4a"
 typography:
   font-family: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'
   font-body: "13px"
@@ -58,6 +59,7 @@ x-layout:
   switch-height: "14px"
   switch-knob: "10px"
   switch-inset: "1px"
+  panel-min-height: "480px"
   panel-max-height: "720px"
   field-label-width: "92px"
   dialog-width: "280px"
@@ -69,6 +71,9 @@ x-layout:
   menu-item-y: "5px"
   icon-menu: "15px"
   icon-inline: "13px"
+  icon-spinner: "14px"
+  icon-help: "12px"
+  hint-max-width: "200px"
   border-width: "1px"
   focus-width: "2px"
 x-opacity:
@@ -77,6 +82,7 @@ x-opacity:
 x-motion:
   spinner-duration: "1s"
 darkColors:
+  hint-bg: "#383838"
   surface: "#1e1e1e"
   card: "#292929"
   menu: "#2b2b2b"
@@ -141,6 +147,7 @@ x-parity:
     colors.info-fg: { selector: ":root", var: "--info-fg" }
     colors.white: { selector: ":root", var: "--white" }
     colors.scrim: { selector: ":root", var: "--scrim" }
+    colors.hint-bg: { selector: ":root", var: "--hint-bg" }
     typography.font-family: { selector: ":root", var: "--font-family" }
     typography.font-body: { selector: ":root", var: "--font-body" }
     typography.font-label: { selector: ":root", var: "--font-label" }
@@ -163,6 +170,7 @@ x-parity:
     x-layout.switch-height: { selector: ":root", var: "--switch-height" }
     x-layout.switch-knob: { selector: ":root", var: "--switch-knob" }
     x-layout.switch-inset: { selector: ":root", var: "--switch-inset" }
+    x-layout.panel-min-height: { selector: ":root", var: "--panel-min-height" }
     x-layout.panel-max-height: { selector: ":root", var: "--panel-max-height" }
     x-layout.field-label-width: { selector: ":root", var: "--field-label-width" }
     x-layout.dialog-width: { selector: ":root", var: "--dialog-width" }
@@ -174,11 +182,15 @@ x-parity:
     x-layout.menu-item-y: { selector: ":root", var: "--menu-item-y" }
     x-layout.icon-menu: { selector: ":root", var: "--icon-menu" }
     x-layout.icon-inline: { selector: ":root", var: "--icon-inline" }
+    x-layout.icon-spinner: { selector: ":root", var: "--icon-spinner" }
+    x-layout.icon-help: { selector: ":root", var: "--icon-help" }
+    x-layout.hint-max-width: { selector: ":root", var: "--hint-max-width" }
     x-layout.border-width: { selector: ":root", var: "--border-width" }
     x-layout.focus-width: { selector: ":root", var: "--focus-width" }
     x-opacity.dim-opacity: { selector: ":root", var: "--dim-opacity" }
     x-opacity.hover-brightness: { selector: ":root", var: "--hover-brightness" }
     x-motion.spinner-duration: { selector: ":root", var: "--spinner-duration" }
+    darkColors.hint-bg: { selector: ".dark", var: "--hint-bg" }
     darkColors.surface: { selector: ".dark", var: "--surface" }
     darkColors.card: { selector: ".dark", var: "--card" }
     darkColors.menu: { selector: ".dark", var: "--menu" }
@@ -281,8 +293,8 @@ pede ao host a altura que comporta o conteúdo intrínseco do menu (`scrollHeigh
 mais bordas, mesmo quando o menu está limitado), mais `sideOffset`,
 `collisionPadding` e a distância do gatilho à borda inferior do painel, e o
 rodapé desce para essa borda; o Radix então coloca todas as ações acima do
-gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura natural
-anterior volta. A reserva é temporária, nunca vai além de `panel-max-height`
+gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura
+anterior volta, nunca abaixo de `panel-min-height`. A reserva é temporária, nunca vai além de `panel-max-height`
 (720 px) e o host ainda limita à tela; só quando a tela não comporta o menu ele
 rola. Não é aberta exceção de CSS para o menu: o dimensionamento fica em
 `ui/src/panelSizing.ts`. O `sideOffset` de 6 px
@@ -299,6 +311,14 @@ incluir suas linhas; comprimi-las a zero subestima a altura necessária.
 Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como no ai-usagebar: âncora em pontos Cocoa, origens negativas preservadas e limites da área visível ao abrir ou redimensionar; a escala da janela anterior não participa. A colocação nativa usa 0 pt abaixo da barra, 8 pt nas laterais e 24 pt acima da borda inferior, sem novos valores CSS; reabrir recaptura a âncora e remoção da tela recorre à primária.
 
 ### Conflicting visual priorities
+
+Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
+(`panel-min-height`, 480 px) e a conserva entre telas, para não haver
+deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
+com a mesma medida. Conteúdo mais alto cresce até `panel-max-height`; tela mais
+baixa limita a janela e o painel rola.
+O pedido ao host soma a estrutura fixa ao `scrollHeight` de panel-content,
+independentemente do viewport atual; mudanças internas também são observadas.
 
 Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
 320 px quando há espaço; em viewport menor, ocupa a largura disponível. Em
@@ -332,18 +352,66 @@ nas preferências, em ambos os temas.
 
 ## Components
 
-O cartão inteiro oferece a ação principal. Durante conexão, clicar cancela.
-Sem resposta oferece Reconectar como ação principal e Desligar separadamente.
-Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
-nome acessível, foco visível e caminho por teclado. Diálogos usam o elemento
-nativo `dialog`, com foco contido e Escape para cancelar.
+Por indicação do Djalma em 2026-11-15, só o interruptor do cartão liga ou
+desliga, emitindo connect/disconnect explícitos conforme o snapshot. É um
+botão com aria-pressed e nome acessível formado por nome do perfil e estado
+traduzido. Sem resposta, o interruptor desliga; Reconectar continua no aviso.
+Com senha pendente, o interruptor abre o diálogo de segredos, sem aviso extra.
+Durante conexão e reconexão, o interruptor fica indisponível e só Cancelar
+cancela; limpeza e estados desabilitados também bloqueiam o interruptor.
+O estado continua vindo do snapshot autoritativo, sem atualização otimista.
 
-Por indicação do Djalma em 2026-11-14, falta de senha aparece apenas no
-indicador do cartão; clicar na conexão continua abrindo o diálogo de segredos,
-sem aviso ou botão adicional abaixo dele. O corpo do cartão não ganha fundo
-interno no hover. Durante conexão ou reconexão, somente a área de Cancelar
-recebe `menu-hover`, com o raio de controle e recuo horizontal `space-xs`.
-A ação principal e o foco por teclado do cartão inteiro permanecem os mesmos.
+O corpo não é clicável: só o icon-button com chevron à direita do
+interruptor abre o perfil, com nome traduzido “Detalhes de {name}”.
+Não há botões aninhados nem segundo foco no corpo. Quando há Notice de aviso
+ou erro, a linha de status não aparece; o nome acessível do interruptor ainda
+contém o estado. Sem Notice, a linha mostra o ponto na cor do estado, na mesma
+caixa e centro; durante conexão e reconexão, o spinner fica dentro do botão
+Cancelar, antes do rótulo, e há um único spinner por cartão.
+Cancelar é um botão real com foco próprio, menu-hover, raio de controle e
+recuo horizontal space-xs.
+
+A seção Segredos do perfil conserva uma linha de status por segredo e usa
+um único botão no cabeçalho: Trocar quando algum segredo aplicável existe,
+Informar quando nenhum existe. O mesmo diálogo atende IPsec (PSK e senha) e
+SSL (senha).
+
+Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
+nome acessível, foco visível e caminho por teclado. Diálogos usam dialog nativo,
+com foco contido e Escape para cancelar. As confirmações de remover o
+componente e o perfil mostram o Icon loader girando dentro do botão primário,
+antes do rótulo, com o botão indisponível e `aria-busy`;
+o texto de espera anunciado como status continua, sem spinner. O Cancelar
+segue bloqueado porque a operação do helper não pode ser cancelada por ali.
+O loader compartilhado tem trilha circular completa em `dim-opacity` e arco de
+90° em `currentColor`, centrados em 12,12 no viewBox de 24. Sua caixa CSS mede
+14 px (`icon-spinner`), não encolhe e gira pelo centro da borda; o botão usa
+flex para manter ícone e texto alinhados. Respeita movimento reduzido.
+
+O rodapé fica sempre visível na base do painel, inclusive em perfil e log,
+fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
+altura real do rodapé, sem sobrepor o conteúdo; a janela curta limita o painel ao viewport.
+A versão usa font-control (12 px), o token pequeno existente. O menu conserva
+seu portal e a reserva temporária de altura.
+Voltar e as rotas do rodapé usam a mesma guarda de alterações pendentes do
+perfil, inclusive na criação: confirmar descarte segue ao destino escolhido;
+continuar editando preserva o formulário. Durante salvar, essas saídas ficam
+indisponíveis. O perfil lembra a origem Home ou Preferências: Voltar, descarte
+confirmado, salvar e remoção retornam à origem. A criação carrega a origem pela
+escolha de tipo; sem origem, retorna à Home.
+
+As quatro linhas não triviais das Preferências usam o componente compartilhado
+`Help`: ícone de interrogação ao lado do rótulo, com tamanho `icon-help` de
+12 px e cor `secondary`, como na referência ai-usagebar. A dica abre por
+ponteiro e foco, fecha com Escape e usa o texto traduzido como nome acessível,
+sem `title`. O portal no `body` acompanha rolagem e resize; o posicionamento
+colide com o viewport com margem `space-md`, invertendo o lado quando preciso.
+A largura máxima `hint-max-width` de 200 px e o fundo `hint-bg` vêm da
+referência, pois não havia papéis equivalentes. O texto reutiliza `white` no
+claro e `text` no escuro. Reutiliza texto de controle, raio pequeno, sombra
+de menu e recuo `space-sm`/`space-md`.
+A altura e a largura também respeitam o viewport menos duas margens; a dica
+rola se não couber. Não há seta nem token de deslocamento adicional.
 
 O menu de opções é um componente compartilhado (`Menu`, `MenuItem`,
 `MenuSeparator`) sobre o mesmo primitivo Radix da referência
@@ -385,6 +453,37 @@ adicional é o cursor de progresso — sem texto novo no catálogo, spinner ou
 mudança de layout. Nenhum valor otimista aparece: o estado marcado continua
 vindo do snapshot autoritativo.
 
+Por indicação do Djalma em 2026-11-15, toda linha clicável com hover dentro
+de grupos (perfis em Preferências, tipos na criação) preenche a linha inteira
+até as bordas do grupo, com o raio do cartão acompanhando o contêiner nos
+cantos da primeira e da última linha. O foco visível continua visível.
+
+Por correção do Djalma em 2026-11-16, o acesso de administrador instalado
+usa três colunas: título e versão na primeira linha, explicação na segunda,
+e lixeira à direita centralizada verticalmente nas duas linhas; as demais
+`Row` continuam como estão. O botão reutiliza `icon-button` com cor neutra do
+tema e nome acessível e `title` traduzidos de Remover. O clique abre a
+mesma confirmação de remoção; não há rótulo separado de remoção.
+Por indicação do Djalma em 2026-11-16, Instalar e Atualizar agem em um clique
+no aviso, no onboarding ou nas Preferências; a autorização é a do Instalador do
+macOS. O botão mostra o loader no lugar até a confirmação do componente. Com
+VPN ativa, desligando ou em limpeza, fica indisponível e pede para desligá-la.
+Remover mantém a confirmação.
+
+Por indicação do Djalma em 2026-11-16, o seletor de perfis do Log é um
+controle segmentado, inclusive com um só perfil: trilho `control`, segmentos
+por conteúdo, seleção elevada em `surface` e texto dos demais em `secondary`.
+Mantém tablist e foco por teclado. Nomes que não cabem encolhem com reticências,
+sem rolagem do trilho, e o nome inteiro fica no `title`.
+
+Por indicação do Djalma em 2026-11-15, a ação de copiar o Log usa `icon-button`
+à direita na mesma linha do nome do perfil ou das abas. O botão fica fora do
+`tablist`, com nome acessível e `title` traduzidos; após copiar, o ícone muda
+para check e o nome traduzido informa que foi copiado. Sem linhas de log, não
+há ação de cópia. O rodapé conserva apenas o texto das últimas 60 linhas.
+Reutiliza o alvo de clique dos ícones de cabeçalho (`control-height`), sem novos
+tokens, e mantém o fluxo atual de cópia e de seleção das abas.
+
 ### Edição por teclado (menu Editar nativo)
 
 Os atalhos padrão de edição (⌘Z, ⇧⌘Z, ⌘X, ⌘C, ⌘V, ⌘A) vêm do menu Editar nativo
@@ -400,7 +499,10 @@ o idioma já validado do host. Sem novos tokens nem alteração visual da UI.
 Usar SF Symbols nativos como imagens de template, acompanhando a aparência da
 barra: `lock.shield.fill` para IPsec conectado, `lock.fill` para SSL conectado,
 `lock.square.stack.fill` para ambos e `lock.open` quando nenhum está conectado.
-`exclamationmark.triangle.fill` indica estado incerto, transitório ou com erro.
+`exclamationmark.triangle.fill` indica erro, túnel sem resposta ou componente
+não verificado. Por correção do Djalma em 2026-11-14, estados em andamento
+(conectando, verificando, reconectando, desconectando) não são alerta: leem como
+desligado e não fecham o cadeado.
 Somente o snapshot autoritativo do helper instalado pode fechar o cadeado;
 demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de altura.
 
@@ -417,9 +519,10 @@ demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de alt
 - Não deixar o menu crescer além do viewport: largura e altura vêm do espaço
   disponível, com rolagem interna e 8 px de borda; a rolagem só vale quando a
   tela não comporta o menu, pois a janela cresce temporariamente para ele.
-- Não fixar permanentemente uma altura grande para o painel, nem calcular a
-  posição do menu: só o tamanho da janela é dimensionado, e a reserva é liberada
-  ao fechar, navegar ou desmontar.
+- Não manter permanentemente a altura extra reservada para o menu, nem calcular
+  a posição do menu: só o tamanho da janela é dimensionado, e a reserva é
+  liberada ao fechar, navegar ou desmontar. A altura predefinida
+  `panel-min-height` é o piso aprovado do painel e não é essa reserva.
 - Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
   `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
   do host nativo, não do CSS.

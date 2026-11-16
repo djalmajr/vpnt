@@ -4,13 +4,13 @@ export type Locale = "pt-BR" | "en-US";
 export type LocalePreference = Locale | "system";
 
 const en = {
+  cleanupHint: "Cleaning up the previous attempt…",
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Install the VPN component?",
   componentRemoveTitle: "Remove the VPN component?",
-  componentInstallHint:
-    "Current tunnels will disconnect. macOS Installer will open and request administrator authorization. Profiles and saved credentials are kept.",
+  componentUpdateBlocked: "Disconnect active VPNs to update.",
+  componentInstallBlocked: "Disconnect active VPNs to install.",
   componentRemoveHint:
     "Current tunnels will disconnect and this account will lose tunnel access. Profiles and saved credentials are kept. Other registered accounts keep access.",
   componentInstallPending:
@@ -50,6 +50,14 @@ const en = {
   light: "Light",
   dark: "Dark",
   startAtLogin: "Open at login",
+  testEveryHelp:
+    "How often VPN Tray checks that each connected tunnel still carries traffic.",
+  notifyStaleHelp:
+    "Shows a notification when a connected tunnel stops carrying traffic.",
+  autoReconnectHelp:
+    "After 3 failed checks in a row, VPN Tray disconnects the tunnel and connects it again.",
+  componentHelp:
+    "A small privileged component starts and stops tunnels only for the registered VPN profiles. Installing or removing it asks for an administrator password.",
   tunnelTest: "Tunnel test",
   testEvery: "Test every",
   seconds: "{count} s",
@@ -61,7 +69,6 @@ const en = {
   helperMissing: "Component not installed",
   helperHint: "Required to start tunnels",
   install: "Install",
-  removeHelper: "Remove component",
   installedHint: "Connect without entering your password",
   about: "About",
   aboutText:
@@ -80,6 +87,11 @@ const en = {
   type: "Type",
   gateway: "Gateway",
   username: "Username",
+  profileDetails: "Details for {name}",
+  usernameShellError:
+    "This looks like a shell expression; enter the literal username.",
+  secretShellWarning:
+    "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
   probeHost: "Address",
@@ -121,10 +133,7 @@ const en = {
   welcomeTitle: "One step to go",
   welcomeHint:
     "Starting a tunnel requires administrator access. VPN Tray installs a small component so you do not need to enter your password every time.",
-  details: "View details",
   component: "Component",
-  installDetails:
-    "The component can only manage registered VPN profiles. Installing or removing it requires administrator confirmation.",
   installing: "Installing…",
   installConfirm:
     "Confirm with your administrator password in the system dialog.",
@@ -197,13 +206,13 @@ const en = {
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
+  cleanupHint: "Limpando a tentativa anterior…",
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Instalar o componente de VPN?",
   componentRemoveTitle: "Remover o componente de VPN?",
-  componentInstallHint:
-    "Os túneis atuais serão desligados. O Instalador do macOS abrirá e pedirá autorização de administrador. Perfis e credenciais salvas serão mantidos.",
+  componentUpdateBlocked: "Desligue as VPNs ativas para atualizar.",
+  componentInstallBlocked: "Desligue as VPNs ativas para instalar.",
   componentRemoveHint:
     "Os túneis atuais serão desligados e esta conta perderá o acesso aos túneis. Perfis e credenciais salvas serão mantidos. Outras contas cadastradas continuam com acesso.",
   componentInstallPending:
@@ -243,6 +252,14 @@ const pt: Record<MessageKey, string> = {
   light: "Claro",
   dark: "Escuro",
   startAtLogin: "Abrir ao iniciar a sessão",
+  testEveryHelp:
+    "Intervalo em que o VPN Tray verifica se cada túnel conectado ainda passa tráfego.",
+  notifyStaleHelp:
+    "Mostra uma notificação quando um túnel conectado para de passar tráfego.",
+  autoReconnectHelp:
+    "Depois de 3 testes seguidos com falha, o VPN Tray desliga o túnel e conecta de novo.",
+  componentHelp:
+    "Um pequeno componente privilegiado inicia e encerra túneis somente dos perfis de VPN cadastrados. Instalar ou remover pede a senha de administrador.",
   tunnelTest: "Teste do túnel",
   testEvery: "Testar a cada",
   seconds: "{count} s",
@@ -254,7 +271,6 @@ const pt: Record<MessageKey, string> = {
   helperMissing: "Componente não instalado",
   helperHint: "Sem ele não dá para ligar túneis",
   install: "Instalar",
-  removeHelper: "Remover componente",
   installedHint: "Liga e desliga sem pedir senha",
   about: "Sobre",
   aboutText:
@@ -273,6 +289,11 @@ const pt: Record<MessageKey, string> = {
   type: "Tipo",
   gateway: "Gateway",
   username: "Usuário",
+  profileDetails: "Detalhes de {name}",
+  usernameShellError:
+    "Isto parece uma expressão de shell; informe o nome de usuário literal.",
+  secretShellWarning:
+    "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
   probeHost: "Endereço",
@@ -315,10 +336,7 @@ const pt: Record<MessageKey, string> = {
   welcomeTitle: "Falta um passo",
   welcomeHint:
     "Ligar um túnel exige acesso de administrador. O VPN Tray instala um componente pequeno para não pedir a senha toda vez.",
-  details: "Ver detalhes",
   component: "Componente",
-  installDetails:
-    "O componente só gerencia perfis de VPN cadastrados. Instalar ou remover exige confirmação de administrador.",
   installing: "Instalando…",
   installConfirm: "Confirme com a senha de administrador na janela do sistema.",
   installFailed: "Não foi possível instalar",

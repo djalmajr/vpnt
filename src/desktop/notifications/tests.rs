@@ -361,7 +361,10 @@ fn exact_limits_are_accepted_and_payload_is_preserved() {
 fn bundle_gate_admits_only_the_application_bundle() {
     assert!(supported_bundle(Some(super::BUNDLE_ID)));
     assert!(!supported_bundle(None));
-    assert!(!supported_bundle(Some("dev.vpnt.app.preview")));
+    assert!(!supported_bundle(Some(&format!(
+        "{}.preview",
+        crate::identifiers::APP
+    ))));
     assert!(!supported_bundle(Some("com.apple.dt.XCTest.tool")));
 }
 

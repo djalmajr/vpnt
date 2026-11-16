@@ -43,7 +43,10 @@ pub(super) fn exchange(
     stream
         .shutdown(Shutdown::Write)
         .map_err(|_| Error::Unavailable)?;
-    let result = match read(stream, &mut input, deadline, state)? {
+    // The five-second budget bounds request delivery, not the removal work.
+    // The executor sends its reply only after removal finishes; keep waiting
+    // under the original operation deadline (including the terminal EOF).
+    let result = match read(stream, &mut input, expires, state)? {
         Some(Reply::Removed {
             id: got,
             component_present,
@@ -54,7 +57,7 @@ pub(super) fn exchange(
         }) if got == id => Err(Error::Rejected(error)),
         _ => return Err(Error::InvalidReply),
     };
-    if read(stream, &mut input, deadline, state)?.is_some() {
+    if read(stream, &mut input, expires, state)?.is_some() {
         return Err(Error::InvalidReply);
     }
     result

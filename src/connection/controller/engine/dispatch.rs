@@ -31,11 +31,18 @@ pub(super) fn dispatch<F: Factory>(
         return;
     }
     let (id, generation) = match &request.command {
+        Command::Diagnostics {} => {
+            // The authenticated helper handles this before forwarding requests.
+            fail(output, ErrorCode::Unavailable);
+            return;
+        }
         Command::Snapshot {} => {
             output.push_back(Message::Snapshot {
                 id: request.id,
                 protocol_version: VERSION,
                 version: env!("CARGO_PKG_VERSION").into(),
+                // The authenticated server attaches the verified installed receipt.
+                build: None,
                 profiles: slots.values().map(|slot| slot.profile.clone()).collect(),
                 connections: slots
                     .values()
@@ -44,6 +51,7 @@ pub(super) fn dispatch<F: Factory>(
                         generation: slot.generation,
                         state: slot.state,
                         failures: slot.failures,
+                        cleaning: slot.cleaning,
                     })
                     .collect(),
             });
@@ -91,6 +99,7 @@ pub(super) fn dispatch<F: Factory>(
             });
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if replacing {
                 ConnectionState::Reconnecting
             } else {
@@ -102,6 +111,7 @@ pub(super) fn dispatch<F: Factory>(
             slot.pending = None;
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if slot.worker.is_some() {
                 ConnectionState::Disconnecting
             } else {
@@ -124,7 +134,9 @@ pub(super) fn dispatch<F: Factory>(
                 return;
             }
         }
-        Command::Snapshot {} | Command::SetProbeInterval { .. } => unreachable!(),
+        Command::Snapshot {} | Command::Diagnostics {} | Command::SetProbeInterval { .. } => {
+            unreachable!()
+        }
     }
     output.push_back(Message::Accepted { id: request.id });
     output.push_back(slot.changed());

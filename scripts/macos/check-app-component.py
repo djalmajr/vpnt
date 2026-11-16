@@ -66,7 +66,7 @@ def main():
     for label, file, mutate, _, _ in mutants:
         original = (ROOT / file).read_text()
         if mutate(original) == original: raise RuntimeError(f'{label}: unchanged mutation')
-    scripts = ['check-installation.py', 'check-app-component.py', 'prepare-installation.py', 'package-installation.py', 'installation_package.py', 'package-app.py', 'app_component.py']
+    scripts = ['identifiers.py', 'check-installation.py', 'check-app-component.py', 'prepare-installation.py', 'package-installation.py', 'installation_package.py', 'package-app.py', 'app_component.py']
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts]
     inputs += [ROOT / 'scripts/macos' / name for name in scripts]
     inputs += build_inputs.source_files(ROOT)

@@ -9,6 +9,7 @@ mod admission;
 mod binding;
 mod bound;
 mod bound_budget;
+mod diagnostic;
 mod fixture;
 mod lease_budget;
 mod ledger;

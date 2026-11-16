@@ -275,6 +275,7 @@ impl Harness {
             connect: Duration::from_secs(5),
             probe: Duration::from_secs(1),
             interval: Duration::from_secs(60),
+            health: Duration::from_millis(2),
             poll: Duration::from_millis(2),
         };
         let worker = thread::spawn(move || run(fixture, 501, profiles, requests, output, timing));
@@ -395,6 +396,7 @@ impl Harness {
                     generation: s.generation,
                     state: s.state,
                     failures: s.failures,
+                    cleaning: s.cleaning,
                 })
                 .collect()
         } else {
@@ -729,6 +731,7 @@ fn coalesced_changes_keep_the_third_failure_and_a_responsive_probe_resets_it() {
             generation: 1,
             state: ConnectionState::Unresponsive,
             failures: 3,
+            cleaning: false,
         } if profile_id == "one"
     )));
     h.control("one", 1, |c| c.responsive = true);
@@ -746,6 +749,7 @@ fn coalesced_changes_keep_the_third_failure_and_a_responsive_probe_resets_it() {
                     generation: 1,
                     state: ConnectionState::Connected,
                     failures: 0,
+                    cleaning: false,
                 } if profile_id == "one"
             )
         })
@@ -789,6 +793,7 @@ fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_e
                     connect: Duration::from_secs(5),
                     probe: Duration::from_secs(1),
                     interval: Duration::from_secs(60),
+                    health: Duration::from_millis(2),
                     poll: Duration::from_millis(2),
                 },
             )

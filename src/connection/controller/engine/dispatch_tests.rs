@@ -51,6 +51,7 @@ fn slot(id: &str, interval: u64) -> Slot<'static> {
         generation: 0,
         state: ConnectionState::Off,
         failures: 0,
+        cleaning: false,
         interval: ProbeClock::new(Duration::from_secs(interval)),
         worker: None,
         pending: None,
@@ -149,6 +150,7 @@ fn connect_carries_its_generation_interval_and_resets_a_failure_streak() {
             generation: 1,
             state: ConnectionState::Connecting,
             failures: 0,
+            cleaning: false,
             ..
         })
     ));

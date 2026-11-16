@@ -38,7 +38,9 @@ export async function invoke(command: Command): Promise<Snapshot> {
     "install_helper",
     "remove_helper",
   ].includes(command.type);
-  const timeout = interactive ? 120000 : 10000;
+  const component =
+    command.type === "install_helper" || command.type === "remove_helper";
+  const timeout = component ? 610000 : interactive ? 120000 : 10000;
   const id = `ui-${++sequence}`;
   const locale = document.documentElement.lang === "pt-BR" ? "pt-BR" : "en-US";
   const body = JSON.stringify({ id, command, locale });

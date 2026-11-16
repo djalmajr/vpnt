@@ -29,6 +29,7 @@ export type Profile = {
   probeMethod: "ping_tcp" | "tcp";
 };
 export type VpnView = {
+  cleaning: boolean;
   profile: Profile;
   state: ConnectionState;
   hasPassword: boolean;

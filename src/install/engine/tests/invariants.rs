@@ -52,14 +52,58 @@ impl Fixture {
 fn update_refreshes_digests_for_registered_users_and_removing_one_preserves_the_other() {
     let mut f = Fixture::new();
     f.activate().unwrap();
+    let reads = std::cell::Cell::new(0usize);
+    let query = |uid| {
+        crate::helper::server::gated_diagnostics(
+            || access::admitted_details(&f.executor.tree, uid).map(|(_, sole)| sole),
+            || {
+                reads.set(reads.get() + 1);
+                Some(vec![])
+            },
+        )
+        .0
+    };
+    assert_eq!(
+        query(601),
+        crate::helper::protocol::DiagnosticsStatus::Ready
+    );
+    assert_eq!(
+        query(602),
+        crate::helper::protocol::DiagnosticsStatus::Unavailable
+    );
+    assert_eq!(reads.get(), 1);
+    assert!(access::admitted_details(&f.executor.tree, 601).unwrap().1);
+    assert_eq!(
+        access::admitted_details(&f.executor.tree, 602),
+        Err(Error::PermissionDenied)
+    );
     f.recipient(602);
     assert_eq!(f.activate().unwrap().users, vec![601, 602]);
+    assert!(!access::admitted_details(&f.executor.tree, 601).unwrap().1);
+    assert!(!access::admitted_details(&f.executor.tree, 602).unwrap().1);
+    let (status, _) = crate::helper::server::gated_diagnostics(
+        || access::admitted_details(&f.executor.tree, 601).map(|(_, sole)| sole),
+        || {
+            reads.set(reads.get() + 1);
+            Some(vec![])
+        },
+    );
+    assert_eq!(status, crate::helper::protocol::DiagnosticsStatus::Shared);
+    assert_eq!(reads.get(), 1);
     let original = fs::read(f.policy(601)).unwrap();
     f.revise();
     assert_eq!(f.activate().unwrap().users, vec![601, 602]);
     assert_ne!(fs::read(f.policy(601)).unwrap(), original);
     let receipt = Receipt::load(&f.executor.tree).unwrap().unwrap();
     receipt.verify(&f.executor.tree).unwrap();
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 601).unwrap(),
+        receipt.build
+    );
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 603),
+        Err(Error::PermissionDenied)
+    );
     access::admit(&f.executor.tree, 601).unwrap();
     access::admit(&f.executor.tree, 602).unwrap();
     assert_eq!(f.executor.remove(601).unwrap().users, vec![602]);

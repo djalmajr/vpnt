@@ -262,15 +262,25 @@ impl Attempt for NativeAttempt<'_> {
         }
     }
     fn cleanup(&mut self) -> bool {
-        if !self.cleanup_network() {
-            return false;
-        }
-        if let Some(profile) = &self.profile_use
-            && profile.complete().is_err()
-        {
-            return false;
-        }
-        self.profile_use = None;
-        true
+        use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
+        diagnostic::begin();
+        let complete = (|| {
+            if !self.cleanup_network() {
+                return false;
+            }
+            if let Some(profile) = &self.profile_use
+                && profile.complete().is_err()
+            {
+                return diagnostic::refuse(Reason::ProfileCompletion);
+            }
+            self.profile_use = None;
+            true
+        })();
+        diagnostic::finish(
+            std::path::Path::new(crate::helper::paths::STATE),
+            &self.owner,
+            complete,
+        );
+        complete
     }
 }

@@ -109,9 +109,25 @@ fn private_ike_configuration_has_fixed_scope_and_only_shared_messages_carry_cred
         ("mobike", "no"),
         ("remote_port", "500"),
         ("local_port", "0"),
+        ("dpd_delay", "30s"),
     ] {
         assert_eq!(conn.get_text(key), Some(value));
     }
+    assert_eq!(conn.get_list("vips").unwrap().len(), 1);
+    assert_eq!(conn.get_list("vips").unwrap()[0].as_slice(), b"0.0.0.0");
+    assert_eq!(
+        conn.get_list("proposals")
+            .unwrap()
+            .iter()
+            .map(|value| value.as_slice())
+            .collect::<Vec<_>>(),
+        [
+            b"aes256-sha256-ecp384".as_slice(),
+            b"aes256-sha256-modp2048",
+            b"aes256-sha256-modp1536",
+            b"aes128-sha1-modp1536",
+        ]
+    );
     assert_eq!(
         conn.get_section("local").unwrap().get_text("auth"),
         Some("eap-mschapv2")
@@ -136,6 +152,20 @@ fn private_ike_configuration_has_fixed_scope_and_only_shared_messages_carry_cred
     assert_eq!(child.get_text("start_action"), Some("none"));
     assert_eq!(child.get_text("dpd_action"), Some("clear"));
     assert_eq!(
+        child
+            .get_list("esp_proposals")
+            .unwrap()
+            .iter()
+            .map(|value| value.as_slice())
+            .collect::<Vec<_>>(),
+        [
+            b"aes256-sha256-ecp384".as_slice(),
+            b"aes256-sha1-ecp384",
+            b"aes256-sha256",
+            b"aes256-sha1",
+        ]
+    );
+    assert_eq!(
         child.get_list("remote_ts").unwrap()[0].as_slice(),
         b"10.20.0.0/24"
     );
@@ -154,7 +184,7 @@ fn private_ike_configuration_has_fixed_scope_and_only_shared_messages_carry_cred
             eap,
             "EAP",
             "fictional-eap-password",
-            "keyid:#66697874757265406578616d706c652e636f6d",
+            "email:fixture@example.com",
         ),
         (psk, "IKE", "fictional-gateway-key", "vpn.example.com"),
     ] {

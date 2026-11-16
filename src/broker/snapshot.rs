@@ -5,6 +5,7 @@ impl<S: SecretStore> Broker<S> {
         &mut self,
         id: String,
         version: String,
+        build: Option<String>,
         profiles: Vec<Profile>,
         statuses: Vec<TunnelStatus>,
     ) -> Result<(), ()> {
@@ -82,6 +83,7 @@ impl<S: SecretStore> Broker<S> {
                 };
                 set_state(&mut c, state);
                 c.failures = status.failures;
+                c.view.cleaning = status.cleaning;
                 current.insert(c.view.profile.id.clone(), c);
             } else {
                 let present = self
@@ -92,13 +94,14 @@ impl<S: SecretStore> Broker<S> {
                     profile.id.clone(),
                     Connection {
                         view: VpnView {
+                            cleaning: status.cleaning,
                             has_password: present,
                             has_psk: present && profile.kind == VpnKind::Ipsec,
                             profile,
-                            state: if present {
-                                State::Off
-                            } else {
+                            state: if status.state == State::Off && !present {
                                 State::MissingSecret
+                            } else {
+                                status.state
                             },
                             log: vec![],
                         },
@@ -120,7 +123,10 @@ impl<S: SecretStore> Broker<S> {
         self.connections = current;
         self.refresh_actions();
         self.ready = true;
-        self.helper = "installed";
+        self.helper = match (self.expected_build.as_deref(), build.as_deref()) {
+            (Some(expected), Some(installed)) if expected == installed => "installed",
+            _ => "outdated",
+        };
         if initial {
             if let Some(retry) = &mut self.retry {
                 retry.ready();

@@ -101,6 +101,7 @@ def main():
         if mutate(original) == original:
             raise RuntimeError(f'{label}: mutation changed nothing')
     hashes = {p.relative_to(ROOT).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file()}
+    hashes['scripts/macos/identifiers.py'] = hashlib.sha256((ROOT / 'scripts/macos/identifiers.py').read_bytes()).hexdigest()
     hashes['scripts/macos/prepare-installation.py'] = hashlib.sha256((ROOT / 'scripts/macos/prepare-installation.py').read_bytes()).hexdigest()
     for key, digest in build_inputs.source_hashes(ROOT).items():
         if key in hashes and hashes[key] != digest:
@@ -113,6 +114,7 @@ def main():
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
             shutil.copy2(ROOT / 'scripts/macos/prepare-installation.py', copy / 'scripts/macos/prepare-installation.py')
+            shutil.copy2(ROOT / 'scripts/macos/identifiers.py', copy / 'scripts/macos/identifiers.py')
             build_inputs.copy_into(ROOT, copy)
             baselines = [('admission', ['--lib', 'install::']), ('preparation', ['--test', 'install_preparation'])]
             for label, selector in baselines: receipt['baseline-' + label] = run(copy, 'baseline-' + label, selector)

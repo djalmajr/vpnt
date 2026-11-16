@@ -20,6 +20,17 @@ impl Repository {
         runtime.directory = root.join("target/vpnt-runtime");
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         fs::copy(source.join("Cargo.toml"), root.join("Cargo.toml")).unwrap();
+        fs::create_dir(root.join("native")).unwrap();
+        fs::copy(
+            source.join("native/identifier-channels.conf"),
+            root.join("native/identifier-channels.conf"),
+        )
+        .unwrap();
+        fs::copy(
+            source.join("scripts/macos/identifiers.py"),
+            root.join("scripts/macos/identifiers.py"),
+        )
+        .unwrap();
         fs::copy(
             source.join("scripts/macos/prepare-installation.py"),
             root.join("scripts/macos/prepare-installation.py"),

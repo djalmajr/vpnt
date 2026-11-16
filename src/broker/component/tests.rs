@@ -34,6 +34,115 @@ fn wait(mut check: impl FnMut() -> bool) {
 }
 
 #[test]
+fn component_install_refuses_live_or_cleaning_connections_before_admission() {
+    let mut peer = Peer::new("flow");
+    let root = peer.root().to_owned();
+    let mut broker = Broker::new(Some(peer.take()), Secrets(Arc::new(AtomicUsize::new(0))));
+    wait(|| broker.snapshot().helper == "installed");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    broker.component.connect = Box::new(move |_, _, _, _| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Err(ComponentError::Unavailable)
+    });
+    for state in [
+        State::Connecting,
+        State::Verifying,
+        State::Connected,
+        State::Unresponsive,
+        State::Reconnecting,
+        State::Disconnecting,
+    ] {
+        broker.connections.get_mut("one").unwrap().view.state = state;
+        assert_eq!(
+            broker.begin_component(
+                Command::InstallHelper {},
+                Locale::EnUs,
+                Instant::now() + Duration::from_secs(2)
+            ),
+            Err("component_busy"),
+            "state: {state:?}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(!peer.retiring());
+    }
+    let connection = broker.connections.get_mut("one").unwrap();
+    connection.view.state = State::Dropped;
+    connection.view.cleaning = true;
+    assert_eq!(
+        broker.begin_component(
+            Command::InstallHelper {},
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(2)
+        ),
+        Err("component_busy")
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    broker.connections.get_mut("one").unwrap().view.cleaning = false;
+    assert_eq!(
+        broker.begin_component(
+            Command::InstallHelper {},
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(2)
+        ),
+        Err("component_unconfirmed")
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(!peer.retiring());
+    drop(broker);
+    drop(peer);
+    assert!(!root.exists(), "fixture peer did not finish and clean up");
+}
+
+#[test]
+fn component_install_rechecks_activity_after_admission_before_runtime_handoff() {
+    let mut peer = Peer::new("flow");
+    let mut broker = Broker::new(Some(peer.take()), Secrets(Arc::new(AtomicUsize::new(0))));
+    wait(|| broker.snapshot().helper == "installed");
+    let root = peer.root().to_owned();
+    let script = root.join("must-not-start.py");
+    fs::write(
+        &script,
+        "import pathlib,sys\npathlib.Path(sys.argv[1]).joinpath('must-not-start').touch()\n",
+    )
+    .unwrap();
+    let directory = root.clone();
+    broker.component.connect = Box::new(move |kind, id, locale, expires| {
+        let mut command = Process::new("/usr/bin/python3");
+        command.arg(&script).arg(&directory);
+        Operation::fixture(kind, command, id, locale, expires)
+    });
+    let token = broker
+        .begin_component(
+            Command::InstallHelper {},
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+    wait(|| broker.component.current.as_ref().unwrap().client.prepared());
+    broker.connections.get_mut("one").unwrap().view.state = State::Connecting;
+    let mut result = None;
+    wait(|| {
+        broker.poll();
+        result = broker.take_component_result();
+        result.is_some()
+    });
+    let (actual, result) = result.unwrap();
+    assert_eq!(actual, token);
+    assert_eq!(result.unwrap_err(), "component_busy");
+    assert!(!peer.retiring());
+    assert!(!root.join("must-not-start").exists());
+    wait(|| {
+        broker.poll();
+        !broker.component_busy()
+    });
+    assert_eq!(broker.snapshot().helper, "installed");
+    drop(broker);
+    drop(peer);
+    assert!(!root.exists(), "fixture peer did not finish and clean up");
+}
+
+#[test]
 fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authenticated_snapshot() {
     let mut old = Peer::new("flow");
     let mut new = Peer::new("flow");

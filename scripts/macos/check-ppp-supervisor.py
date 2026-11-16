@@ -57,7 +57,7 @@ def main():
         tunnel = (directory / "src/tunnel.c").read_text()
         # Fixture-only executable substitution. Keep patched control flow and
         # the full upstream argv builder, without touching the installed path.
-        fixed = '"/Library/PrivilegedHelperTools/dev.vpnt.pppd"'
+        fixed = 'VPNT_PPP_SUPERVISOR'
         if tunnel.count(fixed) != 1:
             raise RuntimeError("Missing mandatory fixed supervisor path")
         tunnel = tunnel.replace(fixed, "PPP_PATH")

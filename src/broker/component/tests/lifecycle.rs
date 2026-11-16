@@ -193,6 +193,17 @@ fn an_incompatible_new_session_cannot_turn_installer_exit_into_installation_succ
 }
 
 #[test]
+fn successful_installer_is_not_confirmed_if_reconnected_build_differs() {
+    let mut h = Harness::new("build-different", HELD);
+    h.begin(Command::InstallHelper {}, 2);
+    h.release();
+    let (_, result) = h.result();
+    assert_eq!(result.unwrap_err(), "component_expired");
+    assert_eq!(h.broker.snapshot().helper, "outdated");
+    assert!(h.root.join("finished").exists());
+}
+
+#[test]
 fn artifact_admission_failure_does_not_disconnect_the_existing_runtime() {
     let mut old = Peer::new("flow");
     let mut broker = Broker::new(Some(old.take()), Secrets(Arc::new(AtomicUsize::new(0))));
@@ -263,4 +274,39 @@ fn quitting_during_a_component_operation_never_restarts_runtime_or_admits_anothe
         ),
         Err("backend_unavailable")
     );
+}
+
+#[test]
+fn completed_removal_after_five_second_request_window_reports_missing_without_timeout() {
+    // Ordinary socket/process fixture: the executor may spend more than the
+    // request-write budget doing removal before it sends its terminal reply.
+    let source = r#"import json,pathlib,socket,sys,time
+p=pathlib.Path(sys.argv[1]);assert (p/'peer.cleaned').exists()
+s=socket.socket(fileno=0)
+s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
+r=json.loads(s.makefile('rb').read())
+time.sleep(5.3)
+(p/'removal_completed').touch()
+s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
+s.shutdown(socket.SHUT_WR);s.close()
+"#;
+    let mut h = Harness::new("flow", source);
+    let token = h.begin(Command::RemoveHelper {}, 12);
+    let until = Instant::now() + Duration::from_secs(10);
+    let (got, result) = loop {
+        h.broker.poll();
+        if let Some(result) = h.broker.take_component_result() {
+            break result;
+        }
+        assert!(Instant::now() < until, "removal result was not delivered");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(got, token);
+    let snapshot = result.expect("completed removal within the operation deadline must succeed");
+    assert!(h.root.join("removal_completed").exists());
+    assert_eq!(snapshot.helper, "missing");
+    assert_eq!(snapshot.component_operation, None);
+    assert!(!h.broker.component_busy());
+    assert_eq!(h.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(h.removes.load(Ordering::Relaxed), 0);
 }

@@ -63,6 +63,123 @@ fn dispatch(b: &mut Broker<Secrets>, c: Command) -> Snapshot {
         .unwrap()
 }
 #[test]
+fn build_identity_marks_old_helpers_outdated_without_disabling_tunnels() {
+    for (mode, expected, packaged) in [
+        ("flow", "installed", true),
+        ("build-different", "outdated", true),
+        ("build-missing", "outdated", true),
+        ("flow", "outdated", false),
+    ] {
+        let mut peer = Peer::new(mode);
+        let root = peer.root().to_owned();
+        let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+        if !packaged {
+            broker.expected_build = None;
+        }
+        let until = Instant::now() + Duration::from_secs(4);
+        while !broker.ready {
+            broker.poll();
+            assert!(
+                Instant::now() < until,
+                "{mode} did not produce an initial snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(broker.snapshot().helper, expected, "mode: {mode}");
+        dispatch(&mut broker, Command::Connect { id: "one".into() });
+        peer.advance();
+        wait(&mut broker, |s| s.vpns[0].state == State::Connected);
+        assert_eq!(broker.snapshot().helper, expected);
+        assert!(!peer.retiring(), "{mode} must keep its helper alive");
+        dispatch(&mut broker, Command::Disconnect { id: "one".into() });
+        wait(&mut broker, |s| s.vpns[0].state == State::Off);
+        assert_eq!(broker.snapshot().helper, expected);
+        if expected == "outdated" {
+            let commands = std::fs::read_to_string(peer.marker.with_extension("commands")).unwrap();
+            assert!(
+                !commands.lines().any(|line| line == "diagnostics"),
+                "old helper must never receive an unsupported diagnostic command"
+            );
+        }
+        drop(broker);
+        drop(peer);
+        assert!(!root.exists(), "fixture {mode} did not clean up");
+    }
+}
+
+#[test]
+fn completed_attempts_request_diagnostics_and_publish_the_redacted_reply() {
+    for case in ["credentials_rejected", "dropped", "disconnect"] {
+        let mut peer = Peer::new("flow");
+        let root = peer.root().to_owned();
+        let home = root.join("fixture-home");
+        std::fs::create_dir(&home).unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(home.join("Library")).unwrap();
+        std::fs::create_dir(home.join("Library/Application Support")).unwrap();
+        let saved = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = saved.clone();
+        let uid = unsafe { libc::geteuid() };
+        let sink_home = home.clone();
+        let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+        broker.diagnostics.with_sink(move |text| {
+            diagnostics::save_at(&sink_home, uid, &text).unwrap();
+            sink.lock().unwrap().push(text);
+        });
+        wait(&mut broker, |snapshot| snapshot.helper == "installed");
+        dispatch(&mut broker, Command::Connect { id: "one".into() });
+        wait(&mut broker, |snapshot| {
+            snapshot.vpns[0].state == State::Connecting
+        });
+        assert!(
+            saved.lock().unwrap().is_empty(),
+            "no diagnostic before an attempt finishes: {case}"
+        );
+        if case != "credentials_rejected" {
+            peer.advance();
+            wait(&mut broker, |snapshot| {
+                snapshot.vpns[0].state == State::Connected
+            });
+        }
+        if case == "disconnect" {
+            dispatch(&mut broker, Command::Disconnect { id: "one".into() });
+        } else {
+            let generation = broker.connections["one"].generation;
+            std::fs::write(peer.marker.with_extension("stale"), serde_json::to_vec(&serde_json::json!({"id":"one", "generation":generation, "state":case, "failures":0})).unwrap()).unwrap();
+        }
+        let until = Instant::now() + Duration::from_secs(4);
+        while saved.lock().unwrap().is_empty() {
+            broker.poll();
+            assert!(Instant::now() < until, "diagnostic not saved after {case}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let text = saved.lock().unwrap()[0].clone();
+        assert!(text.contains("== openfortivpn.log"));
+        assert!(text.contains("== charon.previous.log"));
+        assert!(text.contains("ausente"));
+        let file = home
+            .join("Library/Application Support")
+            .join(crate::identifiers::APP)
+            .join("diagnostics.txt");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
+        let commands = std::fs::read_to_string(peer.marker.with_extension("commands")).unwrap();
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|line| *line == "diagnostics")
+                .count(),
+            1,
+            "{case}: {commands}"
+        );
+        drop(broker);
+        drop(peer);
+        assert!(!root.exists(), "fixture cleanup: {case}");
+    }
+}
+
+#[test]
 fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_generations() {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
