@@ -19,7 +19,7 @@ use tao::{
     event::{Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     platform::unix::{WindowBuilderExtUnix, WindowExtUnix},
-    window::WindowBuilder,
+    window::{Window, WindowBuilder},
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use wry::{NewWindowResponse, WebViewBuilder, WebViewBuilderExtUnix, http::Response};
@@ -29,11 +29,18 @@ enum UserEvent {
     Tray(TrayIconEvent, Option<placement::Anchor>),
     Ipc(Zeroizing<String>, Instant),
     Reply(Reply),
+    Placed { generation: u64, height: u32 },
 }
 
 pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let generation = Arc::new(placement::Generation::default());
+    let placement_proxy = event_loop.create_proxy();
+    let positioner =
+        placement::Positioner::new(Arc::clone(&generation), move |generation, height| {
+            let _ = placement_proxy.send_event(UserEvent::Placed { generation, height });
+        })?;
     let tray_proxy = proxy.clone();
     TrayIconEvent::set_event_handler(Some(move |event| {
         let _ = tray_proxy.send_event(UserEvent::Tray(event, placement::capture()));
@@ -87,13 +94,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut anchor = None;
     let mut height = 360;
     let mut last_focus_hide = None;
-    let mut placement_ready = false;
-    let generation = Arc::new(placement::Generation::default());
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) => {
-                placement_ready = placement::prepare();
                 let result = icon::open_lock()
                     .map_err(|error| error.to_string())
                     .and_then(|icon| {
@@ -115,14 +119,11 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if show {
-                    anchor = placement::capture();
                     let current = placement::advance(&generation);
-                    placement::reposition(
+                    reposition(
                         &window,
-                        anchor.filter(|_| placement_ready),
-                        height,
-                        &generation,
-                        current,
+                        &positioner,
+                        placement::click_request(current, None, height),
                     );
                     window.set_visible(true);
                     window.set_focus();
@@ -144,12 +145,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 let current = placement::advance(&generation);
                 if open {
                     anchor = click;
-                    placement::reposition(
+                    reposition(
                         &window,
-                        anchor.filter(|_| placement_ready),
-                        height,
-                        &generation,
-                        current,
+                        &positioner,
+                        placement::click_request(current, click, height),
                     );
                 }
                 window.set_visible(open);
@@ -177,17 +176,16 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Command::Resize { height: requested } = request.command {
                         height = requested;
+                        let current = placement::advance(&generation);
                         if open {
-                            let current = placement::advance(&generation);
-                            placement::reposition(
+                            reposition(
                                 &window,
-                                anchor.filter(|_| placement_ready),
-                                height,
-                                &generation,
-                                current,
+                                &positioner,
+                                placement::click_request(current, anchor, height),
                             );
                         } else {
                             window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
+                            fix_bounds(&window, height.clamp(180, 720));
                         }
                     }
                     let id = request.id.clone();
@@ -204,18 +202,13 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::Reply(reply)) => send_reply(&webview, &reply),
-            Event::WindowEvent {
-                event: WindowEvent::Resized(size),
-                ..
-            } => {
-                let logical = size.to_logical::<u32>(window.scale_factor());
-                if placement_ready
-                    && logical.width == 320
-                    && logical.height == height.clamp(180, 720)
-                {
-                    let fixed = LogicalSize::new(320, logical.height);
-                    window.set_min_inner_size(Some(fixed));
-                    window.set_max_inner_size(Some(fixed));
+            Event::UserEvent(UserEvent::Placed {
+                generation: placed,
+                height,
+            }) => {
+                let current = placement::current(&generation);
+                if let Some(height) = placement::applied_height(current, placed, height) {
+                    fix_bounds(&window, height);
                 }
             }
             Event::WindowEvent {
@@ -233,6 +226,28 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = &tray;
     });
+}
+
+fn reposition(
+    window: &Window,
+    positioner: &placement::Positioner,
+    request: placement::PlacementRequest,
+) {
+    let height = request.requested.clamp(180, 720);
+    window.set_min_inner_size(None::<LogicalSize<u32>>);
+    window.set_max_inner_size(None::<LogicalSize<u32>>);
+    window.set_resizable(true);
+    window.set_inner_size(LogicalSize::new(320, height));
+    if !positioner.supported() || positioner.send(request).is_err() {
+        fix_bounds(window, height);
+    }
+}
+
+fn fix_bounds(window: &Window, height: u32) {
+    let fixed = LogicalSize::new(320, height);
+    window.set_min_inner_size(Some(fixed));
+    window.set_max_inner_size(Some(fixed));
+    window.set_resizable(false);
 }
 
 fn suppress_click(hidden_at: Option<Instant>, now: Instant) -> bool {

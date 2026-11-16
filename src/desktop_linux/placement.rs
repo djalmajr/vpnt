@@ -1,17 +1,22 @@
 use serde::Deserialize;
 use std::{
-    process::Command,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tao::{dpi::LogicalSize, window::Window};
 
 use super::PRODUCT_NAME;
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+const HYPRCTL: &str = "/usr/bin/hyprctl";
+const TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub(super) struct Anchor {
     pub(super) x: f64,
     pub(super) y: f64,
@@ -43,19 +48,98 @@ pub(super) struct Client {
     pub(super) pinned: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PlacementRequest {
+    pub(super) generation: u64,
+    pub(super) anchor: Option<Anchor>,
+    pub(super) requested: u32,
+}
+
+pub(super) fn click_request(
+    generation: u64,
+    anchor: Option<Anchor>,
+    requested: u32,
+) -> PlacementRequest {
+    PlacementRequest {
+        generation,
+        anchor,
+        requested,
+    }
+}
+
+pub(super) fn applied_height(current: u64, received: u64, height: u32) -> Option<u32> {
+    (current == received).then_some(height)
+}
+
 fn hyprland() -> bool {
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
-fn command(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("/usr/bin/hyprctl")
+// Both pipes are drained while the child runs, so a full pipe cannot defeat the deadline.
+pub(super) fn command_at(path: &Path, args: &[&str]) -> Result<String, String> {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut child = Command::new(path)
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    let stdout = child.stdout.take().ok_or("Missing stdout")?;
+    let stderr = child.stderr.take().ok_or("Missing stderr")?;
+    let (tx, rx) = mpsc::channel();
+    let out_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(8 * 1024 * 1024).read_to_end(&mut bytes);
+        let _ = out_tx.send((true, result.map(|_| bytes)));
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.take(8 * 1024 * 1024).read_to_end(&mut bytes);
+        let _ = tx.send((false, result.map(|_| bytes)));
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("hyprctl timed out after 2s".into());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    };
+    let mut out = None;
+    let mut err = None;
+    for _ in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (is_stdout, bytes) = rx
+            .recv_timeout(remaining)
+            .map_err(|_| "hyprctl timed out after 2s")?;
+        let bytes = bytes.map_err(|e| e.to_string())?;
+        if is_stdout {
+            out = Some(bytes);
+        } else {
+            err = Some(bytes);
+        }
     }
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
+    let stdout = out.unwrap_or_default();
+    if !status.success() {
+        let stderr = err.unwrap_or_default();
+        return Err(
+            String::from_utf8_lossy(if stderr.is_empty() { &stdout } else { &stderr }).into_owned(),
+        );
+    }
+    String::from_utf8(stdout).map_err(|error| error.to_string())
+}
+
+fn command(args: &[&str]) -> Result<String, String> {
+    command_at(Path::new(HYPRCTL), args)
 }
 
 pub(super) fn parse_anchor(json: &str) -> Result<Anchor, serde_json::Error> {
@@ -120,19 +204,21 @@ pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Opt
 #[derive(Default)]
 pub(super) struct Generation {
     value: AtomicU64,
-    gate: Mutex<()>,
 }
 
 pub(super) fn advance(generation: &Generation) -> u64 {
-    let _guard = generation.gate.lock().unwrap_or_else(|e| e.into_inner());
     generation
         .value
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1)
 }
 
+pub(super) fn current(generation: &Generation) -> u64 {
+    generation.value.load(Ordering::SeqCst)
+}
+
 pub(super) fn is_current(generation: &Generation, expected: u64) -> bool {
-    generation.value.load(Ordering::SeqCst) == expected
+    current(generation) == expected
 }
 
 pub(super) fn dispatch_if_current(
@@ -140,7 +226,6 @@ pub(super) fn dispatch_if_current(
     expected: u64,
     dispatch: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let _guard = generation.gate.lock().unwrap_or_else(|e| e.into_inner());
     if is_current(generation, expected) {
         dispatch()
     } else {
@@ -160,18 +245,9 @@ fn eval(lua: &str) -> Result<(), String> {
     eval_response(&command(&["eval", lua])?)
 }
 
-pub(super) fn prepare() -> bool {
-    if !hyprland() {
-        return false;
-    }
+fn prepare() -> Result<(), String> {
     let rule = r#"hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true })"#;
-    match eval(rule) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("Could not register popover rule: {error}");
-            false
-        }
-    }
+    eval(rule)
 }
 
 pub(super) fn lua_for_frame(address: &str, frame: &Frame) -> Option<String> {
@@ -192,31 +268,82 @@ pub(super) fn lua_for_frame(address: &str, frame: &Frame) -> Option<String> {
     ))
 }
 
-pub(super) fn reposition(
-    window: &Window,
-    anchor: Option<Anchor>,
-    requested: u32,
-    generation: &Arc<Generation>,
-    expected: u64,
-) {
-    if anchor.is_none() || !hyprland() || !std::path::Path::new("/usr/bin/hyprctl").is_file() {
-        window.set_inner_size(LogicalSize::new(320, requested.clamp(180, 720)));
-        return;
+pub(super) struct Positioner {
+    input: Sender<PlacementRequest>,
+    supported: bool,
+}
+
+impl Positioner {
+    pub(super) fn new(
+        generation: Arc<Generation>,
+        reply: impl Fn(u64, u32) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let supported = hyprland() && Path::new(HYPRCTL).is_file();
+        let (input, requests) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("vpnt-desktop-placement".into())
+            .spawn(move || {
+                let ready = if supported {
+                    match prepare() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!("Could not register popover rule: {error}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                worker_loop(
+                    requests,
+                    &generation,
+                    |request| {
+                        if ready {
+                            apply(request, &generation)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    reply,
+                );
+            })?;
+        Ok(Self { input, supported })
     }
-    // GTK freezes the previous size when non-resizable; restore fixed bounds after resizing.
-    window.set_min_inner_size(None::<LogicalSize<u32>>);
-    window.set_max_inner_size(None::<LogicalSize<u32>>);
-    window.set_resizable(true);
-    window.set_inner_size(LogicalSize::new(320, requested.clamp(180, 720)));
-    let Some(anchor) = anchor.filter(|_| hyprland()) else {
-        return;
-    };
-    let generation = Arc::clone(generation);
-    std::thread::spawn(move || {
-        if let Err(error) = apply(anchor, requested, &generation, expected) {
-            eprintln!("Could not place popover: {error}");
+
+    pub(super) fn supported(&self) -> bool {
+        self.supported
+    }
+
+    pub(super) fn send(&self, request: PlacementRequest) -> Result<(), ()> {
+        self.input.send(request).map_err(|_| ())
+    }
+}
+
+pub(super) fn worker_loop(
+    requests: Receiver<PlacementRequest>,
+    generation: &Generation,
+    mut process: impl FnMut(PlacementRequest) -> Result<Option<u32>, String>,
+    reply: impl Fn(u64, u32),
+) {
+    while let Ok(mut request) = requests.recv() {
+        while let Ok(latest) = requests.try_recv() {
+            request = latest;
         }
-    });
+        if !is_current(generation, request.generation) {
+            continue;
+        }
+        let height = match process(request) {
+            Ok(Some(height)) => height,
+            Ok(None) => request.requested.clamp(180, 720),
+            Err(error) => {
+                eprintln!("Could not place popover: {error}");
+                request.requested.clamp(180, 720)
+            }
+        };
+        if is_current(generation, request.generation) {
+            reply(request.generation, height);
+        }
+    }
 }
 
 fn own_client() -> Result<Option<Client>, String> {
@@ -226,31 +353,28 @@ fn own_client() -> Result<Option<Client>, String> {
         .find(|c| c.pid == std::process::id() && c.title == PRODUCT_NAME))
 }
 
-fn apply(
-    anchor: Anchor,
-    requested: u32,
-    generation: &Generation,
-    expected: u64,
-) -> Result<(), String> {
+fn apply(request: PlacementRequest, generation: &Generation) -> Result<Option<u32>, String> {
+    let Some(anchor) = request.anchor.or_else(capture) else {
+        return Ok(None);
+    };
     let monitors = parse_monitors(&command(&["monitors", "-j"])?).map_err(|e| e.to_string())?;
-    let frame = frame(anchor, &monitors, requested).ok_or("No valid monitor")?;
+    let frame = frame(anchor, &monitors, request.requested).ok_or("No valid monitor")?;
     for attempt in 0..25 {
-        if !is_current(generation, expected) {
-            return Ok(());
+        if !is_current(generation, request.generation) {
+            return Ok(None);
         }
         if own_client()?.is_some() {
             std::thread::sleep(Duration::from_millis(20));
-            if !is_current(generation, expected) {
-                return Ok(());
+            if !is_current(generation, request.generation) {
+                return Ok(None);
             }
             if let Some(client) = own_client()? {
                 let lua = lua_for_frame(&client.address, &frame).ok_or("Invalid client address")?;
-                return dispatch_if_current(generation, expected, || {
-                    if !client.pinned {
-                        eprintln!("Popover is not pinned (floating: {})", client.floating);
-                    }
-                    eval(&lua)
-                });
+                if !client.pinned {
+                    eprintln!("Popover is not pinned (floating: {})", client.floating);
+                }
+                dispatch_if_current(generation, request.generation, || eval(&lua))?;
+                return Ok(Some(frame.height));
             }
         }
         if attempt < 24 {

@@ -1,7 +1,7 @@
 use super::{backend::Backend, icon, placement};
 use crate::bridge::{Command, Request};
 use std::{
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -112,6 +112,178 @@ fn stale_dispatch_is_rejected_when_open_or_hide_interleaves() {
         let effects: Vec<_> = effect_rx.into_iter().collect();
         assert_eq!(effects, if reopen { vec!["current"] } else { vec![] });
     }
+}
+
+#[test]
+fn timeout_kills_and_reaps_the_fake_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    struct TempRoot(std::path::PathBuf);
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = std::env::temp_dir().join(format!(
+        "vpnt-placement-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let root = TempRoot(path);
+    let script = root.0.join("fake hyprctl");
+    let pid_file = root.0.join("pid file");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nexec /usr/bin/sleep 5\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let result = placement::command_at(&script, &[pid_file.to_str().unwrap()]);
+    let elapsed = start.elapsed();
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let still_exists = std::path::Path::new("/proc").join(pid.trim()).exists();
+    assert_eq!(result.unwrap_err(), "hyprctl timed out after 2s");
+    assert!(
+        elapsed <= Duration::from_millis(2500),
+        "elapsed={elapsed:?} script={script:?}"
+    );
+    assert!(!still_exists, "child PID {pid} still exists after timeout");
+}
+
+#[test]
+fn generation_advance_does_not_wait_for_retained_dispatch() {
+    let generation = Arc::new(placement::Generation::default());
+    let first = placement::advance(&generation);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker_generation = Arc::clone(&generation);
+    let worker = std::thread::spawn(move || {
+        placement::dispatch_if_current(&worker_generation, first, || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            Ok(())
+        })
+        .unwrap();
+    });
+    let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+    let (done_tx, done_rx) = mpsc::channel();
+    let advancing_generation = Arc::clone(&generation);
+    let advancing = std::thread::spawn(move || {
+        let next = placement::advance(&advancing_generation);
+        let _ = done_tx.send(next);
+    });
+    let advanced_before_release = done_rx.recv_timeout(Duration::from_millis(250));
+    let _ = release_tx.send(());
+    worker.join().unwrap();
+    advancing.join().unwrap();
+    assert!(entered.is_ok());
+    assert_eq!(advanced_before_release.unwrap(), first + 1);
+}
+
+#[test]
+fn worker_discards_stale_work_and_coalesces_requests() {
+    let generation = Arc::new(placement::Generation::default());
+    let (input, requests) = mpsc::channel();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (processed_tx, processed_rx) = mpsc::channel();
+    let (effect_tx, effect_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let worker_generation = Arc::clone(&generation);
+    let worker = std::thread::spawn(move || {
+        placement::worker_loop(
+            requests,
+            &worker_generation,
+            |request| {
+                let _ = processed_tx.send(request.generation);
+                if request.generation == 1 {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                }
+                placement::dispatch_if_current(&worker_generation, request.generation, || {
+                    let _ = effect_tx.send(request.generation);
+                    Ok(())
+                })?;
+                Ok(Some(request.requested))
+            },
+            |generation, height| {
+                let _ = reply_tx.send((generation, height));
+            },
+        );
+    });
+    let first = placement::advance(&generation);
+    input
+        .send(placement::click_request(first, None, 200))
+        .unwrap();
+    let entered = entered_rx.recv_timeout(Duration::from_secs(2));
+    let second = placement::advance(&generation);
+    input
+        .send(placement::click_request(second, None, 300))
+        .unwrap();
+    let third = placement::advance(&generation);
+    input
+        .send(placement::click_request(third, None, 400))
+        .unwrap();
+    let _ = release_tx.send(());
+    drop(input);
+    worker.join().unwrap();
+    assert!(entered.is_ok());
+    assert_eq!(processed_rx.into_iter().collect::<Vec<_>>(), [first, third]);
+    assert_eq!(effect_rx.into_iter().collect::<Vec<_>>(), [third]);
+    assert_eq!(reply_rx.into_iter().collect::<Vec<_>>(), [(third, 400)]);
+}
+
+#[test]
+fn applied_height_discards_stale_and_uses_short_monitor() {
+    let monitors =
+        monitors(r#"[{"x":0,"y":0,"width":1280,"height":600,"scale":1,"reserved":[0,26,0,0]}]"#);
+    let frame = placement::frame(placement::Anchor { x: 600.0, y: 10.0 }, &monitors, 720).unwrap();
+    assert_eq!(frame.height, 550);
+    let generation = placement::Generation::default();
+    let current = placement::advance(&generation);
+    let (input, requests) = mpsc::channel();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    input
+        .send(placement::click_request(
+            current,
+            Some(placement::Anchor { x: 600.0, y: 10.0 }),
+            720,
+        ))
+        .unwrap();
+    drop(input);
+    placement::worker_loop(
+        requests,
+        &generation,
+        |request| {
+            Ok(
+                placement::frame(request.anchor.unwrap(), &monitors, request.requested)
+                    .map(|f| f.height),
+            )
+        },
+        |generation, height| {
+            let _ = reply_tx.send((generation, height));
+        },
+    );
+    let (placed, height) = reply_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!((placed, height), (current, 550));
+    assert_eq!(placement::applied_height(current + 1, placed, height), None);
+    assert_eq!(
+        placement::applied_height(current, placed, height),
+        Some(550)
+    );
+}
+
+#[test]
+fn each_open_request_uses_its_click_anchor() {
+    let first = Some(placement::Anchor { x: 100.0, y: 10.0 });
+    let second = Some(placement::Anchor { x: 2000.0, y: 20.0 });
+    let one = placement::click_request(1, first, 360);
+    let two = placement::click_request(2, second, 360);
+    assert_eq!(one.anchor, first);
+    assert_eq!(two.anchor, second);
+    assert_ne!(one.anchor, two.anchor);
+    assert_eq!((one.generation, two.generation), (1, 2));
 }
 
 #[test]
