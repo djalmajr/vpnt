@@ -45,7 +45,7 @@ Separador usa 25% do foreground sobre o fundo do popup; controles normais usam 4
 
 ## Geometria e animação
 
-O painel recebe borda de `--omarchy-border-width` (fallback 2 px) e `--omarchy-popup-border`, com fallback para accent e azul original. O raio externo usa `--omarchy-radius` (fallback 0 px). Os raios internos `sm`, `control`, `card`, `panel` e `popover`, além do switch, seu botão e abas, seguem o mesmo raio; isso evita cantos residuais quando o tema é reto. O posicionador nativo calcula o respiro como metade de `general:gaps_out` do Hyprland: hoje 5 px abaixo da barra e nas laterais; não é margem CSS. A entrada usa fade pela regra de janela `popin 100%`.
+O painel não tem borda no CSS: ele é uma janela do Hyprland, que já desenha a borda com a cor do tema e `general:border_size` (hoje 2 px). Decisão do Djalma, 16/11/2026: a borda própria era redundante. `--omarchy-border-width` e `--omarchy-popup-border` continuam injetadas, sem uso no contorno externo. O raio externo usa `--omarchy-radius` (fallback 0 px). Os raios internos `sm`, `control`, `card`, `panel` e `popover`, além do switch, seu botão e abas, seguem o mesmo raio; isso evita cantos residuais quando o tema é reto. O posicionador nativo calcula o respiro como metade de `general:gaps_out` do Hyprland: hoje 5 px abaixo da barra e nas laterais; não é margem CSS. A entrada usa fade pela regra de janela `popin 100%`.
 
 ## Contraste no tema atual
 

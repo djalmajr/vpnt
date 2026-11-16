@@ -205,10 +205,11 @@
   --radius-panel: var(--omarchy-radius, 0px);
   --radius-popover: var(--omarchy-radius, 0px);
 }
+/* No CSS border: the panel is a Hyprland window, and Hyprland already draws
+   its border with the theme's colour and general:border_size. */
 :root[data-desktop="omarchy"] .panel {
   border-radius: var(--omarchy-radius, 0px);
-  border: var(--omarchy-border-width, 2px) solid
-    var(--omarchy-popup-border, var(--omarchy-accent, #007aff));
+  border: 0;
   background: var(
     --omarchy-popup-background,
     var(--omarchy-background, var(--surface))
