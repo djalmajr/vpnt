@@ -1,5 +1,5 @@
-//! Read only PPP ownership records from configd. Apple's pppd publishes `pid`
-//! and InterfaceName in State:/Network/Service/<service>/PPP. We never mutate
+//! Read only PPP ownership records from configd. Apple's pppd may omit `pid`
+//! while publishing InterfaceName in State:/Network/Service/<service>/PPP. We never mutate
 //! the dynamic store or trust a pidfile in the group-writable /var/run directory.
 use crate::connection::ssl::InterfaceName;
 use core_foundation::{
@@ -15,7 +15,7 @@ use std::{ffi::c_void, ptr};
 pub(super) struct Record {
     pub key: String,
     pub interface: InterfaceName,
-    pub pid: u32,
+    pub pid: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -36,7 +36,49 @@ unsafe extern "C" {
     ) -> CFTypeRef;
 }
 
+#[cfg(test)]
+thread_local! {
+    static OBSERVATIONS: std::cell::RefCell<Option<std::collections::VecDeque<Vec<Record>>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn scripted(records: Option<Vec<Vec<Record>>>) {
+    OBSERVATIONS.with(|slot| *slot.borrow_mut() = records.map(Into::into));
+}
+
 pub(super) fn read() -> Result<Vec<Record>, Unavailable> {
+    #[cfg(test)]
+    if let Some(result) = OBSERVATIONS.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|records| records.pop_front().ok_or(Unavailable))
+    }) {
+        return result;
+    }
+    read_query(None)
+}
+
+pub(super) fn read_attempt(
+    service: &crate::helper::ppp_supervisor::ServiceId,
+) -> Result<(Option<Record>, Vec<Record>), Unavailable> {
+    read_attempt_with(service, read)
+}
+
+fn read_attempt_with(
+    service: &crate::helper::ppp_supervisor::ServiceId,
+    observe: impl FnOnce() -> Result<Vec<Record>, Unavailable>,
+) -> Result<(Option<Record>, Vec<Record>), Unavailable> {
+    let records = observe()?;
+    let key = service.key();
+    let mut matching = records.iter().filter(|record| record.key == key);
+    let attempt = matching.next().cloned();
+    if matching.next().is_some() {
+        return Err(Unavailable);
+    }
+    Ok((attempt, records))
+}
+
+fn read_query(key: Option<&str>) -> Result<Vec<Record>, Unavailable> {
     let name = CFString::new("vpnt PPP ownership");
     // SAFETY: the session has no callback/context and is released under the
     // create rule. Only a fixed PPP-state pattern is read; no configuration is set.
@@ -53,14 +95,19 @@ pub(super) fn read() -> Result<Vec<Record>, Unavailable> {
     }
     // SAFETY: a non-null Create result transfers one retained CF object.
     let store = unsafe { CFType::wrap_under_create_rule(reference) };
-    let patterns = CFArray::from_CFTypes(&[CFString::new("^State:/Network/Service/[^/]+/PPP$")]);
-    // SAFETY: the live session and immutable pattern array outlive the call;
-    // a non-null Copy result transfers its own retain to the caller.
+    let keys = key.map(|key| CFArray::from_CFTypes(&[CFString::new(key)]));
+    let patterns = key
+        .is_none()
+        .then(|| CFArray::from_CFTypes(&[CFString::new("^State:/Network/Service/[^/]+/PPP$")]));
+    // SAFETY: the live session and optional immutable arrays outlive the call.
     let reference = unsafe {
         SCDynamicStoreCopyMultiple(
             store.as_CFTypeRef(),
-            ptr::null(),
-            patterns.as_concrete_TypeRef(),
+            keys.as_ref()
+                .map_or(ptr::null(), |value| value.as_concrete_TypeRef()),
+            patterns
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_concrete_TypeRef()),
         )
     };
     if reference.is_null() {
@@ -108,8 +155,7 @@ fn parse(value: &CFType) -> Result<Vec<Record>, Unavailable> {
         let value = unsafe { CFType::wrap_under_get_rule(value) }
             .downcast::<CFDictionary>()
             .ok_or(Unavailable)?;
-        // pppd may publish a partial record during startup or teardown. It
-        // cannot authorize a link until both the name and PID are present.
+        // pppd may publish a partial record during startup or teardown.
         let Some(name) = field(&value, "InterfaceName") else {
             continue;
         };
@@ -118,14 +164,15 @@ fn parse(value: &CFType) -> Result<Vec<Record>, Unavailable> {
             return Err(Unavailable);
         }
         let interface = InterfaceName::parse(&name.to_string()).ok_or(Unavailable)?;
-        let Some(pid) = field(&value, "pid") else {
-            continue;
-        };
-        let pid = pid
-            .downcast::<CFNumber>()
-            .and_then(|value| value.to_i64())
-            .filter(|pid| *pid > 0 && *pid <= i32::MAX as i64)
-            .ok_or(Unavailable)? as u32;
+        let pid = field(&value, "pid")
+            .map(|pid| {
+                pid.downcast::<CFNumber>()
+                    .and_then(|value| value.to_i64())
+                    .filter(|pid| *pid > 0 && *pid <= i32::MAX as i64)
+                    .map(|pid| pid as u32)
+                    .ok_or(Unavailable)
+            })
+            .transpose()?;
         result.push(Record {
             key,
             interface,
@@ -161,7 +208,7 @@ mod tests {
             vec![Record {
                 key: "State:/Network/Service/fixture/PPP".into(),
                 interface: InterfaceName::parse("ppp42").unwrap(),
-                pid: 42
+                pid: Some(42)
             }]
         );
         for value in [
@@ -176,7 +223,7 @@ mod tests {
             assert!(parse(&records(value)).is_err());
         }
         let partial = CFDictionary::from_CFType_pairs(&[(CFString::new("InterfaceName"), name)]);
-        assert!(parse(&records(partial.as_CFType())).unwrap().is_empty());
+        assert_eq!(parse(&records(partial.as_CFType())).unwrap()[0].pid, None);
         assert!(parse(&pid).is_err());
         assert!(
             parse(
@@ -190,13 +237,30 @@ mod tests {
         );
     }
     #[test]
+    fn attempt_is_selected_from_the_same_observation_as_other_records() {
+        let service =
+            crate::helper::ppp_supervisor::ServiceId::parse("12345678-1234-4123-8123-123456789ABC")
+                .unwrap();
+        let owned = Record {
+            key: service.key(),
+            interface: InterfaceName::parse("ppp42").unwrap(),
+            pid: None,
+        };
+        let mut other = owned.clone();
+        other.key = "State:/Network/Service/other/PPP".into();
+        let input = vec![other, owned.clone()];
+        let (attempt, records) = read_attempt_with(&service, || Ok(input.clone())).unwrap();
+        assert_eq!(attempt, Some(owned));
+        assert_eq!(records, input);
+    }
+    #[test]
     fn native_store_read_never_returns_non_ppp_records() {
         // A read-only native API check. No records/configuration are written,
         // and no personal network metadata is printed or retained in a report.
         for record in read().unwrap() {
             assert!(record.key.starts_with("State:/Network/Service/"));
             assert!(record.key.ends_with("/PPP"));
-            assert!(record.pid > 0);
+            assert!(record.pid.is_none_or(|pid| pid > 0));
         }
     }
 }
