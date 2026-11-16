@@ -45,6 +45,34 @@ fn until(mut check: impl FnMut() -> bool) {
 }
 
 #[test]
+fn component_admission_accepts_599_seconds_and_rejects_expired_or_over_600() {
+    for kind in [Kind::Install, Kind::Remove] {
+        let command = || Command::new("/usr/bin/true");
+        let mut admitted = Operation::fixture(
+            kind,
+            command(),
+            "accepted-599".into(),
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(599),
+        )
+        .expect("599 seconds must be admitted");
+        until(|| admitted.prepared());
+        admitted.close();
+        until(|| admitted.finished());
+        assert_eq!(admitted.poll(), Some(Err(Error::Canceled)));
+        for duration in [Duration::ZERO, Duration::from_secs(601)] {
+            let expires = Instant::now() + duration;
+            let rejected =
+                Operation::fixture(kind, command(), "refused".into(), Locale::EnUs, expires);
+            assert!(
+                matches!(rejected, Err(Error::Expired)),
+                "zero or >600 seconds must be refused"
+            );
+        }
+    }
+}
+
+#[test]
 fn admitted_component_process_cannot_start_before_the_controller_releases_its_gate() {
     let f = Fixture::new();
     let mut unreleased = Operation::fixture(
