@@ -32,6 +32,11 @@ enum UserEvent {
     Tray(TrayIconEvent, Option<placement::Anchor>),
     Ipc(Zeroizing<String>, Instant),
     Reply(Reply),
+    Show {
+        generation: u64,
+        height: u32,
+        anchor: Option<placement::Anchor>,
+    },
     Placed {
         generation: u64,
         height: u32,
@@ -46,12 +51,21 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let placement_proxy = event_loop.create_proxy();
     let positioner = placement::Positioner::new(
         Arc::clone(&generation),
-        move |generation, height, anchor| {
-            let _ = placement_proxy.send_event(UserEvent::Placed {
-                generation,
-                height,
-                anchor,
-            });
+        move |generation, height, anchor, opening| {
+            let event = if opening {
+                UserEvent::Show {
+                    generation,
+                    height,
+                    anchor,
+                }
+            } else {
+                UserEvent::Placed {
+                    generation,
+                    height,
+                    anchor,
+                }
+            };
+            let _ = placement_proxy.send_event(event);
         },
     )?;
     let tray_proxy = proxy.clone();
@@ -108,8 +122,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut anchor = None;
     let mut height = 360;
     let mut last_focus_hide = None;
+    let mut deadline: Option<Instant> = None;
+    let mut visible = false;
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         match event {
             Event::NewEvents(StartCause::Init) => {
                 let result = icon::open_lock()
@@ -136,14 +152,19 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if show {
                     let current = placement::advance(&generation);
                     opening = current;
-                    reposition(
+                    let queued = reposition(
                         &window,
                         &positioner,
                         placement::click_request(current, None, height),
                     );
-                    window.set_visible(true);
-                    window.set_focus();
                     open = true;
+                    if queued {
+                        deadline = Some(Instant::now() + Duration::from_millis(400));
+                    } else {
+                        window.set_visible(true);
+                        window.set_focus();
+                        visible = true;
+                    }
                 }
             }
             Event::UserEvent(UserEvent::Tray(
@@ -159,18 +180,25 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 open = !open;
                 let current = placement::advance(&generation);
+                let mut queued = false;
                 if open {
                     opening = current;
                     anchor = click;
-                    reposition(
+                    queued = reposition(
                         &window,
                         &positioner,
                         placement::click_request(current, click, height),
                     );
                 }
-                window.set_visible(open);
-                if open {
-                    window.set_focus();
+                if open && queued {
+                    deadline = Some(Instant::now() + Duration::from_millis(400));
+                } else {
+                    deadline = None;
+                    window.set_visible(open);
+                    visible = open;
+                    if open {
+                        window.set_focus();
+                    }
                 }
             }
             Event::UserEvent(UserEvent::Ipc(body, received)) => {
@@ -182,6 +210,8 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     if matches!(request.command, Command::Hide {}) {
                         placement::advance(&generation);
                         open = false;
+                        visible = false;
+                        deadline = None;
                         window.set_visible(false);
                     }
                     if matches!(request.command, Command::OpenProject {}) {
@@ -195,11 +225,13 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                         height = requested;
                         let current = placement::advance(&generation);
                         if open {
-                            reposition(
-                                &window,
-                                &positioner,
-                                placement::resize_request(current, opening, anchor, height),
-                            );
+                            let placement = if !visible {
+                                opening = current;
+                                placement::click_request(current, anchor, height)
+                            } else {
+                                placement::resize_request(current, opening, anchor, height)
+                            };
+                            reposition(&window, &positioner, placement);
                         } else {
                             window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
                             fix_bounds(&window, height.clamp(180, 720));
@@ -219,6 +251,47 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::Reply(reply)) => send_reply(&webview, &reply),
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                if show_decision(
+                    open,
+                    visible,
+                    true,
+                    deadline.is_some_and(|at| Instant::now() >= at),
+                ) == ShowDecision::Show
+                {
+                    deadline = None;
+                    window.set_visible(true);
+                    window.set_focus();
+                    visible = true;
+                }
+            }
+            Event::UserEvent(UserEvent::Show {
+                generation: placed,
+                height: placed_height,
+                anchor: used_anchor,
+            }) => {
+                let decision = show_decision(
+                    open,
+                    visible,
+                    placement::current(&generation) == placed,
+                    true,
+                );
+                if decision != ShowDecision::Ignore {
+                    if anchor.is_none() {
+                        anchor = used_anchor;
+                    }
+                    if decision == ShowDecision::Show {
+                        window.set_inner_size(LogicalSize::new(320, placed_height));
+                        fix_bounds(&window, placed_height);
+                        window.set_visible(true);
+                        window.set_focus();
+                        visible = true;
+                        deadline = None;
+                    }
+                    let _ =
+                        positioner.send(placement::resize_request(placed, opening, anchor, height));
+                }
+            }
             Event::UserEvent(UserEvent::Placed {
                 generation: placed,
                 height,
@@ -240,12 +313,34 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 placement::advance(&generation);
                 open = false;
+                visible = false;
+                deadline = None;
                 window.set_visible(false);
             }
             _ => {}
         }
+        if !matches!(*control_flow, ControlFlow::Exit) {
+            *control_flow = deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        }
         let _ = &tray;
     });
+}
+
+#[derive(Debug, PartialEq)]
+enum ShowDecision {
+    Ignore,
+    Show,
+    Reposition,
+}
+
+fn show_decision(open: bool, visible: bool, current: bool, ready: bool) -> ShowDecision {
+    if !open || !current || !ready {
+        ShowDecision::Ignore
+    } else if visible {
+        ShowDecision::Reposition
+    } else {
+        ShowDecision::Show
+    }
 }
 
 fn accept_placement(
@@ -266,7 +361,7 @@ fn reposition(
     window: &Window,
     positioner: &placement::Positioner,
     request: placement::PlacementRequest,
-) {
+) -> bool {
     let height = request.requested.clamp(180, 720);
     window.set_min_inner_size(None::<LogicalSize<u32>>);
     window.set_max_inner_size(None::<LogicalSize<u32>>);
@@ -274,6 +369,9 @@ fn reposition(
     window.set_inner_size(LogicalSize::new(320, height));
     if !positioner.supported() || positioner.send(request).is_err() {
         fix_bounds(window, height);
+        false
+    } else {
+        true
     }
 }
 

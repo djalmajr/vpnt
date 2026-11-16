@@ -208,7 +208,7 @@ fn worker_discards_stale_work_and_coalesces_requests() {
                 })?;
                 Ok(Some(request.requested))
             },
-            |generation, height, _| {
+            |generation, height, _, _| {
                 let _ = reply_tx.send((generation, height));
             },
         );
@@ -263,7 +263,7 @@ fn applied_height_discards_stale_and_uses_short_monitor() {
                     .map(|f| f.height),
             )
         },
-        |generation, height, _| {
+        |generation, height, _, _| {
             let _ = reply_tx.send((generation, height));
         },
     );
@@ -312,7 +312,7 @@ fn show_resize_keeps_the_opening_anchor_after_cursor_moves() {
                 moves.borrow_mut().push((frame.x, frame.y));
                 Ok(Some(frame.height))
             },
-            |generation, height, anchor| {
+            |generation, height, anchor, _| {
                 let _ = reply_tx.send((generation, height, anchor));
             },
         );
@@ -394,7 +394,7 @@ fn resize_before_first_placed_reuses_capture_but_new_opening_recaptures() {
                 })?;
                 Ok(Some(frame.height))
             },
-            |generation, height, anchor| {
+            |generation, height, anchor, _| {
                 let _ = reply_tx.send((generation, height, anchor));
             },
         );
@@ -645,4 +645,74 @@ fn backend_rejects_dead_thread() {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("backend thread did not terminate");
+}
+
+#[test]
+fn show_and_deadline_decisions_respect_visibility_and_generation() {
+    use super::{ShowDecision, show_decision};
+    assert_eq!(
+        show_decision(true, false, false, true),
+        ShowDecision::Ignore
+    );
+    assert_eq!(
+        show_decision(false, false, true, true),
+        ShowDecision::Ignore
+    );
+    assert_eq!(show_decision(true, false, true, true), ShowDecision::Show);
+    assert_eq!(
+        show_decision(true, false, true, false),
+        ShowDecision::Ignore
+    );
+    assert_eq!(
+        show_decision(true, true, true, true),
+        ShowDecision::Reposition
+    );
+}
+
+#[test]
+fn opening_rule_uses_monitor_local_coordinates_and_rejects_invalid_names() {
+    let cases = [
+        ("HDMI-A-1", 1600, 3267.0, 3107, 1507),
+        ("eDP-2", 0, 100.0, 8, 8),
+    ];
+    for (name, origin, anchor_x, global_x, local_x) in cases {
+        let monitors = monitors(&format!(
+            r#"[{{"name":"{name}","x":{origin},"y":0,"width":1920,"height":1080,"scale":1,"reserved":[0,26,0,0]}}]"#
+        ));
+        let frame = placement::frame(
+            placement::Anchor {
+                x: anchor_x,
+                y: 10.0,
+            },
+            &monitors,
+            360,
+        )
+        .unwrap();
+        assert_eq!(frame.x, global_x);
+        assert_eq!(
+            placement::lua_opening_rule(&monitors[0], &frame),
+            format!(
+                r#"hl.window_rule({{ name = "vpnt-tray", match = {{ class = "^(vpnt)$", title = "^(VPN Tray)$" }}, float = true, pin = true, monitor = "{name}", size = {{ 320, 360 }}, move = {{ {local_x}, 26 }}, animation = "popin 100%" }})"#
+            )
+        );
+    }
+    for name in ["DP-1\"", "a b", "", "DP\n1", "éDP", "a;b"] {
+        let json = serde_json::json!([{ "name": name, "x": 0, "y": 0, "width": 1920, "height": 1080, "scale": 1, "reserved": [0, 26, 0, 0] }]);
+        let monitors = monitors(&json.to_string());
+        let frame =
+            placement::frame(placement::Anchor { x: 100.0, y: 10.0 }, &monitors, 360).unwrap();
+        assert_eq!(
+            placement::lua_opening_rule(&monitors[0], &frame),
+            r#"hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true, size = { 320, 360 }, animation = "popin 100%" })"#,
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn prepare_rule_registers_with_omarchy_or_falls_back_to_hyprland() {
+    assert_eq!(
+        placement::PREPARE_RULE,
+        r#"if o and o.window then o.window({ class = "^(vpnt)$", title = "^(VPN Tray)$" }, { name = "vpnt-tray", float = true, pin = true }) else hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true }) end"#
+    );
 }

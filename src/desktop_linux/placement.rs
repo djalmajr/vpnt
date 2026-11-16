@@ -24,6 +24,8 @@ pub(super) struct Anchor {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Monitor {
+    #[serde(default)]
+    name: String,
     x: f64,
     y: f64,
     width: f64,
@@ -52,6 +54,7 @@ pub(super) struct Client {
 pub(super) struct PlacementRequest {
     pub(super) generation: u64,
     opening: u64,
+    pub(super) is_opening: bool,
     pub(super) anchor: Option<Anchor>,
     pub(super) requested: u32,
 }
@@ -64,6 +67,7 @@ pub(super) fn click_request(
     PlacementRequest {
         generation,
         opening: generation,
+        is_opening: true,
         anchor,
         requested,
     }
@@ -78,6 +82,7 @@ pub(super) fn resize_request(
     PlacementRequest {
         generation,
         opening,
+        is_opening: false,
         anchor,
         requested,
     }
@@ -183,8 +188,8 @@ pub(super) fn capture() -> Option<Anchor> {
     }
 }
 
-pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Option<Frame> {
-    let monitor = monitors
+fn monitor_for_anchor(anchor: Anchor, monitors: &[Monitor]) -> Option<&Monitor> {
+    monitors
         .iter()
         .find(|m| {
             m.scale > 0.0
@@ -193,7 +198,11 @@ pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Opt
                 && anchor.y >= m.y
                 && anchor.y < m.y + m.height / m.scale
         })
-        .or_else(|| monitors.first())?;
+        .or_else(|| monitors.first())
+}
+
+pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Option<Frame> {
+    let monitor = monitor_for_anchor(anchor, monitors)?;
     if monitor.scale <= 0.0 {
         return None;
     }
@@ -261,9 +270,36 @@ fn eval(lua: &str) -> Result<(), String> {
     eval_response(&command(&["eval", lua])?)
 }
 
+pub(super) const PREPARE_RULE: &str = concat!(
+    r#"if o and o.window then o.window({ class = "^(vpnt)$", title = "^(VPN Tray)$" }, "#,
+    r#"{ name = "vpnt-tray", float = true, pin = true }) else "#,
+    r#"hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true }) end"#,
+);
+
 fn prepare() -> Result<(), String> {
-    let rule = r#"hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true })"#;
-    eval(rule)
+    eval(PREPARE_RULE)
+}
+
+pub(super) fn lua_opening_rule(monitor: &Monitor, frame: &Frame) -> String {
+    let location = if !monitor.name.is_empty()
+        && monitor
+            .name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        format!(
+            ", monitor = \"{}\", size = {{ 320, {} }}, move = {{ {}, {} }}",
+            monitor.name,
+            frame.height,
+            (f64::from(frame.x) - monitor.x).round() as i64,
+            (f64::from(frame.y) - monitor.y).round() as i64,
+        )
+    } else {
+        format!(", size = {{ 320, {} }}", frame.height)
+    };
+    format!(
+        r#"hl.window_rule({{ name = "vpnt-tray", match = {{ class = "^(vpnt)$", title = "^(VPN Tray)$" }}, float = true, pin = true{location}, animation = "popin 100%" }})"#
+    )
 }
 
 pub(super) fn lua_for_frame(address: &str, frame: &Frame) -> Option<String> {
@@ -292,7 +328,7 @@ pub(super) struct Positioner {
 impl Positioner {
     pub(super) fn new(
         generation: Arc<Generation>,
-        reply: impl Fn(u64, u32, Option<Anchor>) + Send + 'static,
+        reply: impl Fn(u64, u32, Option<Anchor>, bool) + Send + 'static,
     ) -> std::io::Result<Self> {
         let supported = hyprland() && Path::new(HYPRCTL).is_file();
         let (input, requests) = mpsc::channel();
@@ -341,7 +377,7 @@ pub(super) fn worker_loop(
     generation: &Generation,
     mut capture_anchor: impl FnMut() -> Option<Anchor>,
     mut process: impl FnMut(PlacementRequest) -> Result<Option<u32>, String>,
-    reply: impl Fn(u64, u32, Option<Anchor>),
+    reply: impl Fn(u64, u32, Option<Anchor>, bool),
 ) {
     let mut opening_anchor: Option<(u64, Anchor)> = None;
     while let Ok(mut request) = requests.recv() {
@@ -369,7 +405,12 @@ pub(super) fn worker_loop(
             }
         };
         if is_current(generation, request.generation) {
-            reply(request.generation, height, request.anchor);
+            reply(
+                request.generation,
+                height,
+                request.anchor,
+                request.is_opening,
+            );
         }
     }
 }
@@ -387,6 +428,19 @@ fn apply(request: PlacementRequest, generation: &Generation) -> Result<Option<u3
     };
     let monitors = parse_monitors(&command(&["monitors", "-j"])?).map_err(|e| e.to_string())?;
     let frame = frame(anchor, &monitors, request.requested).ok_or("No valid monitor")?;
+    if request.is_opening {
+        let monitor = monitor_for_anchor(anchor, &monitors).ok_or("No valid monitor")?;
+        let rule = lua_opening_rule(monitor, &frame);
+        dispatch_if_current(generation, request.generation, || {
+            if let Err(error) = eval(&rule) {
+                eprintln!("Could not register popover animation rule: {error}");
+                let fallback = rule.replace(", animation = \"popin 100%\"", "");
+                eval(&fallback)?;
+            }
+            Ok(())
+        })?;
+        return Ok(Some(frame.height));
+    }
     for attempt in 0..25 {
         if !is_current(generation, request.generation) {
             return Ok(None);
