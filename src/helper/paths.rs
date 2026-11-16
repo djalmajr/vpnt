@@ -23,6 +23,10 @@ pub(crate) fn charon_log(state: &Path) -> PathBuf {
     state.join("logs").join("charon.log")
 }
 
+pub(crate) fn openfortivpn_log(state: &Path) -> PathBuf {
+    state.join("logs").join("openfortivpn.log")
+}
+
 pub(crate) fn cleanup_log(state: &Path) -> PathBuf {
     state.join("logs").join("cleanup.log")
 }

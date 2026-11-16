@@ -73,6 +73,7 @@ serviço de credenciais e política, sem afirmar isolamento desse estado.
 O charon grava nesse estado `logs/charon.log` (só root, 0600, nível máximo 2,
 `enc = 0` para suprimir o dump de payload decifrado no erro de padding) e conserva
 a tentativa anterior em `logs/charon.previous.log`, com teto de 8 MiB por arquivo.
+O openfortivpn grava `logs/openfortivpn.log` (só root, 0600, mesma rotação para `logs/openfortivpn.previous.log` e mesmo teto de 8 MiB), com cada linha redigida para `[linha redigida]` quando contiver possível segredo e linhas longas registradas como `[linha longa descartada]`.
 O limite de escrita do processo interrompe o crescimento do log sem encerrar o
 charon; identidades, endereços e mensagens do peer podem aparecer no diagnóstico.
 O helper registra recusas de limpeza em `logs/cleanup.log` (só root, 0600, até 8 MiB), com motivo estável, id interno do perfil e número da tentativa, quando o motivo muda ou a cada 30 s.

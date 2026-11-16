@@ -99,8 +99,16 @@ impl SslDriver {
         let binding = egress
             .binding(profile)
             .map_err(|_| StartError::Unavailable)?;
-        let mut driver =
-            Self::start_using(&runtime, profile, credentials, &binding, canceled.clone())?;
+        let mut driver = Self::start_using(
+            &runtime,
+            profile,
+            credentials,
+            &binding,
+            canceled.clone(),
+            std::path::Path::new(paths::STATE),
+            // SAFETY: UID queries have no memory preconditions.
+            unsafe { libc::geteuid() },
+        )?;
         if !egress.is_current(profile).unwrap_or(false) {
             driver.start_error = Some(StartError::Unavailable);
         }
@@ -113,6 +121,8 @@ impl SslDriver {
         credentials: Credentials,
         binding: &Binding,
         canceled: Arc<AtomicBool>,
+        state: &std::path::Path,
+        owner: u32,
     ) -> Result<Self, StartError> {
         let command = command(runtime, profile, binding)?;
         credentials
@@ -120,6 +130,9 @@ impl SslDriver {
             .map_err(|_| StartError::InvalidSecret)?;
         runtime.verify().map_err(map_runtime)?;
         let (server, supervisor) = UnixStream::pair().map_err(|_| StartError::Unavailable)?;
+        // Rotate the diagnostic log immediately before spawning: a missing log
+        // never fails the connection, and the drain keeps working disabled.
+        let _ = super::ssl_output::prepare_log(state, owner);
         let child =
             PinentryChild::spawn_private_runtime(command, credentials.password, supervisor.into())
                 .map_err(|_| StartError::Unavailable)?;
@@ -145,6 +158,8 @@ impl SslDriver {
             start_error: None,
         };
         let setup = (|| {
+            // Logging never fails setup: a missing log keeps the drain running.
+            driver.output.open_log(state, owner);
             let stdout = driver.child.take_stdout().ok_or(StartError::Unavailable)?;
             driver
                 .output
@@ -171,9 +186,10 @@ impl SslDriver {
                 self.start_error = Some(StartError::Unavailable);
             }
         }
-        let exited = self.child.poll()?.is_some();
+        let status = self.child.poll()?;
+        let exited = status.is_some();
         if exited {
-            self.output.finish();
+            self.output.finish_with_status(status);
         }
         let observed = self.output.snapshot();
         Ok(Update {
@@ -189,7 +205,10 @@ impl SslDriver {
         #[cfg(target_os = "macos")]
         self.supervision.cancel();
         let result = self.child.stop(Duration::from_secs(3));
-        self.output.finish();
+        match &result {
+            Ok(outcome) => self.output.finish_with_status(Some(outcome.status)),
+            Err(_) => self.output.finish(),
+        }
         result
     }
     #[cfg(target_os = "macos")]
