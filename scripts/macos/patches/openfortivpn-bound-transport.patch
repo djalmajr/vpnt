@@ -104,14 +104,20 @@
  
  	handle = socket(AF_INET, SOCK_STREAM, 0);
  
-@@ -655,11 +665,24 @@
+@@ -655,11 +665,40 @@
  		goto err_socket;
  	}
  
 +#ifdef __APPLE__
-+	if (fcntl(handle, F_SETFD, FD_CLOEXEC) == -1
-+	    || (tunnel->config->vpnt_ifindex && iface_len == 0))
++	if (fcntl(handle, F_SETFD, FD_CLOEXEC) == -1) {
++		log_error("vpnt: fcntl FD_CLOEXEC: %d: %s\n", errno, strerror(errno));
 +		goto err_post_socket;
++	}
++	if (tunnel->config->vpnt_ifindex && iface_len == 0) {
++		log_error("vpnt: missing interface name for expected index %u\n",
++		          tunnel->config->vpnt_ifindex);
++		goto err_post_socket;
++	}
 +#endif
  	if (iface_len == IF_NAMESIZE) {
  		log_error("socket: Too long iface name\n");
@@ -120,16 +126,26 @@
  	if (iface_len > 0) {
 +#ifdef __APPLE__
 +		bound_index = if_nametoindex(tunnel->config->iface_name);
-+		if (bound_index == 0 || (tunnel->config->vpnt_ifindex
-+		    && bound_index != tunnel->config->vpnt_ifindex)
-+		    || setsockopt(handle, IPPROTO_IP, IP_BOUND_IF,
-+		                  &bound_index, sizeof(bound_index)) != 0)
++		if (bound_index == 0) {
++			log_error("vpnt: if_nametoindex: %d: %s\n", errno, strerror(errno));
 +			goto err_post_socket;
++		}
++		if (tunnel->config->vpnt_ifindex
++		    && bound_index != tunnel->config->vpnt_ifindex) {
++			log_error("vpnt: interface index mismatch (name %u, expected %u)\n",
++			          bound_index, tunnel->config->vpnt_ifindex);
++			goto err_post_socket;
++		}
++		if (setsockopt(handle, IPPROTO_IP, IP_BOUND_IF,
++		                  &bound_index, sizeof(bound_index)) != 0) {
++			log_error("vpnt: setsockopt IP_BOUND_IF: %d: %s\n", errno, strerror(errno));
++			goto err_post_socket;
++		}
 +#endif
  #if HAVE_SO_BINDTODEVICE
  		ret = setsockopt(handle, SOL_SOCKET, SO_BINDTODEVICE,
  		                 tunnel->config->iface_name, iface_len);
-@@ -678,6 +701,9 @@
+@@ -678,6 +717,9 @@
  			          ifr.ifr_name);
  			goto err_post_socket;
  		}
@@ -139,7 +155,7 @@
  		ret = bind(handle, &ifr.ifr_addr, ifr.ifr_addr.sa_len);
  #endif
  		if (ret) {
-@@ -762,6 +788,22 @@
+@@ -762,6 +804,57 @@
  		goto err_connect;
  	}
  
@@ -148,15 +164,50 @@
 +		unsigned int actual_index = 0;
 +		socklen_t size = sizeof(actual_index);
 +		struct sockaddr_in local;
-+		if (getsockopt(handle, IPPROTO_IP, IP_BOUND_IF, &actual_index, &size) != 0
-+		    || size != sizeof(actual_index) || actual_index != bound_index
-+		    || if_nametoindex(tunnel->config->iface_name) != bound_index)
++		if (getsockopt(handle, IPPROTO_IP, IP_BOUND_IF, &actual_index, &size) != 0) {
++			log_error("vpnt: getsockopt IP_BOUND_IF: %d: %s\n", errno, strerror(errno));
 +			goto err_connect;
++		}
++		if (size != sizeof(actual_index)) {
++			log_error("vpnt: IP_BOUND_IF size %u, expected %u\n",
++			          (unsigned int)size, (unsigned int)sizeof(actual_index));
++			goto err_connect;
++		}
++		if (actual_index != bound_index) {
++			log_error("vpnt: bound interface changed after connect (%u != %u)\n",
++			          actual_index, bound_index);
++			goto err_connect;
++		}
++		actual_index = if_nametoindex(tunnel->config->iface_name);
++		if (actual_index == 0) {
++			log_error("vpnt: if_nametoindex after connect: %d: %s\n",
++			          errno, strerror(errno));
++			goto err_connect;
++		}
++		if (actual_index != bound_index) {
++			log_error("vpnt: interface index changed after connect (%u != %u)\n",
++			          actual_index, bound_index);
++			goto err_connect;
++		}
 +		size = sizeof(local);
-+		if (getsockname(handle, (struct sockaddr *)&local, &size) != 0
-+		    || size != sizeof(local) || local.sin_family != AF_INET
-+		    || local.sin_addr.s_addr != bound_source.s_addr)
++		if (getsockname(handle, (struct sockaddr *)&local, &size) != 0) {
++			log_error("vpnt: getsockname: %d: %s\n", errno, strerror(errno));
 +			goto err_connect;
++		}
++		if (size != sizeof(local)) {
++			log_error("vpnt: getsockname size %u, expected %u\n",
++			          (unsigned int)size, (unsigned int)sizeof(local));
++			goto err_connect;
++		}
++		if (local.sin_family != AF_INET) {
++			log_error("vpnt: getsockname family %u, expected AF_INET\n",
++			          (unsigned int)local.sin_family);
++			goto err_connect;
++		}
++		if (local.sin_addr.s_addr != bound_source.s_addr) {
++			log_error("vpnt: source address changed after connect\n");
++			goto err_connect;
++		}
 +	}
 +#endif
  	if (env_proxy != NULL) {
