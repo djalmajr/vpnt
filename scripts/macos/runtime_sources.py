@@ -81,7 +81,10 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     checker = build / "check-routes"
     run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-include", channel_header, "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_routes.c", "-o", checker], build, env, log)
     run([checker], build, env, log)
-    checker = build / "check-transport"
-    run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-include", channel_header, "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_transport.c", "-o", checker], build, env, log)
-    run([checker], build, env, log)
+    # Both values of HAVE_SO_BINDTODEVICE: current macOS SDKs declare the
+    # option, so configure sets 1 and the Darwin path must still bind the source.
+    for bindtodevice in ("0", "1"):
+        checker = build / f"check-transport-{bindtodevice}"
+        run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-include", channel_header, f"-DHAVE_SO_BINDTODEVICE={bindtodevice}", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_transport.c", "-o", checker], build, env, log)
+        run([checker], build, env, log)
     return build / "openfortivpn", source

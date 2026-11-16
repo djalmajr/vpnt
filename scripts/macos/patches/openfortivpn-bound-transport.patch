@@ -104,7 +104,7 @@
  
  	handle = socket(AF_INET, SOCK_STREAM, 0);
  
-@@ -655,11 +665,40 @@
+@@ -655,12 +665,46 @@
  		goto err_socket;
  	}
  
@@ -124,6 +124,7 @@
  		goto err_post_socket;
  	}
  	if (iface_len > 0) {
+-#if HAVE_SO_BINDTODEVICE
 +#ifdef __APPLE__
 +		bound_index = if_nametoindex(tunnel->config->iface_name);
 +		if (bound_index == 0) {
@@ -142,10 +143,16 @@
 +			goto err_post_socket;
 +		}
 +#endif
- #if HAVE_SO_BINDTODEVICE
++		/*
++		 * macOS SDKs from 27 declare SO_BINDTODEVICE, which only binds the
++		 * device. vpnt already pins the device with IP_BOUND_IF above and must
++		 * also bind the source address that the post-connect check verifies.
++		 */
++#if HAVE_SO_BINDTODEVICE && !defined(__APPLE__)
  		ret = setsockopt(handle, SOL_SOCKET, SO_BINDTODEVICE,
  		                 tunnel->config->iface_name, iface_len);
-@@ -678,6 +717,9 @@
+ #else
+@@ -678,6 +722,9 @@
  			          ifr.ifr_name);
  			goto err_post_socket;
  		}
@@ -155,10 +162,11 @@
  		ret = bind(handle, &ifr.ifr_addr, ifr.ifr_addr.sa_len);
  #endif
  		if (ret) {
-@@ -762,6 +804,57 @@
+@@ -761,7 +808,64 @@
+ 		log_error("connect: %s\n", strerror(errno));
  		goto err_connect;
  	}
- 
++
 +#ifdef __APPLE__
 +	if (iface_len > 0) {
 +		unsigned int actual_index = 0;
@@ -205,7 +213,13 @@
 +			goto err_connect;
 +		}
 +		if (local.sin_addr.s_addr != bound_source.s_addr) {
-+			log_error("vpnt: source address changed after connect\n");
++			char actual[INET_ADDRSTRLEN] = "?";
++			char expected[INET_ADDRSTRLEN] = "?";
+ 
++			inet_ntop(AF_INET, &local.sin_addr, actual, sizeof(actual));
++			inet_ntop(AF_INET, &bound_source, expected, sizeof(expected));
++			log_error("vpnt: source address changed after connect (%s != %s)\n",
++			          actual, expected);
 +			goto err_connect;
 +		}
 +	}
