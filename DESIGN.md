@@ -71,6 +71,7 @@ x-layout:
   menu-item-y: "5px"
   icon-menu: "15px"
   icon-inline: "13px"
+  icon-spinner: "14px"
   icon-help: "12px"
   hint-max-width: "200px"
   border-width: "1px"
@@ -181,6 +182,7 @@ x-parity:
     x-layout.menu-item-y: { selector: ":root", var: "--menu-item-y" }
     x-layout.icon-menu: { selector: ":root", var: "--icon-menu" }
     x-layout.icon-inline: { selector: ":root", var: "--icon-inline" }
+    x-layout.icon-spinner: { selector: ":root", var: "--icon-spinner" }
     x-layout.icon-help: { selector: ":root", var: "--icon-help" }
     x-layout.hint-max-width: { selector: ":root", var: "--hint-max-width" }
     x-layout.border-width: { selector: ":root", var: "--border-width" }
@@ -382,8 +384,9 @@ do botão primário, antes do rótulo, com o botão indisponível e `aria-busy`;
 o texto de espera anunciado como status continua, sem spinner. O Cancelar
 segue bloqueado porque a operação do helper não pode ser cancelada por ali.
 O loader compartilhado tem trilha circular completa em `dim-opacity` e arco de
-90° em `currentColor`, centrados na caixa quadrada; a rotação usa o centro do
-viewBox e respeita a preferência por movimento reduzido.
+90° em `currentColor`, centrados em 12,12 no viewBox de 24. Sua caixa CSS mede
+14 px (`icon-spinner`), não encolhe e gira pelo centro da borda; o botão usa
+flex para manter ícone e texto alinhados. Respeita movimento reduzido.
 
 O rodapé fica sempre visível na base do painel, inclusive em perfil e log,
 fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
@@ -465,6 +468,12 @@ O onboarding oferece um único botão Instalar de largura total, sem botão Ver
 detalhes nem estado alternativo de detalhes. Quando o componente está
 desatualizado, o mesmo fluxo usa Atualizar, avisa que túneis ativos devem ser
 desligados e mantém a confirmação antes de abrir o Instalador.
+
+Por indicação do Djalma em 2026-11-16, o seletor de perfis do Log é um
+controle segmentado, inclusive com um só perfil: trilho `control`, segmentos
+por conteúdo, seleção elevada em `surface` e texto dos demais em `secondary`.
+Mantém tablist e foco por teclado. Nomes que não cabem encolhem com reticências,
+sem rolagem do trilho, e o nome inteiro fica no `title`.
 
 Por indicação do Djalma em 2026-11-15, a ação de copiar o Log usa `icon-button`
 à direita na mesma linha do nome do perfil ou das abas. O botão fica fora do

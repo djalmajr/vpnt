@@ -7,6 +7,14 @@ import type { Command, Snapshot, VpnView } from "./model";
 import { defaultPreferences } from "./settings";
 
 let App: typeof import("./App").App;
+let useAppStateHook: typeof import("./useAppState").useAppState;
+let appState:
+  | ReturnType<typeof import("./useAppState").useAppState>
+  | undefined;
+function HookHarness() {
+  appState = useAppStateHook();
+  return createElement("output", null, appState.error ?? "none");
+}
 let createRoot: typeof import("react-dom/client").createRoot;
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -66,12 +74,14 @@ beforeAll(async () => {
   originalFetch = globalThis.fetch;
   ({ createRoot } = await import("react-dom/client"));
   ({ App } = await import("./App"));
+  ({ useAppState: useAppStateHook } = await import("./useAppState"));
 });
 afterEach(async () => {
   try {
     if (root) await act(async () => root?.unmount());
   } finally {
     root = undefined;
+    appState = undefined;
     container?.remove();
     container = undefined;
     globalThis.fetch = originalFetch;
@@ -207,6 +217,208 @@ function destination(locale: Locale, origin: "home" | "preferences") {
 }
 const actions = () =>
   commands.filter((command) => command.type !== "get_snapshot");
+
+test("bridge dá dez minutos só ao componente em HTTP e IPC", async () => {
+  // Use a fresh module bound to this test's window, not a bridge module that
+  // another test may have imported while its own window stub was installed.
+  const originalReply = window.__vpntReply;
+  const modulePath = "./bridge.ts?component-timeout-fixture";
+  const { invoke } = (await import(modulePath)) as typeof import("./bridge");
+  const data: Snapshot = {
+    version: "0.1.0",
+    demo: false,
+    helper: "installed",
+    preferences: defaultPreferences,
+    vpns: [vpn],
+  };
+  const originalTimeout = AbortSignal.timeout;
+  const originalTimer = globalThis.setTimeout;
+  const originalIpc = window.ipc;
+  const durations: number[] = [];
+  try {
+    AbortSignal.timeout = (milliseconds) => {
+      durations.push(milliseconds);
+      return new AbortController().signal;
+    };
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(String(init?.body)) as { id: string };
+      return new Response(JSON.stringify({ id: request.id, snapshot: data }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    const cases: Array<[Command, number]> = [
+      [{ type: "install_helper" }, 610000],
+      [{ type: "remove_helper" }, 610000],
+      [{ type: "toggle", id: "one" }, 120000],
+      [{ type: "connect", id: "one" }, 120000],
+      [{ type: "disconnect", id: "one" }, 120000],
+      [{ type: "reconnect", id: "one" }, 120000],
+      [
+        { type: "save_secrets", id: "one", password: "fictional", psk: "" },
+        120000,
+      ],
+      [{ type: "save_profile", profile: vpn.profile }, 120000],
+      [{ type: "remove_profile", id: "one" }, 120000],
+      [{ type: "get_snapshot" }, 10000],
+      [{ type: "probe", id: "one" }, 10000],
+      [{ type: "disconnect_all" }, 10000],
+      [{ type: "hide" }, 10000],
+      [{ type: "open_project" }, 10000],
+      [{ type: "quit" }, 10000],
+      [{ type: "resize", height: 320 }, 10000],
+      [{ type: "set_demo_state", id: "one", state: "off" }, 10000],
+      [{ type: "set_preferences", preferences: defaultPreferences }, 10000],
+    ];
+    for (const [command] of cases) await invoke(command);
+    expect(durations).toEqual(cases.map(([, timeout]) => timeout));
+    const timers: number[] = [];
+    globalThis.setTimeout = ((
+      handler: TimerHandler,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      timers.push(timeout ?? 0);
+      return originalTimer(handler, timeout, ...args);
+    }) as typeof setTimeout;
+    window.ipc = {
+      postMessage(body) {
+        const request = JSON.parse(body) as { id: string };
+        queueMicrotask(() =>
+          window.__vpntReply?.({ id: request.id, snapshot: data }),
+        );
+      },
+    };
+    await invoke({ type: "install_helper" });
+    await invoke({ type: "remove_helper" });
+    await invoke({ type: "get_snapshot" });
+    expect(timers).toEqual([610000, 610000, 10000]);
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+    globalThis.setTimeout = originalTimer;
+    if (originalIpc) window.ipc = originalIpc;
+    else delete window.ipc;
+    if (originalReply) window.__vpntReply = originalReply;
+    else delete window.__vpntReply;
+  }
+});
+
+test("erro de componente some quando polling confirma instalação, sem nova instalação", async () => {
+  let nextPoll: (() => void) | undefined;
+  commands = [];
+  snapshot = {
+    version: "0.1.0",
+    demo: false,
+    helper: "outdated",
+    preferences: defaultPreferences,
+    vpns: [vpn],
+  };
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as {
+      id: string;
+      command: Command;
+    };
+    commands.push(request.command);
+    const observed = snapshot;
+    if (request.command.type === "get_snapshot") {
+      const done = nextPoll;
+      nextPoll = undefined;
+      done?.();
+    }
+    return new Response(
+      JSON.stringify({ id: request.id, snapshot: observed }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }) as typeof fetch;
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => root?.render(createElement(HookHarness)));
+  async function poll(next: Snapshot) {
+    await act(async () => {
+      const received = new Promise<void>((resolve) => {
+        nextPoll = resolve;
+      });
+      snapshot = next;
+      await received;
+    });
+  }
+  for (const error of ["componentExpired", "componentUnconfirmed"] as const) {
+    await poll({ ...snapshot, helper: "outdated" });
+    if (!appState) throw new Error("hook not mounted");
+    await act(async () => appState?.setError(error));
+    expect(document.querySelector("output")?.textContent).toBe(error);
+    await poll({ ...snapshot, helper: "installed" });
+    expect(document.querySelector("output")?.textContent).toBe("none");
+  }
+  expect(
+    commands.filter(
+      (command) =>
+        command.type === "install_helper" || command.type === "remove_helper",
+    ),
+  ).toHaveLength(0);
+});
+
+test("Log segmentado troca a aba e mantém navegação por teclado", async () => {
+  const { Log } = await import("./screens/Log");
+  const second: VpnView = {
+    ...vpn,
+    profile: { ...vpn.profile, id: "other", name: "Other VPN" },
+  };
+  const data: Snapshot = {
+    version: "0.1.0",
+    demo: false,
+    helper: "installed",
+    preferences: defaultPreferences,
+    vpns: [vpn, second],
+  };
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () =>
+    root?.render(
+      createElement(Log, {
+        snapshot: data,
+        navigate: () => {},
+        run: async () => true,
+        t: (key, values) => translate("en-US", key, values),
+        locale: "en-US",
+      }),
+    ),
+  );
+  const tabs = [
+    ...document.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+  ];
+  expect(tabs).toHaveLength(2);
+  expect(tabs[0]?.getAttribute("aria-selected")).toBe("true");
+  expect(tabs[1]?.getAttribute("aria-selected")).toBe("false");
+  expect(tabs[0]?.classList.contains("primary")).toBe(false);
+  if (!tabs[0] || !tabs[1]) throw new Error("missing log tabs");
+  await click(tabs[1]);
+  expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+  expect(
+    document
+      .querySelector('[role="tabpanel"]')
+      ?.getAttribute("aria-labelledby"),
+  ).toBe(tabs[1].id);
+  await act(async () =>
+    tabs[1]?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+    ),
+  );
+  expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+  expect(document.activeElement).toBe(tabs[0]);
+  await act(async () =>
+    tabs[0]?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "End", bubbles: true }),
+    ),
+  );
+  expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+  expect(document.activeElement).toBe(tabs[1]);
+});
 
 for (const locale of ["pt-BR", "en-US"] as const) {
   for (const origin of ["home", "preferences"] as const) {

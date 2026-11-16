@@ -66,6 +66,7 @@
   --menu-item-y: 5px;
   --icon-menu: 15px;
   --icon-inline: 13px;
+  --icon-spinner: 14px;
   --icon-help: 12px;
   --hint-max-width: 200px;
   --hint-bg: #4a4a4a;
@@ -736,8 +737,29 @@ input[aria-invalid="true"] {
 }
 .tabs {
   display: flex;
-  gap: var(--space-sm);
-  flex-wrap: wrap;
+  min-width: 0;
+  overflow: hidden;
+  padding: var(--space-xs);
+  border-radius: var(--radius-control);
+  background: var(--control);
+}
+/* Long names shrink with an ellipsis instead of scrolling the track. */
+.tabs > [role="tab"] {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--secondary);
+  background: transparent;
+  --button-hover: var(--control-hover);
+  border-radius: calc(var(--radius-control) - var(--border-width));
+}
+.tabs > [role="tab"][aria-selected="true"] {
+  color: var(--text);
+  background: var(--surface);
+  --button-hover: var(--surface);
+  box-shadow: 0 0 0 var(--border-width) var(--separator);
 }
 .log-heading {
   display: flex;
@@ -745,13 +767,9 @@ input[aria-invalid="true"] {
   justify-content: space-between;
   gap: var(--space-sm);
 }
-.log-heading > .tabs,
-.log-heading > strong {
-  flex: 1;
+.log-heading > .tabs {
+  flex: 0 1 auto;
   min-width: 0;
-}
-.log-heading > strong {
-  overflow-wrap: anywhere;
 }
 .log-heading > .icon-button {
   flex-shrink: 0;
@@ -927,10 +945,20 @@ hr {
   opacity: var(--dim-opacity);
 }
 .spin {
-  display: inline-block;
-  transform-box: view-box;
-  transform-origin: center;
+  display: block;
+  flex: none;
+  transform-box: border-box;
+  transform-origin: 50% 50%;
   animation: spin var(--spinner-duration) linear infinite;
+}
+.icon.spin {
+  width: var(--icon-spinner);
+  height: var(--icon-spinner);
+}
+button:has(> .spin) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 @keyframes spin {
   to {
@@ -946,7 +974,5 @@ hr {
 .primary > .spin,
 .danger-fill > .spin,
 .card-cancel > .spin {
-  width: var(--icon-inline);
-  height: var(--icon-inline);
   margin-right: var(--space-xs);
 }

@@ -27,6 +27,20 @@ export function reconcileRoute(previous: Route, snapshot: Snapshot): Route {
   return previous.page === "onboarding" ? { page: "panel" } : previous;
 }
 
+export function reconcileComponentError(
+  error: MessageKey | undefined,
+  snapshot: Snapshot,
+): MessageKey | undefined {
+  if (
+    !snapshot.demo &&
+    snapshot.helper === "installed" &&
+    (error === "componentExpired" || error === "componentUnconfirmed")
+  ) {
+    return undefined;
+  }
+  return error;
+}
+
 export function useAppState() {
   const [local, setLocal] = useState(loadSettings);
   const locale = resolveLocale(local.locale, navigator.languages);
@@ -57,6 +71,7 @@ export function useAppState() {
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
     receivedSnapshot.current = snapshot;
+    setError((previous) => reconcileComponentError(previous, snapshot));
     setSnapshot((previous) =>
       JSON.stringify(previous) === JSON.stringify(snapshot)
         ? previous

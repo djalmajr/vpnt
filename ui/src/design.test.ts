@@ -11,14 +11,52 @@ test("loader tem anel, arco e rotação central", () => {
   expect(html).toContain('class="loader-track"');
   expect(html).toContain('d="M12 3a9 9 0 0 1 9 9"');
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
-  expect(css).toMatch(/\.spin\s*\{[^}]*transform-origin:\s*center/s);
-  expect(css).toMatch(/\.spin\s*\{[^}]*transform-box:\s*view-box/s);
+  expect(css).toMatch(/--icon-spinner:\s*14px\s*;/);
+  expect(css).toMatch(/\.spin\s*\{[^}]*display:\s*block/s);
+  expect(css).toMatch(/\.spin\s*\{[^}]*flex:\s*none/s);
+  expect(css).toMatch(/\.spin\s*\{[^}]*transform-origin:\s*50%\s+50%/s);
+  expect(css).toMatch(/\.spin\s*\{[^}]*transform-box:\s*border-box/s);
+  expect(css).not.toMatch(/\.spin\s*\{[^}]*transform-box:\s*view-box/s);
+  expect(css).toMatch(/\.icon\.spin\s*\{[^}]*width:\s*var\(--icon-spinner\)/s);
+  expect(css).toMatch(/\.icon\.spin\s*\{[^}]*height:\s*var\(--icon-spinner\)/s);
+  expect(css.indexOf(".icon.spin")).toBeGreaterThan(css.indexOf(".icon.large"));
+  expect(css).toMatch(
+    /button:has\(>\s*\.spin\)\s*\{[^}]*display:\s*inline-flex/s,
+  );
   expect(css).toMatch(
     /\.loader-track\s*\{[^}]*opacity:\s*var\(--dim-opacity\)/s,
   );
   expect(css).toMatch(
     /prefers-reduced-motion:\s*reduce[\s\S]*?\.spin\s*\{\s*animation:\s*none/,
   );
+});
+
+test("trilho segmentado usa papéis neutros, não a cor primária", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  expect(css).toMatch(/\.tabs\s*\{[^}]*background:\s*var\(--control\)/s);
+  expect(css).toMatch(
+    /\.tabs\s*>\s*\[role="tab"\]\s*\{[^}]*color:\s*var\(--secondary\)/s,
+  );
+  expect(css).toMatch(
+    /\.tabs\s*>\s*\[role="tab"\]\[aria-selected="true"\]\s*\{[^}]*background:\s*var\(--surface\)/s,
+  );
+  expect(css).toMatch(
+    /\.tabs\s*>\s*\[role="tab"\]\[aria-selected="true"\]\s*\{[^}]*color:\s*var\(--text\)/s,
+  );
+});
+
+// Mutation captured: overflow-x: auto on the track showed a scrollbar and clipped the second profile.
+test("trilho segmentado encolhe os nomes com reticências, sem rolagem", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const track = css.match(/\.tabs\s*\{([^}]*)\}/s)?.[1] ?? "";
+  expect(track).toContain("overflow: hidden");
+  expect(track).not.toMatch(/overflow(-x)?:\s*(auto|scroll)/);
+  const segment =
+    css.match(/\.tabs\s*>\s*\[role="tab"\]\s*\{([^}]*)\}/s)?.[1] ?? "";
+  expect(segment).toContain("flex: 0 1 auto");
+  expect(segment).toContain("min-width: 0");
+  expect(segment).toContain("text-overflow: ellipsis");
+  expect(segment).toContain("white-space: nowrap");
 });
 
 test("lixeira do componente não recebe limite de largura das linhas comuns", () => {

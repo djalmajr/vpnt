@@ -25,7 +25,6 @@ export function Log({
     snapshot.vpns.find((vpn) => vpn.profile.id === selected) ??
     snapshot.vpns[0];
   const selectedId = vpn?.profile.id;
-  const multiple = snapshot.vpns.length > 1;
   const tabId = (id: string) => `${panelId}-${id}`;
   const lines =
     vpn?.log.map(
@@ -50,7 +49,7 @@ export function Log({
         t={t}
       />
       <div className="log-heading">
-        {multiple ? (
+        {vpn ? (
           <div className="tabs" role="tablist" aria-label={t("vpns")}>
             {snapshot.vpns.map((vpn) => (
               <button
@@ -61,7 +60,7 @@ export function Log({
                 aria-controls={panelId}
                 aria-selected={vpn.profile.id === selectedId}
                 tabIndex={vpn.profile.id === selectedId ? 0 : -1}
-                className={vpn.profile.id === selectedId ? "primary" : ""}
+                title={vpn.profile.name}
                 onKeyDown={(event) => {
                   const tabs = Array.from(
                     event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
@@ -93,8 +92,6 @@ export function Log({
               </button>
             ))}
           </div>
-        ) : vpn ? (
-          <strong id={tabId(vpn.profile.id)}>{vpn.profile.name}</strong>
         ) : null}
         {!!lines.length && (
           <button

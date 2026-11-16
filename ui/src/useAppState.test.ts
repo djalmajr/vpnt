@@ -9,9 +9,36 @@ import { profileOriginRoute, type Route } from "./navigation";
 const scope = globalThis as unknown as { window?: unknown };
 const previousWindow = scope.window;
 scope.window = {};
-const { reconcileRoute } = await import("./useAppState");
+const { reconcileRoute, reconcileComponentError } = await import(
+  "./useAppState"
+);
 if (previousWindow === undefined) delete scope.window;
 else scope.window = previousWindow;
+
+test("só confirmação instalada real reconcilia erro de componente", () => {
+  for (const error of ["componentExpired", "componentUnconfirmed"] as const) {
+    expect(reconcileComponentError(error, snapshot())).toBeUndefined();
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "outdated" })),
+    ).toBe(error);
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "missing" })),
+    ).toBe(error);
+    expect(reconcileComponentError(error, snapshot({ demo: true }))).toBe(
+      error,
+    );
+    expect(
+      reconcileComponentError(
+        error,
+        snapshot({ componentOperation: "settling" }),
+      ),
+    ).toBeUndefined();
+  }
+  expect(reconcileComponentError("profileBusy", snapshot())).toBe(
+    "profileBusy",
+  );
+  expect(reconcileComponentError(undefined, snapshot())).toBeUndefined();
+});
 
 test("origem de perfil resolve Home, Preferências e fallback do host", () => {
   expect(profileOriginRoute("home")).toEqual({ page: "panel" });

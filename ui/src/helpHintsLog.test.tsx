@@ -105,15 +105,18 @@ for (const locale of ["pt-BR", "en-US"] as const) {
           locale,
         }),
       );
-    test("uma VPN usa texto sem tablist e nomeia o painel por esse texto", () => {
+    test("uma VPN continua visível como único segmento acessível", () => {
       const html = log(1, "removed-profile");
-      expect(html).not.toContain('role="tablist"');
-      expect(html).not.toContain('role="tab"');
-      const label = html.match(
-        /<strong id="([^"]+)">Fixture one<\/strong>/,
-      )?.[1];
-      expect(label).toBeDefined();
-      expect(html).toContain(`role="tabpanel" aria-labelledby="${label}"`);
+      expect(html).toContain('class="tabs" role="tablist"');
+      expect(html.match(/role="tab"/g)).toHaveLength(1);
+      const selected = html.match(
+        /role="tab" id="([^"]+)" aria-controls="([^"]+)" aria-selected="true" tabindex="0"/,
+      );
+      expect(selected).not.toBeNull();
+      expect(html).toContain(
+        `id="${selected?.[2]}" role="tabpanel" aria-labelledby="${selected?.[1]}"`,
+      );
+      expect(html).not.toContain('class="primary"');
     });
     test("duas VPNs mantêm abas e relação entre seleção e painel", () => {
       const html = log(2, "two");
@@ -127,6 +130,8 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         `id="${selected?.[2]}" role="tabpanel" aria-labelledby="${selected?.[1]}"`,
       );
       expect(html).toContain('aria-selected="false" tabindex="-1"');
+      expect(html).toContain('class="tabs" role="tablist"');
+      expect(html).not.toContain('class="primary"');
     });
     test("copiar fica na linha do perfil ou abas, fora do tablist e do rodapé", () => {
       for (const count of [1, 2]) {
@@ -149,22 +154,15 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         expect(
           html.match(new RegExp(`aria-label="${t("copy")}"`, "g")),
         ).toHaveLength(1);
-        if (count === 1) {
-          expect(heading).toContain(">Fixture one</strong>");
-          expect(heading.indexOf("</strong>")).toBeLessThan(
-            heading.indexOf(`aria-label="${t("copy")}"`),
-          );
-        } else {
-          const tablist = heading.slice(
-            heading.indexOf('role="tablist"'),
-            heading.indexOf("</div>"),
-          );
-          expect(tablist.match(/role="tab"/g)).toHaveLength(2);
-          expect(tablist).not.toContain(`aria-label="${t("copy")}"`);
-          expect(heading.indexOf("</div>")).toBeLessThan(
-            heading.indexOf(`aria-label="${t("copy")}"`),
-          );
-        }
+        const tablist = heading.slice(
+          heading.indexOf('role="tablist"'),
+          heading.indexOf("</div>"),
+        );
+        expect(tablist.match(/role="tab"/g)).toHaveLength(count);
+        expect(tablist).not.toContain(`aria-label="${t("copy")}"`);
+        expect(heading.indexOf("</div>")).toBeLessThan(
+          heading.indexOf(`aria-label="${t("copy")}"`),
+        );
         const footer = html.slice(html.indexOf('<div class="spread">'));
         expect(footer).toContain(t("lastLines"));
         expect(footer).not.toContain("<button");
