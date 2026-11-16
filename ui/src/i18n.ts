@@ -8,13 +8,9 @@ const en = {
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Install the VPN component?",
-  componentUpdateTitle: "Update the VPN component?",
-  componentUpdateHint:
-    "Disconnect active tunnels before updating. macOS Installer will open and request administrator authorization. Profiles and saved credentials are kept.",
   componentRemoveTitle: "Remove the VPN component?",
-  componentInstallHint:
-    "Current tunnels will disconnect. macOS Installer will open and request administrator authorization. Profiles and saved credentials are kept.",
+  componentUpdateBlocked: "Disconnect active VPNs to update.",
+  componentInstallBlocked: "Disconnect active VPNs to install.",
   componentRemoveHint:
     "Current tunnels will disconnect and this account will lose tunnel access. Profiles and saved credentials are kept. Other registered accounts keep access.",
   componentInstallPending:
@@ -214,13 +210,9 @@ const pt: Record<MessageKey, string> = {
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Instalar o componente de VPN?",
-  componentUpdateTitle: "Atualizar o componente de VPN?",
-  componentUpdateHint:
-    "Desligue os túneis ativos antes de atualizar. O Instalador do macOS será aberto e solicitará autorização de administrador. Perfis e credenciais salvas são preservados.",
   componentRemoveTitle: "Remover o componente de VPN?",
-  componentInstallHint:
-    "Os túneis atuais serão desligados. O Instalador do macOS abrirá e pedirá autorização de administrador. Perfis e credenciais salvas serão mantidos.",
+  componentUpdateBlocked: "Desligue as VPNs ativas para atualizar.",
+  componentInstallBlocked: "Desligue as VPNs ativas para instalar.",
   componentRemoveHint:
     "Os túneis atuais serão desligados e esta conta perderá o acesso aos túneis. Perfis e credenciais salvas serão mantidos. Outras contas cadastradas continuam com acesso.",
   componentInstallPending:

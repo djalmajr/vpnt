@@ -53,6 +53,12 @@ for (const locale of ["pt-BR", "en-US"] as const) {
             update: () => {},
             navigate: () => {},
             removeComponent: () => {},
+            install: () => {},
+            installPending: false,
+            installBusy: false,
+            installBlocked: false,
+            updating: helper === "outdated",
+            installFailed: false,
             t,
           }),
         );
@@ -62,7 +68,11 @@ for (const locale of ["pt-BR", "en-US"] as const) {
           ["notifyStale", "notifyStaleHelp"],
           ["autoReconnect", "autoReconnectHelp"],
           [
-            helper === "installed" ? "helperInstalled" : "helperMissing",
+            helper === "installed"
+              ? "helperInstalled"
+              : helper === "outdated"
+                ? "helperOutdated"
+                : "helperMissing",
             "componentHelp",
           ],
         ] as const;

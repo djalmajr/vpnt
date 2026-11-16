@@ -21,6 +21,8 @@ let container: HTMLDivElement | undefined;
 let originalFetch: typeof fetch;
 let commands: Command[];
 let snapshot: Snapshot;
+let pendingInstall: ((success: boolean) => void) | undefined;
+const pendingInstalls = new Set<(success: boolean) => void>();
 const scope = globalThis as typeof globalThis & {
   IS_REACT_ACT_ENVIRONMENT?: boolean;
 };
@@ -78,6 +80,9 @@ beforeAll(async () => {
 });
 afterEach(async () => {
   try {
+    for (const settle of pendingInstalls) settle(false);
+    pendingInstalls.clear();
+    pendingInstall = undefined;
     if (root) await act(async () => root?.unmount());
   } finally {
     root = undefined;
@@ -217,6 +222,401 @@ function destination(locale: Locale, origin: "home" | "preferences") {
 }
 const actions = () =>
   commands.filter((command) => command.type !== "get_snapshot");
+
+async function mountComponentScenario(initial: Snapshot, harness = false) {
+  commands = [];
+  snapshot = initial;
+  localStorage.setItem(
+    "vpnt.preferences.v1",
+    JSON.stringify({ locale: "en-US", theme: "light" }),
+  );
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body)) as {
+      id: string;
+      command: Command;
+    };
+    commands.push(request.command);
+    if (request.command.type === "install_helper") {
+      return await new Promise<Response>((resolve) => {
+        const settle = (success: boolean) => {
+          pendingInstalls.delete(settle);
+          if (pendingInstall === settle) pendingInstall = undefined;
+          if (success)
+            snapshot = {
+              ...snapshot,
+              helper: "installed",
+              componentOperation: undefined,
+            };
+          resolve(
+            new Response(
+              JSON.stringify(
+                success
+                  ? { id: request.id, snapshot }
+                  : { id: request.id, error: "component_unconfirmed" },
+              ),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            ),
+          );
+        };
+        pendingInstalls.add(settle);
+        pendingInstall = settle;
+      });
+    }
+    return new Response(JSON.stringify({ id: request.id, snapshot }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () =>
+    root?.render(createElement(harness ? HookHarness : App)),
+  );
+}
+
+function componentSnapshot(
+  helper: Snapshot["helper"],
+  vpns: VpnView[] = [vpn],
+): Snapshot {
+  return {
+    version: "0.1.0",
+    demo: false,
+    helper,
+    preferences: defaultPreferences,
+    vpns,
+  };
+}
+
+test("aviso Update envia uma vez, permanece na tela e libera retry após falha", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  const button = byText(t("en-US", "update"));
+  await act(async () => {
+    button.click();
+    button.click();
+  });
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(heading()).toBe(t("en-US", "vpns"));
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  expect(button.querySelector("svg.spin")).not.toBeNull();
+  expect(
+    [...document.querySelectorAll('[role="status"]')].filter(
+      (item) => item.textContent === t("en-US", "componentInstallPending"),
+    ),
+  ).toHaveLength(1);
+  await click(button);
+  expect(actions()).toHaveLength(1);
+  await act(async () => pendingInstall?.(false));
+  expect(document.querySelector('[role="alert"]')?.textContent).toBe(
+    t("en-US", "componentUnconfirmed"),
+  );
+  const retry = byText(t("en-US", "tryAgain"));
+  expect(retry.disabled).toBe(false);
+  await click(retry);
+  expect(actions()).toEqual([
+    { type: "install_helper" },
+    { type: "install_helper" },
+  ]);
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "vpns"));
+});
+
+test("conclusão tardia do Update preserva o rascunho do perfil", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byText(t("en-US", "update")));
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  await openProfile("en-US", "home");
+  await edit("en-US", "name", "Draft must survive the installer");
+  // Control: the same unsaved edit is protected on ordinary navigation.
+  await click(byLabel(t("en-US", "back")));
+  expect(dialog("en-US", "discardTitle")).not.toBeNull();
+  await click(byText(t("en-US", "keepEditing")));
+  expect(input("en-US", "name").value).toBe("Draft must survive the installer");
+  await act(async () => pendingInstall?.(true));
+  expect(document.querySelector("form.profile-form")).not.toBeNull();
+  expect(input("en-US", "name").value).toBe("Draft must survive the installer");
+  expect(dialog("en-US", "discardTitle")).toBeNull();
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+});
+
+test("aviso Install envia diretamente sem navegar", async () => {
+  await mountComponentScenario(componentSnapshot("missing"));
+  const button = byText(t("en-US", "install"));
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(heading()).toBe(t("en-US", "vpns"));
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "vpns"));
+});
+
+test("Preferências atualiza diretamente sem navegação intermediária", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byLabel(t("en-US", "preferences")));
+  const button = byText(t("en-US", "update"));
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(heading()).toBe(t("en-US", "preferences"));
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  await act(async () => pendingInstall?.(true));
+});
+
+test("instalação em voo bloqueia os outros pontos de entrada", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byText(t("en-US", "update")));
+  await click(byLabel(t("en-US", "preferences")));
+  const button = byText(t("en-US", "update"));
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBeNull();
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(
+    [...document.querySelectorAll('[role="status"]')].filter(
+      (item) => item.textContent === t("en-US", "componentInstallPending"),
+    ),
+  ).toHaveLength(1);
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "preferences"));
+});
+
+test("Update em voo conserva rótulo e aviso após snapshot missing", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byText(t("en-US", "update")));
+  snapshot = {
+    ...snapshot,
+    helper: "missing",
+    componentOperation: "installing",
+  };
+  await click(byLabel(t("en-US", "preferences")));
+  await click(byLabel(t("en-US", "startAtLogin")));
+  await click(byLabel(t("en-US", "back")));
+  expect(document.body.textContent).toContain(t("en-US", "helperOutdated"));
+  const button = byText(t("en-US", "update"));
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  expect(button.querySelector("svg.spin")).not.toBeNull();
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(
+    [...document.querySelectorAll('[role="status"]')].filter(
+      (item) => item.textContent === t("en-US", "componentInstallPending"),
+    ),
+  ).toHaveLength(1);
+  await act(async () => pendingInstall?.(false));
+});
+
+for (const source of ["onboarding", "preferences"] as const) {
+  test(`${source}: erro libera retry no mesmo ponto`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("missing", source === "onboarding" ? [] : [vpn]),
+    );
+    if (source === "preferences")
+      await click(byLabel(t("en-US", "preferences")));
+    await click(byText(t("en-US", "install")));
+    await act(async () => pendingInstall?.(false));
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe(
+      t("en-US", "componentUnconfirmed"),
+    );
+    expect(heading()).toBe(
+      t("en-US", source === "preferences" ? "preferences" : "vpns"),
+    );
+    const retry = byText(t("en-US", "tryAgain"));
+    expect(retry.disabled).toBe(false);
+    await click(retry);
+    expect(actions()).toEqual([
+      { type: "install_helper" },
+      { type: "install_helper" },
+    ]);
+    await act(async () => pendingInstall?.(false));
+  });
+}
+
+test("conclusão de onboarding não muda a tela escolhida depois do clique", async () => {
+  await mountComponentScenario(componentSnapshot("missing", []));
+  await click(byText(t("en-US", "install")));
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  await click(byLabel(t("en-US", "back")));
+  expect(heading()).toBe(t("en-US", "vpns"));
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "vpns"));
+  expect(document.querySelector("dialog")).toBeNull();
+});
+
+test("Preferências sem perfis segue para nova VPN após instalar", async () => {
+  await mountComponentScenario(componentSnapshot("missing", []));
+  await click(byLabel(t("en-US", "back")));
+  await click(byLabel(t("en-US", "preferences")));
+  await click(byText(t("en-US", "install")));
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "newVpn"));
+  expect(document.querySelector("dialog")).toBeNull();
+});
+
+test("conclusão iniciada em Preferências preserva rascunho aberto depois", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byLabel(t("en-US", "preferences")));
+  await click(byText(t("en-US", "update")));
+  await click(byText(vpn.profile.name + t("en-US", "ipsec")));
+  expect(heading()).toBe(vpn.profile.name);
+  expect(document.querySelector("form.profile-form")).not.toBeNull();
+  await edit("en-US", "name", "Preference draft survives");
+  await act(async () => pendingInstall?.(true));
+  expect(document.querySelector("form.profile-form")).not.toBeNull();
+  expect(input("en-US", "name").value).toBe("Preference draft survives");
+  expect(dialog("en-US", "discardTitle")).toBeNull();
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+});
+
+test("falha tardia não muda a tela nem o rascunho", async () => {
+  await mountComponentScenario(componentSnapshot("outdated"));
+  await click(byText(t("en-US", "update")));
+  await openProfile("en-US", "home");
+  await edit("en-US", "name", "Draft survives failure");
+  await act(async () => pendingInstall?.(false));
+  expect(document.querySelector("form.profile-form")).not.toBeNull();
+  expect(input("en-US", "name").value).toBe("Draft survives failure");
+  expect(dialog("en-US", "discardTitle")).toBeNull();
+  expect(document.querySelector('[role="alert"]')?.textContent).toBe(
+    t("en-US", "componentUnconfirmed"),
+  );
+});
+
+test("Onboarding atualiza em um clique sem confirmação", async () => {
+  await mountComponentScenario(componentSnapshot("outdated", []));
+  const button = byText(t("en-US", "update"));
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "newVpn"));
+});
+
+test("Onboarding instala em um clique sem confirmação", async () => {
+  await mountComponentScenario(componentSnapshot("missing", []));
+  const button = byText(t("en-US", "install"));
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  expect(button.querySelector("svg.spin")).not.toBeNull();
+  expect(
+    [...document.querySelectorAll('[role="status"]')].filter(
+      (item) => item.textContent === t("en-US", "componentInstallPending"),
+    ),
+  ).toHaveLength(1);
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "newVpn"));
+});
+
+test("Preferências instala em um clique e Remover ainda pede confirmação", async () => {
+  await mountComponentScenario(componentSnapshot("missing"));
+  await click(byLabel(t("en-US", "preferences")));
+  const button = byText(t("en-US", "install"));
+  await click(button);
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  expect(heading()).toBe(t("en-US", "preferences"));
+  expect(document.querySelector("dialog")).toBeNull();
+  expect(button.disabled).toBe(true);
+  expect(button.getAttribute("aria-busy")).toBe("true");
+  expect(button.querySelector("svg.spin")).not.toBeNull();
+  expect(
+    [...document.querySelectorAll('[role="status"]')].filter(
+      (item) => item.textContent === t("en-US", "componentInstallPending"),
+    ),
+  ).toHaveLength(1);
+  await act(async () => pendingInstall?.(true));
+  expect(heading()).toBe(t("en-US", "vpns"));
+  await click(byLabel(t("en-US", "preferences")));
+  await click(byLabel(t("en-US", "remove")));
+  expect(dialog("en-US", "componentRemoveTitle")).not.toBeNull();
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+});
+
+for (const [state, cleaning] of [
+  ["connecting", false],
+  ["verifying", false],
+  ["connected", false],
+  ["unresponsive", false],
+  ["reconnecting", false],
+  ["disconnecting", false],
+  ["gateway_timeout", true],
+] as const) {
+  test(`Update recusa ${state} cleaning=${cleaning}`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("outdated", [{ ...vpn, state, cleaning }]),
+    );
+    const button = byText(t("en-US", "update"));
+    expect(button.disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      t("en-US", "componentUpdateBlocked"),
+    );
+    await click(button);
+    expect(actions()).toEqual([]);
+  });
+}
+
+test("ação compartilhada recusa conexão ativa mesmo sem depender do botão", async () => {
+  await mountComponentScenario(
+    componentSnapshot("outdated", [{ ...vpn, state: "connected" }]),
+    true,
+  );
+  if (!appState) throw new Error("hook not mounted");
+  await act(async () => {
+    void appState?.installComponent("panel");
+  });
+  expect(actions()).toEqual([]);
+  expect(appState.installAttempt).toBeUndefined();
+});
+
+test("VPN ativa em outro perfil também bloqueia Update", async () => {
+  const other: VpnView = {
+    ...vpn,
+    profile: { ...vpn.profile, id: "other", name: "Other" },
+    state: "connected",
+  };
+  await mountComponentScenario(componentSnapshot("outdated", [vpn, other]));
+  const button = byText(t("en-US", "update"));
+  expect(button.disabled).toBe(true);
+  expect(document.body.textContent).toContain(
+    t("en-US", "componentUpdateBlocked"),
+  );
+  await click(button);
+  expect(actions()).toEqual([]);
+});
+
+test("operação do backend mantém Update desabilitado sem outro pedido", async () => {
+  await mountComponentScenario({
+    ...componentSnapshot("outdated"),
+    componentOperation: "installing",
+  });
+  const button = byText(t("en-US", "update"));
+  expect(button.disabled).toBe(true);
+  await click(button);
+  expect(actions()).toEqual([]);
+});
+
+test("Preferências exibe dica e impede instalação com VPN ativa", async () => {
+  await mountComponentScenario(
+    componentSnapshot("missing", [{ ...vpn, state: "connected" }]),
+  );
+  await click(byLabel(t("en-US", "preferences")));
+  const button = byText(t("en-US", "install"));
+  expect(button.disabled).toBe(true);
+  expect(document.body.textContent).toContain(
+    t("en-US", "componentInstallBlocked"),
+  );
+  await click(button);
+  expect(actions()).toEqual([]);
+});
 
 test("bridge dá dez minutos só ao componente em HTTP e IPC", async () => {
   // Use a fresh module bound to this test's window, not a bridge module that
@@ -514,10 +914,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
   test(`${locale}: rota criada sem origem volta à Home`, async () => {
     await mount(locale, true);
     await click(byText(t(locale, "install")));
-    const confirmation = dialog(locale, "componentInstallTitle");
-    expect(confirmation).not.toBeNull();
-    if (!confirmation) throw new Error("Install dialog missing");
-    await click(byText(t(locale, "install"), confirmation));
+    expect(document.querySelector("dialog")).toBeNull();
     expect(heading()).toBe(t(locale, "newVpn"));
     await click(byText(t(locale, "ipsec") + t(locale, "ipsecHint")));
     expect(document.querySelector("form.profile-form")).not.toBeNull();

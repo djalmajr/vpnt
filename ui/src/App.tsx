@@ -1,5 +1,9 @@
 import { useCallback, useState } from "react";
-import { ComponentDialog, ComponentStatus } from "./components/ComponentDialog";
+import {
+  ComponentDialog,
+  ComponentStatus,
+  InstallButton,
+} from "./components/ComponentDialog";
 import { Group, Header, Icon, Notice } from "./components/common";
 import { Footer } from "./components/Footer";
 import { RemoveDialog } from "./components/RemoveDialog";
@@ -15,7 +19,7 @@ import { Log } from "./screens/Log";
 import { Onboarding } from "./screens/Onboarding";
 import { Preferences } from "./screens/Preferences";
 import { Profile } from "./screens/Profile";
-import { useAppState } from "./useAppState";
+import { componentBlocked, useAppState } from "./useAppState";
 
 export function App() {
   const {
@@ -35,8 +39,13 @@ export function App() {
     run,
     componentAction,
     setComponentAction,
-    componentInstalled,
+    installAttempt,
+    installFailure,
+    installComponent,
   } = useAppState();
+  const installBusy = !!installAttempt || !!snapshot?.componentOperation;
+  const installBlocked = snapshot ? componentBlocked(snapshot) : false;
+  const updating = installAttempt?.updating ?? snapshot?.helper === "outdated";
   const [navigationGuard, registerNavigationGuard] =
     useState<NavigationGuard>();
   const navigate: Navigate = useCallback(
@@ -70,7 +79,11 @@ export function App() {
           </>
         ) : (
           <>
-            <ComponentStatus snapshot={snapshot} t={t} />
+            <ComponentStatus
+              snapshot={snapshot}
+              installing={!!installAttempt}
+              t={t}
+            />
             {route.page === "panel" && (
               <>
                 <Header
@@ -87,23 +100,28 @@ export function App() {
                   }
                   t={t}
                 />
-                {snapshot.helper !== "installed" && (
+                {(snapshot.helper !== "installed" ||
+                  installAttempt?.source === "panel") && (
                   <Notice>
-                    <p>
-                      {t(
-                        snapshot.helper === "outdated"
-                          ? "helperOutdated"
-                          : "helperBanner",
-                      )}
-                    </p>
-                    <button
-                      type="button"
+                    <p>{t(updating ? "helperOutdated" : "helperBanner")}</p>
+                    {installBlocked && (
+                      <small>
+                        {t(
+                          updating
+                            ? "componentUpdateBlocked"
+                            : "componentInstallBlocked",
+                        )}
+                      </small>
+                    )}
+                    <InstallButton
                       className="primary"
-                      disabled={!!snapshot.componentOperation}
-                      onClick={() => navigate({ page: "onboarding" })}
-                    >
-                      {t(snapshot.helper === "outdated" ? "update" : "install")}
-                    </button>
+                      install={() => void installComponent("panel")}
+                      pending={installAttempt?.source === "panel"}
+                      disabled={installBusy || installBlocked}
+                      updating={updating}
+                      failed={installFailure === "panel"}
+                      t={t}
+                    />
                   </Notice>
                 )}
                 {snapshot.vpns.length ? (
@@ -146,6 +164,12 @@ export function App() {
                 update={updateSettings}
                 navigate={navigate}
                 removeComponent={() => setComponentAction("remove")}
+                install={() => void installComponent("preferences")}
+                installPending={installAttempt?.source === "preferences"}
+                installBusy={installBusy}
+                installBlocked={installBlocked}
+                updating={updating}
+                installFailed={installFailure === "preferences"}
                 t={t}
               />
             )}
@@ -217,9 +241,12 @@ export function App() {
             {route.page === "onboarding" && (
               <Onboarding
                 navigate={navigate}
-                install={() => setComponentAction("install")}
-                busy={!!snapshot.componentOperation}
-                outdated={snapshot.helper === "outdated"}
+                install={() => void installComponent("onboarding")}
+                pending={installAttempt?.source === "onboarding"}
+                busy={installBusy}
+                blocked={installBlocked}
+                outdated={updating}
+                failed={installFailure === "onboarding"}
                 t={t}
               />
             )}
@@ -309,11 +336,8 @@ export function App() {
               ))}
             {componentAction && (
               <ComponentDialog
-                kind={componentAction}
-                updating={snapshot.helper === "outdated"}
                 run={run}
                 close={() => setComponentAction(undefined)}
-                installed={componentInstalled}
                 t={t}
               />
             )}

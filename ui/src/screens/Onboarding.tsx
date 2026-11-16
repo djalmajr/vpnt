@@ -1,3 +1,4 @@
+import { InstallButton } from "../components/ComponentDialog";
 import { Header, Icon, type T } from "../components/common";
 import type { Navigate } from "../navigation";
 
@@ -5,12 +6,18 @@ export function Onboarding({
   navigate,
   install,
   busy,
+  pending,
+  blocked,
+  failed,
   outdated = false,
   t,
 }: {
   navigate: Navigate;
   install: () => void;
   busy: boolean;
+  pending: boolean;
+  blocked: boolean;
+  failed: boolean;
   outdated?: boolean;
   t: T;
 }) {
@@ -23,27 +30,26 @@ export function Onboarding({
       />
       <div className="empty">
         <span className="primary-text">
-          <Icon name={busy ? "loader" : "shield"} large />
+          <Icon name="shield" large />
         </span>
-        <strong>
-          {t(busy ? "componentBusy" : outdated ? "update" : "welcomeTitle")}
-        </strong>
-        <p>
-          {t(
-            busy
-              ? "componentSettling"
-              : outdated
-                ? "helperOutdated"
-                : "welcomeHint",
-          )}
-        </p>
-        {!busy && (
-          <div className="actions fill">
-            <button type="button" className="primary" onClick={install}>
-              {t(outdated ? "update" : "install")}
-            </button>
-          </div>
+        <strong>{t(outdated ? "update" : "welcomeTitle")}</strong>
+        <p>{t(outdated ? "helperOutdated" : "welcomeHint")}</p>
+        {blocked && (
+          <p>
+            {t(outdated ? "componentUpdateBlocked" : "componentInstallBlocked")}
+          </p>
         )}
+        <div className="actions fill">
+          <InstallButton
+            className="primary"
+            install={install}
+            pending={pending}
+            disabled={busy || blocked}
+            updating={outdated}
+            failed={failed}
+            t={t}
+          />
+        </div>
       </div>
     </>
   );

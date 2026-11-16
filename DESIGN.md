@@ -378,9 +378,9 @@ SSL (senha).
 
 Preferências, perfis, log e confirmações ocupam o mesmo popover. Controles têm
 nome acessível, foco visível e caminho por teclado. Diálogos usam dialog nativo,
-com foco contido e Escape para cancelar. As confirmações de instalar/remover
-o componente (e a de remover o perfil) mostram o Icon loader girando dentro
-do botão primário, antes do rótulo, com o botão indisponível e `aria-busy`;
+com foco contido e Escape para cancelar. As confirmações de remover o
+componente e o perfil mostram o Icon loader girando dentro do botão primário,
+antes do rótulo, com o botão indisponível e `aria-busy`;
 o texto de espera anunciado como status continua, sem spinner. O Cancelar
 segue bloqueado porque a operação do helper não pode ser cancelada por ali.
 O loader compartilhado tem trilha circular completa em `dim-opacity` e arco de
@@ -464,10 +464,11 @@ e lixeira à direita centralizada verticalmente nas duas linhas; as demais
 `Row` continuam como estão. O botão reutiliza `icon-button` com cor neutra do
 tema e nome acessível e `title` traduzidos de Remover. O clique abre a
 mesma confirmação de remoção; não há rótulo separado de remoção.
-O onboarding oferece um único botão Instalar de largura total, sem botão Ver
-detalhes nem estado alternativo de detalhes. Quando o componente está
-desatualizado, o mesmo fluxo usa Atualizar, avisa que túneis ativos devem ser
-desligados e mantém a confirmação antes de abrir o Instalador.
+Por indicação do Djalma em 2026-11-16, Instalar e Atualizar agem em um clique
+no aviso, no onboarding ou nas Preferências; a autorização é a do Instalador do
+macOS. O botão mostra o loader no lugar até a confirmação do componente. Com
+VPN ativa, desligando ou em limpeza, fica indisponível e pede para desligá-la.
+Remover mantém a confirmação.
 
 Por indicação do Djalma em 2026-11-16, o seletor de perfis do Log é um
 controle segmentado, inclusive com um só perfil: trilho `control`, segmentos

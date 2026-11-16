@@ -1,3 +1,4 @@
+import { InstallButton } from "../components/ComponentDialog";
 import {
   Group,
   Header,
@@ -18,6 +19,12 @@ export function Preferences({
   update,
   navigate,
   removeComponent,
+  install,
+  installPending,
+  installBusy,
+  installBlocked,
+  updating,
+  installFailed,
   t,
 }: {
   snapshot: Snapshot;
@@ -25,9 +32,16 @@ export function Preferences({
   update: (settings: Settings) => void;
   navigate: Navigate;
   removeComponent: () => void;
+  install: () => void;
+  installPending: boolean;
+  installBusy: boolean;
+  installBlocked: boolean;
+  updating: boolean;
+  installFailed: boolean;
   t: T;
 }) {
   const pending = settings.preferencesPending;
+  const installed = snapshot.helper === "installed" && !installPending;
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     update({ ...settings, [key]: value });
   return (
@@ -152,13 +166,15 @@ export function Preferences({
         <div className="setting-row component-row">
           <span className="setting-label component-title">
             {t(
-              snapshot.helper === "installed"
+              installed
                 ? "helperInstalled"
-                : "helperMissing",
+                : updating
+                  ? "helperOutdated"
+                  : "helperMissing",
             )}
             <Help text={t("componentHelp")} />
           </span>
-          {snapshot.helper === "installed" ? (
+          {installed ? (
             <>
               <small className="component-version">{snapshot.version}</small>
               <button
@@ -173,18 +189,25 @@ export function Preferences({
               </button>
             </>
           ) : (
-            <button
-              type="button"
+            <InstallButton
               className="primary component-install"
-              disabled={!!snapshot.componentOperation}
-              onClick={() => navigate({ page: "onboarding" })}
-            >
-              {t("install")}
-            </button>
+              install={install}
+              pending={installPending}
+              disabled={installBusy || installBlocked}
+              updating={updating}
+              failed={installFailed}
+              t={t}
+            />
           )}
           <small className="component-hint">
             {t(
-              snapshot.helper === "installed" ? "installedHint" : "helperHint",
+              installBlocked && !installed
+                ? updating
+                  ? "componentUpdateBlocked"
+                  : "componentInstallBlocked"
+                : installed
+                  ? "installedHint"
+                  : "helperHint",
             )}
           </small>
         </div>

@@ -67,51 +67,53 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       update: () => {},
       navigate: () => {},
       removeComponent,
+      install: () => {},
+      installPending: false,
+      installBusy: busy,
+      installBlocked: false,
+      updating: false,
+      installFailed: false,
       t,
     });
   describe(`component UI: ${locale}`, () => {
-    test("outdated onboarding and confirmation use the update action", () => {
-      let opens = 0;
-      const onboarding = Onboarding({
-        navigate: () => {},
-        install: () => {
-          opens += 1;
-        },
-        busy: false,
-        outdated: true,
-        t,
-      });
-      expect(renderToStaticMarkup(onboarding)).toContain(t("helperOutdated"));
-      const action = buttons(onboarding).find(
-        (button) => button.children === t("update"),
+    test("outdated onboarding preserves Update while busy", () => {
+      const html = renderToStaticMarkup(
+        createElement(Onboarding, {
+          navigate: () => {},
+          install: () => {},
+          busy: true,
+          pending: true,
+          blocked: false,
+          failed: false,
+          outdated: true,
+          t,
+        }),
       );
-      expect(action).toBeDefined();
-      if (typeof action?.onClick !== "function")
-        throw new Error("missing update action");
-      action.onClick();
-      expect(opens).toBe(1);
-      let confirms = 0;
-      const body = ComponentDialogBody({
-        kind: "install",
-        updating: true,
-        pending: false,
-        confirm: () => {
-          confirms += 1;
-        },
-        close: () => {},
-        t,
-      });
-      expect(renderToStaticMarkup(body)).toContain(t("componentUpdateHint"));
-      const confirm = buttons(body).find(
-        (button) =>
-          Array.isArray(button.children) &&
-          button.children.includes(t("update")),
-      );
-      expect(confirm).toBeDefined();
-      if (typeof confirm?.onClick !== "function")
-        throw new Error("missing confirmation action");
-      confirm.onClick();
-      expect(confirms).toBe(1);
+      expect(html).toContain(t("helperOutdated"));
+      expect(html).toContain(t("update"));
+      expect(html).not.toContain(`>${t("install")}<`);
+      expect(html).toContain('aria-busy="true"');
+      expect(html).toContain(' spin"');
+    });
+    test("onboarding bloqueado explica a ação em ambos os idiomas", () => {
+      for (const outdated of [false, true]) {
+        const html = renderToStaticMarkup(
+          createElement(Onboarding, {
+            navigate: () => {},
+            install: () => {},
+            busy: false,
+            pending: false,
+            blocked: true,
+            failed: false,
+            outdated,
+            t,
+          }),
+        );
+        expect(html).toContain(
+          t(outdated ? "componentUpdateBlocked" : "componentInstallBlocked"),
+        );
+        expect(html).toMatch(/<button[^>]*class="primary"[^>]*disabled/);
+      }
     });
     test("installed version and Remove share one administrator row", () => {
       const html = renderToStaticMarkup(preferences());
@@ -149,51 +151,33 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       );
       expect(css).toMatch(/\.component-hint\s*\{[^}]*grid-area:\s*2\s*\/\s*1/s);
     });
-    for (const kind of ["install", "remove"] as const) {
-      test(`ComponentDialog ${kind}: espera com spinner dentro do primário`, () => {
-        const pending = renderToStaticMarkup(
-          createElement(ComponentDialogBody, {
-            kind,
-            pending: true,
-            confirm: () => {},
-            close: () => {},
-            t,
-          }),
-        );
-        const [text, actions] = pending.split('<div class="actions end">');
-        expect(text).toContain(
-          t(
-            kind === "install"
-              ? "componentInstallPending"
-              : "componentRemovePending",
-          ),
-        );
-        expect(text).not.toContain("<svg");
-        expect(actions).toBeDefined();
-        expectSpinnerOnlyInPrimary(
-          pending,
-          kind === "install" ? "primary" : "danger-fill",
-          t(kind === "install" ? "install" : "remove"),
-        );
-        const idle = renderToStaticMarkup(
-          createElement(ComponentDialogBody, {
-            kind,
-            pending: false,
-            confirm: () => {},
-            close: () => {},
-            t,
-          }),
-        );
-        expect(idle).toContain(
-          t(
-            kind === "install" ? "componentInstallHint" : "componentRemoveHint",
-          ),
-        );
-        expect(idle).not.toContain("<svg");
-        expect(idle).not.toContain("aria-busy");
-        expect(idle).not.toContain("disabled");
-      });
-    }
+    test("ComponentDialog remove: espera com spinner dentro do primário", () => {
+      const pending = renderToStaticMarkup(
+        createElement(ComponentDialogBody, {
+          pending: true,
+          confirm: () => {},
+          close: () => {},
+          t,
+        }),
+      );
+      const [text, actions] = pending.split('<div class="actions end">');
+      expect(text).toContain(t("componentRemovePending"));
+      expect(text).not.toContain("<svg");
+      expect(actions).toBeDefined();
+      expectSpinnerOnlyInPrimary(pending, "danger-fill", t("remove"));
+      const idle = renderToStaticMarkup(
+        createElement(ComponentDialogBody, {
+          pending: false,
+          confirm: () => {},
+          close: () => {},
+          t,
+        }),
+      );
+      expect(idle).toContain(t("componentRemoveHint"));
+      expect(idle).not.toContain("<svg");
+      expect(idle).not.toContain("aria-busy");
+      expect(idle).not.toContain("disabled");
+    });
     test("RemoveDialog: espera com spinner dentro do Remover", () => {
       const saving = renderToStaticMarkup(
         createElement(RemoveDialogBody, {
@@ -254,6 +238,12 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         update: () => {},
         navigate: (route) => routes.push(route),
         removeComponent: () => {},
+        install: () => {},
+        installPending: false,
+        installBusy: false,
+        installBlocked: false,
+        updating: false,
+        installFailed: false,
         t,
       });
       const row = buttons(tree).find(
@@ -295,6 +285,9 @@ for (const locale of ["pt-BR", "en-US"] as const) {
           navigate: () => {},
           install: () => {},
           busy: false,
+          pending: false,
+          blocked: false,
+          failed: false,
         }),
       );
       const actions = html.slice(html.indexOf('<div class="actions fill">'));
@@ -309,23 +302,25 @@ for (const locale of ["pt-BR", "en-US"] as const) {
           navigate: () => {},
           install: () => {},
           busy: true,
+          pending: true,
+          blocked: false,
+          failed: false,
         }),
       );
-      expect(busy).toContain(t("componentSettling"));
-      expect(busy).not.toContain('class="actions fill"');
+      expect(busy).toContain('class="actions fill"');
+      expect(busy).toContain('aria-busy="true"');
+      expect(busy).toContain(' spin"');
     });
     test("removal renders its own confirmation before running", () => {
       let commands = 0;
       const html = renderToStaticMarkup(
         createElement(ComponentDialog, {
-          kind: "remove",
           t,
           run: async () => {
             commands++;
             return true;
           },
           close: () => {},
-          installed: () => {},
         }),
       );
       expect(html).toContain(t("componentRemoveTitle"));
@@ -339,10 +334,11 @@ for (const locale of ["pt-BR", "en-US"] as const) {
 
 // Static wiring guards complement the DOM fixture receipt. SSR does not run
 // effects or prove layout, top-layer placement, focus, scrolling, or WebKit.
-test("App wires Preferences Remove to ComponentDialog remove", () => {
+test("App wires direct install and retains Remove confirmation", () => {
   const app = source("./App.tsx");
   expect(app).toContain('removeComponent={() => setComponentAction("remove")}');
-  expect(app).toMatch(
-    /componentAction &&[\s\S]*<ComponentDialog[\s\S]*kind={componentAction}/,
-  );
+  expect(app).toContain('installComponent("panel")');
+  expect(app).toContain('installComponent("onboarding")');
+  expect(app).toContain('installComponent("preferences")');
+  expect(app).toMatch(/componentAction &&[\s\S]*<ComponentDialog/);
 });
