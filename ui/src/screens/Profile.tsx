@@ -8,13 +8,20 @@ import {
   type T,
 } from "../components/common";
 import type { Profile as VpnProfile, VpnView } from "../model";
-import type { Navigate, RegisterNavigationGuard, Run } from "../navigation";
+import {
+  type Navigate,
+  type ProfileOrigin,
+  profileOriginRoute,
+  type RegisterNavigationGuard,
+  type Run,
+} from "../navigation";
 import { blankProfile } from "../profileDefaults";
 import { hasShellExpression } from "../shellExpression";
 
 export function Profile({
   vpn,
   kind,
+  origin,
   navigate,
   registerNavigationGuard,
   saved,
@@ -25,6 +32,7 @@ export function Profile({
 }: {
   vpn?: VpnView;
   kind?: "ipsec" | "ssl";
+  origin?: ProfileOrigin;
   navigate: Navigate;
   registerNavigationGuard: RegisterNavigationGuard;
   saved: () => void;
@@ -56,7 +64,7 @@ export function Profile({
     });
     return () => registerNavigationGuard(undefined);
   }, [dirty, saving, registerNavigationGuard]);
-  const back = () => navigate({ page: "preferences" });
+  const back = () => navigate(profileOriginRoute(origin));
   const usernameErrorId = useId();
   const usernameError = hasShellExpression(value.username);
   const canSave =

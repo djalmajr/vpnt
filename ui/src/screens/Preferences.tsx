@@ -123,7 +123,13 @@ export function Preferences({
             type="button"
             className="profile-row"
             key={vpn.profile.id}
-            onClick={() => navigate({ page: "profile", id: vpn.profile.id })}
+            onClick={() =>
+              navigate({
+                page: "profile",
+                id: vpn.profile.id,
+                origin: "preferences",
+              })
+            }
           >
             <span>
               {vpn.profile.name}
@@ -135,7 +141,7 @@ export function Preferences({
         <button
           type="button"
           className="link add-profile"
-          onClick={() => navigate({ page: "new" })}
+          onClick={() => navigate({ page: "new", origin: "preferences" })}
         >
           <Icon name="plus" />
           {t("addVpn")}
@@ -143,45 +149,40 @@ export function Preferences({
       </Group>
       <h2 className="section-title">{t("administrator")}</h2>
       <Group>
-        {/* The version and trash share the title line, like the VPN card
-            switch and chevron; the explanation sits on the line below. Only
-            this row differs: every other Row keeps its centered controls. */}
         <div className="setting-row component-row">
-          <div className="component-head">
-            <span className="setting-label">
-              {t(
-                snapshot.helper === "installed"
-                  ? "helperInstalled"
-                  : "helperMissing",
-              )}
-              <Help text={t("componentHelp")} />
-            </span>
-            {snapshot.helper === "installed" ? (
-              <span className="actions">
-                <small>{snapshot.version}</small>
-                <button
-                  type="button"
-                  className="icon-button danger"
-                  aria-label={t("remove")}
-                  title={t("remove")}
-                  disabled={!!snapshot.componentOperation}
-                  onClick={removeComponent}
-                >
-                  <Icon name="trash" />
-                </button>
-              </span>
-            ) : (
+          <span className="setting-label component-title">
+            {t(
+              snapshot.helper === "installed"
+                ? "helperInstalled"
+                : "helperMissing",
+            )}
+            <Help text={t("componentHelp")} />
+          </span>
+          {snapshot.helper === "installed" ? (
+            <>
+              <small className="component-version">{snapshot.version}</small>
               <button
                 type="button"
-                className="primary"
+                className="icon-button component-remove"
+                aria-label={t("remove")}
+                title={t("remove")}
                 disabled={!!snapshot.componentOperation}
-                onClick={() => navigate({ page: "onboarding" })}
+                onClick={removeComponent}
               >
-                {t("install")}
+                <Icon name="trash" />
               </button>
-            )}
-          </div>
-          <small>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="primary component-install"
+              disabled={!!snapshot.componentOperation}
+              onClick={() => navigate({ page: "onboarding" })}
+            >
+              {t("install")}
+            </button>
+          )}
+          <small className="component-hint">
             {t(
               snapshot.helper === "installed" ? "installedHint" : "helperHint",
             )}

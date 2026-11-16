@@ -26,7 +26,7 @@ const paths = {
   trash: "M3 6h18 M9 6V3h6v3 M5 6l1 15h12l1-15 M10 10v7 M14 10v7",
   copy: "M9 9h12v12H9z M5 15H3V3h12v2",
   check: "M5 12l4 4L19 6",
-  loader: "M21 12a9 9 0 1 1-6.219-8.56",
+  loader: "M12 3a9 9 0 0 1 9 9",
   refresh:
     "M3 12a9 9 0 0 1 15-6.7L21 8 M21 3v5h-5 M21 12a9 9 0 0 1-15 6.7L3 16 M3 21v-5h5",
   log: "M4 17l6-5-6-5 M12 19h8",
@@ -54,6 +54,9 @@ export function Icon({
       strokeLinecap="round"
       strokeLinejoin="round"
     >
+      {name === "loader" && (
+        <circle className="loader-track" cx="12" cy="12" r="9" />
+      )}
       <path d={paths[name]} />
     </svg>
   );

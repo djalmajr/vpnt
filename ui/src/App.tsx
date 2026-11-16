@@ -6,7 +6,11 @@ import { RemoveDialog } from "./components/RemoveDialog";
 import { SecretsDialog } from "./components/SecretsDialog";
 import { VpnCard } from "./components/VpnCard";
 import { states } from "./model";
-import type { Navigate, NavigationGuard } from "./navigation";
+import {
+  type Navigate,
+  type NavigationGuard,
+  profileOriginRoute,
+} from "./navigation";
 import { Log } from "./screens/Log";
 import { Onboarding } from "./screens/Onboarding";
 import { Preferences } from "./screens/Preferences";
@@ -127,7 +131,7 @@ export function App() {
                     <button
                       type="button"
                       className="primary block"
-                      onClick={() => navigate({ page: "new" })}
+                      onClick={() => navigate({ page: "new", origin: "home" })}
                     >
                       {t("addVpn")}
                     </button>
@@ -149,7 +153,7 @@ export function App() {
               <>
                 <Header
                   title={t("newVpn")}
-                  back={() => navigate({ page: "preferences" })}
+                  back={() => navigate(profileOriginRoute(route.origin))}
                   t={t}
                 />
                 <h2 className="section-title">{t("chooseType")}</h2>
@@ -158,7 +162,13 @@ export function App() {
                     <button
                       type="button"
                       className="profile-row"
-                      onClick={() => navigate({ page: "profile", kind })}
+                      onClick={() =>
+                        navigate({
+                          page: "profile",
+                          kind,
+                          origin: route.origin,
+                        })
+                      }
                     >
                       <span>
                         {t(kind)}
@@ -178,9 +188,10 @@ export function App() {
                 key={route.id ?? route.kind}
                 vpn={selected}
                 kind={route.kind}
+                origin={route.origin}
                 navigate={navigate}
                 registerNavigationGuard={registerNavigationGuard}
-                saved={() => commitNavigation({ page: "preferences" })}
+                saved={() => commitNavigation(profileOriginRoute(route.origin))}
                 run={run}
                 t={t}
                 secrets={() =>
@@ -286,7 +297,11 @@ export function App() {
                   close={() => setModal(undefined)}
                   removed={() => {
                     setModal(undefined);
-                    navigate({ page: "preferences" });
+                    commitNavigation(
+                      profileOriginRoute(
+                        route.page === "profile" ? route.origin : undefined,
+                      ),
+                    );
                   }}
                   t={t}
                 />

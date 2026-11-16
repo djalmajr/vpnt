@@ -191,14 +191,36 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         expect(details).toBeDefined();
         if (!details) throw new Error("Details button missing");
         click(details);
-        expect(s.routes).toEqual([{ page: "profile", id: profile.id }]);
+        expect(s.routes).toEqual([
+          { page: "profile", id: profile.id, origin: "home" },
+        ]);
         expect(s.commands).toEqual([]);
         expect(s.secretRequests()).toBe(0);
       }
     });
-    test("status usa sempre o ponto; o spinner do conectar fica dentro do Cancel", () => {
+    test("status só aparece sem Notice; o spinner do conectar fica dentro do Cancel", () => {
       for (const state of states) {
         const s = card(state, false, locale);
+        if (
+          [
+            "unresponsive",
+            "dropped",
+            "credentials_rejected",
+            "gateway_timeout",
+            "missing_program",
+          ].includes(state)
+        ) {
+          const lines: ReactElement[] = [];
+          walk(s.tree, (element) => {
+            if (classOf(element).split(" ").includes("status-line"))
+              lines.push(element);
+          });
+          expect(lines).toHaveLength(0);
+          expect(props(principal(s.tree))["aria-label"]).toBe(
+            `${profile.name}: ${translate(locale, `state.${state}`)}`,
+          );
+          continue;
+        }
         const status = statusLine(s.tree);
         expect(loaders(status)).toHaveLength(0);
         const dots: ReactElement[] = [];

@@ -345,19 +345,28 @@ h2 {
   align-items: center;
   gap: var(--space-xs);
 }
-/* The administrator row stacks: version and trash share the title line, the
-   explanation sits on the line below. Every other Row keeps its centered
-   controls. */
 .setting-row.component-row {
-  flex-direction: column;
-  align-items: stretch;
-  gap: var(--space-xs);
-}
-.component-head {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-sm);
+  column-gap: var(--space-sm);
+  row-gap: var(--space-xs);
+}
+.component-title {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+.component-version {
+  grid-area: 1 / 2;
+}
+.component-remove {
+  grid-area: 1 / 3 / 3;
+}
+.component-install {
+  grid-area: 1 / 2 / 3 / 4;
+}
+.component-hint {
+  grid-area: 2 / 1 / 3 / 3;
 }
 .help-trigger {
   display: inline-flex;
@@ -404,6 +413,9 @@ h2 {
 }
 .setting-row > button {
   max-width: 52%;
+}
+.setting-row > .component-remove {
+  max-width: none;
 }
 .switch {
   --switch-radius: calc(var(--radius-sm) - var(--border-width));
@@ -911,7 +923,13 @@ hr {
   overflow: hidden;
   white-space: nowrap;
 }
+.loader-track {
+  opacity: var(--dim-opacity);
+}
 .spin {
+  display: inline-block;
+  transform-box: view-box;
+  transform-origin: center;
   animation: spin var(--spinner-duration) linear infinite;
 }
 @keyframes spin {

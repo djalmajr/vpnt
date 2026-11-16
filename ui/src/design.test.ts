@@ -1,5 +1,32 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { Icon } from "./components/common";
+
+test("loader tem anel, arco e rotação central", () => {
+  const html = renderToStaticMarkup(createElement(Icon, { name: "loader" }));
+  expect(html).toContain('viewBox="0 0 24 24"');
+  expect(html).toContain('cx="12" cy="12" r="9"');
+  expect(html).toContain('class="loader-track"');
+  expect(html).toContain('d="M12 3a9 9 0 0 1 9 9"');
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  expect(css).toMatch(/\.spin\s*\{[^}]*transform-origin:\s*center/s);
+  expect(css).toMatch(/\.spin\s*\{[^}]*transform-box:\s*view-box/s);
+  expect(css).toMatch(
+    /\.loader-track\s*\{[^}]*opacity:\s*var\(--dim-opacity\)/s,
+  );
+  expect(css).toMatch(
+    /prefers-reduced-motion:\s*reduce[\s\S]*?\.spin\s*\{\s*animation:\s*none/,
+  );
+});
+
+test("lixeira do componente não recebe limite de largura das linhas comuns", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  expect(css).toMatch(
+    /\.setting-row\s*>\s*\.component-remove\s*\{[^}]*max-width:\s*none\s*;/s,
+  );
+});
 
 // Mutation captured: a self-referencing field width silently falls back to auto and breaks column alignment.
 test("tokens geométricos não podem formar referências diretas a si mesmos", () => {

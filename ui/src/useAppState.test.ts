@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Snapshot } from "./model";
-import type { Route } from "./navigation";
+import { profileOriginRoute, type Route } from "./navigation";
 
 // The hook module imports the bridge, which registers its reply channel on
 // `window` at import time; the bridge itself is not exercised here. The stub
@@ -12,6 +12,12 @@ scope.window = {};
 const { reconcileRoute } = await import("./useAppState");
 if (previousWindow === undefined) delete scope.window;
 else scope.window = previousWindow;
+
+test("origem de perfil resolve Home, Preferências e fallback do host", () => {
+  expect(profileOriginRoute("home")).toEqual({ page: "panel" });
+  expect(profileOriginRoute("preferences")).toEqual({ page: "preferences" });
+  expect(profileOriginRoute()).toEqual({ page: "panel" });
+});
 
 const snapshot = (overrides: Partial<Snapshot> = {}): Snapshot => ({
   version: "0.1.0",

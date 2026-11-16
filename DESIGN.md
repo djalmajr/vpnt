@@ -361,10 +361,11 @@ O estado continua vindo do snapshot autoritativo, sem atualização otimista.
 
 O corpo não é clicável: só o icon-button com chevron à direita do
 interruptor abre o perfil, com nome traduzido “Detalhes de {name}”.
-Não há botões aninhados nem segundo foco no corpo. A linha de status mostra
-sempre o ponto, na cor do tom do estado, ocupando a mesma caixa e o mesmo
-centro em todos os estados; durante conexão e reconexão, o spinner fica
-dentro do botão Cancelar, antes do rótulo, e há um único spinner por cartão.
+Não há botões aninhados nem segundo foco no corpo. Quando há Notice de aviso
+ou erro, a linha de status não aparece; o nome acessível do interruptor ainda
+contém o estado. Sem Notice, a linha mostra o ponto na cor do estado, na mesma
+caixa e centro; durante conexão e reconexão, o spinner fica dentro do botão
+Cancelar, antes do rótulo, e há um único spinner por cartão.
 Cancelar é um botão real com foco próprio, menu-hover, raio de controle e
 recuo horizontal space-xs.
 
@@ -380,6 +381,9 @@ o componente (e a de remover o perfil) mostram o Icon loader girando dentro
 do botão primário, antes do rótulo, com o botão indisponível e `aria-busy`;
 o texto de espera anunciado como status continua, sem spinner. O Cancelar
 segue bloqueado porque a operação do helper não pode ser cancelada por ali.
+O loader compartilhado tem trilha circular completa em `dim-opacity` e arco de
+90° em `currentColor`, centrados na caixa quadrada; a rotação usa o centro do
+viewBox e respeita a preferência por movimento reduzido.
 
 O rodapé fica sempre visível na base do painel, inclusive em perfil e log,
 fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
@@ -389,7 +393,9 @@ seu portal e a reserva temporária de altura.
 Voltar e as rotas do rodapé usam a mesma guarda de alterações pendentes do
 perfil, inclusive na criação: confirmar descarte segue ao destino escolhido;
 continuar editando preserva o formulário. Durante salvar, essas saídas ficam
-indisponíveis.
+indisponíveis. O perfil lembra a origem Home ou Preferências: Voltar, descarte
+confirmado, salvar e remoção retornam à origem. A criação carrega a origem pela
+escolha de tipo; sem origem, retorna à Home.
 
 As quatro linhas não triviais das Preferências usam o componente compartilhado
 `Help`: ícone de interrogação ao lado do rótulo, com tamanho `icon-help` de
@@ -449,11 +455,11 @@ de grupos (perfis em Preferências, tipos na criação) preenche a linha inteira
 até as bordas do grupo, com o raio do cartão acompanhando o contêiner nos
 cantos da primeira e da última linha. O foco visível continua visível.
 
-Por indicação do Djalma em 2026-11-15, o acesso de administrador instalado
-usa uma única linha: versão e botão de ícone de lixeira ficam na linha do
-título, alinhados a ele, e a explicação ocupa a linha de baixo; as demais
-`Row` continuam como estão. O botão reutiliza `icon-button` e o tom de
-perigo, com nome acessível e `title` traduzidos de Remover. O clique abre a
+Por correção do Djalma em 2026-11-16, o acesso de administrador instalado
+usa três colunas: título e versão na primeira linha, explicação na segunda,
+e lixeira à direita centralizada verticalmente nas duas linhas; as demais
+`Row` continuam como estão. O botão reutiliza `icon-button` com cor neutra do
+tema e nome acessível e `title` traduzidos de Remover. O clique abre a
 mesma confirmação de remoção; não há rótulo separado de remoção.
 O onboarding oferece um único botão Instalar de largura total, sem botão Ver
 detalhes nem estado alternativo de detalhes.

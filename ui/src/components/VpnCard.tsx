@@ -103,34 +103,35 @@ export function VpnCard({
               className="icon-button"
               aria-label={t("profileDetails", { name: profile.name })}
               title={t("profileDetails", { name: profile.name })}
-              onClick={() => navigate({ page: "profile", id: profile.id })}
+              onClick={() =>
+                navigate({ page: "profile", id: profile.id, origin: "home" })
+              }
             >
               <Icon name="chevron" />
             </button>
           </span>
         </span>
-        <span className="card-state">
-          <span className="status-line">
-            {/* The indicator is always the dot, in the tone of the state, so
-                every state shares one box and one center; the spinner for an
-                in-flight connect/reconnect lives inside Cancel instead. */}
-            <span className={color}>
-              <span className="dot" />
+        {!hint && (
+          <span className="card-state">
+            <span className="status-line">
+              <span className={color}>
+                <span className="dot" />
+              </span>
+              <span>{t(`state.${state}`)}</span>
             </span>
-            <span>{t(`state.${state}`)}</span>
+            {cancelable && (
+              <button
+                type="button"
+                className="card-cancel"
+                onClick={() => void run({ type: "disconnect", id: profile.id })}
+                aria-label={t("cancel")}
+              >
+                <Icon name="loader" />
+                {t("cancel")}
+              </button>
+            )}
           </span>
-          {cancelable && (
-            <button
-              type="button"
-              className="card-cancel"
-              onClick={() => void run({ type: "disconnect", id: profile.id })}
-              aria-label={t("cancel")}
-            >
-              <Icon name="loader" />
-              {t("cancel")}
-            </button>
-          )}
-        </span>
+        )}
       </div>
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>

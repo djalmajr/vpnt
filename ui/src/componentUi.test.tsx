@@ -80,25 +80,31 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(lastGroup).toContain(snapshot.version);
       expect(lastGroup).toContain(`aria-label="${t("remove")}"`);
       expect(lastGroup).toContain(`title="${t("remove")}"`);
-      expect(lastGroup).toContain('class="icon-button danger"');
+      expect(lastGroup).toContain('class="icon-button component-remove"');
+      expect(lastGroup).not.toContain('class="icon-button danger"');
       expect(lastGroup).toContain('viewBox="0 0 24 24"');
       expect(lastGroup).not.toContain(`>${t("remove")}<`);
       expect(lastGroup).not.toContain(
         locale === "en-US" ? "Remove component" : "Remover componente",
       );
     });
-    test("versão e lixeira dividem a linha do título; a dica fica embaixo", () => {
+    test("versão acompanha título e lixeira ocupa as duas linhas", () => {
       const html = renderToStaticMarkup(preferences());
       const lastGroup = html.slice(html.lastIndexOf('<section class="group">'));
-      const head = lastGroup.indexOf("component-head");
-      expect(head).toBeGreaterThan(-1);
-      const version = lastGroup.indexOf(snapshot.version);
-      const trash = lastGroup.indexOf(`aria-label="${t("remove")}"`);
-      const hint = lastGroup.indexOf(t("installedHint"));
-      expect(version).toBeGreaterThan(head);
-      expect(trash).toBeGreaterThan(head);
-      expect(version).toBeLessThan(hint);
-      expect(trash).toBeLessThan(hint);
+      expect(lastGroup).toContain('class="component-version"');
+      expect(lastGroup).toContain('class="icon-button component-remove"');
+      expect(lastGroup).toContain('class="component-hint"');
+      const css = source("./styles.css");
+      expect(css).toMatch(
+        /\.setting-row\.component-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto auto/s,
+      );
+      expect(css).toMatch(
+        /\.component-version\s*\{[^}]*grid-area:\s*1\s*\/\s*2/s,
+      );
+      expect(css).toMatch(
+        /\.component-remove\s*\{[^}]*grid-area:\s*1\s*\/\s*3\s*\/\s*3/s,
+      );
+      expect(css).toMatch(/\.component-hint\s*\{[^}]*grid-area:\s*2\s*\/\s*1/s);
     });
     for (const kind of ["install", "remove"] as const) {
       test(`ComponentDialog ${kind}: espera com spinner dentro do primário`, () => {
@@ -171,6 +177,57 @@ for (const locale of ["pt-BR", "en-US"] as const) {
       expect(idle).not.toContain("<svg");
       expect(idle).not.toContain("aria-busy");
       expect(idle).not.toContain("disabled");
+    });
+    test("lista e Add VPN guardam origem Preferências", () => {
+      const routes: unknown[] = [];
+      const profile = {
+        id: "fixture",
+        name: "Fixture",
+        kind: "ssl" as const,
+        gateway: "vpn.example.test",
+        username: "fixture",
+        networks: [],
+        port: 443,
+        certificate: "",
+        probeHost: "192.0.2.1",
+        probePort: 443,
+        probeMethod: "tcp" as const,
+      };
+      const tree = Preferences({
+        snapshot: {
+          ...snapshot,
+          vpns: [
+            {
+              profile,
+              state: "off",
+              cleaning: false,
+              hasPassword: false,
+              hasPsk: false,
+              log: [],
+            },
+          ],
+        },
+        settings,
+        update: () => {},
+        navigate: (route) => routes.push(route),
+        removeComponent: () => {},
+        t,
+      });
+      const row = buttons(tree).find(
+        (button) => button.className === "profile-row",
+      );
+      const add = buttons(tree).find(
+        (button) => button.className === "link add-profile",
+      );
+      expect(row).toBeDefined();
+      expect(add).toBeDefined();
+      if (!row || !add) throw new Error("Profile controls missing");
+      (row.onClick as () => void)();
+      (add.onClick as () => void)();
+      expect(routes).toEqual([
+        { page: "profile", id: "fixture", origin: "preferences" },
+        { page: "new", origin: "preferences" },
+      ]);
     });
     test("Remove requests confirmation without sending a command", () => {
       let confirmations = 0;
