@@ -716,3 +716,40 @@ fn prepare_rule_registers_with_omarchy_or_falls_back_to_hyprland() {
         r#"if o and o.window then o.window({ class = "^(vpnt)$", title = "^(VPN Tray)$" }, { name = "vpnt-tray", float = true, pin = true }) else hl.window_rule({ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true }) end"#
     );
 }
+
+#[test]
+fn omarchy_gap_and_frame_examples() {
+    assert_eq!(placement::parse_gap(r#"{"css":"10 10 10 10"}"#), 5);
+    assert_eq!(placement::parse_gap(r#"{"int":7}"#), 4);
+    assert_eq!(placement::parse_gap("bad"), 5);
+    let screens = monitors(
+        r#"[{"x":1600,"y":0,"width":3225,"height":1800,"scale":1,"reserved":[0,26,0,0]}]"#,
+    );
+    assert_eq!(
+        placement::frame_with_gap(
+            placement::Anchor {
+                x: 3267.0,
+                y: 278.0
+            },
+            &screens,
+            480,
+            Some(5)
+        ),
+        Some(placement::Frame {
+            x: 3107,
+            y: 31,
+            height: 480
+        })
+    );
+    assert_eq!(
+        placement::frame_with_gap(
+            placement::Anchor { x: 1650.0, y: 10.0 },
+            &screens,
+            480,
+            Some(5)
+        )
+        .unwrap()
+        .x,
+        1605
+    );
+}

@@ -163,6 +163,34 @@ fn command(args: &[&str]) -> Result<String, String> {
     command_at(Path::new(HYPRCTL), args)
 }
 
+pub(super) fn rounding() -> u32 {
+    command(&["getoption", "decoration:rounding", "-j"])
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("int")?.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+pub(super) fn parse_gap(json: &str) -> u32 {
+    let value = serde_json::from_str::<serde_json::Value>(json).ok();
+    let n = value
+        .as_ref()
+        .and_then(|v| {
+            v.get("css")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<f64>().ok())
+                .or_else(|| v.get("int").and_then(|v| v.as_f64()))
+        })
+        .filter(|n| n.is_finite() && *n >= 0.0);
+    n.map(|n| (n / 2.0).round() as u32).unwrap_or(5)
+}
+
+fn gap() -> u32 {
+    command(&["getoption", "general:gaps_out", "-j"]).map_or(5, |s| parse_gap(&s))
+}
+
 pub(super) fn parse_anchor(json: &str) -> Result<Anchor, serde_json::Error> {
     serde_json::from_str(json)
 }
@@ -201,7 +229,17 @@ fn monitor_for_anchor(anchor: Anchor, monitors: &[Monitor]) -> Option<&Monitor> 
         .or_else(|| monitors.first())
 }
 
+#[cfg(test)]
 pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Option<Frame> {
+    frame_with_gap(anchor, monitors, requested, None)
+}
+
+pub(super) fn frame_with_gap(
+    anchor: Anchor,
+    monitors: &[Monitor],
+    requested: u32,
+    gap: Option<u32>,
+) -> Option<Frame> {
     let monitor = monitor_for_anchor(anchor, monitors)?;
     if monitor.scale <= 0.0 {
         return None;
@@ -209,15 +247,17 @@ pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Opt
     let width = monitor.width / monitor.scale;
     let height = monitor.height / monitor.scale;
     let [left, top, right, bottom] = monitor.reserved;
-    let available = (height - top - bottom - 24.0).max(0.0) as u32;
+    let extra = gap.map_or(0.0, |g| f64::from(g) * 2.0);
+    let margin = gap.map_or(8.0, f64::from);
+    let available = (height - top - bottom - 24.0 - extra).max(0.0) as u32;
     let panel_height = requested.clamp(180, 720).min(available);
-    let min_x = monitor.x + left + 8.0;
-    let max_x = (monitor.x + width - right - 8.0 - 320.0).max(min_x);
+    let min_x = monitor.x + left + margin;
+    let max_x = (monitor.x + width - right - margin - 320.0).max(min_x);
     let x = (anchor.x - 160.0).clamp(min_x, max_x);
     let y = if anchor.y < monitor.y + height / 2.0 {
-        monitor.y + top
+        monitor.y + top + gap.map_or(0.0, f64::from)
     } else {
-        monitor.y + height - bottom - f64::from(panel_height)
+        monitor.y + height - bottom - f64::from(panel_height) - gap.map_or(0.0, f64::from)
     };
     Some(Frame {
         x: x.round() as i32,
@@ -328,6 +368,7 @@ pub(super) struct Positioner {
 impl Positioner {
     pub(super) fn new(
         generation: Arc<Generation>,
+        omarchy: bool,
         reply: impl Fn(u64, u32, Option<Anchor>, bool) + Send + 'static,
     ) -> std::io::Result<Self> {
         let supported = hyprland() && Path::new(HYPRCTL).is_file();
@@ -346,13 +387,17 @@ impl Positioner {
                 } else {
                     false
                 };
+                let mut current_gap = None;
                 worker_loop(
                     requests,
                     &generation,
                     || if ready { capture() } else { None },
                     |request| {
                         if ready {
-                            apply(request, &generation)
+                            if request.is_opening && omarchy {
+                                current_gap = Some(gap());
+                            }
+                            apply(request, &generation, current_gap)
                         } else {
                             Ok(None)
                         }
@@ -422,12 +467,17 @@ fn own_client() -> Result<Option<Client>, String> {
         .find(|c| c.pid == std::process::id() && c.title == PRODUCT_NAME))
 }
 
-fn apply(request: PlacementRequest, generation: &Generation) -> Result<Option<u32>, String> {
+fn apply(
+    request: PlacementRequest,
+    generation: &Generation,
+    gap: Option<u32>,
+) -> Result<Option<u32>, String> {
     let Some(anchor) = request.anchor else {
         return Ok(None);
     };
     let monitors = parse_monitors(&command(&["monitors", "-j"])?).map_err(|e| e.to_string())?;
-    let frame = frame(anchor, &monitors, request.requested).ok_or("No valid monitor")?;
+    let frame =
+        frame_with_gap(anchor, &monitors, request.requested, gap).ok_or("No valid monitor")?;
     if request.is_opening {
         let monitor = monitor_for_anchor(anchor, &monitors).ok_or("No valid monitor")?;
         let rule = lua_opening_rule(monitor, &frame);

@@ -5,6 +5,7 @@ const TRAY_ID: &str = "vpnt";
 
 mod backend;
 mod icon;
+mod omarchy;
 mod placement;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,7 @@ enum UserEvent {
     Tray(TrayIconEvent, Option<placement::Anchor>),
     Ipc(Zeroizing<String>, Instant),
     Reply(Reply),
+    Theme(omarchy::Theme),
     Show {
         generation: u64,
         height: u32,
@@ -45,12 +47,31 @@ enum UserEvent {
 }
 
 pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
+    glib::set_prgname(Some("vpnt"));
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let detected = omarchy::detect(
+        std::env::var_os("OMARCHY_PATH")
+            .as_deref()
+            .map(std::path::Path::new),
+        std::path::Path::new("/usr/share/omarchy"),
+    );
+    let initial_theme = if detected {
+        let theme_proxy = event_loop.create_proxy();
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        Some(omarchy::start(omarchy::Paths::new(&home), move |theme| {
+            let _ = theme_proxy.send_event(UserEvent::Theme(theme));
+        })?)
+    } else {
+        None
+    };
     let proxy = event_loop.create_proxy();
     let generation = Arc::new(placement::Generation::default());
     let placement_proxy = event_loop.create_proxy();
     let positioner = placement::Positioner::new(
         Arc::clone(&generation),
+        detected,
         move |generation, height, anchor, opening| {
             let event = if opening {
                 UserEvent::Show {
@@ -83,7 +104,12 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         .with_skip_taskbar(true)
         .with_rgba_visual(true)
         .build(&event_loop)?;
-    let webview = WebViewBuilder::new()
+    let mut webview_builder = WebViewBuilder::new();
+    let initial_script = initial_theme.as_ref().map(omarchy::script);
+    if let Some(script) = initial_script.as_deref() {
+        webview_builder = webview_builder.with_initialization_script(script);
+    }
+    let webview = webview_builder
         .with_transparent(true)
         .with_custom_protocol("vpnt".into(), |_id, request| {
             let (mime, body, status) =
@@ -251,6 +277,9 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Event::UserEvent(UserEvent::Reply(reply)) => send_reply(&webview, &reply),
+            Event::UserEvent(UserEvent::Theme(theme)) => {
+                let _ = webview.evaluate_script(&omarchy::script(&theme));
+            }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 if show_decision(
                     open,
