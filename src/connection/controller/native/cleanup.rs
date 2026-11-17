@@ -1,30 +1,78 @@
 use super::*;
 use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
 
+type Retired = Vec<crate::connection::macos::routing::retirement::Retirement>;
+
+/// Persist while the claims are held, then detach them. A failed write keeps
+/// everything unless `journaled`: a journal on disk already describes them.
 fn persist_claims<B: crate::connection::routes::Backend>(
     routes: &mut Coordinator<B>,
     owner: &Owner,
     record: &mut crate::connection::fence::Fence,
+    journaled: bool,
     persist: impl FnOnce(&crate::connection::fence::Fence) -> Result<(), AbandonError>,
     detach: impl FnOnce(&mut B),
 ) -> Result<(), AbandonError> {
-    routes.try_abandon(owner, |inventory| {
+    let written = routes.try_abandon(owner, |inventory| {
         record.routes = inventory.to_vec();
         persist(record)
-    })?;
+    });
+    match written {
+        Ok(_) => {}
+        Err(AbandonError::Persist) if journaled => {
+            routes.abandon(owner);
+        }
+        Err(error) => return Err(error),
+    }
     detach(routes.backend_mut());
     Ok(())
 }
 
-impl NativeAttempt<'_> {
-    pub(super) fn abandon_ssl(&mut self, reason: Reason) -> Result<(), AbandonError> {
+/// `try_lock` contention is `Busy`; a poisoned lock is a failure.
+fn contended<T>(held: std::sync::TryLockError<T>) -> AbandonError {
+    match held {
+        std::sync::TryLockError::WouldBlock => AbandonError::Busy,
+        std::sync::TryLockError::Poisoned(_) => AbandonError::Unsupported,
+    }
+}
+
+impl<'a> NativeAttempt<'a> {
+    /// The abandonment's locks in its order: reservation, coordinator,
+    /// retirement queue, each with `try_lock`. Contention is `Busy` and the
+    /// caller decides. Only `release` lets a successful action free the
+    /// reservation; the claims and the queue are whatever `action` does.
+    fn with_claims<T>(
+        &self,
+        release: bool,
+        action: impl FnOnce(
+            &mut Coordinator<NativeBackend<'a>>,
+            &mut Retired,
+        ) -> Result<T, AbandonError>,
+    ) -> Result<T, AbandonError> {
+        let locked = || {
+            let mut routes = self.routes.try_lock().map_err(contended)?;
+            let queue = routes.backend_mut().retirement_queue();
+            let mut retired = queue.try_lock().map_err(contended)?;
+            action(&mut routes, &mut retired)
+        };
+        let busy = || AbandonError::Busy;
+        let error = || AbandonError::Unsupported;
+        match &self.profile_use {
+            Some(profile) if release => profile.abandon_after(busy, error, locked),
+            Some(profile) => profile.hold(busy, error, locked),
+            None => locked(),
+        }
+    }
+    /// The abandonment inventory under its held locks; releases nothing.
+    fn record_under(
+        &self,
+        reason: Reason,
+        routes: &mut Coordinator<NativeBackend<'a>>,
+        retired: &Retired,
+    ) -> Result<crate::connection::fence::Fence, AbandonError> {
         use crate::connection::{fence, macos::routing::retirement};
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Only the retained driver may signal its own children.
-        if let Some(client) = &mut self.client {
-            let _ = client.stop();
-        }
         let (service_id, processes) = match &self.client {
             Some(client) => {
                 let (service, processes) = client
@@ -54,7 +102,7 @@ impl NativeAttempt<'_> {
                         .as_ref()
                         .is_some_and(|client| client.ppp_may_have_run())
                         && interface.is_none())));
-        let mut record = fence::Fence {
+        Ok(fence::Fence {
             version: 1,
             uid: self.owner.uid,
             profile: self.owner.profile.clone(),
@@ -67,37 +115,92 @@ impl NativeAttempt<'_> {
             dns_key: self.dns.as_ref().map(|dns| dns.key()),
             processes,
             interface,
-            sink: None,
-            retired: Vec::new(),
-            routes: Vec::new(),
-        };
-        let mut commit = || {
-            let mut routes = self
-                .routes
-                .try_lock()
-                .map_err(|_| AbandonError::Unsupported)?;
-            let queue = routes.backend_mut().retirement_queue();
-            let mut retired = queue.try_lock().map_err(|_| AbandonError::Unsupported)?;
-            record.sink = routes
+            sink: routes
                 .backend_mut()
                 .abandonment_sink(&self.owner)
-                .map_err(|_| AbandonError::Unsupported)?;
-            record.retired = retirement::inventory(&retired, &self.owner);
+                .map_err(|_| AbandonError::Unsupported)?,
+            retired: retirement::inventory(retired, &self.owner),
+            routes: routes.inventory(&self.owner),
+        })
+    }
+    /// The fence the abandonment would write, built under the same locks and
+    /// with the same inventory, without releasing anything.
+    pub(super) fn fence_record(
+        &self,
+        reason: Reason,
+    ) -> Result<crate::connection::fence::Fence, AbandonError> {
+        self.with_claims(false, |routes, retired| {
+            self.record_under(reason, routes, retired)
+        })
+    }
+    /// Write `fence_record` as this generation's journal. Success marks the
+    /// attempt journaled; a failure, `Busy` included, leaves the flag as it was.
+    pub(super) fn journal(&mut self, reason: Reason) -> Result<(), AbandonError> {
+        let record = self.fence_record(reason)?;
+        crate::connection::fence::write(&self.fence_root, self.fence_owner, &record)
+            .map_err(|_| AbandonError::Persist)?;
+        self.journaled.store(true, Ordering::Release);
+        Ok(())
+    }
+    /// Journal (ii) before any destructive step, clean up, and once the
+    /// cleanup proves everything absent remove the journal (iii) while the
+    /// reservation still exempts it from recovery. An attempt that spawned
+    /// nothing, or holds no reservation, has nothing to journal.
+    pub(super) fn settle(&mut self) -> bool {
+        let journaling = self.spawn_attempted && self.profile_use.is_some();
+        if journaling && self.journal(Reason::Journal).is_err() {
+            diagnostic::journal_failed();
+        }
+        if !self.cleanup_network() {
+            return false;
+        }
+        if journaling {
+            if crate::connection::fence::remove(
+                &self.fence_root,
+                self.fence_owner,
+                self.owner.uid,
+                &self.owner.profile,
+                self.owner.generation,
+            )
+            .is_err()
+            {
+                return diagnostic::refuse(Reason::DurableCompletion);
+            }
+            self.journaled.store(false, Ordering::Release);
+        }
+        if let Some(profile) = &self.profile_use
+            && profile.complete().is_err()
+        {
+            return diagnostic::refuse(Reason::ProfileCompletion);
+        }
+        self.profile_use = None;
+        true
+    }
+    pub(super) fn abandon_ssl(&mut self, reason: Reason) -> Result<(), AbandonError> {
+        // Only the retained driver may signal its own children.
+        if let Some(client) = &mut self.client {
+            let _ = client.stop();
+        }
+        let journaled = self.journaled.load(Ordering::Acquire);
+        // Contention stays a plain refusal here; the worker retries it.
+        self.with_claims(true, |routes, retired| {
+            let mut record = self.record_under(reason, routes, retired)?;
             persist_claims(
-                &mut routes,
+                routes,
                 &self.owner,
                 &mut record,
+                journaled,
                 |record| {
-                    fence::write(&self.fence_root, self.fence_owner, record)
+                    crate::connection::fence::write(&self.fence_root, self.fence_owner, record)
                         .map_err(|_| AbandonError::Persist)
                 },
-                |backend| backend.abandon_owner(&self.owner, &mut retired),
+                |backend| backend.abandon_owner(&self.owner, retired),
             )
-        };
-        match &self.profile_use {
-            Some(profile) => profile.abandon_after(|| AbandonError::Unsupported, commit)?,
-            None => commit()?,
-        }
+        })
+        .map_err(|error| match error {
+            AbandonError::Busy => AbandonError::Unsupported,
+            error => error,
+        })?;
         self.lease = None;
         self.token = None;
         self.link = None;
@@ -450,10 +553,15 @@ mod abandon_tests {
             attempt.link = Some(Arc::new(link));
             READY_DNS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let _capture = Capture;
+            let journal = || fence::read(&root.0, uid, uid, &profile.id, 1).unwrap();
+            assert!(journal().is_none());
             assert!(
                 attempt.ready().is_ok_and(|ready| ready),
                 "ready fixture server={has_server}"
             );
+            // The first Ok(true) went through the journal (i).
+            assert!(journal().is_some(), "journal at (i) server={has_server}");
+            assert!(attempt.journaled.load(Ordering::Acquire));
             let calls = READY_DNS.with(|slot| slot.borrow().clone().unwrap());
             if has_server {
                 assert_eq!(
@@ -537,6 +645,33 @@ mod abandon_tests {
             _ => panic!("SSL factory expected"),
         };
         attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
+        let live_fence = fence::Fence {
+            version: 1,
+            uid,
+            profile: profile.id.clone(),
+            generation: 1,
+            kind: fence::Kind::Ssl,
+            reason: "observation_failed".into(),
+            incomplete: false,
+            written_unix_ms: 1,
+            service_id: None,
+            dns_key: None,
+            processes: Vec::new(),
+            interface: None,
+            sink: None,
+            retired: Vec::new(),
+            routes: Vec::new(),
+        };
+        fence::write(&root.0, uid, &live_fence).unwrap();
+        let mut other = profile.clone();
+        other.id = "other".into();
+        assert!(factory.verify_cleanup(&other));
+        assert!(!factory.cleanup_blocked(&profile));
+        assert_eq!(
+            fence::read(&root.0, uid, uid, &profile.id, 1).unwrap(),
+            Some(live_fence)
+        );
+        fence::remove(&root.0, uid, uid, &profile.id, 1).unwrap();
         // The real cleanup path must reach and refuse a held coordinator lock.
         // The SSL child is the existing ordinary-user process fixture; the PPP
         // interface is synthetic but its process watches are real.
@@ -828,11 +963,13 @@ mod abandon_tests {
         let attempt = |routes: &mut Coordinator<Fake>, record: &mut fence::Fence, owner_uid| {
             reservation.abandon_after(
                 || AbandonError::Unsupported,
+                || AbandonError::Unsupported,
                 || {
                     persist_claims(
                         routes,
                         &owner,
                         record,
+                        false,
                         |value| {
                             fence::write(&root.0, owner_uid, value)
                                 .map_err(|_| AbandonError::Persist)
@@ -872,5 +1009,435 @@ mod abandon_tests {
         assert_eq!(saved.interface.as_ref().unwrap().name, "ppp0");
         assert_eq!(saved.sink.as_ref().unwrap().name, "utun5");
         assert_eq!(saved.retired.len(), 1);
+    }
+
+    /// The native fixture of the abandonment tests: a borrowed claim, a PPP
+    /// scope and a retirement for generation 1 of `example`, an ordinary-user
+    /// SSL child, a synthetic PPP link and a fixture DNS publication.
+    struct Native {
+        root: Root,
+        uid: u32,
+        controller: crate::helper::controller_lock::ControllerLock,
+        profile: Profile,
+        profiles: Arc<Profiles>,
+    }
+    impl Native {
+        fn new(name: &str) -> Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            let root = Root(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("output/fixtures")
+                    .join(format!(
+                        "{name}-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    )),
+            );
+            fs::create_dir_all(&root.0).unwrap();
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+            let lock_dir = root.0.join("controller");
+            fs::create_dir(&lock_dir).unwrap();
+            fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(lock_dir.join(".controller.lock"))
+                .unwrap();
+            let uid = unsafe { libc::geteuid() };
+            assert_ne!(uid, 0, "fixture requires an ordinary user");
+            let controller =
+                crate::helper::controller_lock::ControllerLock::fixture(&lock_dir, uid).unwrap();
+            let profile: Profile = serde_json::from_value(serde_json::json!({"id":"example","name":"example","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":["10.20.0.0/24"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
+            ProfileStore::open(&root.0, uid)
+                .unwrap()
+                .save(profile.clone())
+                .unwrap();
+            let profiles = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+            Self {
+                root,
+                uid,
+                controller,
+                profile,
+                profiles,
+            }
+        }
+        fn owner(&self) -> Owner {
+            Owner {
+                uid: self.uid,
+                profile: self.profile.id.clone(),
+                generation: 1,
+            }
+        }
+        fn route(&self) -> crate::connection::routes::Route {
+            crate::connection::routes::ppp_networks(&self.profile.networks, 3, true, false, None)
+                .unwrap()[0]
+        }
+        fn routes(&self, claimed: bool) -> Routes<'_> {
+            let mut routes =
+                Coordinator::new(NativeBackend::fixture(&self.controller).unwrap()).unwrap();
+            if claimed {
+                routes.fixture_borrowed_claim(self.owner(), self.route());
+                routes
+                    .backend_mut()
+                    .fixture_scope(self.owner(), self.route());
+                routes.backend_mut().fixture_retired(self.owner());
+            }
+            Arc::new(Mutex::new(routes))
+        }
+        /// A reserved attempt whose SSL child was spawned. `link` adds the
+        /// synthetic PPP interface; the DNS publication is always there.
+        fn attempt<'a>(
+            &'a self,
+            routes: &Routes<'a>,
+            ssl: &crate::connection::ssl::tests::Fixture,
+            link: bool,
+        ) -> (NativeAttempt<'a>, String, Arc<Mutex<Option<String>>>) {
+            use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+            use crate::connection::macos::store::DnsLease;
+            use crate::helper::ppp_supervisor::ServiceId;
+            let factory = NativeFactory::new(routes.clone(), self.profiles.clone(), None, self.uid)
+                .fixture_fence_root(self.root.0.clone(), self.uid);
+            let mut attempt = match factory.create(
+                self.profile.clone(),
+                self.uid,
+                1,
+                Credentials {
+                    password: "fictional".into(),
+                    psk: "".into(),
+                },
+                Arc::new(AtomicBool::new(false)),
+            ) {
+                AttemptKind::Ssl(attempt) => attempt,
+                _ => panic!("SSL factory expected"),
+            };
+            attempt.profile_use = Some(self.profiles.begin(&self.profile, 1).unwrap());
+            let driver = ssl.start("ready.fixture.invalid");
+            let (service, _) = driver.recorded_processes().unwrap();
+            let service = ServiceId::parse(&service).unwrap();
+            let key = format!("State:/Network/Service/{}/DNS", service.as_str());
+            let (lease, state) = DnsLease::fixture(service);
+            lease
+                .publish(&["172.16.0.4".parse().unwrap()], &["corp.example".into()])
+                .unwrap();
+            if link {
+                attempt.link = Some(Arc::new(
+                    OwnedPpp::fixture_with_child(driver.fixture_child_id()).unwrap(),
+                ));
+            }
+            attempt.client = Some(driver);
+            attempt.dns = Some(lease);
+            attempt.spawn_attempted = true;
+            (attempt, key, state)
+        }
+        fn journal(&self) -> Option<fence::Fence> {
+            fence::read(&self.root.0, self.uid, self.uid, &self.profile.id, 1).unwrap()
+        }
+        fn retired(&self, routes: &Routes<'_>) -> usize {
+            let queue = routes.lock().unwrap().backend_mut().retirement_queue();
+            retirement::inventory(&queue.lock().unwrap(), &self.owner()).len()
+        }
+        fn held(&self, routes: &Routes<'_>) -> bool {
+            let mut routes = routes.lock().unwrap();
+            routes.has_owner(&self.owner()) && routes.backend_mut().fixture_has_scope(&self.owner())
+        }
+    }
+
+    #[test]
+    fn established_journals_routes_and_dns_and_a_failed_write_fails_the_connection() {
+        let native = Native::new("journal-ready");
+        let routes = native.routes(true);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, key, state) = native.attempt(&routes, &ssl, true);
+        assert!(native.journal().is_none());
+        assert!(matches!(attempt.established(), Ok(true)));
+        let record = native.journal().expect("journal written at (i)");
+        assert_eq!(record.reason, "journal");
+        assert_eq!(record.routes.len(), 1);
+        assert_eq!(record.routes[0].route, native.route());
+        assert_eq!(record.dns_key.as_deref(), Some(key.as_str()));
+        let (service, processes) = attempt
+            .client
+            .as_ref()
+            .unwrap()
+            .recorded_processes()
+            .unwrap();
+        assert_eq!(record.service_id, Some(service));
+        assert_eq!(record.processes, processes);
+        assert!(record.interface.is_some());
+        assert_eq!(record.retired.len(), 1);
+        assert!(attempt.journaled.load(Ordering::Acquire));
+        // The journal releases nothing: claim, scope, retirement, reservation, DNS.
+        assert!(native.held(&routes));
+        assert_eq!(native.retired(&routes), 1);
+        assert!(!native.profiles.idle());
+        assert_eq!(state.lock().unwrap().as_deref(), Some(key.as_str()));
+        // A failed write fails the connection and leaves the attempt unjournaled.
+        attempt.journaled.store(false, Ordering::Release);
+        fence::remove(&native.root.0, native.uid, native.uid, "example", 1).unwrap();
+        attempt.fence_owner = native.uid.wrapping_add(1);
+        assert!(attempt.established().is_err());
+        assert!(!attempt.journaled.load(Ordering::Acquire));
+        assert!(native.journal().is_none());
+        assert!(native.held(&routes));
+    }
+
+    #[test]
+    fn established_waits_while_a_lock_is_held_and_journals_once_it_is_free() {
+        fn not_yet(native: &Native, attempt: &mut NativeAttempt<'_>, held: &str) {
+            assert!(matches!(attempt.established(), Ok(false)), "{held} held");
+            assert!(!attempt.journaled.load(Ordering::Acquire), "{held} held");
+            assert!(native.journal().is_none(), "{held} held");
+        }
+        let native = Native::new("journal-busy");
+        let routes = native.routes(true);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, _, _) = native.attempt(&routes, &ssl, true);
+        // The coordinator, as another profile's ready() or healthy() holds it.
+        let held = routes.lock().unwrap();
+        not_yet(&native, &mut attempt, "coordinator");
+        drop(held);
+        // The reservations, as recovery's scan holds them.
+        native
+            .profiles
+            .with_live(|_| not_yet(&native, &mut attempt, "reservations"))
+            .unwrap();
+        let queue = routes.lock().unwrap().backend_mut().retirement_queue();
+        let held = queue.lock().unwrap();
+        not_yet(&native, &mut attempt, "retirement queue");
+        drop(held);
+        // Contention released nothing and cost nothing; free, the same
+        // attempt journals and only then reports the connection established.
+        assert!(native.held(&routes));
+        assert!(matches!(attempt.established(), Ok(true)));
+        assert!(attempt.journaled.load(Ordering::Acquire));
+        let record = native
+            .journal()
+            .expect("journal written once the locks are free");
+        assert_eq!(record.routes.len(), 1);
+        assert_eq!(record.retired.len(), 1);
+        assert!(native.held(&routes));
+        // A poisoned coordinator never frees up: a failure, not "not yet".
+        attempt.journaled.store(false, Ordering::Release);
+        fence::remove(&native.root.0, native.uid, native.uid, "example", 1).unwrap();
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = routes.lock().unwrap();
+                    panic!("poison the coordinator");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err() && routes.is_poisoned());
+        assert!(attempt.established().is_err());
+        assert!(!attempt.journaled.load(Ordering::Acquire));
+        assert!(native.journal().is_none());
+    }
+
+    #[test]
+    fn settle_journals_before_the_first_destructive_step_and_a_failed_write_still_cleans() {
+        let native = Native::new("journal-cleanup");
+        let routes = native.routes(true);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, key, _state) = native.attempt(&routes, &ssl, true);
+        // An uncertain cleanup closes DNS and stops the child, then refuses.
+        attempt.uncertain_cleanup = true;
+        diagnostic::begin();
+        assert!(!attempt.settle());
+        assert_eq!(diagnostic::current_reason(), Some(Reason::UncertainCleanup));
+        assert!(!diagnostic::journal_failure());
+        // The cleanup released DNS, but the journal still names it: it was
+        // written before that first destructive step.
+        assert!(attempt.dns.is_none() && attempt.stopped);
+        let record = native.journal().expect("journal written at (ii)");
+        assert_eq!(record.reason, "journal");
+        assert_eq!(record.dns_key.as_deref(), Some(key.as_str()));
+        assert_eq!(record.routes.len(), 1);
+        assert!(record.incomplete);
+        assert!(attempt.journaled.load(Ordering::Acquire));
+        // An unproven cleanup keeps the journal and everything it describes.
+        assert!(native.held(&routes));
+        assert!(!native.profiles.idle());
+
+        let other = Native::new("journal-cleanup-failed");
+        let routes = other.routes(true);
+        let other_ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, _, _state) = other.attempt(&routes, &other_ssl, true);
+        attempt.uncertain_cleanup = true;
+        attempt.fence_owner = other.uid.wrapping_add(1);
+        diagnostic::begin();
+        assert!(!attempt.settle());
+        // The failed journal is noted apart and the cleanup still ran.
+        assert!(diagnostic::journal_failure());
+        assert_eq!(diagnostic::current_reason(), Some(Reason::UncertainCleanup));
+        assert!(attempt.dns.is_none() && attempt.stopped);
+        assert!(!attempt.journaled.load(Ordering::Acquire));
+        assert!(other.journal().is_none());
+    }
+
+    #[test]
+    fn settle_removes_the_journal_once_cleanup_proves_everything_absent() {
+        let native = Native::new("journal-removed");
+        let routes = native.routes(false);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        // No PPP ran and no link exists: the cleanup can prove absence.
+        let (mut attempt, _, _state) = native.attempt(&routes, &ssl, false);
+        assert!(matches!(attempt.established(), Ok(true)));
+        assert!(native.journal().is_some());
+        // (ii) rewrites, the cleanup proves absence, and (iii) removes it
+        // before the reservation is released.
+        diagnostic::begin();
+        assert!(attempt.settle());
+        assert_eq!(diagnostic::current_reason(), None);
+        assert!(attempt.dns.is_none() && attempt.stopped);
+        assert!(native.journal().is_none());
+        assert!(!attempt.journaled.load(Ordering::Acquire));
+        assert!(attempt.profile_use.is_none());
+        assert!(native.profiles.idle());
+    }
+
+    #[test]
+    fn settle_keeps_the_reservation_when_the_journal_cannot_be_removed() {
+        let native = Native::new("journal-kept");
+        let routes = native.routes(false);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, _, _state) = native.attempt(&routes, &ssl, false);
+        attempt.journal(Reason::Journal).unwrap();
+        // Proven absence, but a removal that fails refuses the cleanup.
+        attempt.fence_owner = native.uid.wrapping_add(1);
+        diagnostic::begin();
+        assert!(!attempt.settle());
+        assert_eq!(
+            diagnostic::current_reason(),
+            Some(Reason::DurableCompletion)
+        );
+        assert!(attempt.dns.is_none() && attempt.stopped);
+        assert!(native.journal().is_some());
+        assert!(attempt.journaled.load(Ordering::Acquire));
+        assert!(attempt.profile_use.is_some());
+        assert!(!native.profiles.idle());
+        // The retry removes it and completes.
+        attempt.fence_owner = native.uid;
+        diagnostic::begin();
+        assert!(attempt.settle());
+        assert!(native.journal().is_none());
+        assert!(native.profiles.idle());
+    }
+
+    #[test]
+    fn abandon_releases_after_a_failed_rewrite_only_when_journaled() {
+        let native = Native::new("journal-abandon");
+        let routes = native.routes(true);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, key, _state) = native.attempt(&routes, &ssl, true);
+        // Unjournaled: a failed write holds everything, as before.
+        attempt.fence_owner = native.uid.wrapping_add(1);
+        assert_eq!(
+            attempt.abandon(Reason::RouteOwner),
+            Err(AbandonError::Persist)
+        );
+        assert!(native.held(&routes));
+        assert_eq!(native.retired(&routes), 1);
+        assert!(!native.profiles.idle());
+        assert!(native.journal().is_none());
+        // Journaled: the failed rewrite releases, and the journal remains.
+        attempt.fence_owner = native.uid;
+        attempt.journal(Reason::Journal).unwrap();
+        let journal = native.journal().unwrap();
+        attempt.fence_owner = native.uid.wrapping_add(1);
+        assert_eq!(attempt.abandon(Reason::RouteOwner), Ok(()));
+        assert!(!routes.lock().unwrap().has_owner(&native.owner()));
+        assert!(
+            !routes
+                .lock()
+                .unwrap()
+                .backend_mut()
+                .fixture_has_scope(&native.owner())
+        );
+        assert_eq!(native.retired(&routes), 0);
+        assert!(native.profiles.idle());
+        assert_eq!(native.journal(), Some(journal.clone()));
+        assert_eq!(journal.routes.len(), 1);
+        assert_eq!(journal.dns_key.as_deref(), Some(key.as_str()));
+        assert!(attempt.client.is_none() && attempt.profile_use.is_none());
+    }
+
+    #[test]
+    fn inventory_reads_the_abandonment_inventory_without_detaching() {
+        use crate::connection::routes::AbandonedRoute;
+        let owner = Owner {
+            uid: 501,
+            profile: "example".into(),
+            generation: 1,
+        };
+        let other = Owner {
+            generation: 2,
+            ..owner.clone()
+        };
+        let route =
+            crate::connection::routes::ppp_networks(&["10.20.0.0/24".into()], 3, true, false, None)
+                .unwrap()[0];
+        let mut routes = Coordinator::new(Fake::default()).unwrap();
+        let _lease = routes.acquire(owner.clone(), &[route]).unwrap();
+        let listed = routes.inventory(&owner);
+        assert_eq!(
+            listed,
+            vec![AbandonedRoute {
+                route,
+                created: true
+            }]
+        );
+        assert_eq!(routes.inventory(&owner), listed);
+        assert!(routes.inventory(&other).is_empty());
+        assert!(routes.has_owner(&owner));
+        assert_eq!(routes.backend_mut().removes, 0);
+        assert_eq!(routes.backend_mut().rows.get(&route.key), Some(&route));
+        // Control: the abandonment persists that same inventory, then detaches.
+        let persisted = routes.try_abandon(&owner, |inventory| {
+            assert_eq!(inventory, listed.as_slice());
+            Ok::<_, ()>(())
+        });
+        assert_eq!(persisted, Ok(listed));
+        assert!(!routes.has_owner(&owner));
+        assert_eq!(routes.backend_mut().removes, 0);
+    }
+
+    #[test]
+    fn factory_reports_whether_a_live_ssl_attempt_has_no_journal() {
+        use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+        let native = Native::new("journal-registry");
+        let routes = native.routes(false);
+        let factory = NativeFactory::new(routes, native.profiles.clone(), None, native.uid)
+            .fixture_fence_root(native.root.0.clone(), native.uid);
+        let create = || match factory.create(
+            native.profile.clone(),
+            native.uid,
+            1,
+            Credentials {
+                password: "fictional".into(),
+                psk: "".into(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            AttemptKind::Ssl(attempt) => attempt,
+            _ => panic!("SSL factory expected"),
+        };
+        assert!(!factory.unjournaled());
+        let first = create();
+        assert!(factory.unjournaled());
+        first.journaled.store(true, Ordering::Release);
+        assert!(!factory.unjournaled());
+        let second = create();
+        assert!(factory.unjournaled());
+        drop(second);
+        assert!(!factory.unjournaled());
+        // A registry held elsewhere is reported as an unjournaled attempt.
+        let held = factory.fixture_hold_journals();
+        let contended = std::thread::scope(|scope| scope.spawn(|| factory.unjournaled()).join());
+        drop(held);
+        assert!(contended.unwrap());
+        drop(first);
+        assert!(!factory.unjournaled());
     }
 }

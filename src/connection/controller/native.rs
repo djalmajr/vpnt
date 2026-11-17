@@ -107,7 +107,6 @@ struct NativeAttempt<'a> {
     owner: Owner,
     profile: Profile,
     profiles: Arc<Profiles>,
-    profile_use: Option<ProfileUse>,
     credentials: Option<Credentials>,
     routes: Routes<'a>,
     canceled: Arc<AtomicBool>,
@@ -123,6 +122,12 @@ struct NativeAttempt<'a> {
     uncertain_cleanup: bool,
     fence_root: std::path::PathBuf,
     fence_owner: u32,
+    /// A journal of this generation is on disk: set by (i) or (ii), cleared
+    /// at `start` and by (iii). The factory reads it for the exit watchdog.
+    journaled: Arc<AtomicBool>,
+    // Last: recovery must not classify this attempt as dead while its other
+    // fields are still being dropped during unwind.
+    profile_use: Option<ProfileUse>,
 }
 impl NativeAttempt<'_> {
     fn client_health(&mut self) -> Result<(), Failure> {
@@ -168,6 +173,21 @@ impl NativeAttempt<'_> {
             Err(OwnershipError::NotReady) => Ok(false),
             Err(_) => Err(Failure::unavailable()),
         }
+    }
+    /// (i) The first `Ok(true)` journals the established connection, with
+    /// everything acquired, DNS included. A lock held elsewhere is "not yet":
+    /// the next poll tries again within the connect deadline. A failed write,
+    /// or a record that cannot be built, fails the connection, which then
+    /// takes the ordinary cleanup.
+    fn established(&mut self) -> Result<bool, Failure> {
+        if !self.journaled.load(Ordering::Acquire) {
+            match self.journal(Reason::Journal) {
+                Ok(()) => {}
+                Err(AbandonError::Busy) => return Ok(false),
+                Err(_) => return Err(Failure::unavailable()),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -260,6 +280,7 @@ impl Attempt for NativeAttempt<'_> {
                 error: ErrorCode::MissingProgram,
             });
         }
+        self.journaled.store(false, Ordering::Release);
         check(expires, canceled)?;
         self.profile_use = Some(
             self.profiles
@@ -384,14 +405,23 @@ impl Attempt for NativeAttempt<'_> {
                 client.note_no_dns_domain();
             }
         }
+        // The DNS seam skipped `register_ppp`, so it has no lease to validate;
+        // it still reaches the journal (i) below.
         #[cfg(test)]
-        if READY_DNS.with(|slot| slot.borrow().is_some()) {
-            return Ok(true);
-        }
-        routes
-            .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
-            .map_err(|_| Failure::unavailable())?;
-        Ok(true)
+        let unleased = READY_DNS.with(|slot| slot.borrow().is_some());
+        #[cfg(not(test))]
+        let unleased = false;
+        let valid = if unleased {
+            Ok(())
+        } else {
+            routes
+                .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
+                .map_err(|_| Failure::unavailable())
+        };
+        // The journal takes the coordinator again with try_lock.
+        drop(routes);
+        valid?;
+        self.established()
     }
     fn healthy(&mut self) -> Result<(), Failure> {
         self.client_health()?;
@@ -414,20 +444,9 @@ impl Attempt for NativeAttempt<'_> {
         }
     }
     fn cleanup(&mut self) -> bool {
-        use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
+        use crate::helper::runtime::cleanup as diagnostic;
         diagnostic::begin();
-        let complete = (|| {
-            if !self.cleanup_network() {
-                return false;
-            }
-            if let Some(profile) = &self.profile_use
-                && profile.complete().is_err()
-            {
-                return diagnostic::refuse(Reason::ProfileCompletion);
-            }
-            self.profile_use = None;
-            true
-        })();
+        let complete = self.settle();
         diagnostic::finish(
             std::path::Path::new(crate::helper::paths::STATE),
             &self.owner,

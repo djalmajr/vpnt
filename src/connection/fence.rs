@@ -465,7 +465,12 @@ pub fn read_all(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<Fence>, E
 /// Preserve the path identity even when an individual record is rejected.
 /// A directory or filename that cannot be trusted fails the entire scan.
 type ScannedFence = (String, u64, Result<Fence, Error>);
-pub(crate) fn scan(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<ScannedFence>, Error> {
+pub(crate) fn scan(
+    state_root: &Path,
+    owner: u32,
+    uid: u32,
+    live: &std::collections::BTreeSet<(String, u64)>,
+) -> Result<Vec<ScannedFence>, Error> {
     let Some(dir) = directory(state_root, owner, uid, false).map_err(map_storage)? else {
         return Ok(Vec::new());
     };
@@ -492,6 +497,10 @@ pub(crate) fn scan(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<Scanne
                 continue;
             }
         };
+        // Do not open or interpret an active generation's journal.
+        if live.contains(&(profile.clone(), generation)) {
+            continue;
+        }
         let fence = read_from(&dir, owner, uid, &profile, generation)
             .and_then(|item| item.ok_or(Error::Untrusted));
         result.push((profile, generation, fence));

@@ -24,6 +24,10 @@ static SPAWN_AND_RECEIVE: Mutex<()> = Mutex::new(());
 
 /// Exit code of the importer fail-stop (root decision). Never a core dump.
 pub(crate) const FAIL_STOP_EXIT: libc::c_int = 78;
+/// Exit code of the exit watchdog: an EOF or SIGTERM whose cleanup was still
+/// in flight at request + cleanup budget + margin. One past `FAIL_STOP_EXIT`,
+/// outside sysexits(3) (64–78) and unused by the binaries (0, 1, 2, 64, 77).
+pub(crate) const DEADLINE_EXIT: libc::c_int = 79;
 
 /// Ordinary spawns serialize with descriptor reception. They do not claim hard
 /// realtime; the critical sections are short and never wait for I/O.
@@ -66,4 +70,11 @@ pub(crate) fn mark_cloexec(fd: libc::c_int) -> io::Result<()> {
 pub(crate) fn fail_stop() -> ! {
     // SAFETY: `_exit` is async-signal-safe and terminates immediately.
     unsafe { libc::_exit(FAIL_STOP_EXIT) }
+}
+
+/// Leave without unwinding or joining the stuck worker. What the attempts left
+/// is whatever their journals and fences already describe on disk.
+pub(crate) fn deadline_exit() -> ! {
+    // SAFETY: `_exit` is async-signal-safe and terminates immediately.
+    unsafe { libc::_exit(DEADLINE_EXIT) }
 }

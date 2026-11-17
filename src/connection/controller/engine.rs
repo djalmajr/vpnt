@@ -14,12 +14,98 @@ use dispatch::dispatch;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        Mutex,
+        Condvar, Mutex,
         atomic::Ordering,
         mpsc::{Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, Scope, ScopedJoinHandle},
 };
+
+/// Past the cleanup budget, the watchdog waits this long before `_exit`. The
+/// deadline counts from the instant the engine loop records the request,
+/// within one poll (50 ms) of EOF or SIGTERM while the loop runs: request +
+/// 20 s + 5 s. A loop blocked before it records the request arms nothing.
+const DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+/// The exit request and what the watchdog does once request + budget +
+/// `margin` passes while the engine has not returned. `action` receives
+/// `Factory::unjournaled`.
+pub(super) struct Deadline {
+    exit: Arc<ExitRequested>,
+    margin: Duration,
+    action: Box<dyn Fn(bool) + Send + Sync>,
+}
+impl Deadline {
+    #[cfg(test)]
+    pub(super) fn new(
+        exit: Arc<ExitRequested>,
+        margin: Duration,
+        action: impl Fn(bool) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            exit,
+            margin,
+            action: Box::new(action),
+        }
+    }
+    /// One diagnostic line, then `_exit(DEADLINE_EXIT)`.
+    fn process(exit: Arc<ExitRequested>) -> Self {
+        Self {
+            exit,
+            margin: DEADLINE_MARGIN,
+            action: Box::new(|unjournaled| {
+                crate::helper::runtime::cleanup::deadline(
+                    std::path::Path::new(crate::helper::paths::STATE),
+                    unjournaled,
+                );
+                crate::helper::fd_guard::deadline_exit()
+            }),
+        }
+    }
+}
+#[derive(Default)]
+struct Returned {
+    done: Mutex<bool>,
+    wake: Condvar,
+}
+/// Dropped when the engine's scope body returns or unwinds, before the scope
+/// joins the watchdog.
+struct Finish<'a>(&'a Returned);
+impl Drop for Finish<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.0.wake.notify_all();
+    }
+}
+/// Started at the first exit request. Without a request it returns at once.
+/// The deadline is on the monotonic clock and never moves.
+fn watch(deadline: &Deadline, returned: &Returned, unjournaled: impl FnOnce() -> bool) {
+    let Some(requested) = deadline.exit.at() else {
+        return;
+    };
+    let until = requested + deadline.exit.budget() + deadline.margin;
+    let mut done = returned
+        .done
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    while !*done {
+        let now = Instant::now();
+        if now >= until {
+            drop(done);
+            (deadline.action)(unjournaled());
+            return;
+        }
+        done = returned
+            .wake
+            .wait_timeout(done, until - now)
+            .unwrap_or_else(|error| error.into_inner())
+            .0;
+    }
+}
 
 struct Pending {
     request: String,
@@ -119,7 +205,7 @@ pub(super) fn run<F: Factory>(
         requests,
         output,
         timing,
-        Arc::new(ExitRequested::new(worker::CLEANUP_BUDGET)),
+        Deadline::process(Arc::new(ExitRequested::new(worker::CLEANUP_BUDGET))),
     )
 }
 fn run_with_exit<F: Factory>(
@@ -129,8 +215,9 @@ fn run_with_exit<F: Factory>(
     requests: Receiver<Request>,
     output: SyncSender<Message>,
     timing: Timing,
-    exit: Arc<ExitRequested>,
+    deadline: Deadline,
 ) -> Result<(), ErrorCode> {
+    let exit = &deadline.exit;
     if uid == 0 {
         return Err(ErrorCode::UntrustedConfiguration);
     }
@@ -139,7 +226,10 @@ fn run_with_exit<F: Factory>(
     // may set that generation's clock. `SetProbeInterval` updates the default
     // and every existing slot clock, so queued and live generations follow it.
     let interval = ProbeClock::new(timing.interval);
+    let returned = Returned::default();
     thread::scope(|scope| {
+        let _finish = Finish(&returned);
+        let mut watching = false;
         let mut slots: BTreeMap<_, _> = profiles
             .into_iter()
             .map(|(id, profile)| {
@@ -214,6 +304,11 @@ fn run_with_exit<F: Factory>(
             }
             if closing {
                 exit.request();
+                if !watching {
+                    watching = true;
+                    let (deadline, returned, factory) = (&deadline, &returned, &factory);
+                    scope.spawn(move || watch(deadline, returned, || factory.unjournaled()));
+                }
             }
             for slot in slots.values_mut() {
                 if !closing
@@ -275,7 +370,7 @@ fn run_with_exit<F: Factory>(
                     }
                 }
                 if !closing && slot.worker.is_none() && slot.pending.is_some() {
-                    launch(scope, &factory, uid, slot, timing, &exit);
+                    launch(scope, &factory, uid, slot, timing, exit);
                 }
             }
             if outgoing.len() > 256 {
