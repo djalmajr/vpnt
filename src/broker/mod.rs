@@ -14,7 +14,7 @@ use crate::{
         client::{Client, Error},
         protocol::{self, Message, Request},
     },
-    model::{LogEntry, Snapshot, VpnKind, VpnView},
+    model::{FailureView, LogEntry, Snapshot, VpnKind, VpnView},
     preferences::Preferences,
     secrets::{Credentials, SecretStore},
     session::ConnectionState as State,
@@ -26,7 +26,8 @@ use std::{
 
 struct Pending {
     id: String,
-    previous: (u64, State),
+    /// Generation, state and note restored if the helper rejects the request.
+    previous: (u64, State, Option<FailureView>),
     accepted: bool,
 }
 struct CleanupVerify {
@@ -65,6 +66,9 @@ pub struct Broker<S: SecretStore> {
     cleanup_capable: bool,
     cleanup_probe: Option<BTreeMap<String, u64>>,
     cleanup_verify: Option<CleanupVerify>,
+    /// The helper answered `FAILURE_NOTE_PROBE_SNAPSHOT_ID` with its ack.
+    failure_capable: bool,
+    failure_probe: Option<BTreeMap<String, u64>>,
     preferences_host: Box<dyn crate::preferences::host::Host>,
 }
 impl<S: SecretStore> Broker<S> {
@@ -124,6 +128,8 @@ impl<S: SecretStore> Broker<S> {
             cleanup_capable: false,
             cleanup_probe: None,
             cleanup_verify: None,
+            failure_capable: false,
+            failure_probe: None,
             preferences_host: Box::new(crate::preferences::host::Coordinator::memory()),
         };
         result.begin();
@@ -178,6 +184,8 @@ impl<S: SecretStore> Broker<S> {
         self.cleanup_capable = false;
         self.cleanup_probe = None;
         self.cleanup_verify = None;
+        self.failure_capable = false;
+        self.failure_probe = None;
         self.automatic.clear();
         self.diagnostics.pending = None;
         self.diagnostics.dirty = false;
@@ -277,8 +285,10 @@ impl<S: SecretStore> Broker<S> {
                 state,
                 failures,
                 cleaning,
+                failure,
             } => {
-                if !self.ready {
+                // A note is only valid after the helper acknowledged the probe.
+                if !self.ready || (failure.is_some() && !self.failure_capable) {
                     return Err(());
                 }
                 let c = self.connections.get_mut(&profile_id).ok_or(())?;
@@ -289,7 +299,7 @@ impl<S: SecretStore> Broker<S> {
                     return Err(());
                 }
                 let ended = diagnostics::ended(c.view.state, c.view.cleaning, state, cleaning);
-                set_state(c, state);
+                transition(c, state, failure.map(FailureView::from));
                 c.failures = failures;
                 c.view.cleaning = cleaning;
                 self.refresh_actions();
@@ -313,6 +323,14 @@ impl<S: SecretStore> Broker<S> {
                 {
                     self.cleanup_probe = None;
                     self.cleanup_capable = false;
+                    return Ok(());
+                }
+                if self.failure_probe.is_some()
+                    && (id == protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID
+                        || id == protocol::FAILURE_NOTE_ACK_SNAPSHOT_ID)
+                {
+                    self.failure_probe = None;
+                    self.failure_capable = false;
                     return Ok(());
                 }
                 if self
@@ -339,7 +357,7 @@ impl<S: SecretStore> Broker<S> {
                         let pending = c.pending.take().unwrap();
                         if !pending.accepted {
                             c.generation = pending.previous.0;
-                            set_state(c, pending.previous.1);
+                            transition(c, pending.previous.1, pending.previous.2);
                             rejected = true;
                         }
                     }
@@ -391,8 +409,16 @@ impl<S: SecretStore> Broker<S> {
     }
 }
 
+/// A state of the app's own (no helper note), which clears any note.
 fn set_state(c: &mut Connection, state: State) {
+    transition(c, state, None);
+}
+
+/// `failure` is the helper's note for `state`; it replaces the card's note and
+/// goes into the log entry when the state changes.
+fn transition(c: &mut Connection, state: State, failure: Option<FailureView>) {
     c.view.cleaning = false;
+    c.view.failure = failure;
     c.policy.state(c.generation, state);
     if state != State::Unresponsive {
         c.failures = 0;
@@ -407,6 +433,7 @@ fn set_state(c: &mut Connection, state: State) {
             .unwrap_or_default()
             .as_secs(),
         state,
+        failure,
     });
     if c.view.log.len() > 60 {
         c.view.log.remove(0);

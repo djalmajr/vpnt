@@ -8,7 +8,7 @@ mod native;
 mod profiles;
 mod worker;
 use crate::{
-    helper::protocol::ErrorCode,
+    helper::protocol::{ErrorCode, Step},
     helper::runtime::cleanup::Reason,
     model::{Profile, VpnKind},
     secrets::Credentials,
@@ -28,15 +28,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// `step` names where the failure was born; it never changes `state`/`error`.
+#[derive(Debug)]
 struct Failure {
     state: ConnectionState,
     error: ErrorCode,
+    step: Step,
 }
 impl Failure {
-    fn unavailable() -> Self {
+    /// A local failure at `step`: the attempt drops with a backend failure.
+    fn at(step: Step) -> Self {
         Self {
             state: ConnectionState::Dropped,
             error: ErrorCode::BackendFailure,
+            step,
         }
     }
 }

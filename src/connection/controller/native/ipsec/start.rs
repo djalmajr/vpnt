@@ -14,18 +14,26 @@ impl NativeIpsecAttempt<'_> {
         if self.profile.kind != VpnKind::Ipsec {
             return Err(missing_program());
         }
-        check(expires, canceled)?;
+        check(expires, canceled, Step::Profile)?;
         self.expires = Some(expires);
         let profile_use = self
             .profiles
             .begin(&self.profile, self.owner.generation)
             .map_err(profile_failure)?;
         self.profile_use = Some(profile_use);
-        let egress = IpsecEgress::select(&self.profile, canceled, bounded(expires, canceled)?)
-            .map_err(|_| unavailable())?;
+        let egress = IpsecEgress::select(
+            &self.profile,
+            canceled,
+            bounded(expires, canceled, Step::Egress)?,
+        )
+        .map_err(|_| Failure::at(Step::Egress))?;
+        // Reservation, admission and Control start are the IPsec equivalent
+        // of the SSL client start.
+        let unavailable = || Failure::at(Step::Spawn);
         let domain = self.domain.clone();
         let ledger = domain.ledger().clone();
-        let mut registry = lock_until(domain.registry(), expires, canceled)?;
+        let mut registry =
+            lock_until(domain.registry(), expires, canceled).map_err(|()| unavailable())?;
         let reservation = registry
             .reserve(self.owner.clone())
             .map_err(|_| unavailable())?;

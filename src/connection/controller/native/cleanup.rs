@@ -344,10 +344,13 @@ mod abandon_tests {
             attempt.spawn_attempted = true;
             READY_NETWORKS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let _capture = Capture;
-            assert!(
-                attempt.ready().is_err(),
-                "the actual native writer must reject an unprivileged fixture"
-            );
+            let failure = attempt
+                .ready()
+                .expect_err("the actual native writer must reject an unprivileged fixture");
+            // The real route registration failed: the note names `Routes`.
+            assert_eq!(failure.step, Step::Routes);
+            assert_eq!(failure.state, ConnectionState::Dropped);
+            assert_eq!(failure.error, ErrorCode::BackendFailure);
             let observed = READY_NETWORKS.with(|slot| slot.borrow().clone().unwrap());
             assert_eq!(observed, expected);
             let plan =
@@ -363,6 +366,9 @@ mod abandon_tests {
                     .backend_mut()
                     .fixture_has_scope(&attempt.owner)
             );
+            // The same native attempt checked as a live connection: whatever
+            // its link or lease check finds, the failure is `Health`.
+            assert_eq!(attempt.healthy().unwrap_err().step, Step::Health);
         }
     }
     #[test]

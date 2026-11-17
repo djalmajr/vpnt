@@ -121,20 +121,22 @@ struct NativeAttempt<'a> {
     fence_owner: u32,
 }
 impl NativeAttempt<'_> {
-    fn client_health(&mut self) -> Result<(), Failure> {
+    /// `step`: `Tunnel` while the tunnel comes up, `Health` once connected.
+    fn client_health(&mut self, step: Step) -> Result<(), Failure> {
+        let at = || Failure::at(step);
         self.profile_use
             .as_ref()
-            .ok_or_else(Failure::unavailable)?
+            .ok_or_else(at)?
             .validate()
-            .map_err(|_| Failure::unavailable())?;
+            .map_err(|_| at())?;
         let update = self
             .client
             .as_mut()
-            .ok_or_else(Failure::unavailable)?
+            .ok_or_else(at)?
             .poll()
-            .map_err(|_| Failure::unavailable())?;
+            .map_err(|_| at())?;
         if update.start_error.is_some() {
-            return Err(Failure::unavailable());
+            return Err(at());
         }
         if let Some(failure) = update.failure {
             return Err(Failure {
@@ -143,10 +145,11 @@ impl NativeAttempt<'_> {
                     SslFailure::GatewayTimeout => ConnectionState::GatewayTimeout,
                 },
                 error: ErrorCode::BackendFailure,
+                step,
             });
         }
         if update.exited {
-            return Err(Failure::unavailable());
+            return Err(at());
         }
         Ok(())
     }
@@ -154,15 +157,16 @@ impl NativeAttempt<'_> {
         if self.link.is_some() {
             return Ok(true);
         }
-        let client = self.client.as_mut().ok_or_else(Failure::unavailable)?;
-        let before = self.before.as_ref().ok_or_else(Failure::unavailable)?;
+        let at = || Failure::at(Step::Tunnel);
+        let client = self.client.as_mut().ok_or_else(at)?;
+        let before = self.before.as_ref().ok_or_else(at)?;
         match OwnedPpp::discover(client, before) {
             Ok(link) => {
                 self.link = Some(Arc::new(link));
                 Ok(true)
             }
             Err(OwnershipError::NotReady) => Ok(false),
-            Err(_) => Err(Failure::unavailable()),
+            Err(_) => Err(at()),
         }
     }
 }
@@ -205,16 +209,18 @@ fn ssl_networks(
     Some(networks)
 }
 
+/// Every failure here, including the `DnsLease` that `publish` opens, is born
+/// at the `Dns` step.
 fn apply_dns(
     configured: &[String],
     observation: &crate::connection::ssl_output::Observation,
     publish: impl FnOnce(&[std::net::Ipv4Addr], &[String]) -> Result<(), ()>,
-) -> Result<bool, ()> {
+) -> Result<bool, Failure> {
     if observation.dns_invalid
         || observation.dns_count
             != Some((observation.dns_servers.len(), observation.dns_domains.len()))
     {
-        return Err(());
+        return Err(Failure::at(Step::Dns));
     }
     let domains = if configured.is_empty() {
         &observation.dns_domains
@@ -224,23 +230,24 @@ fn apply_dns(
     if domains.is_empty() || observation.dns_servers.is_empty() {
         return Ok(false);
     }
-    publish(&observation.dns_servers, domains)?;
+    publish(&observation.dns_servers, domains).map_err(|()| Failure::at(Step::Dns))?;
     Ok(true)
 }
-fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
+/// `step`: the step the guarded operation belongs to.
+fn check(expires: Instant, canceled: &AtomicBool, step: Step) -> Result<(), Failure> {
     if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
-        return Err(Failure::unavailable());
+        return Err(Failure::at(step));
     }
     Ok(())
 }
 
-fn bounded(expires: Instant, canceled: &AtomicBool) -> Result<Duration, Failure> {
-    check(expires, canceled)?;
+fn bounded(expires: Instant, canceled: &AtomicBool, step: Step) -> Result<Duration, Failure> {
+    check(expires, canceled, step)?;
     let remaining = expires
         .saturating_duration_since(Instant::now())
         .min(Duration::from_secs(3));
     if remaining.is_zero() {
-        return Err(Failure::unavailable());
+        return Err(Failure::at(step));
     }
     Ok(remaining)
 }
@@ -254,9 +261,10 @@ impl Attempt for NativeAttempt<'_> {
             return Err(Failure {
                 state: ConnectionState::MissingProgram,
                 error: ErrorCode::MissingProgram,
+                step: Step::Profile,
             });
         }
-        check(expires, canceled)?;
+        check(expires, canceled, Step::Profile)?;
         self.profile_use = Some(
             self.profiles
                 .begin(&self.profile, self.owner.generation)
@@ -267,11 +275,12 @@ impl Attempt for NativeAttempt<'_> {
                         StoreError::NotFound => ErrorCode::ProfileNotFound,
                         _ => ErrorCode::UntrustedConfiguration,
                     },
+                    step: Step::Profile,
                 })?,
         );
         // Preflight failures have no spawned child. After attempting spawn,
         // uncertainty must survive even if setup returns an error.
-        check(expires, canceled)?;
+        check(expires, canceled, Step::Runtime)?;
         Runtime::installed()
             .and_then(|_| Runtime::verify_pinentry())
             .and_then(|_| Runtime::verify_ppp_supervisor())
@@ -286,15 +295,23 @@ impl Attempt for NativeAttempt<'_> {
                 } else {
                     ErrorCode::UntrustedConfiguration
                 },
+                step: Step::Runtime,
             })?;
-        check(expires, canceled)?;
-        let egress = Egress::select(&self.profile, canceled, bounded(expires, canceled)?)
-            .map_err(|_| Failure::unavailable())?;
-        check(expires, canceled)?;
-        self.before = Some(Interfaces::read().map_err(|_| Failure::unavailable())?);
-        self.before_routes = Some(Snapshot::read().map_err(|_| Failure::unavailable())?);
-        check(expires, canceled)?;
-        let credentials = self.credentials.take().ok_or_else(Failure::unavailable)?;
+        check(expires, canceled, Step::Egress)?;
+        let egress = Egress::select(
+            &self.profile,
+            canceled,
+            bounded(expires, canceled, Step::Egress)?,
+        )
+        .map_err(|_| Failure::at(Step::Egress))?;
+        // The interface and route baselines belong to the client start: the
+        // owned link and routes are later identified against them.
+        let spawn = || Failure::at(Step::Spawn);
+        check(expires, canceled, Step::Spawn)?;
+        self.before = Some(Interfaces::read().map_err(|_| spawn())?);
+        self.before_routes = Some(Snapshot::read().map_err(|_| spawn())?);
+        check(expires, canceled, Step::Spawn)?;
+        let credentials = self.credentials.take().ok_or_else(spawn)?;
         self.client = Some(
             SslDriver::start(&self.profile, credentials, &egress, &self.canceled).map_err(
                 |error| Failure {
@@ -304,6 +321,7 @@ impl Attempt for NativeAttempt<'_> {
                         ConnectionState::Dropped
                     },
                     error: ErrorCode::BackendFailure,
+                    step: Step::Spawn,
                 },
             )?,
         );
@@ -311,18 +329,19 @@ impl Attempt for NativeAttempt<'_> {
         Ok(())
     }
     fn ready(&mut self) -> Result<bool, Failure> {
-        self.client_health()?;
+        self.client_health(Step::Tunnel)?;
         if !self.discover()? {
             return Ok(false);
         }
         let link = self.link.as_ref().unwrap();
-        let mut routes = self.routes.lock().map_err(|_| Failure::unavailable())?;
+        let at = || Failure::at(Step::Routes);
+        let mut routes = self.routes.lock().map_err(|_| at())?;
         if self.token.is_none() {
-            let client = self.client.as_ref().ok_or_else(Failure::unavailable)?;
+            let client = self.client.as_ref().ok_or_else(at)?;
             let networks = ssl_networks(&self.profile.networks, &client.split_observation())
                 .ok_or_else(|| {
                     client.note_invalid_split();
-                    Failure::unavailable()
+                    at()
                 })?;
             #[cfg(test)]
             let mut backend = ObservedBackend(routes.backend_mut());
@@ -330,12 +349,12 @@ impl Attempt for NativeAttempt<'_> {
             let backend = routes.backend_mut();
             let (token, plan) = backend
                 .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
-                .map_err(|_| Failure::unavailable())?;
+                .map_err(|_| at())?;
             self.token = Some(token); // retain before any fallible ADD/lease
             self.lease = Some(
                 routes
                     .acquire(self.owner.clone(), &plan)
-                    .map_err(|_| Failure::unavailable())?,
+                    .map_err(|_| at())?,
             );
             let observation = client.split_observation();
             apply_dns(
@@ -351,8 +370,7 @@ impl Attempt for NativeAttempt<'_> {
                         .publish(servers, domains)
                         .map_err(|_| ())
                 },
-            )
-            .map_err(|_| Failure::unavailable())?;
+            )?;
             if !self.profile.dns_domains.is_empty() && observation.dns_servers.is_empty() {
                 client.note_no_dns_servers();
             } else if self.profile.dns_domains.is_empty() && observation.dns_domains.is_empty() {
@@ -360,28 +378,32 @@ impl Attempt for NativeAttempt<'_> {
             }
         }
         routes
-            .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
-            .map_err(|_| Failure::unavailable())?;
+            .validate(self.lease.as_ref().ok_or_else(at)?)
+            .map_err(|_| at())?;
         Ok(true)
     }
     fn healthy(&mut self) -> Result<(), Failure> {
-        self.client_health()?;
-        let link = self.link.as_ref().ok_or_else(Failure::unavailable)?;
+        self.client_health(Step::Health)?;
+        let at = || Failure::at(Step::Health);
+        let link = self.link.as_ref().ok_or_else(at)?;
         if !link.is_current().unwrap_or(false) {
-            return Err(Failure::unavailable());
+            return Err(at());
         }
         self.routes
             .lock()
-            .map_err(|_| Failure::unavailable())?
-            .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
-            .map_err(|_| Failure::unavailable())
+            .map_err(|_| at())?
+            .validate(self.lease.as_ref().ok_or_else(at)?)
+            .map_err(|_| at())
     }
+    /// A periodic probe failure is `Health`; the worker marks the initial
+    /// probe, which verifies the new tunnel, as `Verify`.
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
-        let link = self.link.as_ref().ok_or_else(Failure::unavailable)?;
+        let at = || Failure::at(Step::Health);
+        let link = self.link.as_ref().ok_or_else(at)?;
         match probe::probe(link, &self.profile, canceled, timeout) {
             probe::Outcome::Responsive(_) => Ok(true),
             probe::Outcome::Unresponsive | probe::Outcome::Canceled => Ok(false),
-            _ => Err(Failure::unavailable()),
+            _ => Err(at()),
         }
     }
     fn cleanup(&mut self) -> bool {
@@ -442,6 +464,29 @@ mod split_tests {
         assert_eq!(calls.len(), 1);
         value.dns_count = Some((1, 1));
         assert!(apply_dns(&[], &value, |_, _| Ok(())).is_err());
+    }
+
+    // `ready` publishes through `DnsLease`; the closure stands for its
+    // `new`/`publish` result, which the real closure maps to `Err(())`.
+    #[test]
+    fn dns_failures_are_noted_at_the_dns_step() {
+        let mut value = Observation {
+            dns_servers: vec!["172.16.0.4".parse().unwrap()],
+            dns_domains: vec!["corp.example.com".into()],
+            dns_count: Some((1, 1)),
+            ..Observation::default()
+        };
+        let failure = apply_dns(&[], &value, |_, _| Err(())).unwrap_err();
+        assert_eq!(failure.step, Step::Dns);
+        assert_eq!(failure.state, ConnectionState::Dropped);
+        assert_eq!(failure.error, ErrorCode::BackendFailure);
+        value.dns_count = Some((2, 1));
+        let failure = apply_dns(&[], &value, |_, _| panic!("incoherent batch")).unwrap_err();
+        assert_eq!(failure.step, Step::Dns);
+        value.dns_count = Some((1, 1));
+        value.dns_invalid = true;
+        let failure = apply_dns(&[], &value, |_, _| panic!("invalid batch")).unwrap_err();
+        assert_eq!(failure.step, Step::Dns);
     }
 
     #[test]

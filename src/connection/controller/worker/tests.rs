@@ -44,7 +44,7 @@ impl Attempt for Scripted {
     fn healthy(&mut self) -> Result<(), Failure> {
         self.counters.lock().unwrap().healthy += 1;
         if self.fail_healthy {
-            return Err(Failure::unavailable());
+            return Err(Failure::at(Step::Health));
         }
         Ok(())
     }
@@ -112,7 +112,7 @@ impl Attempt for HealthAttempt {
             .send(HealthEvent::Healthy(Instant::now()))
             .unwrap();
         if self.calls == self.fail_on {
-            Err(Failure::unavailable())
+            Err(Failure::at(Step::Health))
         } else {
             Ok(())
         }
@@ -207,6 +207,7 @@ impl HealthRun {
                     state: ConnectionState::Dropped,
                     failures: 0,
                     cleaning: true,
+                    failure: Some(health_note()),
                 }
             ),
             other => panic!("expected failure cleanup, received {other:?}"),
@@ -214,6 +215,7 @@ impl HealthRun {
         let finished = self.finish();
         assert_eq!(finished.state, ConnectionState::Dropped);
         assert_eq!(finished.error, Some(ErrorCode::BackendFailure));
+        assert_eq!(finished.step, Some(Step::Health));
         assert!(self.canceled.load(Ordering::Acquire));
         assert_eq!(
             *self.state.lock().unwrap(),
@@ -221,8 +223,15 @@ impl HealthRun {
                 state: ConnectionState::Dropped,
                 failures: 0,
                 cleaning: false,
+                failure: Some(health_note()),
             })
         );
+    }
+}
+fn health_note() -> crate::helper::protocol::FailureNote {
+    crate::helper::protocol::FailureNote {
+        code: ErrorCode::BackendFailure,
+        step: Step::Health,
     }
 }
 impl Drop for HealthRun {
@@ -645,6 +654,7 @@ fn cleanup_publications_preserve_failure_and_only_user_cancel_disconnects() {
             Err(Failure {
                 state: self.failure.unwrap(),
                 error: ErrorCode::BackendFailure,
+                step: Step::Egress,
             })
         }
         fn ready(&mut self) -> Result<bool, Failure> {
@@ -684,13 +694,21 @@ fn cleanup_publications_preserve_failure_and_only_user_cancel_disconnects() {
             timing(Duration::from_secs(1)),
             clock(1),
         );
+        // The note travels with the first failed status, so the transition
+        // the app logs already carries it; a user cancel has none.
+        let note = failure.map(|_| crate::helper::protocol::FailureNote {
+            code: ErrorCode::BackendFailure,
+            step: Step::Egress,
+        });
         let before = Progress {
             state: failure.unwrap_or(ConnectionState::Disconnecting),
             failures: 0,
             cleaning: failure.is_some(),
+            failure: note,
         };
         assert_eq!(*observed.lock().unwrap(), vec![before; 3]);
         assert_eq!(result.state, failure.unwrap_or(ConnectionState::Off));
+        assert_eq!(result.step, failure.map(|_| Step::Egress));
         if failure.is_some() {
             assert_eq!(
                 *state.lock().unwrap(),
@@ -807,4 +825,98 @@ fn exit_before_cleanup_uses_later_cleanup_start_for_budget() {
     assert!(abandoned.duration_since(cleanup_start) >= Duration::from_millis(120));
     let finished = guard.handle.take().unwrap().join().unwrap();
     assert_eq!(finished.state, ConnectionState::Off);
+}
+
+/// The first traffic probe verifies the new tunnel (`Verify`); a failure of a
+/// later probe keeps the attempt's own step (`Health`).
+#[test]
+fn the_initial_probe_failure_is_verify_and_a_later_one_keeps_its_step() {
+    struct Probing {
+        probes: usize,
+        fail_on: usize,
+    }
+    impl Attempt for Probing {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            self.probes += 1;
+            if self.probes == self.fail_on {
+                Err(Failure::at(Step::Health))
+            } else {
+                Ok(true)
+            }
+        }
+        fn cleanup(&mut self) -> bool {
+            true
+        }
+    }
+    for (fail_on, expected) in [(1, Step::Verify), (2, Step::Health)] {
+        let signals = signals(Arc::new(AtomicBool::new(false)));
+        let state = signals.state.clone();
+        let mut timing = timing(Duration::from_secs(1));
+        timing.health = Duration::from_millis(1);
+        let started = Instant::now();
+        let result = run(
+            Probing { probes: 0, fail_on },
+            signals,
+            timing,
+            ProbeClock::new(Duration::from_millis(5)),
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(result.state, ConnectionState::Dropped);
+        assert_eq!(result.step, Some(expected), "probe {fail_on}");
+        assert_eq!(
+            state.lock().unwrap().unwrap().failure.map(|note| note.step),
+            Some(expected)
+        );
+    }
+}
+
+/// A connection deadline keeps the step the attempt was at: the failure it
+/// replaces, or `Tunnel` while the attempt was still waiting to be ready.
+#[test]
+fn a_timeout_keeps_the_step_the_attempt_was_at() {
+    struct Slow {
+        start: Result<(), Step>,
+        delay: Duration,
+    }
+    impl Attempt for Slow {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            thread::sleep(self.delay);
+            self.start.map_err(Failure::at)
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(false)
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            unreachable!()
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            unreachable!()
+        }
+        fn cleanup(&mut self) -> bool {
+            true
+        }
+    }
+    for (start, delay, expected) in [
+        (Err(Step::Egress), Duration::from_millis(30), Step::Egress),
+        (Ok(()), Duration::from_millis(30), Step::Tunnel),
+        (Ok(()), Duration::ZERO, Step::Tunnel),
+    ] {
+        let result = run(
+            Slow { start, delay },
+            signals(Arc::new(AtomicBool::new(false))),
+            timing(Duration::from_millis(10)),
+            clock(1),
+        );
+        assert_eq!(result.state, ConnectionState::GatewayTimeout);
+        assert_eq!(result.step, Some(expected), "{start:?} after {delay:?}");
+    }
 }

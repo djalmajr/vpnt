@@ -1,4 +1,5 @@
 use super::*;
+use crate::helper::protocol::FailureNote;
 use std::{
     sync::{Condvar, Mutex, atomic::Ordering},
     thread,
@@ -53,6 +54,8 @@ fn cleanup_delay(previous: Duration, elapsed: Duration) -> Duration {
 pub(super) struct Finished {
     pub state: ConnectionState,
     pub error: Option<ErrorCode>,
+    /// Where the attempt failed; `Some` exactly when `error` is.
+    pub step: Option<Step>,
 }
 /// Latest coalesced worker status. `failures` counts consecutive actual failed
 /// traffic probes, so replacing an older status in the slot never loses the
@@ -62,6 +65,8 @@ pub(super) struct Progress {
     pub state: ConnectionState,
     pub failures: u32,
     pub cleaning: bool,
+    /// Carried from the first failed status on, so the transition has it.
+    pub failure: Option<FailureNote>,
 }
 pub(super) struct Signals {
     pub canceled: Arc<AtomicBool>,
@@ -69,10 +74,13 @@ pub(super) struct Signals {
     pub state: Arc<Mutex<Option<Progress>>>,
     pub exit: Arc<ExitRequested>,
 }
-fn timeout() -> Failure {
+/// The connection deadline passed: keep the step of the failure it replaces,
+/// or `Tunnel` while the attempt was still waiting to become ready.
+fn timeout(replaced: Option<&Failure>) -> Failure {
     Failure {
         state: ConnectionState::GatewayTimeout,
         error: ErrorCode::BackendFailure,
+        step: replaced.map_or(Step::Tunnel, |failure| failure.step),
     }
 }
 pub(super) fn run(
@@ -81,7 +89,7 @@ pub(super) fn run(
     timing: Timing,
     interval: ProbeClock,
 ) -> Finished {
-    let send = |state, failures, cleaning| {
+    let send = |state, failures, cleaning, failure| {
         // One coalesced status per worker. A slow pipe reader never blocks
         // traffic/cleanup or loses the latest state to a full progress queue.
         *signals
@@ -91,6 +99,7 @@ pub(super) fn run(
             state,
             failures,
             cleaning,
+            failure,
         });
     };
     let canceled = || signals.canceled.load(Ordering::Acquire);
@@ -106,7 +115,7 @@ pub(super) fn run(
             return Ok(());
         }
         if Instant::now() >= expires {
-            return Err(timeout());
+            return Err(timeout(start.as_ref().err()));
         }
         start?;
         loop {
@@ -114,14 +123,14 @@ pub(super) fn run(
                 return Ok(());
             }
             if Instant::now() >= expires {
-                return Err(timeout());
+                return Err(timeout(None));
             }
             let ready = attempt.ready();
             if canceled() {
                 return Ok(());
             }
             if Instant::now() >= expires {
-                return Err(timeout());
+                return Err(timeout(ready.as_ref().err()));
             }
             if ready? {
                 break;
@@ -131,7 +140,7 @@ pub(super) fn run(
         if canceled() {
             return Ok(());
         }
-        send(ConnectionState::Verifying, 0, false);
+        send(ConnectionState::Verifying, 0, false, None);
         let mut last_probe: Option<Instant> = None;
         let mut last_health: Option<Instant> = None;
         let mut failures = 0_u32;
@@ -154,7 +163,16 @@ pub(super) fn run(
             // probe; health checks and snapshot polls never do.
             let due = last_probe.is_none_or(|last| Instant::now() >= last + interval.get());
             if signals.probe.swap(false, Ordering::AcqRel) || due {
-                let responsive = attempt.probe(&signals.canceled, timing.probe)?;
+                // The first traffic probe verifies the new tunnel; a later
+                // one checks a connection that was already verified.
+                let initial = last_probe.is_none();
+                let responsive =
+                    attempt
+                        .probe(&signals.canceled, timing.probe)
+                        .map_err(|failure| Failure {
+                            step: if initial { Step::Verify } else { failure.step },
+                            ..failure
+                        })?;
                 last_probe = Some(Instant::now());
                 if canceled() {
                     return Ok(());
@@ -175,6 +193,7 @@ pub(super) fn run(
                     },
                     failures,
                     false,
+                    None,
                 );
             }
             thread::sleep(timing.poll);
@@ -184,7 +203,11 @@ pub(super) fn run(
         Ok(()) => ConnectionState::Disconnecting,
         Err(failure) => failure.state,
     };
-    send(cleanup_state, 0, result.is_err());
+    let note = result.as_ref().err().map(|failure| FailureNote {
+        code: failure.error,
+        step: failure.step,
+    });
+    send(cleanup_state, 0, result.is_err(), note);
     // Cancel all outstanding network operations before releasing resources.
     signals.canceled.store(true, Ordering::Release);
     let cleanup_started = Instant::now();
@@ -213,16 +236,18 @@ pub(super) fn run(
         cleanup_poll = cleanup_delay(cleanup_poll, cleanup_started.elapsed());
     }
     if result.is_err() {
-        send(cleanup_state, 0, false);
+        send(cleanup_state, 0, false, note);
     }
     match result {
         Ok(()) => Finished {
             state: ConnectionState::Off,
             error: None,
+            step: None,
         },
         Err(failure) => Finished {
             state: failure.state,
             error: Some(failure.error),
+            step: Some(failure.step),
         },
     }
 }

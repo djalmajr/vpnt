@@ -23,6 +23,29 @@ impl<S: SecretStore> Broker<S> {
             }
         }
     }
+    /// Same probe as cleanup: an older helper echoes the probe ID.
+    pub(super) fn request_failure_snapshot(&mut self) {
+        if self.failure_probe.is_some() {
+            return;
+        }
+        if let Some(client) = &self.client {
+            let observed = self
+                .connections
+                .iter()
+                .map(|(id, c)| (id.clone(), c.generation))
+                .collect();
+            self.failure_probe = Some(observed);
+            if client
+                .send(Request {
+                    id: protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID.into(),
+                    command: protocol::Command::Snapshot {},
+                })
+                .is_err()
+            {
+                self.lost(false);
+            }
+        }
+    }
     pub(super) fn receive_snapshot(
         &mut self,
         id: String,
@@ -34,6 +57,8 @@ impl<S: SecretStore> Broker<S> {
         let initial = !self.ready;
         let probe =
             id == protocol::CLEANUP_PROBE_SNAPSHOT_ID || id == protocol::CLEANUP_ACK_SNAPSHOT_ID;
+        let note_probe = id == protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID
+            || id == protocol::FAILURE_NOTE_ACK_SNAPSHOT_ID;
         let verify = self
             .cleanup_verify
             .as_ref()
@@ -46,6 +71,9 @@ impl<S: SecretStore> Broker<S> {
         } else if probe {
             self.cleanup_capable = id == protocol::CLEANUP_ACK_SNAPSHOT_ID;
             Some(self.cleanup_probe.take().ok_or(())?)
+        } else if note_probe {
+            self.failure_capable = id == protocol::FAILURE_NOTE_ACK_SNAPSHOT_ID;
+            Some(self.failure_probe.take().ok_or(())?)
         } else if verify {
             Some(self.cleanup_verify.take().ok_or(())?.observed)
         } else {
@@ -60,6 +88,7 @@ impl<S: SecretStore> Broker<S> {
                 && statuses
                     .iter()
                     .any(|s| s.generation != 0 || s.state != State::Off))
+            || (!self.failure_capable && statuses.iter().any(|s| s.failure.is_some()))
         {
             return Err(());
         }
@@ -116,7 +145,7 @@ impl<S: SecretStore> Broker<S> {
                 } else {
                     status.state
                 };
-                set_state(&mut c, state);
+                transition(&mut c, state, status.failure.map(FailureView::from));
                 c.failures = status.failures;
                 c.view.cleaning = status.cleaning;
                 current.insert(c.view.profile.id.clone(), c);
@@ -139,6 +168,7 @@ impl<S: SecretStore> Broker<S> {
                             } else {
                                 status.state
                             },
+                            failure: status.failure.map(FailureView::from),
                             log: vec![],
                         },
                         generation: status.generation,
@@ -169,7 +199,8 @@ impl<S: SecretStore> Broker<S> {
                 retry.ready();
             }
             self.request_cleanup_snapshot();
-        } else if !probe && !verify {
+            self.request_failure_snapshot();
+        } else if !probe && !note_probe && !verify {
             self.confirm_admin_snapshot();
         }
         Ok(())

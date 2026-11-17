@@ -7,6 +7,7 @@ pub(super) fn dispatch<F: Factory>(
     output: &mut VecDeque<Message>,
     interval: &ProbeClock,
     cleanup_capable: bool,
+    failure_capable: bool,
 ) {
     let fail = |output: &mut VecDeque<_>, error| {
         output.push_back(Message::Failed {
@@ -34,7 +35,7 @@ pub(super) fn dispatch<F: Factory>(
             return;
         }
         let _ = factory.verify_cleanup(&slot.profile);
-        output.push_back(snapshot(request.id, factory, slots, true));
+        output.push_back(snapshot(request.id, factory, slots, true, failure_capable));
         return;
     }
     // A global cadence preference: no profile/slot lookup, no credential or
@@ -57,7 +58,13 @@ pub(super) fn dispatch<F: Factory>(
             return;
         }
         Command::Snapshot {} => {
-            output.push_back(snapshot(request.id, factory, slots, cleanup_capable));
+            output.push_back(snapshot(
+                request.id,
+                factory,
+                slots,
+                cleanup_capable,
+                failure_capable,
+            ));
             return;
         }
         Command::Connect { id, generation, .. }
@@ -107,6 +114,8 @@ pub(super) fn dispatch<F: Factory>(
             slot.generation = generation;
             slot.failures = 0;
             slot.cleaning = false;
+            // A new attempt clears the previous attempt's note.
+            slot.failure = None;
             slot.state = if replacing {
                 ConnectionState::Reconnecting
             } else {
@@ -119,6 +128,7 @@ pub(super) fn dispatch<F: Factory>(
             slot.generation = generation;
             slot.failures = 0;
             slot.cleaning = false;
+            slot.failure = None;
             slot.state = if slot.worker.is_some() {
                 ConnectionState::Disconnecting
             } else {
@@ -149,7 +159,7 @@ pub(super) fn dispatch<F: Factory>(
         }
     }
     output.push_back(Message::Accepted { id: request.id });
-    output.push_back(slot.changed());
+    output.push_back(slot.changed(failure_capable));
 }
 
 fn snapshot<F: Factory>(
@@ -157,6 +167,7 @@ fn snapshot<F: Factory>(
     factory: &F,
     slots: &BTreeMap<String, Slot<'_>>,
     cleanup_capable: bool,
+    failure_capable: bool,
 ) -> Message {
     Message::Snapshot {
         id,
@@ -178,6 +189,7 @@ fn snapshot<F: Factory>(
                     },
                     failures: if blocked { 0 } else { slot.failures },
                     cleaning: if blocked { false } else { slot.cleaning },
+                    failure: slot.failure.filter(|_| failure_capable && !blocked),
                 }
             })
             .collect(),
