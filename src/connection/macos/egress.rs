@@ -132,9 +132,9 @@ impl Egress {
             && route.next_hop == self.next_hop
             && record.source == self.source)
     }
-    pub(crate) fn transport_default(&self) -> Result<TransportDefault, Error> {
+    pub(crate) fn transport_default(&self) -> Result<Option<TransportDefault>, Error> {
         let index = u16::try_from(self.interface.index).map_err(|_| Error::Invalid)?;
-        TransportDefault::from_egress(index, self.next_hop)
+        TransportDefault::for_plan(index, self.next_hop)
     }
 
     pub(crate) fn binding(&self, profile: &Profile) -> Result<Binding, Error> {

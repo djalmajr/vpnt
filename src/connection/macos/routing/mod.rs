@@ -1,5 +1,5 @@
 //! Native routing. Reader stays GET-only; the separate privileged writer can
-//! adds retained interface routes and manages one typed egress default.
+//! add retained interface routes and manages one typed egress default.
 mod add_codec;
 mod backend;
 mod codec;
@@ -14,6 +14,22 @@ pub use read::{Reader, Snapshot};
 pub use resource_fence::{ResourceFence, RouteWork};
 pub(crate) use transport_default::TransportDefault;
 pub use write::{AddReceipt, AddWriter};
+
+// PF_ROUTE can deliver a GET reply to multiple sockets in this process.
+// Reader and writer must never use the same (PID, sequence) pair.
+fn next_sequence() -> Result<i32, Error> {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static NEXT_SEQUENCE: AtomicI32 = AtomicI32::new(1);
+    let mut value = NEXT_SEQUENCE.load(Ordering::Relaxed);
+    loop {
+        let next = value.checked_add(1).ok_or(Error::Limit)?;
+        match NEXT_SEQUENCE.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return Ok(value),
+            Err(current) => value = current,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Record {

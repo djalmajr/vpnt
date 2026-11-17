@@ -10,7 +10,7 @@ use crate::{
             egress::Egress,
             ppp::{OwnedPpp, OwnershipError},
             ppp_early_cleanup, probe,
-            routing::{InterfaceToken, NativeBackend, Snapshot},
+            routing::{InterfaceToken, NativeBackend, Snapshot, TransportDefault},
             store::DnsLease,
         },
         routes::{Coordinator, Lease, Owner},
@@ -114,6 +114,7 @@ struct NativeAttempt<'a> {
     egress: Option<Box<Egress>>,
     link: Option<Arc<OwnedPpp>>,
     token: Option<InterfaceToken>,
+    requires_transport_default: bool,
     lease: Option<Lease>,
     dns: Option<DnsLease>,
     spawn_attempted: bool,
@@ -152,6 +153,16 @@ impl NativeAttempt<'_> {
         }
         Ok(())
     }
+    fn validate_transport_egress(&self) -> Result<(), Failure> {
+        validate_ssl_egress(self.requires_transport_default, || {
+            self.egress
+                .as_ref()
+                .ok_or_else(Failure::unavailable)?
+                .is_current(&self.profile)
+                .map_err(|_| Failure::unavailable())
+        })
+    }
+
     fn discover(&mut self) -> Result<bool, Failure> {
         if self.link.is_some() {
             return Ok(true);
@@ -327,13 +338,6 @@ impl Attempt for NativeAttempt<'_> {
                     client.note_invalid_split();
                     Failure::unavailable()
                 })?;
-            if let Some(egress) = self.egress.as_ref()
-                && !egress
-                    .is_current(&self.profile)
-                    .map_err(|_| Failure::unavailable())?
-            {
-                return Err(Failure::unavailable());
-            }
             #[cfg(test)]
             let mut backend = ObservedBackend(routes.backend_mut());
             #[cfg(not(test))]
@@ -347,7 +351,10 @@ impl Attempt for NativeAttempt<'_> {
                     self.egress.as_deref(),
                 )
                 .map_err(|_| Failure::unavailable())?;
-            self.token = Some(token); // retain before any fallible ADD/lease
+            self.token = Some(token); // retain before any fallible validation or ADD
+            // This is a dependency of the plan even if acquire borrows it.
+            self.requires_transport_default = plan_requires_transport_default(&plan);
+            self.validate_transport_egress()?;
             self.lease = Some(
                 routes
                     .acquire(self.owner.clone(), &plan)
@@ -383,16 +390,10 @@ impl Attempt for NativeAttempt<'_> {
     fn healthy(&mut self) -> Result<(), Failure> {
         self.client_health()?;
         let link = self.link.as_ref().ok_or_else(Failure::unavailable)?;
-        if !link.is_current().unwrap_or(false)
-            || !self
-                .egress
-                .as_ref()
-                .ok_or_else(Failure::unavailable)?
-                .is_current(&self.profile)
-                .map_err(|_| Failure::unavailable())?
-        {
+        if !link.is_current().unwrap_or(false) {
             return Err(Failure::unavailable());
         }
+        self.validate_transport_egress()?;
         self.routes
             .lock()
             .map_err(|_| Failure::unavailable())?
@@ -431,6 +432,21 @@ impl Attempt for NativeAttempt<'_> {
     }
 }
 
+fn plan_requires_transport_default(plan: &[crate::connection::routes::Route]) -> bool {
+    plan.iter()
+        .any(|route| TransportDefault::try_from(*route).is_ok())
+}
+
+fn validate_ssl_egress(
+    requires_transport_default: bool,
+    is_current: impl FnOnce() -> Result<bool, Failure>,
+) -> Result<(), Failure> {
+    if requires_transport_default && !is_current()? {
+        return Err(Failure::unavailable());
+    }
+    Ok(())
+}
+
 fn route_acquire_failure(error: crate::connection::routes::AcquireError) -> Failure {
     if error.reason == crate::connection::routes::Error::Conflict {
         // SAFETY: the format string is fixed and has no conversion specifiers.
@@ -448,6 +464,38 @@ fn route_acquire_failure(error: crate::connection::routes::AcquireError) -> Fail
 mod split_tests {
     use super::*;
     use crate::connection::ssl_output::Observation;
+
+    #[test]
+    fn connected_split_stays_healthy_after_physical_ipv6_renewal() {
+        use std::net::IpAddr;
+        let before: [IpAddr; 2] = ["192.0.2.2".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        let after: [IpAddr; 2] = ["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+        assert_eq!(before[0], after[0]);
+        assert_ne!(before[1], after[1]);
+        use crate::connection::routes::{Address, Key, NextHop, Route, ppp_networks};
+        let split = ppp_networks(&["10.0.0.0/8".into()], 3, true, true, None).unwrap();
+        let mut full = ppp_networks(&[], 3, true, true, None).unwrap();
+        let ipv6_renewal = || Ok(before == after);
+        assert!(validate_ssl_egress(plan_requires_transport_default(&split), ipv6_renewal).is_ok());
+        assert!(validate_ssl_egress(plan_requires_transport_default(&full), ipv6_renewal).is_ok());
+
+        let router = Address::unscoped("192.0.2.1".parse().unwrap());
+        full.insert(
+            0,
+            Route {
+                key: Key {
+                    network: "0.0.0.0/0".parse().unwrap(),
+                    scope: 7,
+                },
+                interface: 7,
+                next_hop: NextHop::Gateway(router),
+            },
+        );
+        let depends_on_default = plan_requires_transport_default(&full);
+        assert!(depends_on_default);
+        assert!(validate_ssl_egress(depends_on_default, ipv6_renewal).is_err());
+        assert!(validate_ssl_egress(depends_on_default, || Ok(true)).is_ok());
+    }
 
     #[test]
     fn dns_requires_both_a_domain_and_a_server() {

@@ -112,7 +112,7 @@ impl<'a> NativeBackend<'a> {
             )?,
         };
         scope.transport_default = TransportDefault::add_to_plan(&mut plan, || {
-            egress.ok_or(Error::Invalid)?.transport_default().map(Some)
+            egress.ok_or(Error::Invalid)?.transport_default()
         })?;
         let token =
             self.registry

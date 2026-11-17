@@ -2268,10 +2268,14 @@ depois do envio, sem depender de sleeps para sincronizar o cancelamento.
 
 Depois de tentar enviar, timeout/cancelamento/erro retornam um recibo não
 confirmado com a rota tentada; não se presume que nada foi criado. Antes do
-envio, cancelar não produz pacote. A confirmação exige ACK com PID/seq/opcode,
-rota e origem esperados, mas é somente prova de protocolo: o controlador deverá
-reler a tabela e executar o probe antes de Connected. Nem ACK nem igualdade de
-atributos fornece identidade para DELETE. Não há API de DELETE/CHANGE.
+envio, cancelar não produz pacote. A confirmação de ADD PPP exige ACK com
+PID/seq/opcode, rota e origem esperados. O controlador relê a tabela e executa
+o probe antes de Connected. Para o único default IPv4 de transporte escopado,
+o writer tipado também tem GET exato, com máscara /0, e DELETE. A lease só
+autoriza o DELETE com recibo de ADD confirmado e após um novo GET conferir
+gateway, flags e escopo. Um DELETE incerto fica pendente sem reenvio. Outro
+ator pode trocar a entrada entre GET e DELETE. O protocolo não oferece
+identidade da entrada nem operação CHANGE nesta API.
 
 Nenhum teste chama a fábrica privilegiada de ADD, anexa um socket PPP real,
 cria interface ou escreve no kernel de rotas. A aplicação/remoção nativa e a

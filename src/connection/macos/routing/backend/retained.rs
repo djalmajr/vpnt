@@ -223,11 +223,10 @@ impl<'a> NativeBackend<'a> {
         };
         let transport_default = TransportDefault::add_to_plan(&mut plan, || {
             if egress.remote().is_ipv4() {
-                TransportDefault::from_egress(
+                TransportDefault::for_plan(
                     egress.interface_index(),
                     egress.gateway_route().next_hop,
                 )
-                .map(Some)
             } else {
                 Ok(None)
             }

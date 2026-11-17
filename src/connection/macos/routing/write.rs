@@ -1,6 +1,6 @@
 use super::{
     Address, Error, Key, Network, NextHop, Reader, Record, Route, TransportDefault, add_codec,
-    codec,
+    codec, next_sequence,
 };
 use crate::{
     connection::macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink, tcp},
@@ -10,11 +10,10 @@ use std::{
     io,
     mem::{offset_of, size_of},
     os::fd::{AsRawFd, OwnedFd},
-    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
-static NEXT_ADD: AtomicI32 = AtomicI32::new(1);
 /// An attempted ADD must stay in the cleanup plan even if its ACK is lost.
 /// The acknowledgement records the dispatch outcome, not a kernel route ID.
 #[must_use = "retain attempted routes until interface teardown and observed cleanup"]
@@ -179,7 +178,7 @@ impl<'a> AddWriter<'a> {
     ) -> Result<Result<Vec<u8>, Error>, Error> {
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         let pid = i32::try_from(std::process::id()).map_err(|_| Error::Invalid)?;
-        let sequence = sequence()?;
+        let sequence = next_sequence()?;
         let packet = add_codec::scoped_default(request, route, pid, sequence)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         let reply = send_packet(&self.fd, &packet, deadline, canceled)?.and_then(|()| {
@@ -193,16 +192,6 @@ impl<'a> AddWriter<'a> {
             )
         });
         Ok(reply)
-    }
-}
-fn sequence() -> Result<i32, Error> {
-    let mut value = NEXT_ADD.load(Ordering::Relaxed);
-    loop {
-        let next = value.checked_add(1).ok_or(Error::Limit)?;
-        match NEXT_ADD.compare_exchange_weak(value, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(value),
-            Err(current) => value = current,
-        }
     }
 }
 fn exchange(
@@ -219,7 +208,7 @@ fn exchange(
         return Err(Error::Canceled);
     }
     let pid = i32::try_from(std::process::id()).map_err(|_| Error::Invalid)?;
-    let sequence = sequence()?;
+    let sequence = next_sequence()?;
     let packet = add_codec::add(route, source, pid, sequence)?;
     let deadline = Instant::now() + timeout;
     let confirmation = send_packet(fd, &packet, deadline, canceled)?
