@@ -86,6 +86,11 @@ impl<S: SecretStore> Broker<S> {
             }
             Command::Probe { id } => {
                 let c = self.connections.get(&id).ok_or("not_found")?;
+                if c.view.state == State::CleanupUnconfirmed {
+                    self.verify_cleanup(&id)?;
+                    self.refresh_actions();
+                    return Ok(self.snapshot());
+                }
                 if !matches!(
                     c.view.state,
                     State::Connected | State::Verifying | State::Unresponsive
@@ -143,6 +148,32 @@ impl<S: SecretStore> Broker<S> {
     fn connect(&mut self, id: &str, reconnect: bool, expires: Instant) -> Result<(), &'static str> {
         self.connect_guarded(id, reconnect, expires, &|| true)
     }
+    fn verify_cleanup(&mut self, id: &str) -> Result<(), &'static str> {
+        if !self.ready || !self.cleanup_capable {
+            return Err("unavailable");
+        }
+        if self.cleanup_verify.is_some() {
+            return Err("profile_busy");
+        }
+        let next = self.next.checked_add(1).ok_or("unavailable")?;
+        let request = format!("cleanup-{next}");
+        let observed = self
+            .connections
+            .iter()
+            .map(|(id, connection)| (id.clone(), connection.generation))
+            .collect();
+        self.client
+            .as_ref()
+            .ok_or("backend_unavailable")?
+            .send(Request {
+                id: request.clone(),
+                command: protocol::Command::VerifyCleanup { profile: id.into() },
+            })
+            .map_err(|_| "backend_unavailable")?;
+        self.next = next;
+        self.cleanup_verify = Some((request, observed));
+        Ok(())
+    }
     pub(super) fn connect_guarded(
         &mut self,
         id: &str,
@@ -163,6 +194,9 @@ impl<S: SecretStore> Broker<S> {
             return Err("admin_busy");
         }
         let c = self.connections.get_mut(id).ok_or("not_found")?;
+        if c.view.state == State::CleanupUnconfirmed {
+            return Err("profile_busy");
+        }
         let credentials = match self.secrets.load(id, c.view.profile.kind) {
             Ok(credentials) => credentials,
             Err(crate::secrets::SecretError::Missing) => {

@@ -58,6 +58,38 @@ thread_local! {
 }
 
 impl OwnedPpp {
+    #[cfg(test)]
+    pub(crate) fn fixture_with_child(pid: u32) -> Result<Self, OwnershipError> {
+        let parent = Process::read(std::process::id()).map_err(|_| OwnershipError::Unavailable)?;
+        let child = Process::read(pid).map_err(|_| OwnershipError::Unavailable)?;
+        let interface = Interface {
+            name: "ppp42".into(),
+            index: 42,
+            flags: (libc::IFF_UP | libc::IFF_POINTOPOINT) as u32,
+            addresses: std::collections::BTreeSet::from(["192.0.2.2".parse().unwrap()]),
+        };
+        let now = Interfaces {
+            entries: std::collections::BTreeMap::from([("ppp42".into(), interface)]),
+        };
+        let record = Record {
+            key: "fixture-service".into(),
+            interface: crate::connection::ssl::InterfaceName::parse("ppp42").unwrap(),
+            pid: Some(pid),
+        };
+        discover(
+            (parent.identity.pid, pid),
+            &record.key,
+            &Interfaces::default(),
+            &now,
+            &record,
+            std::slice::from_ref(&record),
+            Policy {
+                owner: parent.uid,
+                parent_program: &parent.executable,
+                ppp_program: &child.executable,
+            },
+        )
+    }
     #[cfg_attr(test, allow(private_interfaces))]
     pub fn discover(
         #[cfg(not(test))] driver: &mut DiscoveryDriver,

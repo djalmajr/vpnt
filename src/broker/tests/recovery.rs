@@ -1,6 +1,105 @@
 use super::*;
 
 #[test]
+fn newly_discovered_blocked_profile_requires_negotiated_capability() {
+    let profile: crate::model::Profile = serde_json::from_value(serde_json::json!({"id":"one","name":"Fixture","kind":"ssl","gateway":"vpn.example.test","username":"fixture","networks":[],"port":443,"certificate":"","probeHost":"192.0.2.1","probePort":8443,"probeMethod":"tcp"})).unwrap();
+    for (id, expected) in [
+        (protocol::CLEANUP_ACK_SNAPSHOT_ID, true),
+        (protocol::CLEANUP_PROBE_SNAPSHOT_ID, false),
+    ] {
+        let mut broker = Broker::new(None, Secrets::new());
+        broker.ready = true;
+        broker.cleanup_probe = Some(BTreeMap::new());
+        let result = broker.receive(Message::Snapshot {
+            id: id.into(),
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: None,
+            profiles: vec![profile.clone()],
+            connections: vec![protocol::TunnelStatus {
+                id: "one".into(),
+                generation: 0,
+                state: State::CleanupUnconfirmed,
+                failures: 0,
+                cleaning: false,
+            }],
+        });
+        assert_eq!(result.is_ok(), expected);
+        if expected {
+            assert_eq!(
+                broker.connections["one"].view.state,
+                State::CleanupUnconfirmed
+            );
+        }
+    }
+}
+
+#[test]
+fn old_helper_echoes_probe_and_never_receives_verify_cleanup() {
+    let mut peer = Peer::new("flow");
+    let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+    let until = Instant::now() + Duration::from_secs(4);
+    while !broker.ready || broker.cleanup_probe.is_some() {
+        broker.poll();
+        assert!(Instant::now() < until, "capability probe timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!broker.cleanup_capable);
+    set_state(
+        broker.connections.get_mut("one").unwrap(),
+        State::CleanupUnconfirmed,
+    );
+    assert_eq!(
+        broker
+            .dispatch(
+                Command::Probe { id: "one".into() },
+                Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap_err(),
+        "unavailable"
+    );
+    let commands =
+        std::fs::read_to_string(peer.marker.with_extension("commands")).unwrap_or_default();
+    assert!(!commands.lines().any(|line| line == "verify_cleanup"));
+}
+
+#[test]
+fn busy_connect_after_capability_snapshot_requests_fresh_cleanup_state() {
+    let mut peer = Peer::new("flow");
+    let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+    let until = Instant::now() + Duration::from_secs(4);
+    while !broker.ready || broker.cleanup_probe.is_some() {
+        broker.poll();
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    broker.cleanup_capable = true;
+    broker
+        .dispatch(
+            Command::Connect { id: "one".into() },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    let id = broker.connections["one"]
+        .pending
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    broker
+        .receive(Message::Failed {
+            id,
+            error: protocol::ErrorCode::ProfileBusy,
+        })
+        .unwrap();
+    assert_eq!(broker.connections["one"].view.state, State::Off);
+    assert!(
+        broker.cleanup_probe.is_some(),
+        "retry the state observation after the generation is rolled back"
+    );
+}
+
+#[test]
 fn previous_session_status_survives_busy_eof_and_clears_after_snapshot() {
     fn waiting() -> Message {
         Message::PreviousSessionFinishing {

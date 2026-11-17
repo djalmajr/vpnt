@@ -1,7 +1,7 @@
 mod dispatch;
 mod metadata;
 use super::{
-    worker::{self, Finished, Signals},
+    worker::{self, ExitRequested, Finished, Signals},
     *,
 };
 #[cfg(test)]
@@ -63,6 +63,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
     uid: u32,
     slot: &mut Slot<'scope>,
     timing: Timing,
+    exit: &Arc<ExitRequested>,
 ) {
     let Some(pending) = slot.pending.take() else {
         return;
@@ -74,6 +75,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
         canceled: canceled.clone(),
         probe: probe.clone(),
         state: state.clone(),
+        exit: exit.clone(),
     };
     let profile = slot.profile.clone();
     let generation = slot.generation;
@@ -96,6 +98,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
             canceled,
             probe,
             state,
+            exit: exit.clone(),
         },
         thread,
     });
@@ -108,6 +111,25 @@ pub(super) fn run<F: Factory>(
     requests: Receiver<Request>,
     output: SyncSender<Message>,
     timing: Timing,
+) -> Result<(), ErrorCode> {
+    run_with_exit(
+        factory,
+        uid,
+        profiles,
+        requests,
+        output,
+        timing,
+        Arc::new(ExitRequested::new(worker::CLEANUP_BUDGET)),
+    )
+}
+fn run_with_exit<F: Factory>(
+    factory: F,
+    uid: u32,
+    profiles: Vec<Profile>,
+    requests: Receiver<Request>,
+    output: SyncSender<Message>,
+    timing: Timing,
+    exit: Arc<ExitRequested>,
 ) -> Result<(), ErrorCode> {
     if uid == 0 {
         return Err(ErrorCode::UntrustedConfiguration);
@@ -138,15 +160,25 @@ pub(super) fn run<F: Factory>(
             .collect();
         let mut outgoing = VecDeque::new();
         let mut closing = false;
+        let mut cleanup_capable = false;
         let mut panicked = false;
         loop {
+            if crate::helper::ppp_supervisor::signals::INTERRUPTED.load(Ordering::Acquire) {
+                closing = true;
+            }
             // Bound work per pass so pipe floods cannot starve cleanup/probes.
             for _ in 0..64 {
                 if closing {
                     break;
                 }
                 match requests.try_recv() {
-                    Ok(request) => {
+                    Ok(mut request) => {
+                        if matches!(request.command, Command::Snapshot {})
+                            && request.id == crate::helper::protocol::CLEANUP_PROBE_SNAPSHOT_ID
+                        {
+                            cleanup_capable = true;
+                            request.id = crate::helper::protocol::CLEANUP_ACK_SNAPSHOT_ID.into();
+                        }
                         let refreshed = if matches!(request.command, Command::Snapshot {}) {
                             factory.profiles().and_then(|profiles| {
                                 if let Some(profiles) = profiles {
@@ -163,7 +195,14 @@ pub(super) fn run<F: Factory>(
                                 error,
                             });
                         } else {
-                            dispatch(request, &factory, &mut slots, &mut outgoing, &interval);
+                            dispatch(
+                                request,
+                                &factory,
+                                &mut slots,
+                                &mut outgoing,
+                                &interval,
+                                cleanup_capable,
+                            );
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -172,6 +211,9 @@ pub(super) fn run<F: Factory>(
                         break;
                     }
                 }
+            }
+            if closing {
+                exit.request();
             }
             for slot in slots.values_mut() {
                 if !closing
@@ -233,7 +275,7 @@ pub(super) fn run<F: Factory>(
                     }
                 }
                 if !closing && slot.worker.is_none() && slot.pending.is_some() {
-                    launch(scope, &factory, uid, slot, timing);
+                    launch(scope, &factory, uid, slot, timing, &exit);
                 }
             }
             if outgoing.len() > 256 {

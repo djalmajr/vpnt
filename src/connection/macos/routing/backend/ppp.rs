@@ -1,6 +1,47 @@
 use super::*;
 
 impl<'a> NativeBackend<'a> {
+    pub(crate) fn retirement_queue(&self) -> retirement::Queue {
+        self.retired.clone()
+    }
+    pub(crate) fn abandonment_sink(
+        &self,
+        owner: &Owner,
+    ) -> Result<Option<crate::connection::fence::Sink>, Error> {
+        match self.registry.owner_scope(owner) {
+            None => Ok(None),
+            Some(RegisteredScope::Ppp(scope)) => {
+                Ok(scope
+                    .retirement
+                    .sink()
+                    .map(|sink| crate::connection::fence::Sink {
+                        name: sink.name.clone(),
+                        index: u32::from(sink.index),
+                        source: sink.source,
+                    }))
+            }
+            Some(RegisteredScope::Utun(_)) => Err(Error::Invalid),
+            #[cfg(test)]
+            Some(RegisteredScope::Fixture(_)) => Ok(None),
+        }
+    }
+    /// The queue is locked before persistence; this is infallible after the
+    /// owner scope was validated while holding the coordinator lock.
+    pub(crate) fn abandon_owner(
+        &mut self,
+        owner: &Owner,
+        retired: &mut Vec<retirement::Retirement>,
+    ) {
+        if let Some(scope) = self.registry.take_owner(owner) {
+            match scope {
+                RegisteredScope::Ppp(mut scope) => scope.retirement.abandon(),
+                #[cfg(test)]
+                RegisteredScope::Fixture(_) => {}
+                _ => unreachable!("owner scope validated before persistence"),
+            }
+        }
+        retirement::detach(retired, owner);
+    }
     /// Called with the root-stored profile's networks. The caller retains its
     /// Arc even on registration failure so it can still observe PPP shutdown.
     /// A full tunnel with one family creates its own disabled-packet UTUN for
@@ -44,7 +85,7 @@ impl<'a> NativeBackend<'a> {
             writer,
             canceled: canceled.clone(),
             sink: None,
-            retirement: Guard::new(ppp.clone(), self.retired.clone()),
+            retirement: Guard::new(ppp.clone(), owner.clone(), self.retired.clone()),
         };
         if needs_sink {
             match OwnedSink::create(!ipv4, self.controller) {

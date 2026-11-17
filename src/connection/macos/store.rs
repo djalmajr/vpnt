@@ -79,6 +79,33 @@ fn read_attempt_with(
 }
 
 fn read_query(key: Option<&str>) -> Result<Vec<Record>, Unavailable> {
+    parse(&query(key)?)
+}
+
+/// A partial PPP dictionary still means that the exact service key exists.
+pub(super) fn has_attempt_key(
+    service: &crate::helper::ppp_supervisor::ServiceId,
+) -> Result<bool, Unavailable> {
+    let expected = service.key();
+    let value = query(Some(&expected))?;
+    let dictionary = value.downcast::<CFDictionary>().ok_or(Unavailable)?;
+    let (keys, _) = dictionary.get_keys_and_values();
+    if keys.len() > 1 {
+        return Err(Unavailable);
+    }
+    if let Some(key) = keys.into_iter().next() {
+        let key = unsafe { CFType::wrap_under_get_rule(key) }
+            .downcast::<CFString>()
+            .ok_or(Unavailable)?;
+        if key != CFString::new(&expected) {
+            return Err(Unavailable);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn query(key: Option<&str>) -> Result<CFType, Unavailable> {
     let name = CFString::new("vpnt PPP ownership");
     // SAFETY: the session has no callback/context and is released under the
     // create rule. Only a fixed PPP-state pattern is read; no configuration is set.
@@ -115,7 +142,7 @@ fn read_query(key: Option<&str>) -> Result<Vec<Record>, Unavailable> {
     }
     // SAFETY: non-null Copy result with one owned retain; downcast checks type.
     let value = unsafe { CFType::wrap_under_create_rule(reference) };
-    parse(&value)
+    Ok(value)
 }
 
 fn field(dictionary: &CFDictionary, key: &str) -> Option<CFType> {

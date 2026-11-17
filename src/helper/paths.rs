@@ -9,6 +9,10 @@ pub const PPP_SUPERVISOR: &str = env!("VPNT_PPP_SUPERVISOR_PATH");
 pub const USERS: &str = "/Library/Application Support/vpnt/users";
 pub const STATE: &str = "/Library/Application Support/vpnt";
 
+pub fn fence_directory(uid: u32) -> PathBuf {
+    Path::new(STATE).join("fences").join(uid.to_string())
+}
+
 pub fn runtime_directory() -> PathBuf {
     PathBuf::from(env!("VPNT_RUNTIME_PATH")).join(env!("CARGO_PKG_VERSION"))
 }

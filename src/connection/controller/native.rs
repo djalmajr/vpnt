@@ -60,7 +60,7 @@ pub fn run_ssl(
     // A missing IPsec domain is a real unsupported capability; SSL still runs.
     let domain = NativeDomain::new(controller).ok();
     engine::run(
-        NativeFactory::new(routes, store, domain),
+        NativeFactory::new(routes, store, domain, uid),
         uid,
         profiles,
         requests,
@@ -85,6 +85,8 @@ struct NativeAttempt<'a> {
     spawn_attempted: bool,
     stopped: bool,
     uncertain_cleanup: bool,
+    fence_root: std::path::PathBuf,
+    fence_owner: u32,
 }
 impl NativeAttempt<'_> {
     fn client_health(&mut self) -> Result<(), Failure> {
@@ -151,6 +153,9 @@ fn bounded(expires: Instant, canceled: &AtomicBool) -> Result<Duration, Failure>
 }
 
 impl Attempt for NativeAttempt<'_> {
+    fn abandon(&mut self, reason: Reason) -> Result<(), AbandonError> {
+        self.abandon_ssl(reason)
+    }
     fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure> {
         if self.profile.kind != VpnKind::Ssl {
             return Err(Failure {

@@ -18,6 +18,184 @@ use std::{
     time::Instant,
 };
 
+struct RecoveryEngine(Arc<crate::connection::macos::fence_recovery::tests::RecoveryFixture>);
+struct RecoveryAttempt;
+impl Attempt for RecoveryAttempt {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn ready(&mut self) -> Result<bool, Failure> {
+        Ok(true)
+    }
+    fn healthy(&mut self) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+        Ok(true)
+    }
+    fn cleanup(&mut self) -> bool {
+        true
+    }
+}
+impl Factory for RecoveryEngine {
+    type Attempt = RecoveryAttempt;
+    fn create(
+        &self,
+        _: Profile,
+        _: u32,
+        _: u64,
+        _: Credentials,
+        _: Arc<AtomicBool>,
+    ) -> Self::Attempt {
+        RecoveryAttempt
+    }
+    fn idle(&self) -> bool {
+        true
+    }
+    fn cleanup_blocked(&self, profile: &Profile) -> bool {
+        self.0.blocked(profile)
+    }
+    fn verify_cleanup(&self, profile: &Profile) -> bool {
+        self.0.verify(profile)
+    }
+}
+struct EngineGuard(Option<JoinHandle<Result<(), ErrorCode>>>);
+impl Drop for EngineGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            let _ = worker.join();
+        }
+    }
+}
+struct FixtureSecrets;
+impl crate::secrets::SecretStore for FixtureSecrets {
+    fn contains(&self, _: &str, _: VpnKind) -> Result<bool, crate::secrets::SecretError> {
+        Ok(true)
+    }
+    fn load(&self, _: &str, _: VpnKind) -> Result<Credentials, crate::secrets::SecretError> {
+        Ok(Credentials {
+            password: "fictional".into(),
+            psk: "".into(),
+        })
+    }
+    fn save(
+        &self,
+        _: &str,
+        _: VpnKind,
+        _: &Credentials,
+    ) -> Result<(), crate::secrets::SecretError> {
+        Ok(())
+    }
+    fn remove(&self, _: &str, _: VpnKind) -> Result<(), crate::secrets::SecretError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn broker_and_engine_negotiate_cleanup_and_legacy_snapshots_stay_off() {
+    use crate::{bridge::Command as UiCommand, broker::Broker, helper::client::Client};
+    let recovery =
+        Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
+    let (input, requests) = mpsc::sync_channel(32);
+    let (output, replies) = mpsc::sync_channel(64);
+    let state = recovery.clone();
+    let guard = EngineGuard(Some(thread::spawn(move || {
+        run(
+            RecoveryEngine(state),
+            unsafe { libc::geteuid() },
+            vec![profile("one")],
+            requests,
+            output,
+            Timing::default(),
+        )
+    })));
+    let client = Client::fixture_channels(input, replies);
+    let mut broker = Broker::fixture(client, FixtureSecrets);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = broker.snapshot();
+        if snapshot
+            .vpns
+            .iter()
+            .any(|v| v.profile.id == "one" && v.state == ConnectionState::CleanupUnconfirmed)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "new broker never received negotiated cleanup state"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    recovery.remove_observed_route();
+    broker
+        .dispatch(
+            UiCommand::Probe { id: "one".into() },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    loop {
+        let snapshot = broker.snapshot();
+        if snapshot
+            .vpns
+            .iter()
+            .any(|v| v.profile.id == "one" && v.state == ConnectionState::Off)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "VerifyCleanup did not release the profile"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(recovery.verifies(), 1);
+    assert!(!recovery.fence_exists());
+    drop(broker);
+    drop(guard);
+
+    let recovery =
+        Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
+    let (input, requests) = mpsc::sync_channel(32);
+    let (output, replies) = mpsc::sync_channel(64);
+    let state = recovery.clone();
+    let guard = EngineGuard(Some(thread::spawn(move || {
+        run(
+            RecoveryEngine(state),
+            unsafe { libc::geteuid() },
+            vec![profile("one")],
+            requests,
+            output,
+            Timing::default(),
+        )
+    })));
+    for id in [
+        crate::helper::protocol::WAIT_CAPABILITY_SNAPSHOT_ID,
+        "legacy-query",
+    ] {
+        input
+            .send(Request {
+                id: id.into(),
+                command: Command::Snapshot {},
+            })
+            .unwrap();
+        let message = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Message::Snapshot { connections, .. } = message else {
+            panic!("legacy snapshot expected")
+        };
+        assert!(
+            connections
+                .iter()
+                .all(|status| status.state == ConnectionState::Off)
+        );
+    }
+    assert_eq!(recovery.verifies(), 0);
+    assert!(recovery.fence_exists());
+    drop(input);
+    drop(replies);
+    drop(guard);
+}
+
 #[derive(Default)]
 struct Control {
     started: bool,
@@ -30,6 +208,7 @@ struct Control {
     invalid: bool,
     cleanup_allowed: bool,
     cleanup_calls: usize,
+    abandon_result: Option<Result<(), AbandonError>>,
     stopped: bool,
     finished: bool,
     index: u16,
@@ -250,6 +429,74 @@ impl Attempt for FixtureAttempt {
         c.finished = c.cleanup_allowed && !resources;
         c.finished
     }
+    fn abandon(&mut self, _: Reason) -> Result<(), AbandonError> {
+        let result = self.kernel.lock().unwrap().attempts[&self.key()]
+            .abandon_result
+            .unwrap_or(Err(AbandonError::Unsupported));
+        // This fixture has no durable inventory writer. A configured success is
+        // valid only when it holds no child or route lease.
+        if result.is_ok() && (self.child.is_some() || self.lease.is_some()) {
+            return Err(AbandonError::Unsupported);
+        }
+        result
+    }
+}
+
+#[test]
+fn fixture_abandon_is_configurable_but_retains_live_leases() {
+    let kernel = Arc::new(Mutex::new(Kernel::default()));
+    let routes = Arc::new(Mutex::new(Coordinator::new(Table(kernel.clone())).unwrap()));
+    let fixture = Fixture {
+        uid: 501,
+        kernel: kernel.clone(),
+        routes,
+    };
+    let mut attempt = fixture.create(
+        profile("abandon"),
+        501,
+        1,
+        Credentials {
+            password: Secret::from("fixture-password"),
+            psk: Secret::from(""),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        attempt.abandon(Reason::ObservationFailed),
+        Err(AbandonError::Unsupported)
+    );
+    kernel
+        .lock()
+        .unwrap()
+        .attempts
+        .get_mut(&attempt.key())
+        .unwrap()
+        .abandon_result = Some(Err(AbandonError::Persist));
+    assert_eq!(
+        attempt.abandon(Reason::ObservationFailed),
+        Err(AbandonError::Persist)
+    );
+    kernel
+        .lock()
+        .unwrap()
+        .attempts
+        .get_mut(&attempt.key())
+        .unwrap()
+        .abandon_result = Some(Ok(()));
+    assert_eq!(attempt.abandon(Reason::ObservationFailed), Ok(()));
+    kernel
+        .lock()
+        .unwrap()
+        .attempts
+        .get_mut(&attempt.key())
+        .unwrap()
+        .ready = true;
+    assert!(matches!(attempt.ready(), Ok(true)));
+    assert_eq!(
+        attempt.abandon(Reason::ObservationFailed),
+        Err(AbandonError::Unsupported)
+    );
+    assert!(attempt.routes.lock().unwrap().has_owner(&attempt.owner));
 }
 
 struct Harness {
@@ -259,6 +506,35 @@ struct Harness {
     worker: Option<JoinHandle<Result<(), ErrorCode>>>,
     seen: Vec<Message>,
     next_request: usize,
+}
+
+#[test]
+fn cleanup_verification_rejects_only_the_live_profile() {
+    let mut harness = Harness::new(vec![profile("one"), profile("two")], 64);
+    harness
+        .input
+        .as_ref()
+        .unwrap()
+        .send(Request {
+            id: crate::helper::protocol::CLEANUP_PROBE_SNAPSHOT_ID.into(),
+            command: Command::Snapshot {},
+        })
+        .unwrap();
+    harness.wait(|h| h.seen.iter().any(|message| matches!(message, Message::Snapshot { id, .. } if id == crate::helper::protocol::CLEANUP_ACK_SNAPSHOT_ID)));
+    harness.connect("one", 1);
+    harness.started("one", 1);
+    let busy = harness.command(Command::VerifyCleanup {
+        profile: "one".into(),
+    });
+    harness.wait(|h| h.seen.iter().any(|message| matches!(message, Message::Failed { id, error: ErrorCode::ProfileBusy } if *id == busy)));
+    let idle = harness.command(Command::VerifyCleanup {
+        profile: "two".into(),
+    });
+    harness.wait(|h| {
+        h.seen
+            .iter()
+            .any(|message| matches!(message, Message::Snapshot { id, .. } if *id == idle))
+    });
 }
 impl Harness {
     fn new(profiles: Vec<Profile>, capacity: usize) -> Self {
@@ -869,3 +1145,476 @@ fn inherited_helper_channel_drives_controller_and_retains_cleanup_after_socket_e
 
 #[path = "engine/capabilities_tests.rs"]
 mod capabilities_tests;
+
+#[cfg(target_os = "macos")]
+#[test]
+fn idle_helper_process_fixture() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+    let Some(root) = std::env::var_os("VPNT_IDLE_HELPER_FIXTURE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let uid = unsafe { libc::geteuid() };
+    let _signals = crate::helper::ppp_supervisor::signals::Guard::install().unwrap();
+    let _lock = crate::helper::controller_lock::ControllerLock::fixture(&root, uid).unwrap();
+    // The parent gives this process exclusive ownership of the fixture channel on fd 0.
+    let server = UnixStream::from(unsafe { OwnedFd::from_raw_fd(0) });
+    let kernel = Arc::new(Mutex::new(Kernel::default()));
+    let routes = Arc::new(Mutex::new(Coordinator::new(Table(kernel.clone())).unwrap()));
+    let fixture = Fixture {
+        uid,
+        kernel,
+        routes,
+    };
+    let result = crate::helper::server::runtime_fixture(server, |actual, requests, output| {
+        run(
+            fixture,
+            actual,
+            vec![],
+            requests,
+            output,
+            Timing {
+                connect: Duration::from_secs(5),
+                probe: Duration::from_secs(1),
+                interval: Duration::from_secs(60),
+                health: Duration::from_millis(2),
+                poll: Duration::from_millis(2),
+            },
+        )
+    });
+    assert!(result.is_ok(), "idle server fixture failed: {result:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn idle_helper_releases_lock_after_eof_and_sigterm() {
+    use std::{
+        net::Shutdown,
+        os::{
+            fd::OwnedFd,
+            unix::{
+                fs::{OpenOptionsExt, PermissionsExt},
+                net::UnixStream,
+            },
+        },
+        process::{Child, Stdio},
+    };
+    fn identity(pid: u32) -> Option<Vec<u8>> {
+        let output = ProcessCommand::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart=,comm="])
+            .output()
+            .ok()?;
+        (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+    }
+    struct FixtureProcess {
+        child: Child,
+        client: UnixStream,
+        identity: Vec<u8>,
+        root: std::path::PathBuf,
+    }
+    impl FixtureProcess {
+        fn terminate(&self) {
+            if identity(self.child.id()).as_ref() == Some(&self.identity) {
+                // Only the child spawned by this fixture, after checking start time and command.
+                unsafe {
+                    libc::kill(self.child.id() as i32, libc::SIGTERM);
+                }
+            }
+        }
+        fn exited(&mut self, budget: Duration) -> bool {
+            let deadline = Instant::now() + budget;
+            loop {
+                if self.child.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    impl Drop for FixtureProcess {
+        fn drop(&mut self) {
+            let _ = self.client.shutdown(Shutdown::Write);
+            if !self.exited(Duration::from_millis(200)) {
+                self.terminate();
+            }
+            if self.exited(Duration::from_secs(3)) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+    for signal in [false, true] {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("output/fixtures")
+            .join(format!("idle-helper-{}-{signal}", std::process::id()));
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(".controller.lock"))
+            .unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "connection::controller::engine::tests::idle_helper_process_fixture",
+                "--nocapture",
+            ])
+            .env("VPNT_IDLE_HELPER_FIXTURE", &root)
+            .stdin(Stdio::from(OwnedFd::from(server)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        let recorded = identity(child.id()).expect("ps must capture this fixture child identity");
+        let mut fixture = FixtureProcess {
+            child,
+            client,
+            identity: recorded,
+            root,
+        };
+        crate::helper::protocol::write_request(
+            &mut fixture.client,
+            &Request {
+                id: "idle-test".into(),
+                command: Command::Snapshot {},
+            },
+        )
+        .unwrap();
+        let mut reader = BufReader::new(fixture.client.try_clone().unwrap());
+        assert!(matches!(
+            read_message(&mut reader),
+            Ok(Some(Message::Snapshot { .. }))
+        ));
+        let uid = unsafe { libc::geteuid() };
+        assert!(matches!(
+            crate::helper::controller_lock::ControllerLock::fixture(&fixture.root, uid),
+            Err(crate::helper::controller_lock::LockError::Busy)
+        ));
+        let start = Instant::now();
+        if signal {
+            fixture.terminate();
+        } else {
+            fixture.client.shutdown(Shutdown::Write).unwrap();
+        }
+        assert!(
+            fixture.exited(Duration::from_secs(2)),
+            "idle fixture must exit on {} within 2s",
+            if signal { "SIGTERM" } else { "EOF" }
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            crate::helper::controller_lock::ControllerLock::fixture(&fixture.root, uid).is_ok()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stuck_helper_process_fixture() {
+    use std::os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::net::UnixStream,
+    };
+    let Some(root) = std::env::var_os("VPNT_STUCK_HELPER_FIXTURE") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    struct StuckFactory {
+        root: std::path::PathBuf,
+        active: Arc<AtomicBool>,
+        persist_fails: bool,
+    }
+    struct StuckAttempt {
+        root: std::path::PathBuf,
+        active: Arc<AtomicBool>,
+        persist_fails: bool,
+    }
+    impl Attempt for StuckAttempt {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            std::fs::write(self.root.join("started"), b"1").unwrap();
+            Ok(())
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(false)
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            Ok(false)
+        }
+        fn cleanup(&mut self) -> bool {
+            crate::helper::runtime::cleanup::begin();
+            if !self.persist_fails {
+                crate::helper::runtime::cleanup::mark(Reason::RouteOwner);
+            }
+            std::fs::write(self.root.join("cleaning"), b"1").unwrap();
+            if self.root.join("allow-cleanup").exists() {
+                self.active.store(false, Ordering::Release);
+                true
+            } else {
+                false
+            }
+        }
+        fn abandon(&mut self, reason: Reason) -> Result<(), AbandonError> {
+            std::fs::write(self.root.join("abandoned"), format!("{reason:?}")).unwrap();
+            if self.persist_fails {
+                return Err(AbandonError::Persist);
+            }
+            self.active.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+    impl Factory for StuckFactory {
+        type Attempt = StuckAttempt;
+        fn create(
+            &self,
+            _: Profile,
+            _: u32,
+            _: u64,
+            _: Credentials,
+            _: Arc<AtomicBool>,
+        ) -> Self::Attempt {
+            self.active.store(true, Ordering::Release);
+            StuckAttempt {
+                root: self.root.clone(),
+                active: self.active.clone(),
+                persist_fails: self.persist_fails,
+            }
+        }
+        fn idle(&self) -> bool {
+            !self.active.load(Ordering::Acquire)
+        }
+    }
+    let uid = unsafe { libc::geteuid() };
+    let _signals = crate::helper::ppp_supervisor::signals::Guard::install().unwrap();
+    let _lock = crate::helper::controller_lock::ControllerLock::fixture(&root, uid).unwrap();
+    let server = UnixStream::from(unsafe { OwnedFd::from_raw_fd(0) });
+    let fixture = StuckFactory {
+        root: root.clone(),
+        active: Arc::new(AtomicBool::new(false)),
+        persist_fails: std::env::var_os("VPNT_STUCK_PERSIST").is_some(),
+    };
+    let result = crate::helper::server::runtime_fixture(server, |actual, requests, output| {
+        run_with_exit(
+            fixture,
+            actual,
+            vec![profile("one")],
+            requests,
+            output,
+            Timing {
+                connect: Duration::from_secs(5),
+                probe: Duration::from_secs(1),
+                interval: Duration::from_secs(60),
+                health: Duration::from_millis(2),
+                poll: Duration::from_millis(2),
+            },
+            Arc::new(ExitRequested::new(Duration::from_millis(300))),
+        )
+    });
+    assert!(result.is_ok(), "stuck helper fixture failed: {result:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
+    use std::{
+        net::Shutdown,
+        os::{
+            fd::OwnedFd,
+            unix::{
+                fs::{OpenOptionsExt, PermissionsExt},
+                net::UnixStream,
+            },
+        },
+        process::{Child, Stdio},
+    };
+    fn identity(pid: u32) -> Option<Vec<u8>> {
+        let output = ProcessCommand::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart=,comm="])
+            .output()
+            .ok()?;
+        (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+    }
+    struct ProcessFixture {
+        child: Child,
+        identity: Vec<u8>,
+        client: UnixStream,
+        root: std::path::PathBuf,
+    }
+    impl ProcessFixture {
+        fn signal(&self) {
+            if identity(self.child.id()).as_ref() == Some(&self.identity) {
+                unsafe {
+                    libc::kill(self.child.id() as i32, libc::SIGTERM);
+                }
+            } else {
+                panic!("fixture child identity changed before SIGTERM");
+            }
+        }
+        fn exited(&mut self, timeout: Duration) -> bool {
+            let until = Instant::now() + timeout;
+            loop {
+                if self.child.try_wait().unwrap().is_some() {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn wait_marker(&self, name: &str, timeout: Duration) {
+            let until = Instant::now() + timeout;
+            while !self.root.join(name).exists() {
+                assert!(Instant::now() < until, "fixture marker {name} timed out");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn lock_busy(&self) -> bool {
+            let uid = unsafe { libc::geteuid() };
+            matches!(
+                crate::helper::controller_lock::ControllerLock::fixture(&self.root, uid),
+                Err(crate::helper::controller_lock::LockError::Busy)
+            )
+        }
+    }
+    impl Drop for ProcessFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.root.join("allow-cleanup"), b"1");
+            let _ = self.client.shutdown(Shutdown::Write);
+            if !self.exited(Duration::from_secs(3))
+                && identity(self.child.id()).as_ref() == Some(&self.identity)
+            {
+                unsafe {
+                    libc::kill(self.child.id() as i32, libc::SIGTERM);
+                }
+            }
+            if self.exited(Duration::from_secs(3)) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+    for (signal, persist_fails) in [(false, false), (true, false), (false, true)] {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("output/fixtures")
+            .join(format!(
+                "stuck-helper-{}-{signal}-{persist_fails}",
+                std::process::id()
+            ));
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(".controller.lock"))
+            .unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "connection::controller::engine::tests::stuck_helper_process_fixture",
+                "--nocapture",
+            ])
+            .env("VPNT_STUCK_HELPER_FIXTURE", &root)
+            .stdin(Stdio::from(OwnedFd::from(server)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if persist_fails {
+            command.env("VPNT_STUCK_PERSIST", "1");
+        }
+        let child = command.spawn().unwrap();
+        let recorded = identity(child.id()).expect("ps must capture the fixture child identity");
+        let mut f = ProcessFixture {
+            child,
+            identity: recorded,
+            client,
+            root,
+        };
+        crate::helper::protocol::write_request(
+            &mut f.client,
+            &Request {
+                id: "connect".into(),
+                command: Command::Connect {
+                    id: "one".into(),
+                    generation: 1,
+                    interval: ProbeInterval::TEN,
+                    credentials: Credentials {
+                        password: Secret::from("fixture-password"),
+                        psk: Secret::from(""),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        f.wait_marker("started", Duration::from_secs(3));
+        crate::helper::protocol::write_request(
+            &mut f.client,
+            &Request {
+                id: "disconnect".into(),
+                command: Command::Disconnect {
+                    id: "one".into(),
+                    generation: 2,
+                },
+            },
+        )
+        .unwrap();
+        f.wait_marker("cleaning", Duration::from_secs(3));
+        assert!(f.lock_busy());
+        thread::sleep(Duration::from_millis(450));
+        assert!(
+            !f.root.join("abandoned").exists(),
+            "cleanup without an exit request must not abandon"
+        );
+        let start = Instant::now();
+        if signal {
+            f.signal();
+        } else {
+            f.client.shutdown(Shutdown::Write).unwrap();
+        }
+        f.wait_marker("abandoned", Duration::from_secs(3));
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("abandoned")).unwrap(),
+            if persist_fails {
+                "UncertainCleanup"
+            } else {
+                "RouteOwner"
+            }
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "abandoned before budget"
+        );
+        if persist_fails {
+            assert!(
+                !f.exited(Duration::from_millis(150)),
+                "write failure released the helper"
+            );
+            assert!(f.lock_busy(), "write failure released the lock");
+            std::fs::write(f.root.join("allow-cleanup"), b"1").unwrap();
+        }
+        assert!(
+            f.exited(Duration::from_secs(3)),
+            "helper did not exit after {}",
+            if signal { "SIGTERM" } else { "EOF" }
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let uid = unsafe { libc::geteuid() };
+        assert!(crate::helper::controller_lock::ControllerLock::fixture(&f.root, uid).is_ok());
+    }
+}

@@ -57,6 +57,23 @@ impl Client {
         Ok(client)
     }
     #[cfg(test)]
+    pub(crate) fn fixture_channels(
+        requests: SyncSender<Request>,
+        output: Receiver<Message>,
+    ) -> Self {
+        Self {
+            requests: Some(requests),
+            output,
+            stop: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(State {
+                fault: Mutex::new(None),
+                finished: AtomicBool::new(false),
+            }),
+            failed: false,
+            fixture_build: None,
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn fixture_build(&self) -> Option<&str> {
         self.fixture_build.as_deref()
     }

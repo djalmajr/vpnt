@@ -9,10 +9,18 @@ mod profiles;
 mod worker;
 use crate::{
     helper::protocol::ErrorCode,
+    helper::runtime::cleanup::Reason,
     model::{Profile, VpnKind},
     secrets::Credentials,
     session::ConnectionState,
 };
+
+#[allow(dead_code)] // The worker consumes this contract in the next slice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AbandonError {
+    Unsupported,
+    Persist,
+}
 #[cfg(target_os = "macos")]
 pub use native::run_ssl;
 use std::{
@@ -41,6 +49,11 @@ trait Attempt {
     /// Stop only owned children; return true only after observed cleanup.
     /// Repeated calls must retain all uncertain resources.
     fn cleanup(&mut self) -> bool;
+    /// Without a durable inventory, retain the existing cleanup lock.
+    #[allow(dead_code)] // The worker is intentionally unchanged in this slice.
+    fn abandon(&mut self, _reason: Reason) -> Result<(), AbandonError> {
+        Err(AbandonError::Unsupported)
+    }
 }
 trait Factory: Sync {
     type Attempt: Attempt;
@@ -51,6 +64,13 @@ trait Factory: Sync {
     /// factory advertises IPsec only with its verified context and real ledger.
     fn supports(&self, kind: VpnKind) -> bool {
         kind == VpnKind::Ssl
+    }
+    /// A rejected or unverified durable fence denies admission before secrets.
+    fn cleanup_blocked(&self, _profile: &Profile) -> bool {
+        false
+    }
+    fn verify_cleanup(&self, _profile: &Profile) -> bool {
+        false
     }
     fn create(
         &self,

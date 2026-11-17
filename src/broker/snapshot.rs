@@ -1,6 +1,28 @@
 use super::*;
 use crate::{helper::protocol::TunnelStatus, model::Profile};
 impl<S: SecretStore> Broker<S> {
+    pub(super) fn request_cleanup_snapshot(&mut self) {
+        if self.cleanup_probe.is_some() {
+            return;
+        }
+        if let Some(client) = &self.client {
+            let observed = self
+                .connections
+                .iter()
+                .map(|(id, c)| (id.clone(), c.generation))
+                .collect();
+            self.cleanup_probe = Some(observed);
+            if client
+                .send(Request {
+                    id: protocol::CLEANUP_PROBE_SNAPSHOT_ID.into(),
+                    command: protocol::Command::Snapshot {},
+                })
+                .is_err()
+            {
+                self.lost(false);
+            }
+        }
+    }
     pub(super) fn receive_snapshot(
         &mut self,
         id: String,
@@ -10,11 +32,22 @@ impl<S: SecretStore> Broker<S> {
         statuses: Vec<TunnelStatus>,
     ) -> Result<(), ()> {
         let initial = !self.ready;
+        let probe =
+            id == protocol::CLEANUP_PROBE_SNAPSHOT_ID || id == protocol::CLEANUP_ACK_SNAPSHOT_ID;
+        let verify = self
+            .cleanup_verify
+            .as_ref()
+            .is_some_and(|(request, _)| *request == id);
         let observed = if initial {
             if id != protocol::WAIT_CAPABILITY_SNAPSHOT_ID {
                 return Err(());
             }
             None
+        } else if probe {
+            self.cleanup_capable = id == protocol::CLEANUP_ACK_SNAPSHOT_ID;
+            Some(self.cleanup_probe.take().ok_or(())?)
+        } else if verify {
+            Some(self.cleanup_verify.take().ok_or(())?.1)
         } else {
             Some(self.admin_query(&id).ok_or(())?)
         };
@@ -38,7 +71,9 @@ impl<S: SecretStore> Broker<S> {
             let s = statuses.get(&p.id).ok_or(())?;
             if !initial
                 && !self.connections.contains_key(&p.id)
-                && (s.generation != 0 || s.state != State::Off)
+                && (s.generation != 0
+                    || (s.state != State::Off
+                        && !(self.cleanup_capable && s.state == State::CleanupUnconfirmed)))
             {
                 return Err(());
             }
@@ -132,7 +167,8 @@ impl<S: SecretStore> Broker<S> {
             if let Some(retry) = &mut self.retry {
                 retry.ready();
             }
-        } else {
+            self.request_cleanup_snapshot();
+        } else if !probe && !verify {
             self.confirm_admin_snapshot();
         }
         Ok(())

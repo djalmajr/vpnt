@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, str::FromStr};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,7 +13,8 @@ pub enum Error {
     TimedOut,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Network {
     address: IpAddr,
     prefix: u8,
@@ -63,7 +65,8 @@ impl FromStr for Network {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Address {
     pub ip: IpAddr,
     pub zone: u32,
@@ -88,18 +91,20 @@ impl Address {
             }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Key {
     pub network: Network,
     pub scope: u16,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NextHop {
     Interface,
     Gateway(Address),
     Blackhole,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub key: Key,
     pub interface: u16,

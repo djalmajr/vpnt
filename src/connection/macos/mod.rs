@@ -1,4 +1,5 @@
 pub mod egress;
+pub(crate) mod fence_recovery;
 mod interfaces;
 pub(crate) mod ipsec_early_cleanup;
 pub mod ipsec_egress;

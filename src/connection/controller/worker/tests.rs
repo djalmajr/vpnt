@@ -69,6 +69,7 @@ fn signals(canceled: Arc<AtomicBool>) -> Signals {
         canceled,
         probe: Arc::new(AtomicBool::new(false)),
         state: Arc::new(Mutex::new(None)),
+        exit: Arc::new(ExitRequested::new(CLEANUP_BUDGET)),
     }
 }
 
@@ -533,6 +534,7 @@ impl StreakSignal {
             canceled: self.canceled.clone(),
             probe: self.probe.clone(),
             state: self.state.clone(),
+            exit: Arc::new(ExitRequested::new(CLEANUP_BUDGET)),
         }
     }
     /// Wait until probe `target` has actually run *and* the worker published a
@@ -722,4 +724,87 @@ fn cleanup_backoff_switches_caps_at_thirty_seconds_without_a_terminal_deadline()
         cleanup_delay(Duration::from_secs(5), Duration::from_secs(3600)),
         Duration::from_secs(5)
     );
+}
+
+#[test]
+fn exit_before_cleanup_uses_later_cleanup_start_for_budget() {
+    struct Delayed {
+        start: mpsc::Sender<()>,
+        first_cleanup: mpsc::Sender<Instant>,
+        abandon: mpsc::Sender<Instant>,
+        seen: bool,
+        release: Arc<AtomicBool>,
+    }
+    impl Attempt for Delayed {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            self.start.send(()).unwrap();
+            thread::sleep(Duration::from_millis(180));
+            Ok(())
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(false)
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            Ok(false)
+        }
+        fn cleanup(&mut self) -> bool {
+            if !self.seen {
+                self.first_cleanup.send(Instant::now()).unwrap();
+                self.seen = true;
+            }
+            self.release.load(Ordering::Acquire)
+        }
+        fn abandon(&mut self, _: Reason) -> Result<(), AbandonError> {
+            self.abandon.send(Instant::now()).unwrap();
+            Ok(())
+        }
+    }
+    struct Guard {
+        release: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<Finished>>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.release.store(true, Ordering::Release);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+    let (start_tx, start_rx) = mpsc::channel();
+    let (cleanup_tx, cleanup_rx) = mpsc::channel();
+    let (abandon_tx, abandon_rx) = mpsc::channel();
+    let release = Arc::new(AtomicBool::new(false));
+    let canceled = Arc::new(AtomicBool::new(false));
+    let exit = Arc::new(ExitRequested::new(Duration::from_millis(120)));
+    let signals = Signals {
+        canceled: canceled.clone(),
+        probe: Arc::new(AtomicBool::new(false)),
+        state: Arc::new(Mutex::new(None)),
+        exit: exit.clone(),
+    };
+    let attempt = Delayed {
+        start: start_tx,
+        first_cleanup: cleanup_tx,
+        abandon: abandon_tx,
+        seen: false,
+        release: release.clone(),
+    };
+    let mut guard = Guard {
+        release,
+        handle: Some(thread::spawn(move || {
+            super::run(attempt, signals, timing(Duration::from_secs(2)), clock(1))
+        })),
+    };
+    start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    exit.request();
+    canceled.store(true, Ordering::Release);
+    let cleanup_start = cleanup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let abandoned = abandon_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(abandoned.duration_since(cleanup_start) >= Duration::from_millis(120));
+    let finished = guard.handle.take().unwrap().join().unwrap();
+    assert_eq!(finished.state, ConnectionState::Off);
 }

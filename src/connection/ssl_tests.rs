@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
+pub(crate) struct Fixture {
     directory: PathBuf,
     state: PathBuf,
     runtime: Runtime,
@@ -26,7 +26,7 @@ impl Fixture {
             gateway: Ipv4Addr::LOCALHOST,
         }
     }
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let directory = root.join("output/fixtures").join(format!(
             "ssl-driver-{}-{}",
@@ -98,7 +98,7 @@ impl Fixture {
     fn profile(gateway: &str) -> Profile {
         serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","kind":"ssl","gateway":gateway,"username":"fixture-user","port":443,"networks":[],"certificate":"","probeHost":"127.0.0.1","probePort":8443,"probeMethod":"tcp"})).unwrap()
     }
-    fn start(&self, gateway: &str) -> SslDriver {
+    pub(crate) fn start(&self, gateway: &str) -> SslDriver {
         SslDriver::start_using(
             &self.runtime,
             &Self::profile(gateway),
