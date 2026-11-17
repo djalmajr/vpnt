@@ -157,4 +157,3 @@ não verificado. Por correção do Djalma em 2026-11-14, estados em andamento
 desligado e não fecham o cadeado.
 Somente o snapshot autoritativo do helper instalado pode fechar o cadeado;
 demonstração mantém o cadeado aberto. Preservar a proporção em 18 pt de altura.
-

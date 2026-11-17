@@ -65,4 +65,3 @@ Legibilidade e acesso às ações prevalecem sobre altura fixa. O painel mantém
 viewport fisicamente baixo, o menu rola e continua alcançável; nenhuma ação é
 cortada. Havendo espaço na tela, a altura do painel cresce para o menu (ver
 Layout), em vez de rolar.
-
