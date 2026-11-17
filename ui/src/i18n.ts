@@ -101,6 +101,8 @@ const en = {
     "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
+  networksHintSsl:
+    "Only these networks use the tunnel. Empty: the routes the gateway publishes.",
   probeHost: "Address",
   probeHostHint: "A destination machine, not the router.",
   method: "Method",
@@ -113,6 +115,7 @@ const en = {
   certificateHint: "Accepted server certificate fingerprint.",
   routes: "Routes",
   fullTunnel: "Full tunnel",
+  gatewayRoutes: "Gateway routes",
   secrets: "Secrets",
   psk: "Gateway key (PSK)",
   password: "User password",
@@ -311,6 +314,8 @@ const pt: Record<MessageKey, string> = {
     "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
+  networksHintSsl:
+    "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica.",
   probeHost: "Endereço",
   probeHostHint: "Uma máquina do destino, não o roteador.",
   method: "Método",
@@ -323,6 +328,7 @@ const pt: Record<MessageKey, string> = {
   certificateHint: "Impressão digital aceita do servidor.",
   routes: "Rotas",
   fullTunnel: "Túnel completo",
+  gatewayRoutes: "Rotas do gateway",
   secrets: "Segredos",
   psk: "Chave do gateway (PSK)",
   password: "Senha do usuário",

@@ -301,6 +301,39 @@ function componentSnapshot(
 }
 
 for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: tipo SSL permite editar e salvar as redes exibidas`, async () => {
+    await mount(locale);
+    await openProfile(locale, "home");
+    const typeLabel = [
+      ...document.querySelectorAll<HTMLLabelElement>("label.field"),
+    ].find(
+      (label) => label.querySelector("span")?.textContent === t(locale, "type"),
+    );
+    const type = typeLabel?.querySelector<HTMLSelectElement>("select");
+    if (!type) throw new Error("Type selector missing");
+    await act(async () => {
+      type.value = "ssl";
+      type.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const expectedHint =
+      locale === "pt-BR"
+        ? "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica."
+        : "Only these networks use the tunnel. Empty: the routes the gateway publishes.";
+    expect(document.querySelector("form.profile-form")?.textContent).toContain(
+      expectedHint,
+    );
+    await edit(locale, "networks", "10.0.0.0/8, 192.168.0.0/16");
+    await click(byText(t(locale, "save")));
+    const saved = actions().find((command) => command.type === "save_profile");
+    expect(saved?.type).toBe("save_profile");
+    if (saved?.type !== "save_profile")
+      throw new Error("Profile was not saved");
+    expect(saved.profile.kind).toBe("ssl");
+    expect(saved.profile.networks).toEqual(["10.0.0.0/8", "192.168.0.0/16"]);
+  });
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
   test(`${locale}: verificação continua ocupada após run resolver até o snapshot terminar`, async () => {
     let current: VpnView = { ...vpn, state: "cleanup_unconfirmed" };
     const sent: Command[] = [];

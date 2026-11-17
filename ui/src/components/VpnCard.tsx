@@ -133,7 +133,9 @@ export function VpnCard({
             <strong>{profile.name}</strong>
             <small>
               {t(profile.kind)} ·{" "}
-              {profile.networks.join(", ") || t("fullTunnel")}
+              {profile.networks.length
+                ? profile.networks.join(", ")
+                : t(profile.kind === "ssl" ? "gatewayRoutes" : "fullTunnel")}
             </small>
           </span>
           <span className="card-controls">

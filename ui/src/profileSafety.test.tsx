@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { T } from "./components/common";
+import { VpnCard } from "./components/VpnCard";
 import { translate } from "./i18n";
 import type { VpnView } from "./model";
 import { blankProfile } from "./profileDefaults";
@@ -39,6 +40,53 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         remove: () => {},
       }),
     );
+  test(`${locale}: o cartão distingue redes do gateway de túnel completo`, () => {
+    const label = locale === "pt-BR" ? "Rotas do gateway" : "Gateway routes";
+    const full = locale === "pt-BR" ? "Túnel completo" : "Full tunnel";
+    const card = (vpn: VpnView) =>
+      renderToStaticMarkup(
+        createElement(VpnCard, {
+          vpn,
+          t,
+          run: async () => true,
+          navigate: () => {},
+          secrets: () => {},
+        }),
+      );
+    const ssl = card(fixture("ssl"));
+    expect(ssl).toContain(label);
+    expect(ssl).not.toContain(full);
+    const ipsec = card(fixture("ipsec"));
+    expect(ipsec).toContain(full);
+    expect(ipsec).not.toContain(label);
+    for (const kind of ["ssl", "ipsec"] as const) {
+      const vpn = fixture(kind);
+      vpn.profile.networks = ["10.0.0.0/8", "192.168.0.0/16"];
+      const explicit = card(vpn);
+      expect(explicit).toContain("10.0.0.0/8, 192.168.0.0/16");
+      expect(explicit).not.toContain(label);
+      expect(explicit).not.toContain(full);
+    }
+  });
+  test(`${locale}: formulário mostra a dica de redes própria de cada tipo`, () => {
+    const gatewayHint =
+      locale === "pt-BR"
+        ? "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica."
+        : "Only these networks use the tunnel. Empty: the routes the gateway publishes.";
+    const fullHint =
+      locale === "pt-BR"
+        ? "Só estas redes passam pelo túnel. Vazio: túnel completo."
+        : "Only these networks use the tunnel. Empty: full tunnel.";
+    const ssl = render(fixture("ssl"));
+    expect(ssl).toContain(gatewayHint);
+    expect(ssl).not.toContain(fullHint);
+    expect(ssl).toContain('placeholder="10.20.0.0/24"');
+    expect(ssl).toContain(t("certificateHint"));
+    const ipsec = render(fixture("ipsec"));
+    expect(ipsec).toContain(fullHint);
+    expect(ipsec).not.toContain(gatewayHint);
+    expect(ipsec).toContain('placeholder="10.20.0.0/24"');
+  });
   test(`${locale}: um botão de segredos no IPsec e SSL, conforme status aplicável`, () => {
     for (const kind of ["ipsec", "ssl"] as const) {
       for (const hasPassword of [false, true]) {

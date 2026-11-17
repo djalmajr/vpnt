@@ -170,25 +170,24 @@ export function Profile({
             />
           </label>
           {input("username", "username")}
-          {value.kind === "ipsec" ? (
-            <>
-              <label className="field">
-                <span>{t("networks")}</span>
-                <input
-                  value={networks}
-                  disabled={saving}
-                  placeholder="10.20.0.0/24"
-                  onChange={(event) => setNetworks(event.target.value)}
-                />
-              </label>
-              <p className="hint">{t("networksHint")}</p>
-            </>
-          ) : (
+          {value.kind === "ssl" && (
             <>
               {input("certificate", "certificate")}
               <p className="hint">{t("certificateHint")}</p>
             </>
           )}
+          <label className="field">
+            <span>{t("networks")}</span>
+            <input
+              value={networks}
+              disabled={saving}
+              placeholder="10.20.0.0/24"
+              onChange={(event) => setNetworks(event.target.value)}
+            />
+          </label>
+          <p className="hint">
+            {t(value.kind === "ssl" ? "networksHintSsl" : "networksHint")}
+          </p>
         </Group>
         <h2 className="section-title">{t("tunnelTest")}</h2>
         <Group>
