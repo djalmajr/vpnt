@@ -340,6 +340,20 @@ impl Control {
     pub fn proof(&self) -> Option<Arc<Proof>> {
         self.proof.clone()
     }
+    /// Snapshot of already captured identities; never re-observe a PID here.
+    pub(crate) fn recorded(&self) -> (&ServiceId, Vec<(&Identity, &Path)>) {
+        let mut identities = Vec::new();
+        if let Some(client) = &self.client {
+            identities.push((&client.identity, client.program.as_path()));
+        }
+        if let Some(supervisor) = &self.supervisor {
+            identities.push((&supervisor.identity, supervisor.program.as_path()));
+        }
+        if let Some(proof) = &self.proof {
+            identities.push((&proof.child.identity, proof.child.program.as_path()));
+        }
+        (&self.service, identities)
+    }
     pub fn may_have_run(&self) -> bool {
         self.proof.is_some()
     }
@@ -360,5 +374,53 @@ impl Control {
 impl Drop for Control {
     fn drop(&mut self) {
         self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod recorded_tests {
+    use super::*;
+    #[test]
+    fn recorded_returns_only_previously_captured_identities() {
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let process = Process::read(std::process::id()).unwrap();
+        let mut control = Control::new(
+            server,
+            process.identity.pid,
+            Policy {
+                owner: process.uid,
+                client: process.executable.clone(),
+                supervisor: process.executable.clone(),
+                ppp: process.executable.clone(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let service = control.service.clone();
+        let (before_service, before) = control.recorded();
+        assert_eq!(before_service, &service);
+        assert!(before.is_empty());
+        let observed = || {
+            Arc::new(Observed {
+                identity: process.identity.clone(),
+                program: process.executable.clone(),
+                owner: process.uid,
+                parent: process.parent,
+                watch: Mutex::new(ExitWatch::attach(&process.identity).unwrap()),
+            })
+        };
+        control.client = Some(observed());
+        control.supervisor = Some(observed());
+        let (_, partial) = control.recorded();
+        assert_eq!(partial.len(), 2);
+        assert_eq!(partial[0].0, &process.identity);
+        assert_eq!(partial[1].0, &process.identity);
+        control.proof = Some(Arc::new(
+            Proof::fixture(&process, &process, service).unwrap(),
+        ));
+        let (_, complete) = control.recorded();
+        assert_eq!(complete.len(), 3);
+        assert_eq!(complete[2].0, &process.identity);
+        assert_eq!(complete[2].1, process.executable.as_path());
     }
 }

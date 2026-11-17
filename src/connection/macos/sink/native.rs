@@ -1,7 +1,10 @@
 use super::*;
-use std::{mem::size_of, os::fd::FromRawFd};
+use std::{cell::Cell, mem::size_of, os::fd::FromRawFd};
 
-pub(super) struct Native;
+#[derive(Default)]
+pub(super) struct Native {
+    control_id: Cell<Option<u32>>,
+}
 const CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
 const OPT_FLAGS: i32 = 1;
 const OPT_NAME: i32 = 2;
@@ -35,7 +38,7 @@ impl Api for Native {
     fn open(&self) -> io::Result<OwnedFd> {
         socket(libc::PF_SYSTEM, libc::SYSPROTO_CONTROL)
     }
-    fn connect(&self, fd: RawFd) -> io::Result<()> {
+    fn bind(&self, fd: RawFd) -> io::Result<()> {
         let mut info = libc::ctl_info {
             ctl_id: 0,
             ctl_name: [0; libc::MAX_KCTL_NAME],
@@ -51,6 +54,23 @@ impl Api for Native {
             return Err(io::ErrorKind::InvalidData.into());
         }
         let address = control(info.ctl_id);
+        // SAFETY: address has the declared native sockaddr_ctl layout/length.
+        if unsafe {
+            libc::bind(
+                fd,
+                (&address as *const libc::sockaddr_ctl).cast(),
+                size_of::<libc::sockaddr_ctl>() as _,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.control_id.set(Some(info.ctl_id));
+        Ok(())
+    }
+    fn connect(&self, fd: RawFd) -> io::Result<()> {
+        let id = self.control_id.get().ok_or(io::ErrorKind::NotConnected)?;
+        let address = control(id);
         // SAFETY: address has the declared native sockaddr_ctl layout/length.
         if unsafe {
             libc::connect(

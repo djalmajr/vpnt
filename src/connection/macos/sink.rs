@@ -52,7 +52,7 @@ impl<'a> OwnedSink<'a> {
             error,
             retired: None,
         })?;
-        let socket = create_using(ipv4, &native::Native, || {
+        let socket = create_using(ipv4, &native::Native::default(), || {
             controller.validate().map_err(|_| Error::Unavailable)
         })?;
         Ok(Self { socket, controller })
@@ -71,7 +71,7 @@ impl<'a> OwnedSink<'a> {
     }
     pub fn validate(&self) -> Result<(), Error> {
         self.controller.validate().map_err(|_| Error::Unavailable)?;
-        self.socket.validate(&native::Native)
+        self.socket.validate(&native::Native::default())
     }
     pub fn identity(&self) -> RetiredSink {
         self.socket.identity.clone()
@@ -91,6 +91,7 @@ fn require_root() -> Result<(), Error> {
 }
 trait Api {
     fn open(&self) -> io::Result<OwnedFd>;
+    fn bind(&self, fd: RawFd) -> io::Result<()>;
     fn connect(&self, fd: RawFd) -> io::Result<()>;
     fn name(&self, fd: RawFd) -> io::Result<String>;
     fn set_flags(&self, fd: RawFd, flags: u32) -> io::Result<()>;
@@ -149,6 +150,12 @@ fn create_using(
         if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(Error::Unavailable);
         }
+        api.bind(fd.as_raw_fd()).map_err(|_| Error::Unavailable)?;
+        api.set_flags(fd.as_raw_fd(), DROP_BOTH)
+            .map_err(|_| Error::Unavailable)?;
+        if api.flags(fd.as_raw_fd()).map_err(|_| Error::Unavailable)? != DROP_BOTH {
+            return Err(Error::Changed);
+        }
         api.connect(fd.as_raw_fd())
             .map_err(|_| Error::Unavailable)?;
         let name = api.name(fd.as_raw_fd()).map_err(|_| Error::Unavailable)?;
@@ -177,11 +184,6 @@ fn create_using(
             index,
             source: None,
         });
-        api.set_flags(fd.as_raw_fd(), DROP_BOTH)
-            .map_err(|_| Error::Unavailable)?;
-        if api.flags(fd.as_raw_fd()).map_err(|_| Error::Unavailable)? != DROP_BOTH {
-            return Err(Error::Changed);
-        }
         let table = api.table()?;
         let source = (0..32)
             .find_map(|_| {

@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
-struct Fixture {
+pub(crate) struct Fixture {
     directory: PathBuf,
     state: PathBuf,
     runtime: Runtime,
@@ -26,7 +26,7 @@ impl Fixture {
             gateway: Ipv4Addr::LOCALHOST,
         }
     }
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let directory = root.join("output/fixtures").join(format!(
             "ssl-driver-{}-{}",
@@ -81,7 +81,7 @@ impl Fixture {
         }
         let manifest = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
             "strongswan":{"version":"6.1.0","source":"fixture","sha256":"fixture","backend":"kernel-libipsec","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/charon-private-pid.patch"))),"strongswan-utun-framing.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-utun-framing.patch"))),"strongswan-libipsec-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-libipsec-no-routes.patch"))),"charon-parent-eof.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/charon-parent-eof.patch"))),"strongswan-retain-utun.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-retain-utun.patch"))),"strongswan-protected-udp.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-protected-udp.patch")))}},
-            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-no-routes.patch"))),"openfortivpn-bound-transport.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-bound-transport.patch"))),"openfortivpn-ppp-supervisor.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-ppp-supervisor.patch")))}},"files":files});
+            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-no-routes.patch"))),"openfortivpn-bound-transport.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-bound-transport.patch"))),"openfortivpn-ppp-supervisor.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-ppp-supervisor.patch"))),"openfortivpn-split-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-split-routes.patch"))),"openfortivpn-split-dns.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-split-dns.patch")))}},"files":files});
         fs::write(
             directory.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
@@ -95,10 +95,14 @@ impl Fixture {
             runtime,
         }
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn diagnostic_log(&self) -> std::path::PathBuf {
+        paths::openfortivpn_log(&self.state)
+    }
     fn profile(gateway: &str) -> Profile {
         serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","kind":"ssl","gateway":gateway,"username":"fixture-user","port":443,"networks":[],"certificate":"","probeHost":"127.0.0.1","probePort":8443,"probeMethod":"tcp"})).unwrap()
     }
-    fn start(&self, gateway: &str) -> SslDriver {
+    pub(crate) fn start(&self, gateway: &str) -> SslDriver {
         SslDriver::start_using(
             &self.runtime,
             &Self::profile(gateway),

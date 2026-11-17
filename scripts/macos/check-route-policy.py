@@ -56,6 +56,11 @@ def run(copy, label, arguments, expected):
         raise RuntimeError(f"{label}: timed out") from None
     (REPORTS / f"{label}.log").write_text(output)
     if process.returncode != expected or (expected == 101 and "test result: FAILED" not in output):
+        # CI keeps only stdout: name the failing tests instead of a bare exit.
+        failures = [line for line in output.splitlines()
+                    if line.startswith("---- ") or " panicked at " in line
+                    or (line.startswith("test ") and line.endswith(" FAILED"))]
+        print("\n".join(failures[-40:]), flush=True)
         raise RuntimeError(f"{label}: expected a test exit {expected}, got {process.returncode}")
     if expected == 0 and "test result: ok." not in output:
         raise RuntimeError(f"{label}: no executed test result")

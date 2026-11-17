@@ -13,6 +13,7 @@ use crate::helper::{
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
+    net::Ipv4Addr,
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -40,6 +41,13 @@ const PREVIOUS_NAME: &str = "openfortivpn.previous.log";
 pub(super) struct Observation {
     pub candidate: Option<InterfaceName>,
     pub failure: Option<SslFailure>,
+    pub split: Vec<(Ipv4Addr, u8)>,
+    pub split_count: Option<usize>,
+    pub split_invalid: bool,
+    pub dns_servers: Vec<Ipv4Addr>,
+    pub dns_domains: Vec<String>,
+    pub dns_count: Option<(usize, usize)>,
+    pub dns_invalid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +62,31 @@ pub(super) struct Output {
 }
 
 impl Output {
+    pub fn note_no_dns_servers(&self) {
+        if let Some(log) = &self.log {
+            log.push_line(
+                "vpnt: domínios internos configurados, mas o gateway não publicou servidores DNS"
+                    .as_bytes(),
+                false,
+            );
+        }
+    }
+    pub fn note_no_dns_domain(&self) {
+        if let Some(log) = &self.log {
+            log.push_line(
+                "vpnt: o gateway não publicou domínio; DNS não configurado".as_bytes(),
+                false,
+            );
+        }
+    }
+    pub fn note_invalid_split(&self) {
+        if let Some(log) = &self.log {
+            log.push_line(
+                "vpnt: o gateway não publicou rotas válidas".as_bytes(),
+                false,
+            );
+        }
+    }
     /// Enable per-attempt diagnostic logging. Never fails: any failure leaves
     /// logging disabled and the connection proceeds without it.
     pub fn open_log(&mut self, state: &Path, owner: u32) {
@@ -525,6 +558,105 @@ fn drain(
 }
 
 fn parse(line: &[u8], observed: &mut Observation) {
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: dns-server ") {
+        let server = std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok());
+        if observed.dns_count.is_some()
+            || observed.dns_servers.len() >= 2
+            || server.is_none_or(|ip| {
+                ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+                    || ip.is_link_local()
+                    || ip.octets()[0] == 0
+            })
+        {
+            observed.dns_invalid = true;
+        } else {
+            observed.dns_servers.push(server.unwrap());
+        }
+        return;
+    }
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: dns-domain ") {
+        let domain = std::str::from_utf8(value).ok().filter(|value| {
+            !value.is_empty()
+                && value.len() <= 253
+                && value.is_ascii()
+                && value.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                })
+        });
+        match domain {
+            Some(domain) if observed.dns_count.is_none() && observed.dns_domains.len() < 8 => {
+                observed.dns_domains.push(domain.to_ascii_lowercase());
+            }
+            _ => observed.dns_invalid = true,
+        }
+        return;
+    }
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: dns ") {
+        let count = std::str::from_utf8(value).ok().and_then(|s| {
+            let (servers, domains) = s.split_once(' ')?;
+            let a = servers.parse::<usize>().ok()?;
+            let b = domains.parse::<usize>().ok()?;
+            (servers == a.to_string() && domains == b.to_string() && a <= 2 && b <= 8)
+                .then_some((a, b))
+        });
+        if observed.dns_count.is_some()
+            || count.is_none()
+            || count != Some((observed.dns_servers.len(), observed.dns_domains.len()))
+        {
+            observed.dns_invalid = true;
+        } else {
+            observed.dns_count = count;
+        }
+        return;
+    }
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: split-route ") {
+        if observed.split_count.is_some() || observed.split.len() >= 64 {
+            observed.split_invalid = true;
+            return;
+        }
+        let parsed = std::str::from_utf8(value).ok().and_then(|text| {
+            let (addr, mask) = text.split_once('/')?;
+            let addr = addr.parse::<Ipv4Addr>().ok()?;
+            let mask = mask.parse::<Ipv4Addr>().ok()?;
+            let bits = u32::from(mask);
+            let prefix = bits.leading_ones() as u8;
+            if bits != u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+                || u32::from(addr) & bits != u32::from(addr)
+            {
+                return None;
+            }
+            Some((addr, prefix))
+        });
+        if let Some(route) = parsed {
+            observed.split.push(route);
+        } else {
+            observed.split_invalid = true;
+        }
+        return;
+    }
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: split-routes ") {
+        let count = std::str::from_utf8(value).ok().and_then(|s| {
+            let n = s.parse::<usize>().ok()?;
+            (s == n.to_string() && n <= 64).then_some(n)
+        });
+        if observed.split_count.is_some() || count.is_none() {
+            observed.split_invalid = true;
+        } else {
+            observed.split_count = count;
+        }
+        return;
+    }
     if line==b"ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc." {
         observed.failure=Some(SslFailure::CredentialsRejected);
     } else if (line==b"ERROR:  connect: Connection timed out" || line==b"ERROR:  connect: Operation timed out") && observed.failure.is_none() {
@@ -551,6 +683,83 @@ mod tests {
         sync::atomic::AtomicU64,
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn dns_output_requires_strict_values_and_complete_counts() {
+        let mut seen = Observation::default();
+        for line in [
+            "INFO:   vpnt: dns-server 172.16.0.4",
+            "INFO:   vpnt: dns-server 172.16.0.3",
+            "INFO:   vpnt: dns-domain Corp.Example",
+            "INFO:   vpnt: dns 2 1",
+        ] {
+            parse(line.as_bytes(), &mut seen);
+        }
+        assert!(!seen.dns_invalid);
+        assert_eq!(seen.dns_domains, ["corp.example"]);
+        assert_eq!(seen.dns_count, Some((2, 1)));
+        for line in [
+            "INFO:   vpnt: dns-domain bad_name",
+            "INFO:   vpnt: dns-domain -bad.example",
+            "INFO:   vpnt: dns-server 127.0.0.1",
+            "INFO:   vpnt: dns-server 224.0.0.1",
+            "INFO:   vpnt: dns-server 0.0.0.0",
+            "INFO:   vpnt: dns invalid",
+            "INFO:   vpnt: dns 2 1",
+        ] {
+            let mut seen = Observation::default();
+            parse(line.as_bytes(), &mut seen);
+            assert!(seen.dns_invalid, "{line}");
+        }
+    }
+
+    #[test]
+    fn split_output_is_bounded_and_strict() {
+        let mut observation = Observation::default();
+        for line in [
+            "INFO:   Connected to gateway.",
+            "INFO:   Authenticated.",
+            "INFO:   Remote gateway has allocated a VPN.",
+            "INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
+            "INFO:   vpnt: split-route 172.16.0.0/255.255.0.0",
+            "INFO:   vpnt: split-route 192.168.1.0/255.255.255.0",
+            "INFO:   vpnt: split-routes 3",
+            "INFO:   Interface ppp0 is UP.",
+            "INFO:   Tunnel is up and running.",
+        ] {
+            parse(line.as_bytes(), &mut observation);
+        }
+        assert_eq!(observation.split_count, Some(3));
+        assert_eq!(observation.candidate.as_ref().unwrap().as_str(), "ppp0");
+        assert_eq!(
+            observation.split,
+            vec![
+                ("10.0.0.0".parse().unwrap(), 8),
+                ("172.16.0.0".parse().unwrap(), 16),
+                ("192.168.1.0".parse().unwrap(), 24)
+            ]
+        );
+        assert!(!observation.split_invalid);
+
+        for line in [
+            "INFO:   vpnt: split-route 10.0.0.0/255.0.255.0",
+            "INFO:   vpnt: split-route 10.1.0.1/255.255.0.0",
+            "INFO:   vpnt: split-routes invalid",
+        ] {
+            let mut observation = Observation::default();
+            parse(line.as_bytes(), &mut observation);
+            assert!(observation.split_invalid, "{line}");
+        }
+        let mut observation = Observation::default();
+        for _ in 0..65 {
+            parse(
+                b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
+                &mut observation,
+            );
+        }
+        assert!(observation.split_invalid);
+        assert_eq!(observation.split.len(), 64);
+    }
     struct State {
         directory: std::path::PathBuf,
     }

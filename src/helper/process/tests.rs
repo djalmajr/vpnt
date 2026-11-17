@@ -11,6 +11,24 @@ use std::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn killed_child_poll_timeout_keeps_exit_unconfirmed() {
+    use std::os::unix::process::ExitStatusExt;
+    let start = Instant::now();
+    let result = poll_after_kill(
+        || Ok((start.elapsed() >= Duration::from_millis(200)).then(|| ExitStatus::from_raw(0))),
+        Duration::from_millis(30),
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(start.elapsed() < Duration::from_millis(180));
+    let status = poll_after_kill(
+        || Ok(Some(ExitStatus::from_raw(0))),
+        Duration::from_millis(30),
+    )
+    .unwrap();
+    assert!(status.success());
+}
+
 /// Own ordinary child and private directory; removed by `Drop` on every path.
 struct Fixture {
     directory: PathBuf,

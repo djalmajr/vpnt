@@ -16,6 +16,8 @@ pub const VERSION: u32 = 3;
 /// Backwards-compatible capability/version carried by the initial snapshot ID.
 /// A v3 helper treats it as an ordinary opaque request ID and echoes it.
 pub const WAIT_CAPABILITY_SNAPSHOT_ID: &str = "snapshot-wait-v1";
+pub const CLEANUP_PROBE_SNAPSHOT_ID: &str = "snapshot-cleanup-v1";
+pub const CLEANUP_ACK_SNAPSHOT_ID: &str = "snapshot-cleanup-ack-v1";
 pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
@@ -41,6 +43,9 @@ pub enum Command {
     Snapshot {},
     #[cfg(unix)]
     Diagnostics {},
+    VerifyCleanup {
+        profile: String,
+    },
     Connect {
         id: String,
         generation: u64,
@@ -171,6 +176,8 @@ pub fn parse_request(bytes: &[u8]) -> Result<Request, ProtocolError> {
         Command::Snapshot {} => {}
         #[cfg(unix)]
         Command::Diagnostics {} => {}
+        Command::VerifyCleanup { profile } if valid_profile_id(profile) => {}
+        Command::VerifyCleanup { .. } => return Err(ProtocolError::InvalidRequest),
         Command::SetProbeInterval { .. } => {}
         Command::Connect {
             id,

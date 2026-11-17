@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    sync::{Mutex, atomic::Ordering},
+    sync::{Condvar, Mutex, atomic::Ordering},
     thread,
     time::Instant,
 };
@@ -8,6 +8,38 @@ use std::{
 const CLEANUP_MAX_POLL: Duration = Duration::from_secs(1);
 const CLEANUP_SLOW_AFTER: Duration = Duration::from_secs(30);
 const CLEANUP_SLOW_MAX_POLL: Duration = Duration::from_secs(5);
+pub(super) const CLEANUP_BUDGET: Duration = Duration::from_secs(20);
+
+pub(super) struct ExitRequested {
+    at: Mutex<Option<Instant>>,
+    wake: Condvar,
+    budget: Duration,
+}
+impl ExitRequested {
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            at: Mutex::new(None),
+            wake: Condvar::new(),
+            budget,
+        }
+    }
+    pub fn request(&self) {
+        let mut at = self.at.lock().unwrap_or_else(|error| error.into_inner());
+        if at.is_none() {
+            *at = Some(Instant::now());
+            self.wake.notify_all();
+        }
+    }
+    fn at(&self) -> Option<Instant> {
+        *self.at.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    fn wait(&self, delay: Duration, seen: Option<Instant>) {
+        let at = self.at.lock().unwrap_or_else(|error| error.into_inner());
+        if *at == seen {
+            let _ = self.wake.wait_timeout(at, delay);
+        }
+    }
+}
 
 fn cleanup_delay(previous: Duration, elapsed: Duration) -> Duration {
     let cap = if elapsed >= CLEANUP_SLOW_AFTER {
@@ -35,6 +67,7 @@ pub(super) struct Signals {
     pub canceled: Arc<AtomicBool>,
     pub probe: Arc<AtomicBool>,
     pub state: Arc<Mutex<Option<Progress>>>,
+    pub exit: Arc<ExitRequested>,
 }
 fn timeout() -> Failure {
     Failure {
@@ -157,7 +190,26 @@ pub(super) fn run(
     let cleanup_started = Instant::now();
     let mut cleanup_poll = timing.poll.min(CLEANUP_MAX_POLL);
     while !attempt.cleanup() {
-        thread::sleep(cleanup_poll);
+        let requested = signals.exit.at();
+        if let Some(requested) = requested {
+            let deadline = cleanup_started.max(requested) + signals.exit.budget;
+            if Instant::now() >= deadline {
+                let reason = crate::helper::runtime::cleanup::current_reason()
+                    .unwrap_or(Reason::UncertainCleanup);
+                if attempt.abandon(reason).is_ok() {
+                    break;
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let delay = if remaining.is_zero() {
+                cleanup_poll
+            } else {
+                cleanup_poll.min(remaining)
+            };
+            signals.exit.wait(delay, requested.into());
+        } else {
+            signals.exit.wait(cleanup_poll, None);
+        }
         cleanup_poll = cleanup_delay(cleanup_poll, cleanup_started.elapsed());
     }
     if result.is_err() {

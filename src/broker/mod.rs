@@ -29,6 +29,11 @@ struct Pending {
     previous: (u64, State),
     accepted: bool,
 }
+struct CleanupVerify {
+    request: String,
+    profile: String,
+    observed: BTreeMap<String, u64>,
+}
 struct Connection {
     view: VpnView,
     generation: u64,
@@ -57,9 +62,16 @@ pub struct Broker<S: SecretStore> {
     locale: crate::localization::Locale,
     automatic: std::collections::VecDeque<automatic::Action>,
     sent_interval: Option<crate::preferences::ProbeInterval>,
+    cleanup_capable: bool,
+    cleanup_probe: Option<BTreeMap<String, u64>>,
+    cleanup_verify: Option<CleanupVerify>,
     preferences_host: Box<dyn crate::preferences::host::Host>,
 }
 impl<S: SecretStore> Broker<S> {
+    #[cfg(test)]
+    pub(crate) fn fixture(client: Client, secrets: S) -> Self {
+        Self::new(Some(client), secrets)
+    }
     pub fn runtime(secrets: S) -> Self {
         Self::reconnecting(retry::Retry::runtime(), secrets)
     }
@@ -109,6 +121,9 @@ impl<S: SecretStore> Broker<S> {
             locale: crate::localization::Locale::default(),
             automatic: automatic::queue(),
             sent_interval: None,
+            cleanup_capable: false,
+            cleanup_probe: None,
+            cleanup_verify: None,
             preferences_host: Box::new(crate::preferences::host::Coordinator::memory()),
         };
         result.begin();
@@ -160,6 +175,9 @@ impl<S: SecretStore> Broker<S> {
         self.dead = true;
         self.ready = false;
         self.sent_interval = None;
+        self.cleanup_capable = false;
+        self.cleanup_probe = None;
+        self.cleanup_verify = None;
         self.automatic.clear();
         self.diagnostics.pending = None;
         self.diagnostics.dirty = false;
@@ -288,7 +306,23 @@ impl<S: SecretStore> Broker<S> {
                     }
                 }
             }
-            Message::Failed { id, .. } => {
+            Message::Failed { id, error } => {
+                if self.cleanup_probe.is_some()
+                    && (id == protocol::CLEANUP_PROBE_SNAPSHOT_ID
+                        || id == protocol::CLEANUP_ACK_SNAPSHOT_ID)
+                {
+                    self.cleanup_probe = None;
+                    self.cleanup_capable = false;
+                    return Ok(());
+                }
+                if self
+                    .cleanup_verify
+                    .as_ref()
+                    .is_some_and(|pending| pending.request == id)
+                {
+                    self.cleanup_verify = None;
+                    return Ok(());
+                }
                 if self.diagnostics.pending.as_deref() == Some(id.as_str()) {
                     self.diagnostics.pending = None;
                     if std::mem::take(&mut self.diagnostics.dirty) {
@@ -299,14 +333,19 @@ impl<S: SecretStore> Broker<S> {
                 if self.fail_admin_query(&id) {
                     return Ok(());
                 }
+                let mut rejected = false;
                 for c in self.connections.values_mut() {
                     if c.pending.as_ref().is_some_and(|p| p.id == id) {
                         let pending = c.pending.take().unwrap();
                         if !pending.accepted {
                             c.generation = pending.previous.0;
                             set_state(c, pending.previous.1);
+                            rejected = true;
                         }
                     }
+                }
+                if rejected && error == protocol::ErrorCode::ProfileBusy && self.cleanup_capable {
+                    self.request_cleanup_snapshot();
                 }
             }
             Message::Diagnostics { id, status, logs } => {
@@ -329,13 +368,25 @@ impl<S: SecretStore> Broker<S> {
     }
     pub fn snapshot(&mut self) -> Snapshot {
         self.poll();
+        let verifying = self
+            .cleanup_verify
+            .as_ref()
+            .map(|pending| pending.profile.as_str());
         Snapshot {
             version: env!("CARGO_PKG_VERSION"),
             demo: false,
             helper: self.helper,
             component_operation: self.component.status(),
             preferences: self.preferences,
-            vpns: self.connections.values().map(|c| c.view.clone()).collect(),
+            vpns: self
+                .connections
+                .values()
+                .map(|c| {
+                    let mut view = c.view.clone();
+                    view.cleanup_verifying = verifying == Some(view.profile.id.as_str());
+                    view
+                })
+                .collect(),
         }
     }
 }

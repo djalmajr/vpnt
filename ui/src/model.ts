@@ -13,6 +13,7 @@ export const states = [
   "missing_program",
   "offline",
   "helper_missing",
+  "cleanup_unconfirmed",
 ] as const;
 export type ConnectionState = (typeof states)[number];
 export type Profile = {
@@ -22,6 +23,7 @@ export type Profile = {
   gateway: string;
   username: string;
   networks: string[];
+  dnsDomains?: string[];
   port: number;
   certificate: string;
   probeHost: string;
@@ -30,6 +32,7 @@ export type Profile = {
 };
 export type VpnView = {
   cleaning: boolean;
+  cleanupVerifying: boolean;
   profile: Profile;
   state: ConnectionState;
   hasPassword: boolean;

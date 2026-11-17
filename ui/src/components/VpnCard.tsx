@@ -1,6 +1,48 @@
+import { useRef, useState } from "react";
 import { active, type VpnView } from "../model";
 import type { Navigate, Run } from "../navigation";
 import { Icon, Notice, type T } from "./common";
+
+function VerifyCleanup({
+  id,
+  t,
+  run,
+  cleaning,
+  cleanupVerifying,
+}: {
+  id: string;
+  t: T;
+  run: Run;
+  cleaning: boolean;
+  cleanupVerifying: boolean;
+}) {
+  const [pending, setPending] = useState(false);
+  const inFlight = useRef(false);
+  const busy = pending || cleanupVerifying;
+  const verify = async () => {
+    if (cleaning || cleanupVerifying || inFlight.current) return;
+    inFlight.current = true;
+    setPending(true);
+    try {
+      await run({ type: "probe", id });
+    } finally {
+      inFlight.current = false;
+      setPending(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      className="primary"
+      disabled={cleaning || busy}
+      aria-busy={busy || undefined}
+      onClick={() => void verify()}
+    >
+      {busy && <Icon name="loader" />}
+      {t("checkAgain")}
+    </button>
+  );
+}
 
 export function VpnCard({
   vpn,
@@ -30,9 +72,13 @@ export function VpnCard({
   ].includes(state);
   const disabled =
     cleaning ||
-    ["offline", "helper_missing", "missing_program", "disconnecting"].includes(
-      state,
-    );
+    [
+      "offline",
+      "helper_missing",
+      "missing_program",
+      "disconnecting",
+      "cleanup_unconfirmed",
+    ].includes(state);
   const cancelable = state === "connecting" || state === "reconnecting";
   const missingSecret = state === "missing_secret";
   const on = active(state);
@@ -41,6 +87,7 @@ export function VpnCard({
     "dropped",
     "missing_secret",
     "missing_program",
+    "cleanup_unconfirmed",
   ].includes(state);
   const danger = ["credentials_rejected", "gateway_timeout"].includes(state);
   const color = danger
@@ -53,17 +100,19 @@ export function VpnCard({
           ? "primary-text"
           : "muted";
   const hint =
-    state === "unresponsive"
-      ? "staleHint"
-      : state === "dropped"
-        ? "droppedHint"
-        : state === "credentials_rejected"
-          ? "credentialsHint"
-          : state === "gateway_timeout"
-            ? "timeoutHint"
-            : state === "missing_program"
-              ? "programHint"
-              : null;
+    state === "cleanup_unconfirmed"
+      ? "cleanupUnconfirmedHint"
+      : state === "unresponsive"
+        ? "staleHint"
+        : state === "dropped"
+          ? "droppedHint"
+          : state === "credentials_rejected"
+            ? "credentialsHint"
+            : state === "gateway_timeout"
+              ? "timeoutHint"
+              : state === "missing_program"
+                ? "programHint"
+                : null;
   const toggle = () => {
     if (disabled || cancelable) return;
     if (missingSecret) {
@@ -84,7 +133,9 @@ export function VpnCard({
             <strong>{profile.name}</strong>
             <small>
               {t(profile.kind)} ·{" "}
-              {profile.networks.join(", ") || t("fullTunnel")}
+              {profile.networks.length
+                ? profile.networks.join(", ")
+                : t(profile.kind === "ssl" ? "gatewayRoutes" : "fullTunnel")}
             </small>
           </span>
           <span className="card-controls">
@@ -135,6 +186,9 @@ export function VpnCard({
       </div>
       {hint && (
         <Notice tone={danger ? "error" : "warn"}>
+          {state === "cleanup_unconfirmed" && (
+            <strong>{t("state.cleanup_unconfirmed")}</strong>
+          )}
           <p>{t(hint)}</p>
           {cleaning && (
             <p id={cleanupId} role="status">
@@ -142,7 +196,15 @@ export function VpnCard({
             </p>
           )}
           <div className="actions">
-            {state === "missing_program" ? (
+            {state === "cleanup_unconfirmed" ? (
+              <VerifyCleanup
+                id={profile.id}
+                t={t}
+                run={run}
+                cleaning={cleaning}
+                cleanupVerifying={vpn.cleanupVerifying}
+              />
+            ) : state === "missing_program" ? (
               <button
                 type="button"
                 {...pending}

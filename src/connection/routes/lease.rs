@@ -1,5 +1,6 @@
 use super::{Error, Key, Route};
 use crate::model::valid_profile_id;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicU64, Ordering},
@@ -45,6 +46,13 @@ pub struct Owner {
     pub uid: u32,
     pub profile: String,
     pub generation: u64,
+}
+/// Observation data only; this record does not grant authority to delete a route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedRoute {
+    pub route: Route,
+    pub created: bool,
 }
 impl Owner {
     fn valid(&self) -> bool {
@@ -106,6 +114,29 @@ pub struct Coordinator<B: Backend> {
     claims: BTreeMap<u64, Claim>,
 }
 impl<B: Backend> Coordinator<B> {
+    #[cfg(test)]
+    pub(crate) fn fixture_borrowed_claim(&mut self, owner: Owner, route: Route) {
+        assert!(self.entries.is_empty() && self.claims.is_empty());
+        self.next += 1;
+        let token = self.next;
+        self.entries.insert(
+            route.key,
+            Entry {
+                route,
+                receipt: None,
+                users: BTreeSet::from([token]),
+            },
+        );
+        self.claims.insert(
+            token,
+            Claim {
+                owner,
+                keys: vec![route.key],
+                releasing: false,
+                failed: false,
+            },
+        );
+    }
     pub fn new(backend: B) -> Result<Self, Error> {
         let manager = manager_id()?;
         Ok(Self {
@@ -126,6 +157,62 @@ impl<B: Backend> Coordinator<B> {
     }
     pub fn has_owner(&self, owner: &Owner) -> bool {
         self.claims.values().any(|claim| claim.owner == *owner)
+    }
+    /// Persist an inventory while the claims are still held, then detach them.
+    /// An error leaves the coordinator and the backend untouched. The callback
+    /// must return success only after its record is durable.
+    pub fn try_abandon<E>(
+        &mut self,
+        owner: &Owner,
+        persist: impl FnOnce(&[AbandonedRoute]) -> Result<(), E>,
+    ) -> Result<Vec<AbandonedRoute>, E> {
+        let mut inventory = BTreeMap::new();
+        for claim in self.claims.values().filter(|claim| claim.owner == *owner) {
+            for key in &claim.keys {
+                if let Some(entry) = self.entries.get(key) {
+                    inventory.insert(
+                        *key,
+                        AbandonedRoute {
+                            route: entry.route,
+                            created: entry.receipt.is_some(),
+                        },
+                    );
+                }
+            }
+        }
+        let inventory: Vec<_> = inventory.into_values().collect();
+        persist(&inventory)?;
+        Ok(self.abandon(owner))
+    }
+    /// Detach only this exact owner, without consulting or modifying the backend.
+    /// The caller must durably record a conservative inventory before using this.
+    pub fn abandon(&mut self, owner: &Owner) -> Vec<AbandonedRoute> {
+        let tokens: Vec<_> = self
+            .claims
+            .iter()
+            .filter_map(|(&token, claim)| (claim.owner == *owner).then_some(token))
+            .collect();
+        let mut abandoned = BTreeMap::new();
+        for token in tokens {
+            if let Some(claim) = self.claims.remove(&token) {
+                for key in claim.keys {
+                    if let Some(entry) = self.entries.get_mut(&key) {
+                        abandoned.insert(
+                            key,
+                            AbandonedRoute {
+                                route: entry.route,
+                                created: entry.receipt.is_some(),
+                            },
+                        );
+                        entry.users.remove(&token);
+                        if entry.users.is_empty() {
+                            self.entries.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        abandoned.into_values().collect()
     }
     pub fn validate(&mut self, lease: &Lease) -> Result<(), Error> {
         if lease.manager != self.manager {

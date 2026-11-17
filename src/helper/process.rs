@@ -206,12 +206,35 @@ impl ManagedChild {
             });
         }
         self.child.kill()?;
-        let status = self.child.wait()?;
-        self.status = Some(status);
+        // Reaping a killed child is still an observation and need not be
+        // instantaneous. Bound this wait and retain the Child on timeout so a
+        // caller can retry or record its identity conservatively.
+        let status = poll_after_kill(|| self.poll(), Duration::from_millis(100))?;
         Ok(StopOutcome {
             status,
             escalated: true,
         })
+    }
+}
+
+fn poll_after_kill(
+    mut poll: impl FnMut() -> io::Result<Option<ExitStatus>>,
+    timeout: Duration,
+) -> io::Result<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = poll()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "child exit unconfirmed",
+            ));
+        }
+        thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 

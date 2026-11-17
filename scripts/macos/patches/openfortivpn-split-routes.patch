@@ -1,0 +1,79 @@
+--- a/src/ipv4.h
++++ b/src/ipv4.h
+@@ -65,6 +65,7 @@
+ 	int		ns2_was_there;  // were ns2 already in /etc/resolv.conf?
+ 	int		dns_suffix_was_there; // was the dns suffix already there?
+ 	int		split_routes;
++	int		split_invalid;
+ 	int		route_to_vpn_is_added;
+ 
+ 	struct rtentry	def_rt; // default route
+--- a/src/http.c
++++ b/src/http.c
+@@ -873,6 +873,14 @@
+ 	gateway = xml_get(xml_find(' ', "ipv4=", val, 1));
+ 	if (!gateway)
+ 		log_warn("No gateway address, using interface for routing\n");
++	else {
++		struct in_addr parsed_gateway;
++		if (inet_pton(AF_INET, gateway, &parsed_gateway) != 1) {
++			tunnel->ipv4.split_invalid = 1;
++			free(gateway);
++			gateway = NULL;
++		}
++	}
+ 
+ 	// The dns search string
+ 	val = buffer;
+@@ -907,18 +915,24 @@
+ 
+ 		dest = xml_get(xml_find(' ', "ip=", val, 1));
+ 		if (!dest) {
++			tunnel->ipv4.split_invalid = 1;
+ 			log_warn("No ip address for a route\n");
+ 			continue;
+ 		}
+ 
+ 		mask = xml_get(xml_find(' ', "mask=", val, 1));
+ 		if (!mask) {
++			tunnel->ipv4.split_invalid = 1;
+ 			log_warn("No mask for a route\n");
+ 			free(dest);
+ 			continue;
+ 		}
+ 
+-		ipv4_add_split_vpn_route(tunnel, dest, mask, gateway);
++		struct in_addr parsed_dest, parsed_mask;
++		if (inet_pton(AF_INET, dest, &parsed_dest) != 1 ||
++		    inet_pton(AF_INET, mask, &parsed_mask) != 1 ||
++		    ipv4_add_split_vpn_route(tunnel, dest, mask, gateway) != 0)
++			tunnel->ipv4.split_invalid = 1;
+ 
+ 		free(dest);
+ 		free(mask);
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -1412,7 +1412,23 @@
+ 		          err_http_str(ret));
+ 		ret = 1;
+ 		goto err_tunnel;
++	}
++
++	/* Emit numeric values only; XML text never reaches this channel. */
++	for (int i = 0; i < tunnel.ipv4.split_routes; i++) {
++		char dest[INET_ADDRSTRLEN], mask[INET_ADDRSTRLEN];
++		struct rtentry *route = &tunnel.ipv4.split_rt[i];
++		if (!inet_ntop(AF_INET, &route_dest(route), dest, sizeof(dest)) ||
++		    !inet_ntop(AF_INET, &route_mask(route), mask, sizeof(mask))) {
++			tunnel.ipv4.split_invalid = 1;
++			break;
++		}
++		log_info("vpnt: split-route %s/%s\n", dest, mask);
+ 	}
++	if (tunnel.ipv4.split_invalid)
++		log_info("vpnt: split-routes invalid\n");
++	else
++		log_info("vpnt: split-routes %d\n", tunnel.ipv4.split_routes);
+ 
+ 	// Step 4: run a pppd process
+ 	log_debug("Establishing the tunnel\n");

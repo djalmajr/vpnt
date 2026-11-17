@@ -79,6 +79,38 @@ pub struct SslDriver {
 }
 
 impl SslDriver {
+    #[cfg(test)]
+    pub(crate) fn fixture_child_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fixture_output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::{io::Write, net::Shutdown, os::unix::net::UnixStream};
+        let (reader, mut writer) = UnixStream::pair()?;
+        self.output.attach(reader)?;
+        writer.write_all(bytes)?;
+        writer.shutdown(Shutdown::Write)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn split_observation(&self) -> super::ssl_output::Observation {
+        self.output.snapshot()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_invalid_split(&self) {
+        self.output.note_invalid_split();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_no_dns_domain(&self) {
+        self.output.note_no_dns_domain();
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_no_dns_servers(&self) {
+        self.output.note_no_dns_servers();
+    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     #[cfg(target_os = "macos")]
@@ -216,6 +248,29 @@ impl SslDriver {
         self.supervision.proof()
     }
     #[cfg(target_os = "macos")]
+    pub(crate) fn recorded_processes(
+        &self,
+    ) -> io::Result<(String, Vec<crate::connection::fence::ProcessIdentity>)> {
+        let (service, identities) = self.supervision.recorded();
+        let processes = identities
+            .into_iter()
+            .map(|(identity, program)| {
+                Ok(crate::connection::fence::ProcessIdentity {
+                    pid: identity.pid,
+                    start_sec: i64::try_from(identity.start.0)
+                        .map_err(|_| io::ErrorKind::InvalidData)?,
+                    start_usec: i32::try_from(identity.start.1)
+                        .map_err(|_| io::ErrorKind::InvalidData)?,
+                    program: program
+                        .to_str()
+                        .ok_or(io::ErrorKind::InvalidData)?
+                        .to_owned(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((service.as_str().to_owned(), processes))
+    }
+    #[cfg(target_os = "macos")]
     pub(crate) fn ppp_may_have_run(&self) -> bool {
         self.supervision.may_have_run()
     }
@@ -289,4 +344,4 @@ fn map_runtime(error: RuntimeError) -> StartError {
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "ssl_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -22,6 +22,7 @@ impl Observer for Empty {
 
 fn profile(networks: &[&str]) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: "Selection".into(),
         name: "Selection fixture".into(),
         kind: VpnKind::Ipsec,

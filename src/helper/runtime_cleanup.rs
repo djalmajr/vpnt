@@ -45,7 +45,7 @@ pub(crate) enum Reason {
     ObservationFailed,
 }
 impl Reason {
-    fn id(self) -> &'static str {
+    pub(crate) fn id(self) -> &'static str {
         match self {
             Self::ProducerNotStopped => "producer_not_stopped",
             Self::FenceIncomplete => "fence_incomplete",
@@ -84,6 +84,9 @@ struct Diagnostic {
 thread_local! { static DIAGNOSTIC: RefCell<Diagnostic> = RefCell::default(); }
 pub(crate) fn begin() {
     DIAGNOSTIC.with(|d| d.borrow_mut().reason = None);
+}
+pub(crate) fn current_reason() -> Option<Reason> {
+    DIAGNOSTIC.with(|d| d.borrow().reason)
 }
 pub(crate) fn mark(reason: Reason) {
     DIAGNOSTIC.with(|d| {

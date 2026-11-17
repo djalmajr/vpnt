@@ -18,6 +18,7 @@ pub enum ConnectionState {
     MissingProgram,
     Offline,
     HelperMissing,
+    CleanupUnconfirmed,
 }
 
 impl ConnectionState {

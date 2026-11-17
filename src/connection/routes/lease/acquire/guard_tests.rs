@@ -70,6 +70,65 @@ fn manager() -> (Coordinator<Fake>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
 }
 
 #[test]
+fn abandon_preserves_shared_route_and_never_removes_backend_rows() {
+    let (mut manager, _, _) = manager();
+    let shared = route("10.20.0.0/16", 3);
+    let unique = route("10.21.0.0/16", 3);
+    let first = owner("first", 1);
+    let second = owner("second", 2);
+    let _first_lease = manager.acquire(first.clone(), &[shared, unique]).unwrap();
+    let second_lease = manager.acquire(second.clone(), &[shared]).unwrap();
+    assert!(manager.abandon(&owner("first", 2)).is_empty());
+    let abandoned = manager.abandon(&first);
+    assert_eq!(abandoned.len(), 2);
+    assert!(abandoned.iter().any(|item| item.route == shared));
+    assert!(abandoned.iter().any(|item| item.route == unique));
+    assert!(!manager.has_owner(&first));
+    assert!(manager.has_owner(&second));
+    assert_eq!(manager.backend.rows.len(), 2);
+    assert_eq!(manager.validate(&second_lease), Ok(()));
+    let serialized = serde_json::to_value(&abandoned).unwrap();
+    assert_eq!(serialized.as_array().unwrap().len(), 2);
+    manager.abandon(&second);
+    assert!(!manager.has_resources());
+    assert_eq!(manager.backend.rows.len(), 2);
+}
+
+#[test]
+fn failed_inventory_write_keeps_claims_and_success_detaches_only_after_write() {
+    let (mut manager, _, _) = manager();
+    let first = owner("first", 1);
+    let second = owner("second", 2);
+    let shared = route("10.20.0.0/16", 3);
+    let unique = route("10.21.0.0/16", 3);
+    let first_lease = manager.acquire(first.clone(), &[shared, unique]).unwrap();
+    let second_lease = manager.acquire(second.clone(), &[shared]).unwrap();
+    let failure = manager.try_abandon(&first, |inventory| {
+        assert_eq!(inventory.len(), 2);
+        assert!(inventory.iter().any(|item| item.route == shared));
+        assert!(inventory.iter().any(|item| item.route == unique));
+        Err::<(), _>("write failed")
+    });
+    assert_eq!(failure, Err("write failed"));
+    assert!(manager.has_owner(&first));
+    assert_eq!(manager.validate(&first_lease), Ok(()));
+    assert_eq!(manager.validate(&second_lease), Ok(()));
+    assert_eq!(manager.backend.rows.len(), 2);
+
+    let mut recorded = Vec::new();
+    manager
+        .try_abandon(&first, |inventory| {
+            recorded = inventory.to_vec();
+            Ok::<(), &str>(())
+        })
+        .unwrap();
+    assert_eq!(recorded.len(), 2);
+    assert!(!manager.has_owner(&first));
+    assert_eq!(manager.validate(&second_lease), Ok(()));
+    assert_eq!(manager.backend.rows.len(), 2);
+}
+
+#[test]
 fn initial_guard_failure_creates_no_claim_or_call() {
     let (mut manager, creates, calls) = manager();
     let first = Arc::new(AtomicUsize::new(0));

@@ -27,6 +27,31 @@ impl Peer {
         let marker = root.join("peer");
         let mut command = Command::new("/usr/bin/python3");
         command
+            .arg("-c")
+            // The real server handles a closed writer by stopping its reader
+            // and joining cleanup. Mirror that behavior when the fake peer's
+            // response races an intentional channel close.
+            .arg(
+                r#"import pathlib, runpy, sys, time
+script, mode, marker = sys.argv[1:]
+if mode == 'forced-broken-pipe':
+    import socket
+    def fail_send(*args, **kwargs):
+        raise BrokenPipeError('fixture closed writer')
+    socket.socket.sendall = fail_send
+sys.argv = [script, mode, marker]
+try:
+    runpy.run_path(script, run_name='__main__')
+except (BrokenPipeError, ConnectionResetError):
+    pathlib.Path(marker + '.retiring').touch()
+    if mode in ('malformed', 'retiring'):
+        until = time.monotonic() + 5
+        while not pathlib.Path(marker + '.allow_cleanup').exists() and time.monotonic() < until:
+            time.sleep(0.005)
+    time.sleep(0.15)
+    pathlib.Path(marker + '.cleaned').touch()
+"#,
+            )
             .arg(
                 std::env::current_dir()
                     .unwrap()
@@ -107,6 +132,21 @@ fn a_private_child_receives_the_request_and_shutdown_waits_for_its_cleanup_witho
     assert!(!client.finished(), "EOF is not a cleanup exit receipt");
     wait(|| client.finished());
     assert!(peer.cleaned());
+}
+#[test]
+fn fixture_peer_still_cleans_up_when_its_response_hits_a_closed_writer() {
+    let mut peer = Peer::new("forced-broken-pipe");
+    let mut client = peer.take();
+    client
+        .send(Request {
+            id: "snapshot-cleanup-v1".into(),
+            command: super::super::protocol::Command::Snapshot {},
+        })
+        .unwrap();
+    wait(|| peer.cleaned());
+    assert!(peer.retiring());
+    client.close();
+    wait(|| client.finished());
 }
 #[test]
 fn malformed_and_incompatible_replies_fail_the_channel_instead_of_becoming_snapshots() {

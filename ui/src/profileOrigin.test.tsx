@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, createElement } from "react";
 import type { Root } from "react-dom/client";
+import { VpnCard } from "./components/VpnCard";
 import { type Locale, type MessageKey, translate } from "./i18n";
 import type { Command, Snapshot, VpnView } from "./model";
 import { defaultPreferences } from "./settings";
@@ -59,6 +60,7 @@ const vpn: VpnView = {
   },
   state: "off",
   cleaning: false,
+  cleanupVerifying: false,
   hasPassword: false,
   hasPsk: false,
   log: [],
@@ -296,6 +298,200 @@ function componentSnapshot(
     preferences: defaultPreferences,
     vpns,
   };
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: tipo SSL permite editar e salvar as redes exibidas`, async () => {
+    await mount(locale);
+    await openProfile(locale, "home");
+    expect(
+      document.querySelector("form.profile-form")?.textContent,
+    ).not.toContain(t(locale, "dnsDomains"));
+    const typeLabel = [
+      ...document.querySelectorAll<HTMLLabelElement>("label.field"),
+    ].find(
+      (label) => label.querySelector("span")?.textContent === t(locale, "type"),
+    );
+    const type = typeLabel?.querySelector<HTMLSelectElement>("select");
+    if (!type) throw new Error("Type selector missing");
+    await act(async () => {
+      type.value = "ssl";
+      type.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const expectedHint =
+      locale === "pt-BR"
+        ? "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica."
+        : "Only these networks use the tunnel. Empty: the routes the gateway publishes.";
+    expect(document.querySelector("form.profile-form")?.textContent).toContain(
+      expectedHint,
+    );
+    expect(document.querySelector("form.profile-form")?.textContent).toContain(
+      t(locale, "dnsDomainsHint"),
+    );
+    await edit(locale, "dnsDomains", " CORP.Example.Com, Sub.Example ");
+    await edit(locale, "networks", "10.0.0.0/8, 192.168.0.0/16");
+    await click(byText(t(locale, "save")));
+    const saved = actions().find((command) => command.type === "save_profile");
+    expect(saved?.type).toBe("save_profile");
+    if (saved?.type !== "save_profile")
+      throw new Error("Profile was not saved");
+    expect(saved.profile.dnsDomains).toEqual([
+      "corp.example.com",
+      "sub.example",
+    ]);
+    expect(saved.profile.kind).toBe("ssl");
+    expect(saved.profile.networks).toEqual(["10.0.0.0/8", "192.168.0.0/16"]);
+  });
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: verificação continua ocupada após run resolver até o snapshot terminar`, async () => {
+    let current: VpnView = { ...vpn, state: "cleanup_unconfirmed" };
+    const sent: Command[] = [];
+    let resolved = false;
+    const render = () =>
+      root?.render(
+        createElement(VpnCard, {
+          vpn: current,
+          t: (key, values) => translate(locale, key, values),
+          run: async (command) => {
+            sent.push(command);
+            current = { ...current, cleanupVerifying: true };
+            render();
+            resolved = true;
+            return true;
+          },
+          navigate: () => {},
+          secrets: () => {},
+        }),
+      );
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => render());
+    const button = byText(
+      locale === "pt-BR" ? "Conferir de novo" : "Check again",
+      container,
+    );
+    expect(button.disabled).toBe(false);
+    await act(async () => button.click());
+    expect(resolved).toBe(true);
+    expect(sent).toEqual([{ type: "probe", id: vpn.profile.id }]);
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(button.querySelector("svg.spin")).not.toBeNull();
+    await act(async () => button.click());
+    expect(sent).toHaveLength(1);
+    current = { ...current, cleanupVerifying: false };
+    await act(async () => render());
+    expect(current.state).toBe("cleanup_unconfirmed");
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-busy")).toBeNull();
+    expect(button.querySelector("svg.spin")).toBeNull();
+  });
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: limpeza não confirmada permite conferir novamente sem bloquear outro perfil`, async () => {
+    const blocked: VpnView = {
+      ...vpn,
+      state: "cleanup_unconfirmed" as VpnView["state"],
+      hasPassword: true,
+      hasPsk: true,
+    };
+    const other: VpnView = {
+      ...vpn,
+      profile: { ...vpn.profile, id: "other", name: "Other VPN" },
+      hasPassword: true,
+      hasPsk: true,
+    };
+    await mountComponentScenario(
+      componentSnapshot("installed", [blocked, other]),
+      false,
+      locale,
+    );
+    const card = document.querySelector(
+      '[data-testid="vpn-card-profile-fixture"]',
+    );
+    const otherCard = document.querySelector('[data-testid="vpn-card-other"]');
+    if (!card || !otherCard) throw new Error("fixture cards missing");
+    const title =
+      locale === "pt-BR" ? "Limpeza não confirmada" : "Cleanup unconfirmed";
+    const hint =
+      locale === "pt-BR"
+        ? "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis."
+        : "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.";
+    const label = locale === "pt-BR" ? "Conferir de novo" : "Check again";
+    expect(card.textContent).toContain(title);
+    expect(card.textContent).toContain(hint);
+    expect(card.textContent).not.toContain(
+      locale === "pt-BR" ? "Conectar" : "Connect",
+    );
+    expect(
+      card.querySelector<HTMLButtonElement>("button.switch")?.disabled,
+    ).toBe(true);
+    expect(
+      otherCard.querySelector<HTMLButtonElement>("button.switch")?.disabled,
+    ).toBe(false);
+
+    let release: ((value: Response) => void) | undefined;
+    let requestId = "";
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(String(init?.body)) as {
+        id: string;
+        command: Command;
+      };
+      commands.push(request.command);
+      requestId = request.id;
+      if (request.command.type !== "probe") {
+        return new Response(JSON.stringify({ id: request.id, snapshot }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return await new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+    }) as typeof fetch;
+    try {
+      const button = byText(label, card);
+      act(() => button.click());
+      expect(actions()).toEqual([{ type: "probe", id: blocked.profile.id }]);
+      expect(button.disabled).toBe(true);
+      expect(button.getAttribute("aria-busy")).toBe("true");
+      expect(button.querySelector("svg.spin")).not.toBeNull();
+      act(() => button.click());
+      expect(actions()).toHaveLength(1);
+      await act(async () => {
+        release?.(
+          new Response(JSON.stringify({ id: requestId, snapshot }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      });
+      expect(button.disabled).toBe(false);
+      expect(button.querySelector("svg.spin")).toBeNull();
+      const otherSwitch =
+        otherCard.querySelector<HTMLButtonElement>("button.switch");
+      if (!otherSwitch) throw new Error("other profile control missing");
+      await click(otherSwitch);
+      expect(actions()).toEqual([
+        { type: "probe", id: blocked.profile.id },
+        { type: "connect", id: other.profile.id },
+      ]);
+    } finally {
+      release?.(
+        new Response(JSON.stringify({ id: requestId, snapshot }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+  });
 }
 
 test("aviso Update envia uma vez, permanece na tela e libera retry após falha", async () => {

@@ -46,11 +46,15 @@ export function Profile({
   );
   const [value, setValue] = useState(initial);
   const [networks, setNetworks] = useState(initial.networks.join(", "));
+  const [dnsDomains, setDnsDomains] = useState(
+    (initial.dnsDomains ?? []).join(", "),
+  );
   const [discard, setDiscard] = useState<() => void>();
   const [saving, setSaving] = useState(false);
   const dirty =
     JSON.stringify(value) !== JSON.stringify(initial) ||
-    networks !== initial.networks.join(", ");
+    networks !== initial.networks.join(", ") ||
+    dnsDomains !== (initial.dnsDomains ?? []).join(", ");
   const set = <K extends keyof VpnProfile>(key: K, next: VpnProfile[K]) =>
     setValue({ ...value, [key]: next });
   useLayoutEffect(() => {
@@ -124,16 +128,23 @@ export function Profile({
           event.preventDefault();
           if (canSave) {
             setSaving(true);
-            void run({
-              type: "save_profile",
-              profile: {
-                ...value,
-                networks: networks
-                  .split(",")
-                  .map((network) => network.trim())
-                  .filter(Boolean),
-              },
-            })
+            const profile = {
+              ...value,
+              networks: networks
+                .split(",")
+                .map((network) => network.trim())
+                .filter(Boolean),
+            };
+            const domains =
+              value.kind === "ssl"
+                ? dnsDomains
+                    .split(",")
+                    .map((domain) => domain.trim().toLowerCase())
+                    .filter(Boolean)
+                : [];
+            if (domains.length) profile.dnsDomains = domains;
+            else delete profile.dnsDomains;
+            void run({ type: "save_profile", profile })
               .then((ok) => {
                 if (ok) saved();
               })
@@ -170,23 +181,38 @@ export function Profile({
             />
           </label>
           {input("username", "username")}
-          {value.kind === "ipsec" ? (
-            <>
-              <label className="field">
-                <span>{t("networks")}</span>
-                <input
-                  value={networks}
-                  disabled={saving}
-                  placeholder="10.20.0.0/24"
-                  onChange={(event) => setNetworks(event.target.value)}
-                />
-              </label>
-              <p className="hint">{t("networksHint")}</p>
-            </>
-          ) : (
+          {value.kind === "ssl" && (
             <>
               {input("certificate", "certificate")}
               <p className="hint">{t("certificateHint")}</p>
+            </>
+          )}
+          <label className="field">
+            <span>{t("networks")}</span>
+            <input
+              value={networks}
+              disabled={saving}
+              placeholder="10.20.0.0/24"
+              onChange={(event) => setNetworks(event.target.value)}
+            />
+          </label>
+          <p className="hint">
+            {t(value.kind === "ssl" ? "networksHintSsl" : "networksHint")}
+          </p>
+          {value.kind === "ssl" && (
+            <>
+              <label className="field">
+                <span>{t("dnsDomains")}</span>
+                <input
+                  value={dnsDomains}
+                  disabled={saving}
+                  placeholder="corp.example.com"
+                  onChange={(event) => setDnsDomains(event.target.value)}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+              <p className="hint">{t("dnsDomainsHint")}</p>
             </>
           )}
         </Group>

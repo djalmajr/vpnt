@@ -19,6 +19,12 @@ pub struct Profile {
     pub gateway: String,
     pub username: String,
     pub networks: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_dns_domains"
+    )]
+    pub dns_domains: Vec<String>,
     pub port: u16,
     pub certificate: String,
     pub probe_host: String,
@@ -47,6 +53,21 @@ impl Profile {
         if self.networks.len() > 64 || self.networks.iter().any(|network| !valid_network(network)) {
             return Err("invalid_network");
         }
+        if (self.kind != VpnKind::Ssl && !self.dns_domains.is_empty())
+            || self.dns_domains.len() > 8
+            || self
+                .dns_domains
+                .iter()
+                .any(|domain| !valid_dns_domain(domain))
+            || self
+                .dns_domains
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != self.dns_domains.len()
+        {
+            return Err("invalid_profile");
+        }
         if !valid_host(&self.probe_host)
             || self.probe_port == 0
             || self.probe_port == 22
@@ -68,6 +89,29 @@ impl Profile {
         }
         Ok(())
     }
+}
+
+fn deserialize_dns_domains<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    Ok(Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|domain| domain.to_ascii_lowercase())
+        .collect())
+}
+
+fn valid_dns_domain(domain: &str) -> bool {
+    domain.contains('.')
+        && domain.len() <= 253
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 pub(crate) fn valid_profile_id(value: &str) -> bool {
@@ -113,6 +157,7 @@ fn valid_network(value: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct VpnView {
     pub cleaning: bool,
+    pub cleanup_verifying: bool,
     pub profile: Profile,
     pub state: ConnectionState,
     pub has_password: bool,

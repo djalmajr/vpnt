@@ -7,18 +7,35 @@ pub(super) struct NativeFactory<'a> {
     routes: Routes<'a>,
     profiles: Arc<Profiles>,
     domain: Option<NativeDomain<'a>>,
+    fence_root: std::path::PathBuf,
+    fence_owner: u32,
+    recovery: Mutex<crate::connection::macos::fence_recovery::Recovery>,
 }
 
 impl<'a> NativeFactory<'a> {
+    #[cfg(test)]
+    pub(super) fn fixture_fence_root(mut self, root: std::path::PathBuf, owner: u32) -> Self {
+        self.fence_root = root;
+        self.fence_owner = owner;
+        self
+    }
     pub(super) fn new(
         routes: Routes<'a>,
         profiles: Arc<Profiles>,
         domain: Option<NativeDomain<'a>>,
+        uid: u32,
     ) -> Self {
         Self {
             routes,
             profiles,
             domain,
+            fence_root: crate::helper::paths::STATE.into(),
+            fence_owner: 0,
+            recovery: Mutex::new(crate::connection::macos::fence_recovery::Recovery::new(
+                std::path::Path::new(crate::helper::paths::STATE),
+                0,
+                uid,
+            )),
         }
     }
 }
@@ -65,6 +82,13 @@ impl Attempt for AttemptKind<'_> {
             Self::Denied(attempt) => attempt.cleanup(),
         }
     }
+    fn abandon(&mut self, reason: Reason) -> Result<(), AbandonError> {
+        match self {
+            Self::Ssl(attempt) => attempt.abandon(reason),
+            Self::Ipsec(_) => Err(AbandonError::Unsupported),
+            Self::Denied(_) => Ok(()),
+        }
+    }
 }
 
 /// Real denied admission when the host has no IPsec domain. It performs no
@@ -101,6 +125,16 @@ impl<'a> Factory for NativeFactory<'a> {
     }
     fn supports(&self, kind: VpnKind) -> bool {
         kind == VpnKind::Ssl || (kind == VpnKind::Ipsec && self.domain.is_some())
+    }
+    fn cleanup_blocked(&self, profile: &Profile) -> bool {
+        self.recovery
+            .lock()
+            .map_or(true, |recovery| recovery.blocked(profile))
+    }
+    fn verify_cleanup(&self, profile: &Profile) -> bool {
+        self.recovery
+            .lock()
+            .is_ok_and(|mut recovery| recovery.verify(profile))
     }
     fn create(
         &self,
@@ -149,14 +183,17 @@ impl<'a> Factory for NativeFactory<'a> {
             link: None,
             token: None,
             lease: None,
+            dns: None,
             spawn_attempted: false,
             stopped: false,
             uncertain_cleanup: false,
+            fence_root: self.fence_root.clone(),
+            fence_owner: self.fence_owner,
         })
     }
     fn idle(&self) -> bool {
         let routes_idle = {
-            let Ok(mut routes) = self.routes.lock() else {
+            let Ok(mut routes) = self.routes.try_lock() else {
                 return false;
             };
             routes.retry_cleanup();
@@ -192,5 +229,7 @@ mod tests {
                 .is_err()
         );
         assert!(denied.cleanup());
+        let mut dispatch = AttemptKind::Denied(DeniedAttempt);
+        assert_eq!(dispatch.abandon(Reason::ObservationFailed), Ok(()));
     }
 }

@@ -24,6 +24,7 @@ const vpn = (id: string): VpnView => ({
   },
   state: "off",
   cleaning: false,
+  cleanupVerifying: false,
   hasPassword: false,
   hasPsk: false,
   log: [{ timestamp: 1, state: "off" }],

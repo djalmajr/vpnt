@@ -47,3 +47,61 @@ fn ssl_profile_rejects_native_username_truncation_and_invalid_fingerprints() {
     profile.certificate = "A1".repeat(32);
     assert!(profile.validate().is_ok());
 }
+
+#[test]
+fn dns_domains_round_trip_validation_and_ipsec_rejection() {
+    let old = serde_json::json!({"id":"a","name":"Example","kind":"ssl","gateway":"vpn.example.com", "username":"user","networks":[],"port":443,"certificate":"", "probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"});
+    let profile: Profile = serde_json::from_value(old.clone()).unwrap();
+    assert!(profile.dns_domains.is_empty());
+    assert_eq!(serde_json::to_value(&profile).unwrap(), old);
+    let mut value = old.clone();
+    value["dnsDomains"] = serde_json::json!(["CORP.Example.Com", "other.example"]);
+    let profile: Profile = serde_json::from_value(value).unwrap();
+    assert_eq!(profile.dns_domains, ["corp.example.com", "other.example"]);
+    profile.validate().unwrap();
+    let saved = serde_json::to_value(&profile).unwrap();
+    assert_eq!(
+        saved["dnsDomains"],
+        serde_json::json!(["corp.example.com", "other.example"])
+    );
+    assert_eq!(serde_json::from_value::<Profile>(saved).unwrap(), profile);
+    let mut bad = profile.clone();
+    for domains in [
+        vec!["".into()],
+        vec!["single".into()],
+        vec!["a..b".into()],
+        vec!["a.b.".into()],
+        vec!["-a.b".into()],
+        vec!["a-.b".into()],
+        vec!["a_b.example".into()],
+        vec!["é.example".into()],
+        vec![format!("{}.com", "a".repeat(64))],
+        vec![format!(
+            "{}.{}.{}.{}.com",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63)
+        )],
+        vec!["a.b".into(), "a.b".into()],
+    ] {
+        bad.dns_domains = domains;
+        assert_eq!(
+            bad.validate(),
+            Err("invalid_profile"),
+            "{:?}",
+            bad.dns_domains
+        );
+    }
+    bad.dns_domains = (0..8).map(|i| format!("host{i}.example.net")).collect();
+    assert_eq!(bad.validate(), Ok(()));
+    bad.dns_domains.push("host8.example.net".into());
+    assert_eq!(bad.validate(), Err("invalid_profile"));
+    let mut ipsec = old;
+    ipsec["kind"] = serde_json::json!("ipsec");
+    ipsec["dnsDomains"] = serde_json::json!(["a.b"]);
+    assert_eq!(
+        serde_json::from_value::<Profile>(ipsec).unwrap().validate(),
+        Err("invalid_profile")
+    );
+}

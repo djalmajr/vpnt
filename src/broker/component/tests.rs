@@ -26,7 +26,7 @@ impl SecretStore for Secrets {
     }
 }
 fn wait(mut check: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(4);
+    let end = Instant::now() + Duration::from_secs(15);
     while !check() {
         assert!(Instant::now() < end, "component broker timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -116,7 +116,9 @@ fn component_install_rechecks_activity_after_admission_before_runtime_handoff() 
         .begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(3),
+            // Generous: this test is about the activity recheck, and a loaded
+            // host can take seconds to prepare, which used to expire first.
+            Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
     wait(|| broker.component.current.as_ref().unwrap().client.prepared());

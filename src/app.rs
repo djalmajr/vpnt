@@ -46,6 +46,7 @@ impl App {
         ] {
             app.connections.push(Connection {
                 profile: Profile {
+                    dns_domains: Vec::new(),
                     id: id.into(),
                     name: name.into(),
                     kind,
@@ -88,6 +89,7 @@ impl App {
                 .iter()
                 .map(|connection| VpnView {
                     cleaning: false,
+                    cleanup_verifying: false,
                     profile: connection.profile.clone(),
                     state: connection.session.state(),
                     has_password: connection.has_password,

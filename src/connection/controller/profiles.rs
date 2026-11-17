@@ -65,10 +65,25 @@ impl Profiles {
         })
     }
     pub(super) fn idle(&self) -> bool {
-        self.reservations.lock().is_ok_and(|r| r.is_empty())
+        self.reservations.try_lock().is_ok_and(|r| r.is_empty())
     }
 }
 impl ProfileUse {
+    /// Hold the reservation through the durable write and release only after
+    /// the action commits successfully.
+    pub(super) fn abandon_after<E>(
+        &self,
+        error: impl Fn() -> E,
+        action: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut all = self.reservations.try_lock().map_err(|_| error())?;
+        if !all.contains_key(&self.key) {
+            return Err(error());
+        }
+        action()?;
+        all.remove(&self.key);
+        Ok(())
+    }
     pub(super) fn validate(&self) -> Result<(), StoreError> {
         self.reservations
             .lock()
@@ -85,7 +100,87 @@ impl ProfileUse {
         all.remove(&self.key);
         Ok(())
     }
+    /// Release without asserting cleanup. Only call after durable fencing.
+    #[allow(dead_code)] // The native abandonment path is not connected yet.
+    pub(super) fn abandon(&self) -> Result<(), StoreError> {
+        self.reservations
+            .lock()
+            .map_err(|_| StoreError::Io)?
+            .remove(&self.key)
+            .map(|_| ())
+            .ok_or(StoreError::InvalidData)
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod abandon_tests {
+    use super::*;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn abandon_releases_only_the_named_reservation() {
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(
+            std::env::current_dir()
+                .unwrap()
+                .join("output/fixtures")
+                .join(format!(
+                    "profile-abandon-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )),
+        );
+        fs::create_dir_all(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let store = ProfileStore::open(&root.0, uid).unwrap();
+        let profile = |id: &str| -> Profile {
+            serde_json::from_value(serde_json::json!({"id":id,"name":id,"kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":["10.20.0.0/24"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap()
+        };
+        let first = profile("first");
+        let second = profile("second");
+        store.save(first.clone()).unwrap();
+        store.save(second.clone()).unwrap();
+        let profiles = Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap());
+        let first_use = profiles.begin(&first, 1).unwrap();
+        let second_use = profiles.begin(&second, 1).unwrap();
+        assert!(!profiles.idle());
+        let held = profiles.reservations.lock().unwrap();
+        let observed = std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let profiles = &profiles;
+            let first_use = &first_use;
+            scope.spawn(move || {
+                let idle = profiles.idle();
+                let abandon = first_use.abandon_after(|| StoreError::Io, || Ok(()));
+                let _ = send.send((idle, abandon));
+            });
+            let observed = receive.recv_timeout(std::time::Duration::from_millis(250));
+            drop(held);
+            observed
+        });
+        assert_eq!(observed.unwrap(), (false, Err(StoreError::Io)));
+        assert_eq!(store.remove("first"), Err(StoreError::Busy));
+        first_use.abandon().unwrap();
+        assert_eq!(store.remove("second"), Err(StoreError::Busy));
+        assert!(!profiles.idle());
+        second_use.complete().unwrap();
+        assert!(profiles.idle());
+        assert_eq!(first_use.abandon(), Err(StoreError::InvalidData));
+        store.remove("first").unwrap();
+        store.remove("second").unwrap();
+    }
+}

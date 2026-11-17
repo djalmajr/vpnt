@@ -5,6 +5,9 @@ export type LocalePreference = Locale | "system";
 
 const en = {
   cleanupHint: "Cleaning up the previous attempt…",
+  cleanupUnconfirmedHint:
+    "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.",
+  checkAgain: "Check again",
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
@@ -96,8 +99,13 @@ const en = {
     "This looks like a shell expression; enter the literal username.",
   secretShellWarning:
     "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
+  dnsDomains: "Internal domains",
+  dnsDomainsHint:
+    "Optional. While connected, these domains use the VPN's DNS; everything else is unchanged. E.g. corp.example.com",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
+  networksHintSsl:
+    "Only these networks use the tunnel. Empty: the routes the gateway publishes.",
   probeHost: "Address",
   probeHostHint: "A destination machine, not the router.",
   method: "Method",
@@ -110,6 +118,7 @@ const en = {
   certificateHint: "Accepted server certificate fingerprint.",
   routes: "Routes",
   fullTunnel: "Full tunnel",
+  gatewayRoutes: "Gateway routes",
   secrets: "Secrets",
   psk: "Gateway key (PSK)",
   password: "User password",
@@ -206,11 +215,15 @@ const en = {
   "state.missing_program": "VPN client missing",
   "state.offline": "No network connection",
   "state.helper_missing": "Waiting for the component",
+  "state.cleanup_unconfirmed": "Cleanup unconfirmed",
 };
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
   cleanupHint: "Limpando a tentativa anterior…",
+  cleanupUnconfirmedHint:
+    "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis.",
+  checkAgain: "Conferir de novo",
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",
@@ -302,8 +315,13 @@ const pt: Record<MessageKey, string> = {
     "Isto parece uma expressão de shell; informe o nome de usuário literal.",
   secretShellWarning:
     "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
+  dnsDomains: "Domínios internos",
+  dnsDomainsHint:
+    "Opcional. Com a VPN ligada, estes domínios usam o DNS da VPN; o resto não muda. Ex.: corp.example.com",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
+  networksHintSsl:
+    "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica.",
   probeHost: "Endereço",
   probeHostHint: "Uma máquina do destino, não o roteador.",
   method: "Método",
@@ -316,6 +334,7 @@ const pt: Record<MessageKey, string> = {
   certificateHint: "Impressão digital aceita do servidor.",
   routes: "Rotas",
   fullTunnel: "Túnel completo",
+  gatewayRoutes: "Rotas do gateway",
   secrets: "Segredos",
   psk: "Chave do gateway (PSK)",
   password: "Senha do usuário",
@@ -413,6 +432,7 @@ const pt: Record<MessageKey, string> = {
   "state.missing_program": "Falta o cliente de VPN",
   "state.offline": "Sem rede no computador",
   "state.helper_missing": "Aguardando o componente",
+  "state.cleanup_unconfirmed": "Limpeza não confirmada",
 };
 
 export const catalogs: Record<Locale, Record<MessageKey, string>> = {

@@ -354,6 +354,8 @@ nas preferências, em ambos os temas.
 
 ## Components
 
+Por indicação do Djalma em 2026-11-17, o cartão de limpeza não confirmada apresenta o aviso e a ação “Conferir de novo”, com loader durante a solicitação.
+
 Por indicação do Djalma em 2026-11-16, com uma sessão anterior terminando, o painel avisa com loader e não oferece instalar.
 
 Por indicação do Djalma em 2026-11-15, só o interruptor do cartão liga ou
