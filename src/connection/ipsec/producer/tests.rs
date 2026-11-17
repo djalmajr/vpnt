@@ -13,10 +13,11 @@ mod diagnostic;
 mod fixture;
 mod lease_budget;
 mod ledger;
+mod orphan;
 mod startup;
 mod userspace;
 mod utun;
-use fixture::Fixture;
+pub(super) use fixture::Fixture;
 #[derive(Clone, Default)]
 struct Kernel(Arc<Mutex<BTreeSet<u32>>>);
 impl KernelClaims for Kernel {

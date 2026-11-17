@@ -32,6 +32,31 @@ pub(super) enum Stage {
     Stopped,
 }
 
+/// Durable identity of the retained UTUN. Capture records name and index with
+/// no VIPs (nothing configured yet); `configure` then records the whole VIP
+/// intention for the same name and index before any alias ioctl.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LinkClaim {
+    pub name: String,
+    pub index: NonZeroU16,
+    pub vips: Vec<std::net::IpAddr>,
+}
+
+impl LinkClaim {
+    fn valid(&self) -> bool {
+        let unit = self.name.strip_prefix("utun");
+        unit.and_then(|unit| unit.parse::<u32>().ok())
+            .is_some_and(|unit| self.name == format!("utun{unit}"))
+            && self.vips.len() <= 2
+            && (self.vips.len() < 2 || self.vips[0].is_ipv4() != self.vips[1].is_ipv4())
+            && self
+                .vips
+                .iter()
+                .all(|vip| crate::connection::routes::Address::unscoped(*vip).valid_gateway())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Record {
@@ -54,6 +79,13 @@ pub(super) struct Record {
     pub transport_interface: Option<NonZeroU16>,
     pub stage: Stage,
     pub child: Option<Birth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkClaim>,
+    /// `kern.bootsessionuuid` when the controller created the claim; absent in
+    /// legacy records or when the read failed. Startup recovery compares it
+    /// with the current boot session, with no clock involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_session: Option<String>,
 }
 impl Record {
     pub fn owner(&self) -> Owner {
@@ -87,6 +119,14 @@ impl Record {
             || self.child.as_ref().is_some_and(|c| !c.valid())
             || (self.stage == Stage::Running && self.child.is_none())
             || (matches!(self.stage, Stage::Prepared | Stage::Starting) && self.child.is_some())
+            || self
+                .link
+                .as_ref()
+                .is_some_and(|link| self.child.is_none() || !link.valid())
+            || self
+                .boot_session
+                .as_deref()
+                .is_some_and(|uuid| !boot_session_valid(uuid))
         {
             return Err(Error::Invalid);
         }
@@ -97,10 +137,21 @@ impl Record {
         let mut b = other.clone();
         a.stage = Stage::Prepared;
         a.child = None;
+        a.link = None;
         b.stage = Stage::Prepared;
         b.child = None;
+        b.link = None;
         a == b
     }
+}
+/// Canonical UUID text (`8-4-4-4-12` hex digits, either case), the form the
+/// kernel reports for `kern.bootsessionuuid`.
+pub(super) fn boot_session_valid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {
+            group.len() == length && group.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 pub(super) fn hex(value: &str, length: usize) -> bool {
     value.len() == length

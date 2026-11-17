@@ -1,6 +1,6 @@
 //! Opaque admission and its private handle. The map owns the strong resource;
 //! the handle only shares the actual admission and marks Draining on last Drop.
-use super::super::{NativePeer, Peer, bound::budget};
+use super::super::{NativePeer, Peer, bound::budget, record::LinkClaim};
 use super::{Inner, resource::Entry};
 use crate::connection::{
     ipsec::{Candidate, Error},
@@ -10,6 +10,7 @@ use crate::connection::{
 };
 use crate::helper::vici::Client;
 use std::{
+    num::NonZeroU16,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -135,6 +136,24 @@ impl<'a> Admission<'a> {
         budget::check_until(expires, &cancel)?;
         if !entry.state.live() {
             return Err(Error::Changed);
+        }
+        let super::pins::PinState::Captured(retained) = &*pin else {
+            return Err(Error::Changed);
+        };
+        let index = u16::try_from(retained.index())
+            .ok()
+            .and_then(NonZeroU16::new)
+            .ok_or(Error::Invalid)?;
+        let link = LinkClaim {
+            name: retained.name().into(),
+            index,
+            vips: candidate.vips.clone(),
+        };
+        // Persist the whole alias intention before any ioctl can change the UTUN.
+        {
+            let peer = budget::lock_until(expires, &cancel, &entry.peer)?;
+            let mut producer = budget::lock_until(expires, &cancel, &peer.producer)?;
+            producer.lease.record_link(link, expires, &cancel)?;
         }
         let retained = pin.take_retained().ok_or(Error::Changed)?;
         let controller = self.handle.ledger.context.controller;
