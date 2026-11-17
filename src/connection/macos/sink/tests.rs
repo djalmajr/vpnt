@@ -19,6 +19,8 @@ struct Fixture {
     records: RefCell<Vec<Record>>,
     calls: RefCell<Vec<&'static str>>,
     flags: Cell<u32>,
+    bound: Cell<bool>,
+    connected: Cell<bool>,
     failure: &'static str,
     name: String,
     index: u32,
@@ -35,6 +37,8 @@ impl Fixture {
             records: RefCell::new(vec![]),
             calls: RefCell::new(vec![]),
             flags: Cell::new(0),
+            bound: Cell::new(false),
+            connected: Cell::new(false),
             failure,
             name: "utun42".into(),
             index: 234,
@@ -82,11 +86,20 @@ impl Api for Fixture {
         self.calls.borrow_mut().push("open");
         Ok(self.fd.borrow_mut().take().unwrap())
     }
+    fn bind(&self, _: RawFd) -> io::Result<()> {
+        self.calls.borrow_mut().push("bind");
+        self.bound.set(true);
+        Ok(())
+    }
     fn connect(&self, _: RawFd) -> io::Result<()> {
         self.calls.borrow_mut().push("connect-new-unit");
         if self.failure == "connect" {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
+        if !self.bound.get() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.connected.set(true);
         self.interfaces
             .borrow_mut()
             .entries
@@ -103,10 +116,14 @@ impl Api for Fixture {
     fn set_flags(&self, _: RawFd, flags: u32) -> io::Result<()> {
         assert_eq!(flags, 3);
         self.calls.borrow_mut().push("disable-both-directions");
+        if !self.bound.get() || self.connected.get() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         self.flags.set(flags);
         Ok(())
     }
     fn flags(&self, _: RawFd) -> io::Result<u32> {
+        self.calls.borrow_mut().push("read-flags");
         Ok(
             if self.failure == "flags"
                 || (self.failure == "flags-race"
@@ -172,6 +189,30 @@ impl Api for Fixture {
 }
 
 #[test]
+fn sink_fixture_enforces_kernel_flag_phase() {
+    let fixture = Fixture::new("");
+    let fd = fixture.open().unwrap();
+    assert_eq!(
+        fixture
+            .set_flags(fd.as_raw_fd(), DROP_BOTH)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    fixture.bind(fd.as_raw_fd()).unwrap();
+    fixture.set_flags(fd.as_raw_fd(), DROP_BOTH).unwrap();
+    fixture.connect(fd.as_raw_fd()).unwrap();
+    assert_eq!(
+        fixture
+            .set_flags(fd.as_raw_fd(), DROP_BOTH)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    drop(fd);
+    fixture.closed();
+}
+#[test]
 fn sink_disables_packets_before_alias_and_retains_only_its_control_descriptor() {
     for ipv4 in [true, false] {
         let fixture = Fixture::new("");
@@ -194,9 +235,12 @@ fn sink_disables_packets_before_alias_and_retains_only_its_control_descriptor() 
             *fixture.calls.borrow(),
             [
                 "open",
-                "connect-new-unit",
+                "bind",
                 "disable-both-directions",
-                "assign-only-own-interface"
+                "read-flags",
+                "connect-new-unit",
+                "assign-only-own-interface",
+                "read-flags"
             ]
         );
         // SAFETY: fd belongs to the live socket throughout the query.
@@ -237,12 +281,12 @@ fn sink_failures_close_only_owned_fd_and_keep_partial_alias_retirement() {
         .err()
         .unwrap();
         fixture.closed();
-        if failure == "connect" {
+        if failure == "connect" || failure == "flags" {
             assert!(error.retired.is_none());
         } else {
             let retired = error.retired.unwrap();
             assert_eq!(retired.index, 234);
-            assert_eq!(retired.source.is_some(), failure != "flags");
+            assert!(retired.source.is_some());
             assert!(!retired.gone(&fixture.interfaces.borrow(), &Snapshot { records: vec![] }));
         }
         assert!(
