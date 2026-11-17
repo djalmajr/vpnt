@@ -3,6 +3,15 @@
 Este contrato separa o protótipo estático, o host, os fluxos de demonstração
 e a futura camada de VPN real. Nenhuma evidência de demonstração prova uma VPN.
 
+## Test layers
+
+- unit: `cargo test --locked --lib -- --test-threads=2 --skip keychain && (cd ui && bun test src)`
+- integration: `cargo test --locked --all-targets --all-features`
+- contract: `cargo test --locked --no-default-features && cargo test --locked --test runtime_policy --test profiles`
+- e2e: manual: o app instalado com o componente, ligando e desligando as VPNs reais e conferindo rotas, DNS e o acesso aos hosts internos de cada perfil; uma fixture não prova uma VPN
+- mutation: manual: `python3 scripts/macos/check-*.py`, um por campanha, como no job `macos-oracles`
+- design: `bun scripts/design/check-tokens.ts && bun scripts/design/check-classes.ts`
+
 ## Código do app
 
 Na raiz do repositório, após instalar as dependências da UI:
@@ -599,9 +608,7 @@ arquivo do kernel segue mantendo o lock: o teste vermelho terminou com exit 101;
 os seis testes do lock e o teste do instalador passaram; o mutante sem o
 desbloqueio voltou a exit 101 e a restauração passou. Uma revisão estática
 independente passou sem achados. Isso não demonstra a causa histórica do CI5, e
-o resultado do próximo workflow remoto continua pendente. Relatórios:
-`.soho/vpnt-parallel-20261112/reports/controller-lock-release.md` e
-`controller-lock-release-review.md`.
+o resultado do próximo workflow remoto continua pendente.
 
 [FAIL, salvamento nativo ainda não confirmado] O formulário real foi preenchido
 e validado após polling, mas a tentativa de SaveProfile retornou alteração não
