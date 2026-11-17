@@ -1,22 +1,41 @@
 //! Read-only fallback when the retained process receipt predates discovery of
 //! an addressed PPP link. Never deletes/destroys by a name, key or guessed PID.
-use super::{
-    Interfaces,
-    process::{Identity, Process},
-    routing::Snapshot,
-    store,
-};
+use super::{Interfaces, ppp_control::ChildIdentity, process::Process, routing::Snapshot, store};
 use crate::connection::routes::{Error, Network};
 use std::collections::BTreeSet;
+
+#[cfg(test)]
+thread_local! {
+    static OBSERVATION: std::cell::RefCell<Option<(Interfaces, Snapshot, Vec<store::Record>)>> = const { std::cell::RefCell::new(None) };
+    static PROCESS: std::cell::RefCell<Option<Process>> = const { std::cell::RefCell::new(None) };
+}
+
+fn observe() -> Result<(Interfaces, Snapshot, Vec<store::Record>), Error> {
+    #[cfg(test)]
+    if let Some(observation) = OBSERVATION.with(|slot| slot.borrow_mut().take()) {
+        return Ok(observation);
+    }
+    Ok((
+        Interfaces::read().map_err(|_| Error::Unavailable)?,
+        Snapshot::read()?,
+        store::read().map_err(|_| Error::Unavailable)?,
+    ))
+}
+
+fn observe_process(pid: u32) -> std::io::Result<Process> {
+    #[cfg(test)]
+    if let Some(process) = PROCESS.with(|slot| slot.borrow_mut().take()) {
+        return Ok(process);
+    }
+    Process::read(pid)
+}
 
 pub(crate) fn complete(
     before: &Interfaces,
     table: &Snapshot,
-    child: &Identity,
+    child: &ChildIdentity,
 ) -> Result<bool, Error> {
-    let now = Interfaces::read().map_err(|_| Error::Unavailable)?;
-    let routes = Snapshot::read()?;
-    let records = store::read().map_err(|_| Error::Unavailable)?;
+    let (now, routes, records) = observe()?;
     let mut foreign = BTreeSet::new();
     let mut ours = BTreeSet::new();
     for interface in now
@@ -28,20 +47,26 @@ pub(crate) fn complete(
             .iter()
             .filter(|record| record.interface.as_str() == interface.name)
             .collect();
-        if matching.iter().any(|record| record.pid == child.pid) {
+        if matching
+            .iter()
+            .any(|record| record.key == child.service().key())
+        {
             ours.insert(interface.index);
         }
-        if matching.len() != 1 {
+        if matching.len() != 1 || matching[0].key == child.service().key() {
             continue;
         }
-        let Ok(owner) = Process::read(matching[0].pid) else {
+        let Some(pid) = matching[0].pid else {
+            continue;
+        };
+        let Ok(owner) = observe_process(pid) else {
             continue;
         };
         if owner.running
             && owner.uid == 0
             && owner.real_uid == 0
             && owner.executable == std::path::Path::new(crate::helper::ppp_supervisor::SYSTEM_PPP)
-            && owner.identity != *child
+            && owner.identity != **child
         {
             foreign.insert(interface.index);
             ours.remove(&interface.index);
@@ -141,6 +166,72 @@ mod tests {
             gateway: None,
             source: None,
         }
+    }
+    #[test]
+    fn complete_does_not_authorize_our_conflicting_pid_or_unattributed_foreign_link() {
+        use crate::{connection::ssl::InterfaceName, helper::ppp_supervisor::ServiceId};
+        let service = ServiceId::parse("12345678-1234-4123-8123-123456789ABC").unwrap();
+        let child = ChildIdentity::fixture(
+            super::super::process::Identity {
+                pid: 42,
+                start: (1, 0),
+            },
+            service,
+        );
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                OBSERVATION.with(|slot| *slot.borrow_mut() = None);
+                PROCESS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let fake_process = || Process {
+            identity: super::super::process::Identity {
+                pid: 99,
+                start: (2, 0),
+            },
+            parent: 1,
+            uid: 0,
+            real_uid: 0,
+            running: true,
+            executable: crate::helper::ppp_supervisor::SYSTEM_PPP.into(),
+        };
+        let before = Interfaces::default();
+        let table = Snapshot { records: vec![] };
+        let now = Interfaces {
+            entries: BTreeMap::from([("ppp42".into(), interface("ppp42", 42, "10.20.0.2"))]),
+        };
+        let record = store::Record {
+            key: child.service().key(),
+            interface: InterfaceName::parse("ppp42").unwrap(),
+            pid: Some(99),
+        };
+        PROCESS.with(|slot| *slot.borrow_mut() = Some(fake_process()));
+        OBSERVATION.with(|slot| {
+            *slot.borrow_mut() = Some((
+                now.clone(),
+                Snapshot { records: vec![] },
+                vec![record.clone()],
+            ))
+        });
+        assert!(!complete(&before, &table, &child).unwrap());
+        let mut foreign = record;
+        foreign.key = "State:/Network/Service/other/PPP".into();
+        PROCESS.with(|slot| *slot.borrow_mut() = Some(fake_process()));
+        OBSERVATION.with(|slot| {
+            *slot.borrow_mut() = Some((
+                now.clone(),
+                Snapshot { records: vec![] },
+                vec![foreign.clone()],
+            ))
+        });
+        assert!(complete(&before, &table, &child).unwrap());
+        foreign.pid = None;
+        OBSERVATION.with(|slot| {
+            *slot.borrow_mut() = Some((now, Snapshot { records: vec![] }, vec![foreign]))
+        });
+        assert!(!complete(&before, &table, &child).unwrap());
     }
     #[test]
     fn early_cleanup_preserves_before_and_foreign_ppp_but_waits_for_our_or_unattributed_link() {

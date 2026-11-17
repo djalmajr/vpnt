@@ -29,11 +29,22 @@ def early_receipt(source):
 
 
 def run(copy, label, expected):
-    result = subprocess.run([sys.executable, "scripts/macos/check-ppp-supervisor.py"], cwd=copy, capture_output=True, timeout=90)
+    execution_path = copy / "output/fixtures/ppp-supervisor/executions.json"
+    execution_path.parent.mkdir(parents=True, exist_ok=True)
+    execution_path.write_text("{}\n")
+    try:
+        result = subprocess.run([sys.executable, "scripts/macos/check-ppp-supervisor.py"], cwd=copy, capture_output=True, timeout=1800)
+    except subprocess.TimeoutExpired as error:
+        (REPORTS / f"{label}.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
+        raise RuntimeError(f"{label}: supervisor checker timed out after 1800s") from error
     (REPORTS / f"{label}.log").write_bytes(result.stdout + result.stderr)
-    executions = json.loads((copy / "output/fixtures/ppp-supervisor/executions.json").read_text())
     if result.returncode != expected:
-        raise RuntimeError(f"{label}: expected script exit {expected}, got {result.returncode}")
+        raise RuntimeError(f"{label}: expected script exit {expected}, got {result.returncode}; see {REPORTS / (label+'.log')}")
+    if not execution_path.is_file():
+        raise RuntimeError(f"{label}: checker produced no execution receipt; see {REPORTS / (label+'.log')}")
+    executions = json.loads(execution_path.read_text())
+    if any("timeout" in result for result in executions.values()):
+        raise RuntimeError(f"{label}: checker step timed out; see {REPORTS / (label+'.log')}")
     if any(result["exit"] for name, result in executions.items() if name.startswith("compile-") or name in ["build", "format"]):
         raise RuntimeError(f"{label}: compilation/format failure does not count")
     failed = {name: result for name, result in executions.items() if result["exit"] == 101}

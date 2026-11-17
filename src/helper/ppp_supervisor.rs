@@ -17,6 +17,53 @@ use std::{
 };
 pub const INHERITED_FD: i32 = 4;
 pub const SYSTEM_PPP: &str = "/usr/sbin/pppd";
+
+/// Canonical UUID v4 for one controller-authorized PPP attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceId(String);
+impl ServiceId {
+    pub fn random() -> io::Result<Self> {
+        let mut bytes = [0u8; 16];
+        // SAFETY: getentropy fills this live buffer, below its 256-byte limit.
+        if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+        Ok(Self(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )))
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 36 || bytes[14] != b'4' || !matches!(bytes[19], b'8' | b'9' | b'A' | b'B')
+        {
+            return None;
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            if if [8, 13, 18, 23].contains(&index) {
+                *byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit() || byte.is_ascii_lowercase()
+            } {
+                return None;
+            }
+        }
+        Some(Self(value.into()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn key(&self) -> String {
+        format!("State:/Network/Service/{}/PPP", self.0)
+    }
+}
 // openfortivpn 1.24.1 pppd_run with our fixed no-peerdns/accept-remote options.
 // Validate the entire caller argv, then build a new command from these values.
 pub const ARGUMENTS: &[&str] = &[
@@ -91,6 +138,9 @@ pub unsafe fn inherited_supervise(
     let fd = channel.as_raw_fd();
     let pid = std::process::id();
     raw::exchange(fd, raw::frame(*b"VPS1", pid), *b"VPA1", pid)?;
+    let mut service = [0u8; 36];
+    raw::read(fd, &mut service, raw::deadline()?)?;
+    append_service(&mut command, &service)?;
     if signals::INTERRUPTED.load(Ordering::Acquire) {
         return finish(fd, 0, Err(io::ErrorKind::Interrupted.into()));
     }
@@ -161,6 +211,15 @@ pub unsafe fn inherited_supervise(
     };
     finish(fd, child_pid, result)
 }
+fn append_service(command: &mut Command, bytes: &[u8]) -> io::Result<()> {
+    let service = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(ServiceId::parse)
+        .ok_or(io::ErrorKind::InvalidData)?;
+    command.args(["serviceid", service.as_str()]);
+    Ok(())
+}
+
 fn finish(fd: i32, child: u32, result: io::Result<ExitStatus>) -> io::Result<ExitStatus> {
     raw::write(fd, &raw::frame(*b"VPF1", child), raw::deadline()?)?;
     result
@@ -233,4 +292,32 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         }
     }
     Ok((read, write))
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    #[test]
+    fn fixed_command_appends_only_a_valid_attempt_uuid() {
+        let mut command = system_command();
+        let uuid = b"12345678-1234-4123-8123-123456789ABC";
+        append_service(&mut command, uuid).unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[args.len() - 2], "serviceid");
+        assert_eq!(args[args.len() - 1], std::str::from_utf8(uuid).unwrap());
+        for invalid in [
+            &b"12345678-1234-1123-8123-123456789ABC"[..],
+            &b"12345678-1234-4123-7123-123456789ABC"[..],
+            &b"12345678-1234-4123-8123-123456789abc"[..],
+            &b"../etc"[..],
+        ] {
+            let mut command = system_command();
+            let original = command.get_args().count();
+            assert!(append_service(&mut command, invalid).is_err());
+            assert_eq!(command.get_args().count(), original);
+        }
+        let first = ServiceId::random().unwrap();
+        assert_eq!(ServiceId::parse(first.as_str()), Some(first.clone()));
+        assert_ne!(first, ServiceId::random().unwrap());
+    }
 }

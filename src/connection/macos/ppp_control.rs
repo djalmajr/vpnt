@@ -1,7 +1,7 @@
 //! Host end of one inherited PPP capability. All permissions are conditional
 //! on native identity/ancestry and retained exit watches. No PID signaling.
 use super::process::{ExitWatch, Identity, Process};
-use crate::helper::local_socket::peer_uid;
+use crate::helper::{local_socket::peer_uid, ppp_supervisor::ServiceId};
 use std::{
     io::{self, Read, Write},
     net::Shutdown,
@@ -76,17 +76,84 @@ impl Observed {
             .exited()
     }
 }
+pub(crate) struct ChildIdentity {
+    identity: Identity,
+    service: ServiceId,
+}
+impl std::ops::Deref for ChildIdentity {
+    type Target = Identity;
+    fn deref(&self) -> &Identity {
+        &self.identity
+    }
+}
+impl ChildIdentity {
+    #[cfg(test)]
+    pub(super) fn fixture(identity: Identity, service: ServiceId) -> Self {
+        Self { identity, service }
+    }
+    pub fn service(&self) -> &ServiceId {
+        &self.service
+    }
+}
 pub(crate) struct Proof {
     client: Arc<Observed>,
     supervisor: Arc<Observed>,
     child: Arc<Observed>,
+    child_identity: ChildIdentity,
+    #[cfg(test)]
+    supervisor_receipt: Option<Identity>,
 }
 impl Proof {
+    #[cfg(test)]
+    pub(super) fn fixture(
+        parent: &Process,
+        child: &Process,
+        service: ServiceId,
+    ) -> io::Result<Self> {
+        fn observed(process: &Process) -> io::Result<Arc<Observed>> {
+            Ok(Arc::new(Observed {
+                identity: process.identity.clone(),
+                program: process.executable.clone(),
+                owner: process.uid,
+                parent: process.parent,
+                watch: Mutex::new(ExitWatch::attach(&process.identity)?),
+            }))
+        }
+        let supervisor = observed(parent)?;
+        Ok(Self {
+            client: Arc::clone(&supervisor),
+            supervisor,
+            child: observed(child)?,
+            child_identity: ChildIdentity {
+                identity: child.identity.clone(),
+                service,
+            },
+            supervisor_receipt: None,
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_bad_supervisor_receipt(&mut self) {
+        let mut identity = self.supervisor.identity.clone();
+        identity.start.0 = identity.start.0.wrapping_add(1);
+        self.supervisor_receipt = Some(identity);
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_bad_receipt(&mut self) {
+        self.child_identity.identity.start.0 = self.child_identity.identity.start.0.wrapping_add(1);
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_invalid(&mut self) {
+        Arc::get_mut(&mut self.child).unwrap().program = "/invalid-fixture".into();
+    }
     pub fn supervisor(&self) -> &Identity {
+        #[cfg(test)]
+        if let Some(receipt) = &self.supervisor_receipt {
+            return receipt;
+        }
         &self.supervisor.identity
     }
-    pub fn child(&self) -> &Identity {
-        &self.child.identity
+    pub fn child(&self) -> &ChildIdentity {
+        &self.child_identity
     }
     pub fn current(&self) -> io::Result<bool> {
         Ok(self.client.current()? && self.supervisor.current()? && self.child.current()?)
@@ -100,6 +167,7 @@ pub(crate) struct Control {
     client_pid: u32,
     policy: Policy,
     canceled: Arc<AtomicBool>,
+    service: ServiceId,
     client: Option<Arc<Observed>>,
     supervisor: Option<Arc<Observed>>,
     proof: Option<Arc<Proof>>,
@@ -126,6 +194,7 @@ impl Control {
             client_pid,
             policy,
             canceled,
+            service: ServiceId::random()?,
             client: None,
             supervisor: None,
             proof: None,
@@ -229,6 +298,12 @@ impl Control {
                 self.proof = Some(Arc::new(Proof {
                     client: client.clone(),
                     supervisor: supervisor.clone(),
+                    #[cfg(test)]
+                    supervisor_receipt: None,
+                    child_identity: ChildIdentity {
+                        identity: child.identity.clone(),
+                        service: self.service.clone(),
+                    },
                     child,
                 }));
                 self.permit(*b"VPC1", pid)
@@ -256,7 +331,11 @@ impl Control {
         let mut bytes = [0; 8];
         bytes[..4].copy_from_slice(&magic);
         bytes[4..].copy_from_slice(&pid.to_be_bytes());
-        self.socket.write_all(&bytes)
+        self.socket.write_all(&bytes)?;
+        if magic == *b"VPA1" {
+            self.socket.write_all(self.service.as_str().as_bytes())?;
+        }
+        Ok(())
     }
     pub fn proof(&self) -> Option<Arc<Proof>> {
         self.proof.clone()

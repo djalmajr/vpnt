@@ -24,6 +24,11 @@ pub struct Outcome {
     pub files: usize,
     pub cleanup_pending: bool,
 }
+#[cfg(not(test))]
+const CONTROLLER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const CONTROLLER_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct Executor {
     tree: Tree,
     checks: Checks,
@@ -37,7 +42,7 @@ impl Executor {
         if payload.owner() != self.tree.owner {
             return Err(Error::PermissionDenied);
         }
-        let _guard = self.tree.bootstrap()?;
+        let _guard = self.tree.bootstrap_wait(CONTROLLER_WAIT)?;
         pending::clear(&self.tree, &_guard)?;
         Journal::recover(&self.tree)?;
         self.checks.installed(&[])?;
@@ -51,7 +56,7 @@ impl Executor {
     }
     fn remove(&mut self, uid: u32) -> Result<Outcome, Error> {
         policy::account(uid)?;
-        let _guard = self.tree.bootstrap()?;
+        let _guard = self.tree.bootstrap_wait(CONTROLLER_WAIT)?;
         pending::clear(&self.tree, &_guard)?;
         Journal::recover(&self.tree)?;
         self.checks.installed(&[])?;

@@ -438,3 +438,131 @@ except Exception as exc:
         );
     }
 }
+
+#[cfg(test)]
+mod previous_wait_actor_tests {
+    use super::*;
+    use crate::helper::client::Client;
+
+    #[test]
+    fn actor_returns_waiting_snapshot_without_admitting_actions() {
+        let script = format!(
+            r#"import socket,json
+s=socket.socket(fileno=0)
+data=b''
+while not data.endswith(b'\n'):
+    part=s.recv(4096)
+    if not part: break
+    data+=part
+s.sendall((json.dumps(dict(type='previous_session_finishing',protocol_version=3,version='{}'))+'\n').encode())
+while s.recv(4096): pass
+s.close()
+"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command.args(["-c", &script]);
+        let client = Client::fixture(command).unwrap();
+        let finished = client.fixture_finished();
+        let verify_finished = finished.clone();
+        struct ActorGuard<F: Fn() -> bool> {
+            worker: Option<Worker>,
+            finished: F,
+        }
+        impl<F: Fn() -> bool> Drop for ActorGuard<F> {
+            fn drop(&mut self) {
+                drop(self.worker.take());
+                let until = Instant::now() + Duration::from_secs(4);
+                while !(self.finished)() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let (ready, wait) = mpsc::sync_channel(1);
+        let (replies, receive) = mpsc::sync_channel(2);
+        let worker = Worker::spawn(
+            move || {
+                let mut broker =
+                    Broker::transport_fixture(client, Keychain(Err(SecretError::Unavailable)));
+                let until = Instant::now() + Duration::from_secs(3);
+                while broker.snapshot().helper != "previous_session_finishing" {
+                    assert!(Instant::now() < until);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ready.send(()).unwrap();
+                (None, Some(broker))
+            },
+            move |reply| {
+                let _ = replies.send(reply);
+            },
+        )
+        .unwrap();
+        let guard = ActorGuard {
+            worker: Some(worker),
+            finished,
+        };
+        wait.recv_timeout(Duration::from_secs(4)).unwrap();
+        let start = Instant::now();
+        guard
+            .worker
+            .as_ref()
+            .unwrap()
+            .send(
+                Request {
+                    id: "waiting".into(),
+                    command: crate::bridge::Command::GetSnapshot {},
+                    locale: None,
+                },
+                start,
+            )
+            .unwrap();
+        let reply = receive.recv_timeout(Duration::from_secs(11)).unwrap();
+        assert_eq!(reply.error, None);
+        assert_eq!(reply.snapshot.unwrap().helper, "previous_session_finishing");
+        guard
+            .worker
+            .as_ref()
+            .unwrap()
+            .send(
+                Request {
+                    id: "blocked".into(),
+                    command: crate::bridge::Command::Connect {
+                        id: "fixture".into(),
+                    },
+                    locale: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            receive
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .error
+                .is_some()
+        );
+        guard
+            .worker
+            .as_ref()
+            .unwrap()
+            .send(
+                Request {
+                    id: "component-blocked".into(),
+                    command: crate::bridge::Command::InstallHelper {},
+                    locale: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("previous_session_finishing")
+        );
+        drop(guard);
+        assert!(verify_finished(), "fixture child must exit and be reaped");
+    }
+}

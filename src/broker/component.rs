@@ -101,6 +101,9 @@ impl<S: SecretStore> Broker<S> {
         if self.component.closed {
             return Err("backend_unavailable");
         }
+        if self.helper == "previous_session_finishing" {
+            return Err("previous_session_finishing");
+        }
         if self.component.busy() || self.administration.busy() {
             return Err("component_busy");
         }
@@ -251,6 +254,9 @@ fn map_error(error: ComponentError) -> &'static str {
         ComponentError::Canceled => "component_canceled",
         ComponentError::Untrusted | ComponentError::Incompatible => "component_incompatible",
         ComponentError::Rejected(crate::install::Error::Busy) => "component_busy",
+        ComponentError::Rejected(crate::install::Error::PreviousSessionFinishing) => {
+            "previous_session_finishing"
+        }
         _ => "component_unconfirmed",
     }
 }

@@ -22,6 +22,7 @@ pub enum Error {
     Unavailable,
     Incompatible,
     Busy,
+    PreviousSessionFinishing,
 }
 struct State {
     fault: Mutex<Option<Error>>,
@@ -117,6 +118,11 @@ impl Client {
             return Err(error);
         }
         Ok(self.output.try_iter().take(64).collect())
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_finished(&self) -> impl Fn() -> bool + Send + Clone + 'static {
+        let state = self.state.clone();
+        move || state.finished.load(Ordering::Acquire)
     }
     pub fn finished(&self) -> bool {
         self.state.finished.load(Ordering::Acquire)

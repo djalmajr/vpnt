@@ -45,7 +45,7 @@ export type NativePreferences = {
 export type Snapshot = {
   version: string;
   demo: boolean;
-  helper: "installed" | "missing" | "outdated";
+  helper: "installed" | "missing" | "outdated" | "previous_session_finishing";
   componentOperation?: "installing" | "removing" | "settling";
   // Required: the backend that ships inside this app always produces it. The
   // UI only falls back to documented defaults before the first snapshot (or a

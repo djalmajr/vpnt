@@ -20,6 +20,7 @@ pub enum Error {
     Io,
     PermissionDenied,
     Busy,
+    PreviousSessionFinishing,
     Conflict,
     RecoveryRequired,
     PolicyRejected,

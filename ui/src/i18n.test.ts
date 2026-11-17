@@ -30,3 +30,12 @@ test("os catálogos mantêm as mesmas chaves, incluindo as dicas", () => {
     Object.keys(catalogs["en-US"]).sort(),
   );
 });
+
+test("o prazo exibido é de 60 segundos nos dois idiomas", () => {
+  expect(translate("en-US", "timeoutHint")).toBe(
+    "The gateway did not respond within 60 seconds.",
+  );
+  expect(translate("pt-BR", "timeoutHint")).toBe(
+    "O gateway não respondeu em 60 segundos.",
+  );
+});

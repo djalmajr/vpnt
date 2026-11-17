@@ -121,7 +121,7 @@ fn active_controller_unknown_files_and_corrupted_receipts_refuse_mutation() {
     let mut f = Fixture::new();
     let lock = f.executor.tree.bootstrap().unwrap();
     let before = files(&f.root);
-    assert!(matches!(f.activate(), Err(Error::Busy)));
+    assert!(matches!(f.activate(), Err(Error::PreviousSessionFinishing)));
     assert_eq!(files(&f.root), before);
     drop(lock);
     f.executor
@@ -326,4 +326,23 @@ fn a_sticky_public_tools_directory_traverses_install_update_rollback_and_remove_
     assert!(!f.executor.tree.resolve("adapters/helper").unwrap().exists());
     assert_eq!(mode(), 0o1755);
     assert!(tools.is_dir());
+}
+
+#[test]
+fn installer_waits_for_controller_release_and_distinguishes_timeout() {
+    use std::time::{Duration, Instant};
+    let mut f = Fixture::new();
+    let held = f.executor.tree.bootstrap().unwrap();
+    let started = Instant::now();
+    assert!(matches!(f.activate(), Err(Error::PreviousSessionFinishing)));
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    let (send, receive) = std::sync::mpsc::channel();
+    tree::LOCK_BUSY_SIGNAL.with(|slot| *slot.borrow_mut() = Some(send));
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(held);
+        });
+        assert!(f.activate().is_ok());
+    });
 }

@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn previous_session_status_survives_busy_eof_and_clears_after_snapshot() {
+    fn waiting() -> Message {
+        Message::PreviousSessionFinishing {
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+        }
+    }
+    let mut broker = Broker::new(None, Secrets::new());
+    broker.receive(waiting()).unwrap();
+    assert_eq!(broker.helper, "previous_session_finishing");
+    assert!(broker.startup > Instant::now() + Duration::from_secs(35));
+    let deadline = broker.startup;
+    broker.receive(waiting()).unwrap();
+    assert_eq!(
+        broker.startup, deadline,
+        "repeat notices cannot extend the deadline"
+    );
+    broker.lost(false);
+    assert_eq!(broker.helper, "previous_session_finishing");
+
+    broker.dead = false;
+    broker.receive(waiting()).unwrap();
+    broker
+        .receive(Message::Snapshot {
+            id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+            build: None,
+            profiles: vec![],
+            connections: vec![],
+        })
+        .unwrap();
+    assert!(broker.ready);
+    assert!(!broker.waiting_previous);
+    assert_eq!(broker.helper, "outdated");
+    assert!(broker.receive(waiting()).is_err());
+    broker.lost(false);
+    assert_eq!(broker.helper, "missing");
+}
+
+#[test]
 fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() {
     let mut first = Peer::new("restart");
     let secrets = Secrets::new();
@@ -107,4 +148,99 @@ fn runtime_recovery_revalidates_every_snapshot_and_backs_off_on_unavailable_laun
     );
     drop(broker);
     drop(compatible);
+}
+
+#[test]
+fn notice_then_eof_preserves_only_the_terminal_wait_cause() {
+    use std::process::Command as Process;
+    for (suffix, expected) in [
+        ("", "previous_session_finishing"),
+        ("b'{broken}\\n'", "missing"),
+        ("snapshot", "missing"),
+    ] {
+        let script = format!(
+            r#"import socket,json
+s=socket.socket(fileno=0)
+data=b''
+while not data.endswith(b'\n'):
+    part=s.recv(4096)
+    if not part: break
+    data+=part
+s.sendall((json.dumps(dict(type='previous_session_finishing',protocol_version=3,version='{}'))+'\n').encode())
+{}
+s.shutdown(socket.SHUT_WR)
+s.close()
+"#,
+            env!("CARGO_PKG_VERSION"),
+            if suffix.is_empty() {
+                String::new()
+            } else if suffix == "snapshot" {
+                format!(
+                    "s.sendall((json.dumps(dict(type='snapshot',id='{}',protocol_version=3,version='{}',profiles=[],connections=[]))+'\\n').encode())",
+                    protocol::WAIT_CAPABILITY_SNAPSHOT_ID,
+                    env!("CARGO_PKG_VERSION")
+                )
+            } else {
+                format!("s.sendall({suffix})")
+            }
+        );
+        let mut command = Process::new("/usr/bin/python3");
+        command.args(["-c", &script]);
+        let client = Client::fixture(command).unwrap();
+        let mut broker = Broker::new(Some(client), Secrets::new());
+        let until = Instant::now() + Duration::from_secs(3);
+        while !broker.client.as_ref().unwrap().finished() {
+            assert!(Instant::now() < until, "fixture child did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.helper, expected);
+        assert!(snapshot.vpns.is_empty());
+        assert!(!broker.ready);
+    }
+}
+
+#[test]
+fn terminal_notice_after_ready_does_not_reclassify_a_lost_live_session() {
+    let script = format!(
+        r#"import socket,json
+s=socket.socket(fileno=0)
+def read():
+    data=b''
+    while not data.endswith(b'\n'):
+        part=s.recv(4096)
+        if not part: return None
+        data+=part
+    return json.loads(data)
+r=read()
+s.sendall((json.dumps(dict(type='snapshot',id=r['id'],protocol_version=3,version='{}',build='a'*64,profiles=[],connections=[]))+'\n').encode())
+read()
+s.sendall((json.dumps(dict(type='previous_session_finishing',protocol_version=3,version='{}'))+'\n').encode())
+s.shutdown(socket.SHUT_WR)
+s.close()
+"#,
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_VERSION")
+    );
+    let mut command = std::process::Command::new("/usr/bin/python3");
+    command.args(["-c", &script]);
+    let mut broker = Broker::new(Some(Client::fixture(command).unwrap()), Secrets::new());
+    wait(&mut broker, |snapshot| snapshot.helper == "installed");
+    assert!(broker.ready);
+    broker
+        .client
+        .as_ref()
+        .unwrap()
+        .send(Request {
+            id: "wake".into(),
+            command: protocol::Command::Snapshot {},
+        })
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !broker.client.as_ref().unwrap().finished() {
+        assert!(Instant::now() < until, "fixture child did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(broker.snapshot().helper, "missing");
+    assert!(!broker.ready);
 }

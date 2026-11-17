@@ -352,6 +352,8 @@ nas preferências, em ambos os temas.
 
 ## Components
 
+Por indicação do Djalma em 2026-11-16, com uma sessão anterior terminando, o painel avisa com loader e não oferece instalar.
+
 Por indicação do Djalma em 2026-11-15, só o interruptor do cartão liga ou
 desliga, emitindo connect/disconnect explícitos conforme o snapshot. É um
 botão com aria-pressed e nome acessível formado por nome do perfil e estado

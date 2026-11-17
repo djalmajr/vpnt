@@ -371,3 +371,38 @@ s.shutdown(socket.SHUT_WR);s.close()
         }))
     );
 }
+
+#[test]
+fn removal_client_preserves_previous_session_finishing_from_installer() {
+    let fixture = Fixture::new();
+    let source = r#"import json,socket
+s=socket.socket(fileno=0)
+s.sendall((json.dumps({'type':'ready','format':1,'version':'VERSION'})+'\n').encode())
+data=b''
+while not data.endswith(b'\n'):
+    part=s.recv(4096)
+    if not part: break
+    data+=part
+request=json.loads(data)
+s.sendall((json.dumps({'type':'failed','id':request['id'],'error':'previous_session_finishing'})+'\n').encode())
+s.shutdown(socket.SHUT_WR)
+s.close()
+"#.replace("VERSION", env!("CARGO_PKG_VERSION"));
+    let mut operation = Operation::fixture(
+        Kind::Remove,
+        fixture.command(&source),
+        "remove-finishing".into(),
+        Locale::EnUs,
+        Instant::now() + Duration::from_secs(4),
+    )
+    .unwrap();
+    until(|| operation.prepared());
+    operation.proceed();
+    until(|| operation.finished());
+    assert_eq!(
+        operation.poll(),
+        Some(Err(Error::Rejected(
+            crate::install::Error::PreviousSessionFinishing
+        )))
+    );
+}

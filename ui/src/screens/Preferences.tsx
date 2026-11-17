@@ -42,6 +42,7 @@ export function Preferences({
 }) {
   const pending = settings.preferencesPending;
   const installed = snapshot.helper === "installed" && !installPending;
+  const finishing = snapshot.helper === "previous_session_finishing";
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     update({ ...settings, [key]: value });
   return (
@@ -166,15 +167,17 @@ export function Preferences({
         <div className="setting-row component-row">
           <span className="setting-label component-title">
             {t(
-              installed
-                ? "helperInstalled"
-                : updating
-                  ? "helperOutdated"
-                  : "helperMissing",
+              finishing
+                ? "administrator"
+                : installed
+                  ? "helperInstalled"
+                  : updating
+                    ? "helperOutdated"
+                    : "helperMissing",
             )}
             <Help text={t("componentHelp")} />
           </span>
-          {installed ? (
+          {finishing ? null : installed ? (
             <>
               <small className="component-version">{snapshot.version}</small>
               <button
@@ -201,13 +204,15 @@ export function Preferences({
           )}
           <small className="component-hint">
             {t(
-              installBlocked && !installed
-                ? updating
-                  ? "componentUpdateBlocked"
-                  : "componentInstallBlocked"
-                : installed
-                  ? "installedHint"
-                  : "helperHint",
+              finishing
+                ? "helperPreviousSession"
+                : installBlocked && !installed
+                  ? updating
+                    ? "componentUpdateBlocked"
+                    : "componentInstallBlocked"
+                  : installed
+                    ? "installedHint"
+                    : "helperHint",
             )}
           </small>
         </div>

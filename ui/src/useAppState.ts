@@ -20,10 +20,16 @@ import {
  * later authoritative `installed` confirmation leaves it stale (it keeps
  * offering Install after a late successful installation). Every explicit route
  * is the user's intent and must never be taken over by a snapshot: only
- * `onboarding` is reconciled, and only from a real (non-demo) snapshot.
+ * `onboarding` is reconciled, and only from a real (non-demo) snapshot that
+ * confirms installation or reports that an earlier session is still finishing.
  */
 export function reconcileRoute(previous: Route, snapshot: Snapshot): Route {
-  if (snapshot.demo || snapshot.helper !== "installed") return previous;
+  if (
+    snapshot.demo ||
+    (snapshot.helper !== "installed" &&
+      snapshot.helper !== "previous_session_finishing")
+  )
+    return previous;
   return previous.page === "onboarding" ? { page: "panel" } : previous;
 }
 
@@ -45,8 +51,12 @@ export type InstallSource = "panel" | "onboarding" | "preferences";
 export type InstallAttempt = { source: InstallSource; updating: boolean };
 
 export function componentBlocked(snapshot: Snapshot): boolean {
-  return snapshot.vpns.some(
-    (vpn) => active(vpn.state) || vpn.state === "disconnecting" || vpn.cleaning,
+  return (
+    snapshot.helper === "previous_session_finishing" ||
+    snapshot.vpns.some(
+      (vpn) =>
+        active(vpn.state) || vpn.state === "disconnecting" || vpn.cleaning,
+    )
   );
 }
 
@@ -81,6 +91,8 @@ export function useAppState() {
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
     receivedSnapshot.current = snapshot;
+    if (snapshot.helper === "previous_session_finishing")
+      setComponentAction(undefined);
     if (!snapshot.demo && snapshot.helper === "installed")
       setInstallFailure(undefined);
     setError((previous) => reconcileComponentError(previous, snapshot));
@@ -93,7 +105,7 @@ export function useAppState() {
       firstSnapshot.current = false;
       if (
         !snapshot.demo &&
-        snapshot.helper !== "installed" &&
+        (snapshot.helper === "missing" || snapshot.helper === "outdated") &&
         !snapshot.vpns.length
       )
         navigate({ page: "onboarding" });
@@ -103,7 +115,9 @@ export function useAppState() {
     // runs it, and an automatic onboarding redirect would lose that origin.
     const installing = installLock.current;
     navigate((previous) =>
-      installing ? previous : reconcileRoute(previous, snapshot),
+      installing && snapshot.helper !== "previous_session_finishing"
+        ? previous
+        : reconcileRoute(previous, snapshot),
     );
     // Fresh authoritative state: flush preference intent that was waiting for
     // one (first snapshot, or a reply that could not be reconciled in place).
@@ -130,6 +144,7 @@ export function useAppState() {
           admin_incompatible: "adminIncompatible",
           secret_cleanup_failed: "secretCleanupFailed",
           component_busy: "componentBusy",
+          previous_session_finishing: "previousSessionFinishing",
           component_expired: "componentExpired",
           component_canceled: "componentUnconfirmed",
           component_unconfirmed: "componentUnconfirmed",
