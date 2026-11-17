@@ -222,14 +222,7 @@ impl<'a> NativeBackend<'a> {
             )?,
         };
         let transport_default = TransportDefault::add_to_plan(&mut plan, || {
-            if egress.remote().is_ipv4() {
-                TransportDefault::for_plan(
-                    egress.interface_index(),
-                    egress.gateway_route().next_hop,
-                )
-            } else {
-                Ok(None)
-            }
+            ipsec_transport_default(egress.gateway_route())
         })?;
         let scope = UtunScope {
             pin,
@@ -248,6 +241,15 @@ impl<'a> NativeBackend<'a> {
                 .register(super::RegisteredScope::Utun(scope), owner, plan.clone())?;
         Ok((token, plan))
     }
+}
+
+fn ipsec_transport_default(gateway_pin: Route) -> Result<Option<TransportDefault>, Error> {
+    if !gateway_pin.key.network.address().is_ipv4() {
+        return Ok(None);
+    }
+    // The gateway pin contains a synthesized host key, so the observed prefix
+    // is unknown here.
+    TransportDefault::for_plan(gateway_pin.interface, gateway_pin.next_hop, None)
 }
 
 fn map_ipsec(error: ipsec::Error) -> Error {

@@ -17,10 +17,28 @@ impl TransportDefault {
         })
     }
 
-    pub(crate) fn for_plan(index: u16, next_hop: NextHop) -> Result<Option<Self>, Error> {
+    pub(crate) fn for_plan(
+        index: u16,
+        next_hop: NextHop,
+        observed_key: Option<Key>,
+    ) -> Result<Option<Self>, Error> {
         if next_hop == NextHop::Interface {
-            // The connected route is already more specific than the tunnel halves.
-            return Ok(None);
+            if observed_key.is_some_and(|key| {
+                key.network.address().is_ipv4()
+                    && key.network.prefix() > 1
+                    && (key.scope == 0 || key.scope == index)
+            }) {
+                return Ok(None);
+            }
+            // SAFETY: fixed NUL-terminated format string without placeholders.
+            unsafe {
+                libc::syslog(
+                    libc::LOG_WARNING,
+                    c"vpnt: on-link transport lacks a proven IPv4 route more specific than the tunnel halves"
+                        .as_ptr(),
+                )
+            };
+            return Err(Error::Conflict);
         }
         Self::from_egress(index, next_hop).map(Some)
     }
@@ -81,14 +99,49 @@ impl TryFrom<Route> for TransportDefault {
 
 #[cfg(test)]
 #[test]
-fn full_plan_accepts_directly_connected_ipv4_transport_without_a_scoped_default() {
+fn full_plan_requires_a_more_specific_on_link_ipv4_route() {
     use crate::connection::routes::ppp_networks;
     let full = ppp_networks(&[], 3, true, true, None).unwrap();
     let mut split = ppp_networks(&["10.0.0.0/8".into()], 3, true, true, None).unwrap();
-    let on_link = || TransportDefault::for_plan(7, NextHop::Interface);
-    assert_eq!(TransportDefault::add_to_plan(&mut split, on_link), Ok(None));
+    let on_link = |network: &str| {
+        let record = Record {
+            key: Key {
+                network: network.parse().unwrap(),
+                scope: 0,
+            },
+            interface: 7,
+            flags: libc::RTF_UP,
+            gateway: None,
+            source: None,
+        };
+        let route = record.route().unwrap();
+        TransportDefault::for_plan(route.interface, route.next_hop, Some(record.key))
+    };
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut split, || on_link("0.0.0.0/0")),
+        Ok(None)
+    );
     let mut plan = full.clone();
-    assert_eq!(TransportDefault::add_to_plan(&mut plan, on_link), Ok(None));
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut plan, || on_link("192.0.2.0/24")),
+        Ok(None)
+    );
+    assert_eq!(plan, full);
+    for network in ["0.0.0.0/0", "128.0.0.0/1"] {
+        let mut plan = full.clone();
+        assert_eq!(
+            TransportDefault::add_to_plan(&mut plan, || on_link(network)),
+            Err(Error::Conflict),
+            "direct physical route {network}"
+        );
+        assert_eq!(plan, full);
+    }
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut plan, || {
+            TransportDefault::for_plan(7, NextHop::Interface, None)
+        }),
+        Err(Error::Conflict)
+    );
     assert_eq!(plan, full);
     assert_eq!(
         TransportDefault::from_egress(7, NextHop::Interface),

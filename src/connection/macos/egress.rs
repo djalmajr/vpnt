@@ -3,12 +3,12 @@
 use super::{
     interfaces::{Interface, Interfaces},
     resolve,
-    routing::{Reader, TransportDefault},
+    routing::{Reader, Snapshot, TransportDefault},
     tcp,
 };
 use crate::{
     connection::{
-        routes::{Address, Error, NextHop},
+        routes::{Address, Error, Key, NextHop, Route},
         ssl::Binding,
     },
     model::{Profile, VpnKind},
@@ -25,6 +25,7 @@ pub struct Egress {
     interface: Interface,
     gateway: Ipv4Addr,
     next_hop: NextHop,
+    observed_key: Option<Key>,
     source: Option<Address>,
 }
 impl Egress {
@@ -88,6 +89,9 @@ impl Egress {
                 interface: interface.clone(),
                 gateway,
                 next_hop: route.next_hop,
+                observed_key: Snapshot::read()
+                    .ok()
+                    .and_then(|snapshot| observed_key(&snapshot, route)),
                 source: record.source,
             };
             if !result.is_current(profile)? {
@@ -134,7 +138,7 @@ impl Egress {
     }
     pub(crate) fn transport_default(&self) -> Result<Option<TransportDefault>, Error> {
         let index = u16::try_from(self.interface.index).map_err(|_| Error::Invalid)?;
-        TransportDefault::for_plan(index, self.next_hop)
+        TransportDefault::for_plan(index, self.next_hop, self.observed_key)
     }
 
     pub(crate) fn binding(&self, profile: &Profile) -> Result<Binding, Error> {
@@ -148,6 +152,12 @@ impl Egress {
         })
     }
 }
+
+fn observed_key(snapshot: &Snapshot, selected: Route) -> Option<Key> {
+    let record = snapshot.exact(selected.key).ok().flatten()?;
+    (record.route() == Ok(selected)).then_some(record.key)
+}
+
 fn remote(address: Ipv4Addr, interfaces: &Interfaces) -> bool {
     !address.is_loopback()
         && !address.is_unspecified()
@@ -170,6 +180,36 @@ fn resolve_error(error: tcp::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::macos::routing::Record;
+
+    #[test]
+    fn ssl_route_proof_requires_the_selected_snapshot_key_and_interface() {
+        let mut record = Record {
+            key: Key {
+                network: "192.0.2.0/24".parse().unwrap(),
+                scope: 7,
+            },
+            interface: 7,
+            flags: libc::RTF_UP | libc::RTF_IFSCOPE,
+            gateway: None,
+            source: None,
+        };
+        let selected = record.route().unwrap();
+        let mut snapshot = Snapshot {
+            records: vec![record.clone()],
+        };
+        assert_eq!(observed_key(&snapshot, selected), Some(selected.key));
+        snapshot.records.push(record.clone());
+        assert_eq!(observed_key(&snapshot, selected), None);
+        record.key.scope = 0;
+        snapshot.records = vec![record.clone()];
+        assert_eq!(observed_key(&snapshot, selected), None);
+        record.key = selected.key;
+        record.interface = 8;
+        snapshot.records = vec![record];
+        assert_eq!(observed_key(&snapshot, selected), None);
+    }
+
     fn profile(host: &str) -> Profile {
         Profile {
             dns_domains: Vec::new(),

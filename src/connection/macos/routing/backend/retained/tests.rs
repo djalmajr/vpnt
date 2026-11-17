@@ -31,6 +31,24 @@ fn route(index: u16) -> Route {
     }
 }
 
+#[test]
+fn ipsec_full_plan_refuses_an_on_link_ipv4_pin_without_prefix_proof() {
+    let gateway_pin = route(7);
+    let full = ppp_networks(&[], 3, true, true, None).unwrap();
+    let mut plan = full.clone();
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut plan, || ipsec_transport_default(gateway_pin)),
+        Err(Error::Conflict)
+    );
+    assert_eq!(plan, full);
+
+    let mut split = ppp_networks(&["10.0.0.0/8".into()], 3, true, true, None).unwrap();
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut split, || ipsec_transport_default(gateway_pin)),
+        Ok(None)
+    );
+}
+
 #[derive(Clone)]
 struct TestPin {
     index: u16,
