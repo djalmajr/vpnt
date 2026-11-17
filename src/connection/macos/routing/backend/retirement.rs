@@ -6,11 +6,12 @@ use crate::connection::{
 };
 use std::net::IpAddr;
 
-pub(super) struct Retirement {
-    pub ppp: Option<Arc<OwnedPpp>>,
-    pub sink: Option<RetiredSink>,
+pub(crate) struct Retirement {
+    pub(super) owner: Option<Owner>,
+    pub(super) ppp: Option<Arc<OwnedPpp>>,
+    pub(super) sink: Option<RetiredSink>,
 }
-pub(super) type Queue = Arc<Mutex<Vec<Retirement>>>;
+pub(crate) type Queue = Arc<Mutex<Vec<Retirement>>>;
 pub(super) fn admit(queue: &Queue) -> Result<(), Error> {
     if !queue.lock().map_err(|_| Error::Unavailable)?.is_empty() {
         return Err(Error::Busy);
@@ -24,9 +25,10 @@ pub(super) struct Guard {
     queue: Queue,
 }
 impl Guard {
-    pub fn new(ppp: Arc<OwnedPpp>, queue: Queue) -> Self {
+    pub fn new(ppp: Arc<OwnedPpp>, owner: Owner, queue: Queue) -> Self {
         Self {
             resource: Some(Retirement {
+                owner: Some(owner),
                 ppp: Some(ppp),
                 sink: None,
             }),
@@ -37,6 +39,10 @@ impl Guard {
         self.resource
             .as_ref()
             .and_then(|resource| resource.sink.as_ref())
+    }
+    /// Used only after the durable inventory has been committed.
+    pub fn abandon(&mut self) {
+        self.resource = None;
     }
     pub fn set_sink(&mut self, sink: Option<RetiredSink>) {
         if let Some(resource) = &mut self.resource {
@@ -58,6 +64,35 @@ impl Guard {
         }
         Ok(true)
     }
+}
+pub(crate) fn inventory(
+    queue: &[Retirement],
+    owner: &Owner,
+) -> Vec<crate::connection::fence::RetiredIdentity> {
+    queue
+        .iter()
+        .filter(|entry| entry.owner.as_ref() == Some(owner))
+        .map(|entry| crate::connection::fence::RetiredIdentity {
+            interface: entry
+                .ppp
+                .as_ref()
+                .map(|ppp| crate::connection::fence::Interface {
+                    name: ppp.name().to_owned(),
+                    index: ppp.index(),
+                }),
+            sink: entry
+                .sink
+                .as_ref()
+                .map(|sink| crate::connection::fence::Sink {
+                    name: sink.name.clone(),
+                    index: u32::from(sink.index),
+                    source: sink.source,
+                }),
+        })
+        .collect()
+}
+pub(crate) fn detach(queue: &mut Vec<Retirement>, owner: &Owner) {
+    queue.retain(|entry| entry.owner.as_ref() != Some(owner));
 }
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -149,10 +184,68 @@ mod tests {
     };
     use std::collections::{BTreeMap, BTreeSet};
     #[test]
+    fn inventory_and_detach_use_exact_owner_and_keep_unknown_resources() {
+        let first = Owner {
+            uid: 501,
+            profile: "first".into(),
+            generation: 1,
+        };
+        let other = Owner {
+            uid: 501,
+            profile: "first".into(),
+            generation: 2,
+        };
+        let sink = || {
+            Some(RetiredSink {
+                name: "utun42".into(),
+                index: 234,
+                source: Some("fd12::1".parse().unwrap()),
+            })
+        };
+        let queue = Arc::new(Mutex::new(vec![
+            Retirement {
+                owner: Some(other.clone()),
+                ppp: None,
+                sink: sink(),
+            },
+            Retirement {
+                owner: None,
+                ppp: None,
+                sink: sink(),
+            },
+        ]));
+        let guard = Guard {
+            resource: Some(Retirement {
+                owner: Some(first.clone()),
+                ppp: None,
+                sink: sink(),
+            }),
+            queue: queue.clone(),
+        };
+        drop(guard);
+        let mut entries = queue.lock().unwrap();
+        let recorded = inventory(&entries, &first);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].sink.as_ref().unwrap().name, "utun42");
+        assert_eq!(recorded[0].sink.as_ref().unwrap().index, 234);
+        assert_eq!(
+            recorded[0].sink.as_ref().unwrap().source,
+            Some("fd12::1".parse().unwrap())
+        );
+        detach(&mut entries, &first);
+        assert!(inventory(&entries, &first).is_empty());
+        assert_eq!(inventory(&entries, &other).len(), 1);
+        assert_eq!(
+            entries.iter().filter(|entry| entry.owner.is_none()).count(),
+            1
+        );
+    }
+    #[test]
     fn failed_scope_retains_retirement_until_observed_complete_including_read_errors() {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let pending = || Guard {
             resource: Some(Retirement {
+                owner: None,
                 ppp: None,
                 sink: Some(RetiredSink {
                     name: "utun42".into(),

@@ -56,6 +56,11 @@ def run(copy, label, arguments, expected):
         raise RuntimeError(f"{label}: timed out") from None
     (REPORTS / f"{label}.log").write_text(output)
     if process.returncode != expected or (expected == 101 and "test result: FAILED" not in output):
+        # CI keeps only stdout: name the failing tests instead of a bare exit.
+        failures = [line for line in output.splitlines()
+                    if line.startswith("---- ") or " panicked at " in line
+                    or (line.startswith("test ") and line.endswith(" FAILED"))]
+        print("\n".join(failures[-40:]), flush=True)
         raise RuntimeError(f"{label}: expected a test exit {expected}, got {process.returncode}")
     if expected == 0 and "test result: ok." not in output:
         raise RuntimeError(f"{label}: no executed test result")
@@ -262,7 +267,7 @@ def main():
          lambda s: replace_once(s, "&& factory.idle()", "&& true"),
          ["--lib", "profiles_run_concurrently_and_eof"]),
         ("controller-untested-tunnel-connected", "src/connection/controller/worker.rs",
-         lambda s: replace_once(s, "send(ConnectionState::Verifying, 0)", "send(ConnectionState::Connected, 0)"),
+         lambda s: replace_once(s, "send(ConnectionState::Verifying, 0, false)", "send(ConnectionState::Connected, 0, false)"),
          ["--lib", "controller_connects_only_after_leases"]),
         ("controller-unresponsive-probe-accepted", "src/connection/controller/worker.rs",
          lambda s: replace_once(s, "send(\n                    if responsive {", "send(\n                    if true {"),

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Prepare a private VPN runtime in target/, without installing or connecting."""
+from identifiers import tool
 import argparse
 import hashlib
 import json
@@ -16,7 +17,7 @@ from runtime_sources import build_fortinet, FORTI_VERSION, FORTI_URL, FORTI_SHA
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-PREFIX = Path("/Library/PrivilegedHelperTools/dev.vpnt.runtime") / VERSION
+PREFIX = Path(tool("runtime")) / VERSION
 SWAN_VERSION = "6.1.0"
 SWAN_URL = f"https://download.strongswan.org/strongswan-{SWAN_VERSION}.tar.bz2"
 SWAN_SHA = "fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4"
@@ -36,6 +37,8 @@ SWAN_PATCHES = [
 FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
 SUPERVISOR_PATCH = ROOT / "scripts/macos/patches/openfortivpn-ppp-supervisor.patch"
+SPLIT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-split-routes.patch"
+DNS_PATCH = ROOT / "scripts/macos/patches/openfortivpn-split-dns.patch"
 
 
 def digest(path):
@@ -197,7 +200,7 @@ def verify_runtime(root):
         raise RuntimeError("Runtime manifest does not declare the kernel-libipsec backend")
     if manifest["strongswan"]["patches"] != expected_swan_patches():
         raise RuntimeError("Runtime does not include the exact strongSwan patch set")
-    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH]}:
+    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]}:
         raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
@@ -248,7 +251,7 @@ def verify_runtime(root):
             if program == "openfortivpn":
                 # Parse the driver's fixed options in the real client, then
                 # exit via --version before config, credentials or networking.
-                arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", "--pinentry=/Library/PrivilegedHelperTools/dev.vpnt.pinentry", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--ifname=lo0", "--vpnt-ifindex=1", "--vpnt-gateway-ip=127.0.0.1", "--trusted-cert=" + "a1" * 32]
+                arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", f"--pinentry={tool('pinentry')}", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--ifname=lo0", "--vpnt-ifindex=1", "--vpnt-gateway-ip=127.0.0.1", "--trusted-cert=" + "a1" * 32]
             result = subprocess.run(arguments + ["--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
             if result.returncode or result.stdout.strip() != expected:
                 raise RuntimeError(f"Private {program} startup/version check failed")
@@ -362,7 +365,7 @@ def main():
     for patch in SWAN_PATCHES:
         run(["/usr/bin/patch", "-t", "-p1", "--fuzz=0", "-i", patch], source, os.environ.copy(), log)
     env = {key: value for key, value in os.environ.items() if not key.startswith(("DYLD_", "LD_"))}
-    env.update(CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib", PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"))
+    env.update(CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib -Wl,-headerpad_max_install_names", PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"))
     configure = [
         source / "configure",
         f"--prefix={PREFIX}",
@@ -396,6 +399,7 @@ def main():
         {
             "configure": [str(value) for value in configure],
             "openssl": str(openssl),
+            "ldflags": env["LDFLAGS"],
             "backend": SWAN_BACKEND,
             "patches": expected_swan_patches(),
         },
@@ -460,7 +464,7 @@ def main():
                 "version": FORTI_VERSION,
                 "source": FORTI_URL,
                 "sha256": FORTI_SHA,
-                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH]},
+                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]},
             },
             "files": files,
         }

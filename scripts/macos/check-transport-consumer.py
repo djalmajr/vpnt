@@ -43,7 +43,7 @@ def main():
     openssl = Path(subprocess.check_output(["brew", "--prefix", "openssl@4"], text=True).strip())
     fixture = ROOT / "tests/fixtures/fortinet_transport.c"
     patches = [ROOT / "scripts/macos/patches" / name for name in [
-        "openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch"]]
+        "openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch", "openfortivpn-split-routes.patch", "openfortivpn-split-dns.patch"]]
     receipt = {"archiveSha256": FORTI_SHA, "sourceSha256": {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in [fixture, *patches]
@@ -59,15 +59,21 @@ def main():
             for index, patch in enumerate(patches):
                 execute(f"patch-{index}", ["/usr/bin/patch", "-t", "-p1", "-i", patch], source)
             program = directory / "consumer"
-            compile_command = ["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip",
-                "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1",
-                '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include",
-                f"-L{openssl}/lib", "-lssl", "-lcrypto", fixture, "-o", program]
 
-            def run(label, expected=0):
-                execute(f"{label}-compile", compile_command, directory)
+            def compile_command(bindtodevice):
+                # Current macOS SDKs declare SO_BINDTODEVICE, so configure sets 1.
+                return ["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip",
+                    f"-DHAVE_SO_BINDTODEVICE={bindtodevice}",
+                    '-DVPNT_PPP_SUPERVISOR="/nonexistent/vpnt-fixture-pppd"',
+                    "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1",
+                    '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include",
+                    f"-L{openssl}/lib", "-lssl", "-lcrypto", fixture, "-o", program]
+
+            def run(label, expected=0, bindtodevice="1"):
+                execute(f"{label}-compile", compile_command(bindtodevice), directory)
                 receipt[label] = execute(label, [program], directory, expected)
 
+            run("baseline-bindtodevice-0", bindtodevice="0")
             run("baseline")
             tunnel = source / "src/tunnel.c"
             original = tunnel.read_text()
@@ -76,6 +82,8 @@ def main():
                  "setsockopt(handle, IPPROTO_IP, IP_BOUND_IF,\n\t\t                  &bound_index, sizeof(bound_index))", "0"),
                 ("expected-index-ignored", "bound_index != tunnel->config->vpnt_ifindex", "0"),
                 ("gateway-resolved-again", "tunnel->config->vpnt_gateway_ip.s_addr != INADDR_ANY", "0"),
+                ("source-binding-skipped",
+                 "bound_source = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;", "(void)0;"),
             ]
             for name, before, after in mutations:
                 try:
@@ -85,10 +93,11 @@ def main():
                     tunnel.write_text(original)
             run("restored")
             receipt["casesPassed"] = 6
+            receipt["bindtodeviceVariants"] = ["0", "1"]
             receipt["mutationsDetected"] = len(mutations)
     finally:
         (REPORTS / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-    print("Patched TCP consumer: 6 scenarios and 3 mutations passed; no VPN or route changes")
+    print("Patched TCP consumer: 6 scenarios (HAVE_SO_BINDTODEVICE 0 and 1) and 4 mutations passed; no VPN or route changes")
 
 
 if __name__ == "__main__":

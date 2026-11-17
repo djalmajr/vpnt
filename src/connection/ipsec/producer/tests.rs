@@ -9,6 +9,7 @@ mod admission;
 mod binding;
 mod bound;
 mod bound_budget;
+mod diagnostic;
 mod fixture;
 mod lease_budget;
 mod ledger;
@@ -32,6 +33,7 @@ fn owner(id: &str, generation: u64) -> Owner {
 }
 fn config<N: Observer>(registry: &Registry<N>, reservation: &Reservation) -> Config {
     let p = Profile {
+        dns_domains: Vec::new(),
         id: reservation.owner().profile.clone(),
         name: "Fixture".into(),
         kind: VpnKind::Ipsec,

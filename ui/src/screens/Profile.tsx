@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useLayoutEffect, useState } from "react";
 import {
   Dialog,
   Group,
@@ -8,13 +8,23 @@ import {
   type T,
 } from "../components/common";
 import type { Profile as VpnProfile, VpnView } from "../model";
-import type { Navigate, Run } from "../navigation";
+import {
+  type Navigate,
+  type ProfileOrigin,
+  profileOriginRoute,
+  type RegisterNavigationGuard,
+  type Run,
+} from "../navigation";
 import { blankProfile } from "../profileDefaults";
+import { hasShellExpression } from "../shellExpression";
 
 export function Profile({
   vpn,
   kind,
+  origin,
   navigate,
+  registerNavigationGuard,
+  saved,
   run,
   t,
   secrets,
@@ -22,7 +32,10 @@ export function Profile({
 }: {
   vpn?: VpnView;
   kind?: "ipsec" | "ssl";
+  origin?: ProfileOrigin;
   navigate: Navigate;
+  registerNavigationGuard: RegisterNavigationGuard;
+  saved: () => void;
   run: Run;
   t: T;
   secrets: () => void;
@@ -33,16 +46,33 @@ export function Profile({
   );
   const [value, setValue] = useState(initial);
   const [networks, setNetworks] = useState(initial.networks.join(", "));
-  const [discard, setDiscard] = useState(false);
+  const [dnsDomains, setDnsDomains] = useState(
+    (initial.dnsDomains ?? []).join(", "),
+  );
+  const [discard, setDiscard] = useState<() => void>();
   const [saving, setSaving] = useState(false);
   const dirty =
     JSON.stringify(value) !== JSON.stringify(initial) ||
-    networks !== initial.networks.join(", ");
+    networks !== initial.networks.join(", ") ||
+    dnsDomains !== (initial.dnsDomains ?? []).join(", ");
   const set = <K extends keyof VpnProfile>(key: K, next: VpnProfile[K]) =>
     setValue({ ...value, [key]: next });
-  const back = () =>
-    dirty ? setDiscard(true) : navigate({ page: "preferences" });
+  useLayoutEffect(() => {
+    registerNavigationGuard({
+      blocked: saving,
+      request: (proceed) => {
+        if (saving) return;
+        if (dirty) setDiscard(() => proceed);
+        else proceed();
+      },
+    });
+    return () => registerNavigationGuard(undefined);
+  }, [dirty, saving, registerNavigationGuard]);
+  const back = () => navigate(profileOriginRoute(origin));
+  const usernameErrorId = useId();
+  const usernameError = hasShellExpression(value.username);
   const canSave =
+    !usernameError &&
     !!value.name.trim() &&
     !!value.gateway.trim() &&
     !!value.probeHost.trim() &&
@@ -61,6 +91,10 @@ export function Profile({
       <span>{t(label)}</span>
       <input
         value={value[key]}
+        aria-invalid={key === "username" && usernameError ? true : undefined}
+        aria-describedby={
+          key === "username" && usernameError ? usernameErrorId : undefined
+        }
         disabled={saving}
         placeholder={placeholder}
         maxLength={key === "name" ? 120 : 253}
@@ -68,6 +102,15 @@ export function Profile({
         spellCheck={false}
         autoComplete="off"
       />
+      {key === "username" && usernameError && (
+        <small
+          id={usernameErrorId}
+          className="field-error danger-text"
+          role="alert"
+        >
+          {t("usernameShellError")}
+        </small>
+      )}
     </label>
   );
   return (
@@ -85,18 +128,25 @@ export function Profile({
           event.preventDefault();
           if (canSave) {
             setSaving(true);
-            void run({
-              type: "save_profile",
-              profile: {
-                ...value,
-                networks: networks
-                  .split(",")
-                  .map((network) => network.trim())
-                  .filter(Boolean),
-              },
-            })
+            const profile = {
+              ...value,
+              networks: networks
+                .split(",")
+                .map((network) => network.trim())
+                .filter(Boolean),
+            };
+            const domains =
+              value.kind === "ssl"
+                ? dnsDomains
+                    .split(",")
+                    .map((domain) => domain.trim().toLowerCase())
+                    .filter(Boolean)
+                : [];
+            if (domains.length) profile.dnsDomains = domains;
+            else delete profile.dnsDomains;
+            void run({ type: "save_profile", profile })
               .then((ok) => {
-                if (ok) navigate({ page: "preferences" });
+                if (ok) saved();
               })
               .finally(() => setSaving(false));
           }
@@ -131,23 +181,38 @@ export function Profile({
             />
           </label>
           {input("username", "username")}
-          {value.kind === "ipsec" ? (
-            <>
-              <label className="field">
-                <span>{t("networks")}</span>
-                <input
-                  value={networks}
-                  disabled={saving}
-                  placeholder="10.20.0.0/24"
-                  onChange={(event) => setNetworks(event.target.value)}
-                />
-              </label>
-              <p className="hint">{t("networksHint")}</p>
-            </>
-          ) : (
+          {value.kind === "ssl" && (
             <>
               {input("certificate", "certificate")}
               <p className="hint">{t("certificateHint")}</p>
+            </>
+          )}
+          <label className="field">
+            <span>{t("networks")}</span>
+            <input
+              value={networks}
+              disabled={saving}
+              placeholder="10.20.0.0/24"
+              onChange={(event) => setNetworks(event.target.value)}
+            />
+          </label>
+          <p className="hint">
+            {t(value.kind === "ssl" ? "networksHintSsl" : "networksHint")}
+          </p>
+          {value.kind === "ssl" && (
+            <>
+              <label className="field">
+                <span>{t("dnsDomains")}</span>
+                <input
+                  value={dnsDomains}
+                  disabled={saving}
+                  placeholder="corp.example.com"
+                  onChange={(event) => setDnsDomains(event.target.value)}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+              <p className="hint">{t("dnsDomainsHint")}</p>
             </>
           )}
         </Group>
@@ -188,26 +253,27 @@ export function Profile({
         </Group>
         {!!vpn && (
           <>
-            <h2 className="section-title">{t("secrets")}</h2>
+            <div className="spread">
+              <h2 className="section-title">{t("secrets")}</h2>
+              <button type="button" onClick={secrets} disabled={saving}>
+                {t(
+                  vpn.hasPassword || (value.kind === "ipsec" && vpn.hasPsk)
+                    ? "change"
+                    : "provide",
+                )}
+              </button>
+            </div>
             <Group>
               {value.kind === "ipsec" && (
                 <Row
                   label={t("psk")}
                   hint={t(vpn.hasPsk ? "stored" : "notStored")}
-                >
-                  <button type="button" onClick={secrets} disabled={saving}>
-                    {t(vpn.hasPsk ? "change" : "provide")}
-                  </button>
-                </Row>
+                />
               )}
               <Row
                 label={t("password")}
                 hint={t(vpn.hasPassword ? "stored" : "notStored")}
-              >
-                <button type="button" onClick={secrets} disabled={saving}>
-                  {t(vpn.hasPassword ? "change" : "provide")}
-                </button>
-              </Row>
+              />
             </Group>
           </>
         )}
@@ -233,17 +299,17 @@ export function Profile({
         </div>
       </form>
       {discard && (
-        <Dialog title={t("discardTitle")} close={() => setDiscard(false)} t={t}>
+        <Dialog
+          title={t("discardTitle")}
+          close={() => setDiscard(undefined)}
+          t={t}
+        >
           <p>{t("discardHint")}</p>
           <div className="actions end">
-            <button type="button" onClick={() => setDiscard(false)}>
+            <button type="button" onClick={() => setDiscard(undefined)}>
               {t("keepEditing")}
             </button>
-            <button
-              type="button"
-              className="danger"
-              onClick={() => navigate({ page: "preferences" })}
-            >
+            <button type="button" className="danger" onClick={discard}>
               {t("discard")}
             </button>
           </div>

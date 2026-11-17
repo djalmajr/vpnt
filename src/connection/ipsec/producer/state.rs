@@ -27,6 +27,7 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 pub(super) struct Store {
     pub root: Directory,
     io: Mutex<()>,
+    log: std::path::PathBuf,
     /// Test-only one-shot hook: set a caller's cancel flag after the record
     /// scan and immediately before the first durable create.
     #[cfg(test)]
@@ -48,6 +49,7 @@ impl Store {
         };
         Ok(Arc::new(Self {
             root,
+            log: crate::helper::paths::charon_log(parent),
             io: Mutex::new(()),
             #[cfg(test)]
             before_create: Mutex::new(None),
@@ -152,8 +154,8 @@ impl Store {
         let dir = unstarted.0.as_ref().unwrap();
         budget::check(budget)?;
         let conf = match transport_interface {
-            Some(index) => config::render_bound(&dir.path, index)?,
-            None => config::render(&dir.path)?,
+            Some(index) => config::render_bound(&dir.path, &self.log, index)?,
+            None => config::render(&dir.path, &self.log)?,
         };
         let owner = reservation.owner();
         let record = Record {

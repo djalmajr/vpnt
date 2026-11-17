@@ -79,6 +79,38 @@ pub struct SslDriver {
 }
 
 impl SslDriver {
+    #[cfg(test)]
+    pub(crate) fn fixture_child_id(&self) -> u32 {
+        self.child.id()
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fixture_output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::{io::Write, net::Shutdown, os::unix::net::UnixStream};
+        let (reader, mut writer) = UnixStream::pair()?;
+        self.output.attach(reader)?;
+        writer.write_all(bytes)?;
+        writer.shutdown(Shutdown::Write)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn split_observation(&self) -> super::ssl_output::Observation {
+        self.output.snapshot()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_invalid_split(&self) {
+        self.output.note_invalid_split();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_no_dns_domain(&self) {
+        self.output.note_no_dns_domain();
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_no_dns_servers(&self) {
+        self.output.note_no_dns_servers();
+    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     #[cfg(target_os = "macos")]
@@ -99,8 +131,16 @@ impl SslDriver {
         let binding = egress
             .binding(profile)
             .map_err(|_| StartError::Unavailable)?;
-        let mut driver =
-            Self::start_using(&runtime, profile, credentials, &binding, canceled.clone())?;
+        let mut driver = Self::start_using(
+            &runtime,
+            profile,
+            credentials,
+            &binding,
+            canceled.clone(),
+            std::path::Path::new(paths::STATE),
+            // SAFETY: UID queries have no memory preconditions.
+            unsafe { libc::geteuid() },
+        )?;
         if !egress.is_current(profile).unwrap_or(false) {
             driver.start_error = Some(StartError::Unavailable);
         }
@@ -113,6 +153,8 @@ impl SslDriver {
         credentials: Credentials,
         binding: &Binding,
         canceled: Arc<AtomicBool>,
+        state: &std::path::Path,
+        owner: u32,
     ) -> Result<Self, StartError> {
         let command = command(runtime, profile, binding)?;
         credentials
@@ -120,6 +162,9 @@ impl SslDriver {
             .map_err(|_| StartError::InvalidSecret)?;
         runtime.verify().map_err(map_runtime)?;
         let (server, supervisor) = UnixStream::pair().map_err(|_| StartError::Unavailable)?;
+        // Rotate the diagnostic log immediately before spawning: a missing log
+        // never fails the connection, and the drain keeps working disabled.
+        let _ = super::ssl_output::prepare_log(state, owner);
         let child =
             PinentryChild::spawn_private_runtime(command, credentials.password, supervisor.into())
                 .map_err(|_| StartError::Unavailable)?;
@@ -145,6 +190,8 @@ impl SslDriver {
             start_error: None,
         };
         let setup = (|| {
+            // Logging never fails setup: a missing log keeps the drain running.
+            driver.output.open_log(state, owner);
             let stdout = driver.child.take_stdout().ok_or(StartError::Unavailable)?;
             driver
                 .output
@@ -171,9 +218,10 @@ impl SslDriver {
                 self.start_error = Some(StartError::Unavailable);
             }
         }
-        let exited = self.child.poll()?.is_some();
+        let status = self.child.poll()?;
+        let exited = status.is_some();
         if exited {
-            self.output.finish();
+            self.output.finish_with_status(status);
         }
         let observed = self.output.snapshot();
         Ok(Update {
@@ -189,12 +237,38 @@ impl SslDriver {
         #[cfg(target_os = "macos")]
         self.supervision.cancel();
         let result = self.child.stop(Duration::from_secs(3));
-        self.output.finish();
+        match &result {
+            Ok(outcome) => self.output.finish_with_status(Some(outcome.status)),
+            Err(_) => self.output.finish(),
+        }
         result
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn supervised_ppp(&self) -> Option<Arc<Proof>> {
         self.supervision.proof()
+    }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn recorded_processes(
+        &self,
+    ) -> io::Result<(String, Vec<crate::connection::fence::ProcessIdentity>)> {
+        let (service, identities) = self.supervision.recorded();
+        let processes = identities
+            .into_iter()
+            .map(|(identity, program)| {
+                Ok(crate::connection::fence::ProcessIdentity {
+                    pid: identity.pid,
+                    start_sec: i64::try_from(identity.start.0)
+                        .map_err(|_| io::ErrorKind::InvalidData)?,
+                    start_usec: i32::try_from(identity.start.1)
+                        .map_err(|_| io::ErrorKind::InvalidData)?,
+                    program: program
+                        .to_str()
+                        .ok_or(io::ErrorKind::InvalidData)?
+                        .to_owned(),
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((service.as_str().to_owned(), processes))
     }
     #[cfg(target_os = "macos")]
     pub(crate) fn ppp_may_have_run(&self) -> bool {
@@ -270,4 +344,4 @@ fn map_runtime(error: RuntimeError) -> StartError {
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "ssl_tests.rs"]
-mod tests;
+pub(crate) mod tests;

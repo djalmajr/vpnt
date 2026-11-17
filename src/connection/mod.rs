@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "macos", test))]
 pub mod controller;
+pub mod fence;
 #[cfg(unix)]
 pub mod ipsec;
 #[cfg(target_os = "macos")]

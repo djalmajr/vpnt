@@ -22,6 +22,7 @@ pub enum Error {
     Unavailable,
     Incompatible,
     Busy,
+    PreviousSessionFinishing,
 }
 struct State {
     fault: Mutex<Option<Error>>,
@@ -33,6 +34,8 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     state: Arc<State>,
     failed: bool,
+    #[cfg(test)]
+    fixture_build: Option<String>,
 }
 impl Client {
     pub fn runtime() -> Result<Self, Error> {
@@ -49,7 +52,30 @@ impl Client {
     }
     #[cfg(test)]
     pub(crate) fn fixture(command: Command) -> Result<Self, Error> {
-        Self::spawn(command)
+        let mut client = Self::spawn(command)?;
+        client.fixture_build = Some("a".repeat(64));
+        Ok(client)
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_channels(
+        requests: SyncSender<Request>,
+        output: Receiver<Message>,
+    ) -> Self {
+        Self {
+            requests: Some(requests),
+            output,
+            stop: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(State {
+                fault: Mutex::new(None),
+                finished: AtomicBool::new(false),
+            }),
+            failed: false,
+            fixture_build: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_build(&self) -> Option<&str> {
+        self.fixture_build.as_deref()
     }
     fn spawn(command: Command) -> Result<Self, Error> {
         if !std::path::Path::new(command.get_program()).is_absolute() {
@@ -76,6 +102,8 @@ impl Client {
             stop,
             state,
             failed: false,
+            #[cfg(test)]
+            fixture_build: None,
         })
     }
     pub fn send(&self, request: Request) -> Result<(), Error> {
@@ -107,6 +135,11 @@ impl Client {
             return Err(error);
         }
         Ok(self.output.try_iter().take(64).collect())
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_finished(&self) -> impl Fn() -> bool + Send + Clone + 'static {
+        let state = self.state.clone();
+        move || state.finished.load(Ordering::Acquire)
     }
     pub fn finished(&self) -> bool {
         self.state.finished.load(Ordering::Acquire)

@@ -203,6 +203,20 @@ impl<S: Scope, K: Table> Registry<S, K> {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+    pub(super) fn owner_scope(&self, owner: &Owner) -> Option<&S> {
+        self.entries
+            .values()
+            .find(|entry| entry.owner == *owner)
+            .map(|entry| &entry.scope)
+    }
+    pub(super) fn take_owner(&mut self, owner: &Owner) -> Option<S> {
+        let key = *self
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.owner == *owner)?
+            .0;
+        self.entries.remove(&key).map(|entry| entry.scope)
+    }
     fn observed(&mut self, key: Key) -> Result<Option<Route>, Error> {
         // Coordinator treats Error::Changed as disposable. Read failures must
         // instead retain receipts even if the platform adapter used that code.

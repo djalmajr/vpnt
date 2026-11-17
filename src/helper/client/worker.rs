@@ -71,6 +71,7 @@ fn pump(
 ) -> Result<(), Error> {
     let mut incoming = Vec::new();
     let mut began = None;
+    let mut waiting_previous = false;
     let mut sending: Option<(Zeroizing<Vec<u8>>, usize, Instant)> = None;
     loop {
         if stop.load(Ordering::Acquire) {
@@ -111,7 +112,13 @@ fn pump(
         for _ in 0..8 {
             let mut chunk = [0; 8192];
             let count = match stream.read(&mut chunk) {
-                Ok(0) => return Err(Error::Unavailable),
+                Ok(0) => {
+                    return Err(if waiting_previous && incoming.is_empty() {
+                        Error::PreviousSessionFinishing
+                    } else {
+                        Error::Unavailable
+                    });
+                }
                 Ok(count) => count,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -133,6 +140,11 @@ fn pump(
                             }
                         })?
                         .ok_or(Error::Unavailable)?;
+                    waiting_previous = matches!(
+                        &message,
+                        Message::PreviousSessionFinishing { version, .. }
+                            if version == env!("CARGO_PKG_VERSION")
+                    );
                     output.try_send(message).map_err(|_| Error::Unavailable)?;
                     began = None;
                 } else {

@@ -6,6 +6,7 @@ pub(super) fn dispatch<F: Factory>(
     slots: &mut BTreeMap<String, Slot<'_>>,
     output: &mut VecDeque<Message>,
     interval: &ProbeClock,
+    cleanup_capable: bool,
 ) {
     let fail = |output: &mut VecDeque<_>, error| {
         output.push_back(Message::Failed {
@@ -15,6 +16,25 @@ pub(super) fn dispatch<F: Factory>(
     };
     if !valid_profile_id(&request.id) {
         fail(output, ErrorCode::InvalidRequest);
+        return;
+    }
+    if let Command::VerifyCleanup { profile } = &request.command {
+        if !cleanup_capable {
+            fail(output, ErrorCode::Unavailable);
+            return;
+        }
+        let Some(slot) = slots.get(profile) else {
+            fail(output, ErrorCode::ProfileNotFound);
+            return;
+        };
+        // A queued or live attempt owns its own inventory. Recovery may only
+        // examine this profile after its worker has finished and been joined.
+        if slot.worker.is_some() || slot.pending.is_some() {
+            fail(output, ErrorCode::ProfileBusy);
+            return;
+        }
+        let _ = factory.verify_cleanup(&slot.profile);
+        output.push_back(snapshot(request.id, factory, slots, true));
         return;
     }
     // A global cadence preference: no profile/slot lookup, no credential or
@@ -31,28 +51,19 @@ pub(super) fn dispatch<F: Factory>(
         return;
     }
     let (id, generation) = match &request.command {
+        Command::Diagnostics {} => {
+            // The authenticated helper handles this before forwarding requests.
+            fail(output, ErrorCode::Unavailable);
+            return;
+        }
         Command::Snapshot {} => {
-            output.push_back(Message::Snapshot {
-                id: request.id,
-                protocol_version: VERSION,
-                version: env!("CARGO_PKG_VERSION").into(),
-                profiles: slots.values().map(|slot| slot.profile.clone()).collect(),
-                connections: slots
-                    .values()
-                    .map(|slot| TunnelStatus {
-                        id: slot.profile.id.clone(),
-                        generation: slot.generation,
-                        state: slot.state,
-                        failures: slot.failures,
-                    })
-                    .collect(),
-            });
+            output.push_back(snapshot(request.id, factory, slots, cleanup_capable));
             return;
         }
         Command::Connect { id, generation, .. }
         | Command::Disconnect { id, generation }
         | Command::Probe { id, generation } => (id, *generation),
-        Command::SetProbeInterval { .. } => unreachable!(),
+        Command::SetProbeInterval { .. } | Command::VerifyCleanup { .. } => unreachable!(),
     };
     let Some(slot) = slots.get_mut(id) else {
         fail(output, ErrorCode::ProfileNotFound);
@@ -73,6 +84,10 @@ pub(super) fn dispatch<F: Factory>(
             credentials,
             ..
         } => {
+            if factory.cleanup_blocked(&slot.profile) {
+                fail(output, ErrorCode::ProfileBusy);
+                return;
+            }
             if !factory.supports(slot.profile.kind) {
                 fail(output, ErrorCode::MissingProgram);
                 return;
@@ -91,6 +106,7 @@ pub(super) fn dispatch<F: Factory>(
             });
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if replacing {
                 ConnectionState::Reconnecting
             } else {
@@ -102,6 +118,7 @@ pub(super) fn dispatch<F: Factory>(
             slot.pending = None;
             slot.generation = generation;
             slot.failures = 0;
+            slot.cleaning = false;
             slot.state = if slot.worker.is_some() {
                 ConnectionState::Disconnecting
             } else {
@@ -124,8 +141,45 @@ pub(super) fn dispatch<F: Factory>(
                 return;
             }
         }
-        Command::Snapshot {} | Command::SetProbeInterval { .. } => unreachable!(),
+        Command::Snapshot {}
+        | Command::Diagnostics {}
+        | Command::SetProbeInterval { .. }
+        | Command::VerifyCleanup { .. } => {
+            unreachable!()
+        }
     }
     output.push_back(Message::Accepted { id: request.id });
     output.push_back(slot.changed());
+}
+
+fn snapshot<F: Factory>(
+    id: String,
+    factory: &F,
+    slots: &BTreeMap<String, Slot<'_>>,
+    cleanup_capable: bool,
+) -> Message {
+    Message::Snapshot {
+        id,
+        protocol_version: VERSION,
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: None,
+        profiles: slots.values().map(|slot| slot.profile.clone()).collect(),
+        connections: slots
+            .values()
+            .map(|slot| {
+                let blocked = cleanup_capable && factory.cleanup_blocked(&slot.profile);
+                TunnelStatus {
+                    id: slot.profile.id.clone(),
+                    generation: slot.generation,
+                    state: if blocked {
+                        ConnectionState::CleanupUnconfirmed
+                    } else {
+                        slot.state
+                    },
+                    failures: if blocked { 0 } else { slot.failures },
+                    cleaning: if blocked { false } else { slot.cleaning },
+                }
+            })
+            .collect(),
+    }
 }

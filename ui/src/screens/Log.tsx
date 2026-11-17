@@ -48,52 +48,73 @@ export function Log({
         }
         t={t}
       />
-      <div className="tabs" role="tablist" aria-label={t("vpns")}>
-        {snapshot.vpns.map((vpn) => (
+      <div className="log-heading">
+        {vpn ? (
+          <div className="tabs" role="tablist" aria-label={t("vpns")}>
+            {snapshot.vpns.map((vpn) => (
+              <button
+                type="button"
+                key={vpn.profile.id}
+                role="tab"
+                id={tabId(vpn.profile.id)}
+                aria-controls={panelId}
+                aria-selected={vpn.profile.id === selectedId}
+                tabIndex={vpn.profile.id === selectedId ? 0 : -1}
+                title={vpn.profile.name}
+                onKeyDown={(event) => {
+                  const tabs = Array.from(
+                    event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+                      "[role=tab]",
+                    ) ?? [],
+                  );
+                  const index = tabs.indexOf(event.currentTarget);
+                  const next =
+                    event.key === "ArrowRight"
+                      ? (index + 1) % tabs.length
+                      : event.key === "ArrowLeft"
+                        ? (index - 1 + tabs.length) % tabs.length
+                        : event.key === "Home"
+                          ? 0
+                          : event.key === "End"
+                            ? tabs.length - 1
+                            : -1;
+                  if (next < 0) return;
+                  event.preventDefault();
+                  tabs[next]?.focus();
+                  tabs[next]?.click();
+                }}
+                onClick={() => {
+                  setSelected(vpn.profile.id);
+                  setCopied(false);
+                }}
+              >
+                {vpn.profile.name}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {!!lines.length && (
           <button
             type="button"
-            key={vpn.profile.id}
-            role="tab"
-            id={tabId(vpn.profile.id)}
-            aria-controls={panelId}
-            aria-selected={vpn.profile.id === selectedId}
-            tabIndex={vpn.profile.id === selectedId ? 0 : -1}
-            className={vpn.profile.id === selectedId ? "primary" : ""}
-            onKeyDown={(event) => {
-              const tabs = Array.from(
-                event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
-                  "[role=tab]",
-                ) ?? [],
-              );
-              const index = tabs.indexOf(event.currentTarget);
-              const next =
-                event.key === "ArrowRight"
-                  ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft"
-                    ? (index - 1 + tabs.length) % tabs.length
-                    : event.key === "Home"
-                      ? 0
-                      : event.key === "End"
-                        ? tabs.length - 1
-                        : -1;
-              if (next < 0) return;
-              event.preventDefault();
-              tabs[next]?.focus();
-              tabs[next]?.click();
-            }}
+            className="icon-button"
+            aria-label={t(copied ? "copied" : "copy")}
+            title={t(copied ? "copied" : "copy")}
             onClick={() => {
-              setSelected(vpn.profile.id);
-              setCopied(false);
+              void navigator.clipboard
+                .writeText(lines.join("\n"))
+                .then(() => setCopied(true))
+                .catch(() => setCopied(false));
             }}
           >
-            {vpn.profile.name}
+            <Icon name={copied ? "check" : "copy"} />
           </button>
-        ))}
+        )}
       </div>
       <div
         id={panelId}
         role="tabpanel"
         aria-labelledby={vpn ? tabId(vpn.profile.id) : undefined}
+        aria-label={vpn ? undefined : t("log")}
         // biome-ignore lint/a11y/noNoninteractiveTabindex: Static log panels need keyboard focus for scrolling (ARIA APG tabs pattern).
         tabIndex={0}
       >
@@ -110,17 +131,6 @@ export function Log({
       {!!lines.length && (
         <div className="spread">
           <small>{t("lastLines")}</small>
-          <button
-            type="button"
-            onClick={() => {
-              void navigator.clipboard
-                .writeText(lines.join("\n"))
-                .then(() => setCopied(true))
-                .catch(() => setCopied(false));
-            }}
-          >
-            {t(copied ? "copied" : "copy")}
-          </button>
         </div>
       )}
     </>

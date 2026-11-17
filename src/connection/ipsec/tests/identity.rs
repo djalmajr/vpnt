@@ -50,15 +50,28 @@ fn names_preserve_uid_generation_case_and_the_full_profile_and_default_selectors
 }
 
 #[test]
-fn usernames_are_opaque_key_id_bytes_even_when_they_look_like_identity_patterns() {
+fn usernames_have_explicit_text_types_and_the_same_eap_secret_owner() {
     let mut registry = Registry::new(Observation::default());
     let reservation = registry.reserve(owner("Case", 1)).unwrap();
     for (username, encoded) in [
-        ("%any", "keyid:#25616e79"),
-        ("*", "keyid:#2a"),
-        ("fqdn:#2a", "keyid:#6671646e3a233261"),
-        ("192.0.2.0/24", "keyid:#3139322e302e322e302f3234"),
-        ("{0}:", "keyid:#7b307d3a"),
+        ("fixture.user", "fqdn:fixture.user"),
+        ("Fixture@Example.com", "email:Fixture@Example.com"),
+        ("%any", "fqdn:%any"),
+        ("fqdn:#2a", "fqdn:fqdn:#2a"),
+        ("email:alice@example.com", "email:email:alice@example.com"),
+        ("192.0.2.0/24", "fqdn:192.0.2.0/24"),
+        ("{0}:", "fqdn:{0}:"),
+        ("a#b", "fqdn:a#b"),
+        ("CN=fixture", "fqdn:CN=fixture"),
+        ("@fixture", "email:@fixture"),
+        ("^fixture", "fqdn:^fixture"),
+        ("fixture$", "fqdn:fixture$"),
+        ("a,b", "fqdn:a,b"),
+        ("jo\u{e3}o", "fqdn:#6a6fc3a36f"),
+        (
+            "jos\u{e9}@example.com",
+            "email:#6a6f73c3a9406578616d706c652e636f6d",
+        ),
     ] {
         let mut p = profile();
         p.username = username.into();
@@ -72,11 +85,54 @@ fn usernames_are_opaque_key_id_bytes_even_when_they_look_like_identity_patterns(
         assert_eq!(local.get_text("id"), Some(encoded));
         assert_eq!(local.get_text("eap_id"), Some(encoded));
         let [eap, _] = c.shared(creds()).unwrap();
+        let eap = wire("load-shared", eap);
+        assert_eq!(eap.get_list("owners").unwrap().len(), 1);
         assert_eq!(
             eap.get_list("owners").unwrap()[0].as_slice(),
             encoded.as_bytes()
         );
     }
+}
+
+#[test]
+fn usernames_cannot_inject_hex_regex_wildcards_or_control_bytes() {
+    let mut registry = Registry::new(Observation::default());
+    let reservation = registry.reserve(owner("Case", 1)).unwrap();
+    for username in [
+        "",
+        "#616263",
+        "#616263@example.com",
+        "^fixture$",
+        "^fixture@example.com$",
+        "*",
+        "*.example.com",
+        "fixture*",
+        "fixture\0suffix",
+        "fixture\nother",
+        "fixture\r",
+        "fixture\t",
+        "fixture\u{7f}",
+        "fixture\u{85}",
+    ] {
+        let mut p = profile();
+        p.username = username.into();
+        assert!(
+            matches!(config(&registry, &reservation, &p), Err(Error::Invalid)),
+            "{username:?}"
+        );
+    }
+    let mut p = profile();
+    p.username = "x".repeat(201);
+    assert!(matches!(
+        config(&registry, &reservation, &p),
+        Err(Error::Invalid)
+    ));
+}
+
+#[test]
+fn unspecified_gateways_cannot_be_used_as_remote_identities() {
+    let mut registry = Registry::new(Observation::default());
+    let reservation = registry.reserve(owner("Case", 1)).unwrap();
     for gateway in ["0.0.0.0", "::", "0::0"] {
         let mut p = profile();
         p.gateway = gateway.into();

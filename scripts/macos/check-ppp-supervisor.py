@@ -21,8 +21,14 @@ REPORTS = ROOT / "output/fixtures/ppp-supervisor"
 EXECUTIONS = {}
 
 
-def run(label, command, expected=0):
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=30)
+def run(label, command, expected=0, timeout=30):
+    try:
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        (REPORTS / f"{label}.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
+        EXECUTIONS[label] = {"timeout": timeout, "command": list(map(str, command))}
+        (REPORTS / "executions.json").write_text(json.dumps(EXECUTIONS, indent=2) + "\n")
+        raise RuntimeError(f"{label}: timed out after {timeout}s; see {REPORTS / (label+'.log')}") from error
     (REPORTS / f"{label}.log").write_bytes(result.stdout + result.stderr)
     EXECUTIONS[label] = {"exit": result.returncode, "command": list(map(str, command))}
     (REPORTS / "executions.json").write_text(json.dumps(EXECUTIONS, indent=2) + "\n")
@@ -37,8 +43,8 @@ def main():
     if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA:
         raise SystemExit("Prepare the verified openfortivpn archive with build-runtime.py first")
     REPORTS.mkdir(parents=True, exist_ok=True)
-    run("build", ["cargo", "build", "--locked", "--offline", "--no-default-features", "--lib", "--bin", "vpnt-pppd"])
-    run("configuration", ["cargo", "test", "--locked", "--offline", "--no-default-features", "--lib", "helper::ppp_config"])
+    run("build", ["cargo", "build", "--locked", "--offline", "--no-default-features", "--lib", "--bin", "vpnt-pppd"], timeout=600)
+    run("configuration", ["cargo", "test", "--locked", "--offline", "--no-default-features", "--lib", "helper::ppp_config"], timeout=600)
     library = ["--edition=2024", "--extern", f"vpnt={ROOT}/target/debug/libvpnt.rlib", "-L", f"dependency={ROOT}/target/debug/deps"]
     # The read-only observer used by the fixture also needs this same libc.
     libc = max((ROOT / "target/debug/deps").glob("liblibc-*.rlib"), key=lambda path: path.stat().st_mtime)
@@ -57,7 +63,7 @@ def main():
         tunnel = (directory / "src/tunnel.c").read_text()
         # Fixture-only executable substitution. Keep patched control flow and
         # the full upstream argv builder, without touching the installed path.
-        fixed = '"/Library/PrivilegedHelperTools/dev.vpnt.pppd"'
+        fixed = 'VPNT_PPP_SUPERVISOR'
         if tunnel.count(fixed) != 1:
             raise RuntimeError("Missing mandatory fixed supervisor path")
         tunnel = tunnel.replace(fixed, "PPP_PATH")
@@ -65,10 +71,34 @@ def main():
         ppp = tunnel[tunnel.index("static int pppd_run("):tunnel.index("static const char * const ppp_message[]")]
         source = directory / "client.c"
         source.write_text((FIXTURE / "client-head.c").read_text() + builder + ppp + (FIXTURE / "client-tail.c").read_text())
-        run("compile-child", ["/usr/bin/cc", "-Wall", "-Wextra", "-Werror", FIXTURE / "child.c", "-o", directory / "child"])
+        # Stage updated wire consumers privately: the original fixtures remain
+        # untouched while this checker exercises the production UUID handshake.
+        def replace_once(text, old, new):
+            if text.count(old) != 1:
+                raise RuntimeError(f"fixture anchor changed: {old!r}")
+            return text.replace(old, new, 1)
+        child = (FIXTURE / "child.c").read_text()
+        child = replace_once(child, 'assert(argc==3+(int)(sizeof(expected)/sizeof(expected[0])));', 'assert(argc==5+(int)(sizeof(expected)/sizeof(expected[0])));')
+        child = replace_once(child, 'for(int i=3;i<argc;i++) assert(strcmp(argv[i],expected[i-3])==0);', 'for(int i=3;i<argc-2;i++) assert(strcmp(argv[i],expected[i-3])==0);\n    assert(strcmp(argv[argc-2],"serviceid")==0);\n    assert(strlen(argv[argc-1])==36 && argv[argc-1][14]==\'4\');')
+        child = replace_once(child, 'fprintf(marker,"%d\\n",getpid());', 'fprintf(marker,"%d\\n%s\\n",getpid(),argv[argc-1]);')
+        (directory / "child.c").write_text(child)
+        owner = (FIXTURE / "owner.rs").read_text()
+        owner = replace_once(owner, '#[path = "../../../src/connection/macos/process.rs"]', f'#[path = "{ROOT}/src/connection/macos/process.rs"]')
+        owner = replace_once(owner, 'value.trim().parse()', 'value.lines().next().unwrap_or("").parse()')
+        owner = replace_once(owner, '        .write_all(&frame(b"VPA1", supervisor))\n        .unwrap();', '        .write_all(&frame(b"VPA1", supervisor))\n        .unwrap();\n    owner.channel.write_all(b"12345678-1234-4123-8123-123456789ABC").unwrap();')
+        owner = replace_once(owner, '            .write_all(&frame(b"VPA1", supervisor + 1))\n            .unwrap();', '            .write_all(&frame(b"VPA1", supervisor + 1))\n            .unwrap();\n        owner.channel.write_all(b"12345678-1234-4123-8123-123456789ABC").unwrap();')
+        (directory / "owner.rs").write_text(owner)
+        host = (FIXTURE / "owner-host.rs").read_text()
+        for file in ["src/helper/local_socket.rs", "src/connection/macos/ppp_control.rs", "src/connection/macos/process.rs"]:
+            host = replace_once(host, f'#[path = "../../../{file}"]', f'#[path = "{ROOT}/{file}"]')
+        host = replace_once(host, '    pub use super::local_socket;', '    pub use super::local_socket;\n    pub use vpnt::helper::ppp_supervisor;')
+        host = replace_once(host, 's.trim().parse::<u32>().ok()', 's.lines().next().and_then(|line| line.parse::<u32>().ok())')
+        host = replace_once(host, '            assert_eq!(proof.child().pid, pid);', '            assert_eq!(proof.child().pid, pid);\n            let marker = fs::read_to_string(&args[2]).unwrap();\n            assert_eq!(marker.lines().nth(1), Some(proof.child().service().as_str()));')
+        (directory / "owner-host.rs").write_text(host)
+        run("compile-child", ["/usr/bin/cc", "-Wall", "-Wextra", "-Werror", directory / "child.c", "-o", directory / "child"])
         run("compile-adapter", ["rustc", FIXTURE / "adapter.rs", *library, "-o", directory / "adapter"])
-        run("compile-owner", ["rustc", FIXTURE / "owner.rs", *library, "--extern", f"libc={libc}", "-o", directory / "owner"])
-        run("compile-host", ["rustc", FIXTURE / "owner-host.rs", *library, "--extern", f"libc={libc}", "-o", directory / "owner-host"])
+        run("compile-owner", ["rustc", directory / "owner.rs", *library, "--extern", f"libc={libc}", "-o", directory / "owner"])
+        run("compile-host", ["rustc", directory / "owner-host.rs", *library, "--extern", f"libc={libc}", "-o", directory / "owner-host"])
         for mode in cases:
             adapter = directory / f"adapter-{mode}"
             if mode == "production-gate":

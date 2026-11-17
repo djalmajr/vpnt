@@ -1,5 +1,5 @@
 //! Read-only proof that a PPP interface belongs to our still-owned SSL client.
-//! configd records supply candidate PIDs only; this module never signals one.
+//! configd records correlate an attempt; this module never signals a PID from them.
 use super::{
     interfaces::{Interface, Interfaces},
     ppp_control::Proof,
@@ -36,14 +36,70 @@ struct Policy<'a> {
     ppp_program: &'a Path,
 }
 
+#[cfg(not(test))]
+type DiscoveryDriver = SslDriver;
+#[cfg(test)]
+pub(crate) trait DiscoveryDriver {
+    fn poll(&mut self) -> std::io::Result<crate::connection::ssl::Update>;
+    fn supervised_ppp(&self) -> Option<Arc<Proof>>;
+}
+#[cfg(test)]
+impl DiscoveryDriver for SslDriver {
+    fn poll(&mut self) -> std::io::Result<crate::connection::ssl::Update> {
+        SslDriver::poll(self)
+    }
+    fn supervised_ppp(&self) -> Option<Arc<Proof>> {
+        SslDriver::supervised_ppp(self)
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static DISCOVERY_POLICY: std::cell::RefCell<Option<(u32, PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
 impl OwnedPpp {
-    pub fn discover(driver: &mut SslDriver, before: &Interfaces) -> Result<Self, OwnershipError> {
+    #[cfg(test)]
+    pub(crate) fn fixture_with_child(pid: u32) -> Result<Self, OwnershipError> {
+        let parent = Process::read(std::process::id()).map_err(|_| OwnershipError::Unavailable)?;
+        let child = Process::read(pid).map_err(|_| OwnershipError::Unavailable)?;
+        let interface = Interface {
+            name: "ppp42".into(),
+            index: 42,
+            flags: (libc::IFF_UP | libc::IFF_POINTOPOINT) as u32,
+            addresses: std::collections::BTreeSet::from(["192.0.2.2".parse().unwrap()]),
+        };
+        let now = Interfaces {
+            entries: std::collections::BTreeMap::from([("ppp42".into(), interface)]),
+        };
+        let record = Record {
+            key: "fixture-service".into(),
+            interface: crate::connection::ssl::InterfaceName::parse("ppp42").unwrap(),
+            pid: Some(pid),
+        };
+        discover(
+            (parent.identity.pid, pid),
+            &record.key,
+            &Interfaces::default(),
+            &now,
+            &record,
+            std::slice::from_ref(&record),
+            Policy {
+                owner: parent.uid,
+                parent_program: &parent.executable,
+                ppp_program: &child.executable,
+            },
+        )
+    }
+    #[cfg_attr(test, allow(private_interfaces))]
+    pub fn discover(
+        #[cfg(not(test))] driver: &mut DiscoveryDriver,
+        #[cfg(test)] driver: &mut dyn DiscoveryDriver,
+        before: &Interfaces,
+    ) -> Result<Self, OwnershipError> {
         let update = driver.poll().map_err(|_| OwnershipError::Unavailable)?;
         if update.exited || update.failure.is_some() || update.start_error.is_some() {
             return Err(OwnershipError::NotReady);
         }
-        let now = Interfaces::read().map_err(|_| OwnershipError::Unavailable)?;
-        let records = store::read().map_err(|_| OwnershipError::Unavailable)?;
         let supervision = driver.supervised_ppp().ok_or(OwnershipError::NotReady)?;
         if !supervision
             .current()
@@ -51,19 +107,44 @@ impl OwnedPpp {
         {
             return Err(OwnershipError::NotReady);
         }
+        #[cfg(not(test))]
+        let now = Interfaces::read().map_err(|_| OwnershipError::Unavailable)?;
+        #[cfg(test)]
+        let now = current_interfaces().map_err(|_| OwnershipError::Unavailable)?;
+        let service = supervision.child().service();
+        let (record, records) =
+            store::read_attempt(service).map_err(|_| OwnershipError::Unavailable)?;
+        let record = record.ok_or(OwnershipError::NotReady)?;
         let parent_program = Path::new(paths::PPP_SUPERVISOR);
+        #[cfg(test)]
+        let policy_override = DISCOVERY_POLICY.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        let (owner, parent_program, ppp_program) = policy_override.as_ref().map_or(
+            (0, parent_program, Path::new("/usr/sbin/pppd")),
+            |(owner, parent, ppp)| (*owner, parent.as_path(), ppp.as_path()),
+        );
+        #[cfg(not(test))]
+        let (owner, ppp_program) = (0, Path::new("/usr/sbin/pppd"));
         let mut proof = discover(
-            supervision.supervisor().pid,
+            (supervision.supervisor().pid, supervision.child().pid),
+            &service.key(),
             before,
             &now,
+            &record,
             &records,
             Policy {
-                owner: 0,
+                owner,
                 parent_program,
-                ppp_program: Path::new("/usr/sbin/pppd"),
+                ppp_program,
             },
         )?;
-        if proof.parent != *supervision.supervisor() || proof.ppp != *supervision.child() {
+        if proof.parent != *supervision.supervisor()
+            || proof.ppp != **supervision.child()
+            || !same_attempt(service, &record)?
+            || !supervision
+                .current()
+                .map_err(|_| OwnershipError::Unavailable)?
+        {
             return Err(OwnershipError::ForeignLink);
         }
         proof.supervision = Some(supervision);
@@ -108,20 +189,29 @@ impl OwnedPpp {
         {
             return Ok(false);
         }
-        let records = store::read().map_err(|_| OwnershipError::Unavailable)?;
+        let Some(proof) = &self.supervision else {
+            return Ok(false);
+        };
+        let (attempt, records) = store::read_attempt(proof.child().service())
+            .map_err(|_| OwnershipError::Unavailable)?;
         let Ok(record) = unique_record(&records, &self.interface.name) else {
             return Ok(false);
         };
-        if record.pid != self.ppp.pid || record.key != self.service_key {
+        if attempt.as_ref() != Some(record)
+            || record.pid.is_some_and(|pid| pid != self.ppp.pid)
+            || record.key != self.service_key
+        {
             return Ok(false);
         }
-        let interfaces = Interfaces::read().map_err(|_| OwnershipError::Unavailable)?;
+        let interfaces = current_interfaces().map_err(|_| OwnershipError::Unavailable)?;
         let Some(now) = interfaces.entries.get(&self.interface.name) else {
             return Ok(false);
         };
         Ok(now.index == self.interface.index
             && now.usable_ppp()
             && now.addresses == self.interface.addresses
+            && same_attempt(proof.child().service(), record)?
+            && proof.current().map_err(|_| OwnershipError::Unavailable)?
             && !self.exited()?)
     }
     /// Both retained kernel exit watches, not a PID lookup. Interface and route
@@ -162,7 +252,10 @@ impl OwnedPpp {
         let Ok(record) = unique_record(&records, &self.interface.name) else {
             return Ok(false);
         };
-        let Ok(current) = Process::read(record.pid) else {
+        let Some(pid) = record.pid else {
+            return Ok(false);
+        };
+        let Ok(current) = Process::read(pid) else {
             return Ok(false);
         };
         Ok(current.identity != self.ppp
@@ -187,6 +280,29 @@ impl OwnedPpp {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_INTERFACES: std::cell::RefCell<Option<Interfaces>> = const { std::cell::RefCell::new(None) };
+}
+
+fn current_interfaces() -> std::io::Result<Interfaces> {
+    #[cfg(test)]
+    if let Some(interfaces) = TEST_INTERFACES.with(|slot| slot.borrow().clone()) {
+        return Ok(interfaces);
+    }
+    Interfaces::read()
+}
+
+fn same_attempt(
+    service: &crate::helper::ppp_supervisor::ServiceId,
+    expected: &Record,
+) -> Result<bool, OwnershipError> {
+    let (attempt, records) =
+        store::read_attempt(service).map_err(|_| OwnershipError::Unavailable)?;
+    Ok(attempt.as_ref() == Some(expected)
+        && unique_record(&records, expected.interface.as_str()).ok() == Some(expected))
+}
+
 fn unique_record<'a>(records: &'a [Record], name: &str) -> Result<&'a Record, OwnershipError> {
     let mut matches = records
         .iter()
@@ -199,9 +315,11 @@ fn unique_record<'a>(records: &'a [Record], name: &str) -> Result<&'a Record, Ow
 }
 
 fn discover(
-    parent_pid: u32,
+    (parent_pid, child_pid): (u32, u32),
+    service_key: &str,
     before: &Interfaces,
     now: &Interfaces,
+    record: &Record,
     records: &[Record],
     policy: Policy<'_>,
 ) -> Result<OwnedPpp, OwnershipError> {
@@ -213,31 +331,29 @@ fn discover(
     {
         return Err(OwnershipError::ForeignLink);
     }
-    // Ignore the interface name printed by openfortivpn. Upstream can choose
-    // another PPP interface when two tunnels have the same negotiated address.
-    // Identify our unique child and its interface using configd + kernel data.
-    let mut candidate = None;
-    for record in records {
-        let Ok(ppp) = Process::read(record.pid) else {
-            continue;
-        };
-        if ppp.parent != parent_pid {
-            continue;
-        }
-        if !related(
-            &parent,
-            &ppp,
-            policy.owner,
-            policy.parent_program,
-            policy.ppp_program,
-        ) || candidate.is_some()
-        {
-            return Err(OwnershipError::ForeignLink);
-        }
-        candidate = Some((record, ppp));
+    // UUID is not secret. We trust root and writers with the applicable
+    // SCDynamicStore-write-access entitlement as OS components:
+    // https://github.com/apple-oss-distributions/configd/blob/main/configd.tproj/session.c#L966
+    // Never authorize from the interface name printed by openfortivpn.
+    if record.key != service_key {
+        return Err(OwnershipError::NotReady);
     }
-    let (record, ppp) = candidate.ok_or(OwnershipError::NotReady)?;
-    unique_record(records, record.interface.as_str())?;
+    if record.pid.is_some_and(|pid| pid != child_pid) {
+        return Err(OwnershipError::ForeignLink);
+    }
+    if unique_record(records, record.interface.as_str())? != record {
+        return Err(OwnershipError::ForeignLink);
+    }
+    let ppp = Process::read(child_pid).map_err(|_| OwnershipError::NotReady)?;
+    if !related(
+        &parent,
+        &ppp,
+        policy.owner,
+        policy.parent_program,
+        policy.ppp_program,
+    ) {
+        return Err(OwnershipError::ForeignLink);
+    }
     let interface = now
         .entries
         .get(record.interface.as_str())
@@ -254,7 +370,7 @@ fn discover(
     );
     // Registration/path reads must not hide an intervening exit or reparent.
     let current_parent = Process::read(parent_pid).map_err(|_| OwnershipError::NotReady)?;
-    let current_ppp = Process::read(record.pid).map_err(|_| OwnershipError::NotReady)?;
+    let current_ppp = Process::read(child_pid).map_err(|_| OwnershipError::NotReady)?;
     if current_parent.identity != parent.identity
         || current_ppp.identity != ppp.identity
         || !related(

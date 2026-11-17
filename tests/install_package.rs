@@ -110,7 +110,8 @@ fn native_package_is_repeatable_audited_and_scripts_refuse_volume_or_unprivilege
             assert_eq!(
                 fs::read_to_string(&path).unwrap().lines().last().unwrap(),
                 format!(
-                    "exec /Library/PrivilegedHelperTools/dev.vpnt.staging/{}/adapters/installer activate",
+                    "exec {}/{}/adapters/installer activate",
+                    vpnt::helper::paths::STAGING,
                     result["id"].as_str().unwrap()
                 )
             );
@@ -177,7 +178,7 @@ fn native_archive_audit_rejects_changed_authority_destination_actions_and_owners
         (
             "destination",
             "Component.pkg/PackageInfo",
-            "/Library/PrivilegedHelperTools/dev.vpnt.staging/",
+            &format!("{}/", vpnt::helper::paths::STAGING),
             "/tmp/",
             "Component destination",
         ),

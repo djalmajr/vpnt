@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveLocale, translate } from "./i18n";
+import { catalogs, resolveLocale, translate } from "./i18n";
 
 describe("idioma da interface", () => {
   // Mutation captured: ignoring the preference makes English fall back to system Portuguese.
@@ -23,4 +23,19 @@ describe("idioma da interface", () => {
       expect(confirmation).not.toContain("{name}");
     }
   });
+});
+
+test("os catálogos mantêm as mesmas chaves, incluindo as dicas", () => {
+  expect(Object.keys(catalogs["pt-BR"]).sort()).toEqual(
+    Object.keys(catalogs["en-US"]).sort(),
+  );
+});
+
+test("o prazo exibido é de 60 segundos nos dois idiomas", () => {
+  expect(translate("en-US", "timeoutHint")).toBe(
+    "The gateway did not respond within 60 seconds.",
+  );
+  expect(translate("pt-BR", "timeoutHint")).toBe(
+    "O gateway não respondeu em 60 segundos.",
+  );
 });

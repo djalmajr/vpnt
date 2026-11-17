@@ -13,7 +13,7 @@ assert stream.getsockname() == '' and stream.getpeername() == ''
 assert os.getcwd() == '/' and 'VPNT_TEST_UNTRUSTED' not in os.environ
 assert os.environ['VPNT_AUTH_LOCALE'] == 'pt-BR'
 assert os.environ['VPNT_AUTH_UNTIL_NS'].isdecimal()
-assert os.environ['SUDO_ASKPASS'] == '/Library/PrivilegedHelperTools/dev.vpnt.askpass'
+assert os.environ['SUDO_ASKPASS'] == sys.argv[4]
 (root / 'started').write_text('yes')
 def send(value):
     stream.sendall(json.dumps(value).encode() + b'\n')

@@ -48,7 +48,7 @@ pub(crate) enum Icon {
     Ssl,
     /// Both kinds connected.
     Both,
-    /// Attention: unresponsive, error, transitional or unverified helper.
+    /// Attention: unresponsive, error or unverified helper.
     Warning,
 }
 
@@ -113,9 +113,15 @@ pub(crate) fn icon_for(snapshot: Option<&Snapshot>, error: bool) -> Icon {
                     VpnKind::Ssl => SSL,
                 };
             }
-            ConnectionState::Off => {}
-            // Unresponsive, error and transitional states all need attention,
-            // and attention outranks any verified profile.
+            // Work in progress proves no tunnel and is not a problem either: it
+            // reads like Off, so the triangle is kept for what needs attention.
+            ConnectionState::Off
+            | ConnectionState::Connecting
+            | ConnectionState::Verifying
+            | ConnectionState::Reconnecting
+            | ConnectionState::Disconnecting => {}
+            // Unresponsive and error states need attention, and attention
+            // outranks any verified profile.
             _ => return Icon::Warning,
         }
     }

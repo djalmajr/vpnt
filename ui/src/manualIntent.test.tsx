@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
-import type { T } from "./components/common";
+import { Icon } from "./components/common";
 import { VpnCard } from "./components/VpnCard";
 import { translate } from "./i18n";
 import {
@@ -29,11 +29,11 @@ const profile: VpnView["profile"] = {
   probeMethod: "ping_tcp",
 };
 
-const t: T = (key, values) => translate("pt-BR", key, values);
-
 const view = (state: ConnectionState): VpnView => ({
   profile,
   state,
+  cleaning: false,
+  cleanupVerifying: false,
   hasPassword: true,
   hasPsk: true,
   log: [],
@@ -73,121 +73,223 @@ function buttons(tree: ReactNode): ReactElement[] {
 }
 
 function principal(tree: ReactNode): ReactElement {
-  const matches = buttons(tree).filter(
-    (button) => props(button).className === "card-toggle",
-  );
+  const matches: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (String(props(element).className).split(" ").includes("switch"))
+      matches.push(element);
+  });
   expect(matches).toHaveLength(1);
   return matches[0];
 }
 
 function click(element: ReactElement) {
   const handler = props(element).onClick;
-  if (typeof handler !== "function")
-    throw new Error("element has no onClick handler");
-  (handler as () => void)();
+  if (typeof handler === "function") (handler as () => void)();
 }
 
-function card(state: ConnectionState) {
+function card(
+  state: ConnectionState,
+  cleaning = false,
+  locale: "pt-BR" | "en-US" = "pt-BR",
+) {
   const commands: Command[] = [];
+  const routes: unknown[] = [];
   let secretRequests = 0;
   const run: Run = async (command) => {
     commands.push(command);
     return true;
   };
   const tree = VpnCard({
-    vpn: view(state),
-    t,
+    vpn: { ...view(state), cleaning },
+    t: (key, values) => translate(locale, key, values),
     run,
-    navigate: () => {},
+    navigate: (route) => {
+      routes.push(route);
+    },
     secrets: () => {
       secretRequests += 1;
     },
   });
-  return { tree, commands, secretRequests: () => secretRequests };
+  return { tree, commands, routes, secretRequests: () => secretRequests };
 }
-
-/** What the user asked for by clicking the card, per the root contract. */
-const intent = (state: ConnectionState) =>
-  state === "missing_secret"
-    ? "secrets"
-    : state === "unresponsive"
-      ? "reconnect"
-      : active(state)
-        ? "disconnect"
-        : "connect";
 
 const source = (path: string) =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
-describe("intenção explícita do cartão de VPN", () => {
-  // Red baseline: the card sent the legacy `toggle`, so a stale active snapshot
-  // turned an already-off tunnel back on (and loaded secrets a second time).
-  test("cada estado emite a intenção do usuário, nunca o toggle genérico", () => {
-    for (const state of states) {
-      const s = card(state);
-      const expected = intent(state);
-      // Disabled states are unreachable through the DOM; the handler contract
-      // still has to name the user's direction, not the latest snapshot.
-      click(principal(s.tree));
-      if (expected === "secrets") {
-        expect(s.commands).toHaveLength(0);
-        expect(s.secretRequests()).toBe(1);
-      } else {
-        expect(s.commands).toEqual([{ type: expected, id: profile.id }]);
-        expect(s.commands[0].type).not.toBe("toggle");
+function classOf(element: ReactElement): string {
+  return String(props(element).className ?? "");
+}
+
+function loaders(tree: ReactNode): ReactElement[] {
+  const found: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (element.type === Icon && props(element).name === "loader")
+      found.push(element);
+  });
+  return found;
+}
+
+function statusLine(tree: ReactNode): ReactElement {
+  const matches: ReactElement[] = [];
+  walk(tree, (element) => {
+    if (classOf(element).split(" ").includes("status-line"))
+      matches.push(element);
+  });
+  expect(matches).toHaveLength(1);
+  return matches[0];
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  describe(`intenção explícita do interruptor: ${locale}`, () => {
+    test("cada estado emite a direção exibida; espera e limpeza ficam inertes", () => {
+      for (const state of states) {
+        for (const cleaning of [false, true]) {
+          const s = card(state, cleaning, locale);
+          const control = principal(s.tree);
+          const disabled =
+            cleaning ||
+            [
+              "offline",
+              "helper_missing",
+              "missing_program",
+              "cleanup_unconfirmed",
+              "disconnecting",
+              "connecting",
+              "reconnecting",
+            ].includes(state);
+          expect(control.type).toBe("button");
+          expect(props(control).disabled).toBe(disabled);
+          expect(props(control)["aria-pressed"]).toBe(active(state));
+          expect(props(control)["aria-label"]).toBe(
+            `${profile.name}: ${translate(locale, `state.${state}`)}`,
+          );
+          click(control);
+          expect(s.routes).toEqual([]);
+          expect(s.commands).toEqual(
+            disabled || state === "missing_secret"
+              ? []
+              : [
+                  {
+                    type: active(state) ? "disconnect" : "connect",
+                    id: profile.id,
+                  },
+                ],
+          );
+          expect(s.secretRequests()).toBe(
+            !disabled && state === "missing_secret" ? 1 : 0,
+          );
+        }
+      }
+    });
+    test("só o chevron abre detalhes; o corpo não é clicável", () => {
+      for (const state of states) {
+        const s = card(state, false, locale);
+        expect(props(s.tree).onClick).toBeUndefined();
+        const details = buttons(s.tree).find(
+          (button) =>
+            props(button)["aria-label"] ===
+            translate(locale, "profileDetails", { name: profile.name }),
+        );
+        expect(details).toBeDefined();
+        if (!details) throw new Error("Details button missing");
+        click(details);
+        expect(s.routes).toEqual([
+          { page: "profile", id: profile.id, origin: "home" },
+        ]);
+        expect(s.commands).toEqual([]);
         expect(s.secretRequests()).toBe(0);
       }
-    }
-  });
-
-  test("cartões desabilitados seguem desabilitados e o rótulo/pressed continuam", () => {
-    for (const state of states) {
-      const button = principal(card(state).tree);
-      expect(props(button).disabled).toBe(
-        [
-          "offline",
-          "helper_missing",
-          "missing_program",
-          "disconnecting",
-        ].includes(state),
+    });
+    test("status só aparece sem Notice; o spinner do conectar fica dentro do Cancel", () => {
+      for (const state of states) {
+        const s = card(state, false, locale);
+        if (
+          [
+            "unresponsive",
+            "dropped",
+            "credentials_rejected",
+            "gateway_timeout",
+            "missing_program",
+            "cleanup_unconfirmed",
+          ].includes(state)
+        ) {
+          const lines: ReactElement[] = [];
+          walk(s.tree, (element) => {
+            if (classOf(element).split(" ").includes("status-line"))
+              lines.push(element);
+          });
+          expect(lines).toHaveLength(0);
+          expect(props(principal(s.tree))["aria-label"]).toBe(
+            `${profile.name}: ${translate(locale, `state.${state}`)}`,
+          );
+          continue;
+        }
+        const status = statusLine(s.tree);
+        expect(loaders(status)).toHaveLength(0);
+        const dots: ReactElement[] = [];
+        walk(status, (element) => {
+          if (
+            element.type === "span" &&
+            classOf(element).split(" ").includes("dot")
+          )
+            dots.push(element);
+        });
+        expect(dots).toHaveLength(1);
+        const cancelable = state === "connecting" || state === "reconnecting";
+        const cancel = buttons(s.tree).find(
+          (button) =>
+            props(button)["aria-label"] === translate(locale, "cancel"),
+        );
+        if (cancelable) {
+          expect(cancel).toBeDefined();
+          if (!cancel) throw new Error("Cancel missing");
+          expect(loaders(cancel)).toHaveLength(1);
+        } else {
+          expect(cancel).toBeUndefined();
+        }
+        expect(loaders(s.tree)).toHaveLength(cancelable ? 1 : 0);
+      }
+    });
+    test("só Cancelar cancela conexão/reconexão, sem navegar", () => {
+      for (const state of ["connecting", "reconnecting"] as const) {
+        const s = card(state, false, locale);
+        click(principal(s.tree));
+        expect(s.commands).toEqual([]);
+        const cancel = buttons(s.tree).find(
+          (button) =>
+            props(button)["aria-label"] === translate(locale, "cancel"),
+        );
+        expect(cancel).toBeDefined();
+        if (!cancel) throw new Error("Cancel missing");
+        click(cancel);
+        expect(s.commands).toEqual([{ type: "disconnect", id: profile.id }]);
+        expect(s.routes).toEqual([]);
+      }
+    });
+    test("Notice não abre o perfil e conserva reconectar", () => {
+      const s = card("unresponsive", false, locale);
+      const reconnect = buttons(s.tree).find(
+        (button) =>
+          textOf(props(button).children) === translate(locale, "reconnect"),
       );
-      expect(props(button)["aria-pressed"]).toBe(active(state));
-      expect(props(button)["aria-label"]).toBe(
-        `${profile.name}: ${t(`state.${state}`)}`,
-      );
-    }
+      expect(reconnect).toBeDefined();
+      if (!reconnect) throw new Error("Reconnect missing");
+      click(reconnect);
+      expect(s.commands).toEqual([{ type: "reconnect", id: profile.id }]);
+      expect(s.routes).toEqual([]);
+    });
+    test("senha pendente só oferece o switch e detalhes, sem aviso extra", () => {
+      const s = card("missing_secret", false, locale);
+      expect(buttons(s.tree)).toHaveLength(2);
+      expect(textOf(s.tree)).not.toContain(translate(locale, "secretHint"));
+      click(principal(s.tree));
+      expect(s.secretRequests()).toBe(1);
+      expect(s.commands).toEqual([]);
+    });
   });
+}
 
-  test("os rótulos de espera, cancelar e o estado continuam iguais", () => {
-    for (const state of states) {
-      const text = textOf(card(state).tree);
-      expect(text).toContain(t(`state.${state}`));
-      if (state === "connecting" || state === "reconnecting")
-        expect(text).toContain(t("cancel"));
-    }
-  });
-
-  test("o botão Desligar do cartão sem resposta também emite disconnect", () => {
-    const s = card("unresponsive");
-    const matches = buttons(s.tree).filter(
-      (button) => textOf(props(button).children) === t("disconnect"),
-    );
-    expect(matches).toHaveLength(1);
-    click(matches[0]);
-    expect(s.commands).toEqual([{ type: "disconnect", id: profile.id }]);
-  });
-
-  test("o cartão sem segredo continua abrindo o diálogo de segredo", () => {
-    const s = card("missing_secret");
-    const text = textOf(s.tree);
-    expect(text).toContain(t("state.missing_secret"));
-    expect(text).not.toContain(t("secretHint"));
-    expect(text).not.toContain(t("providePassword"));
-    click(principal(s.tree));
-    expect(s.secretRequests()).toBe(1);
-    expect(s.commands).toHaveLength(0);
-  });
-
+describe("sequência dos comandos interativos", () => {
   // Static delta only: SecretsDialog owns React hooks, so invoking it outside a
   // renderer would invent a framework. Root verifies the sequence in WKWebView.
   test("o diálogo de segredo só conecta depois de salvar com sucesso", () => {

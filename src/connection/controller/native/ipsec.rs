@@ -92,7 +92,14 @@ impl Attempt for NativeIpsecAttempt<'_> {
         self.probe_driver(canceled, timeout)
     }
     fn cleanup(&mut self) -> bool {
-        self.cleanup_driver()
+        crate::helper::runtime::cleanup::begin();
+        let complete = self.cleanup_driver();
+        crate::helper::runtime::cleanup::finish(
+            std::path::Path::new(crate::helper::paths::STATE),
+            &self.owner,
+            complete,
+        );
+        complete
     }
 }
 

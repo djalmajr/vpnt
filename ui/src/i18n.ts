@@ -4,13 +4,16 @@ export type Locale = "pt-BR" | "en-US";
 export type LocalePreference = Locale | "system";
 
 const en = {
+  cleanupHint: "Cleaning up the previous attempt…",
+  cleanupUnconfirmedHint:
+    "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.",
+  checkAgain: "Check again",
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Install the VPN component?",
   componentRemoveTitle: "Remove the VPN component?",
-  componentInstallHint:
-    "Current tunnels will disconnect. macOS Installer will open and request administrator authorization. Profiles and saved credentials are kept.",
+  componentUpdateBlocked: "Disconnect active VPNs to update.",
+  componentInstallBlocked: "Disconnect active VPNs to install.",
   componentRemoveHint:
     "Current tunnels will disconnect and this account will lose tunnel access. Profiles and saved credentials are kept. Other registered accounts keep access.",
   componentInstallPending:
@@ -20,6 +23,10 @@ const en = {
   componentSettling:
     "Waiting for the previous operation to finish. Another installation or removal cannot start yet.",
   componentBusy: "A component change is still pending.",
+  helperPreviousSession:
+    "The previous session is still finishing. VPN Tray will continue when it ends.",
+  previousSessionFinishing:
+    "The previous session is still finishing. Try again in a moment.",
   componentExpired:
     "The operation timed out. It may still be finishing. No new request will be sent automatically.",
   componentUnconfirmed:
@@ -50,6 +57,14 @@ const en = {
   light: "Light",
   dark: "Dark",
   startAtLogin: "Open at login",
+  testEveryHelp:
+    "How often VPN Tray checks that each connected tunnel still carries traffic.",
+  notifyStaleHelp:
+    "Shows a notification when a connected tunnel stops carrying traffic.",
+  autoReconnectHelp:
+    "After 3 failed checks in a row, VPN Tray disconnects the tunnel and connects it again.",
+  componentHelp:
+    "A small privileged component starts and stops tunnels only for the registered VPN profiles. Installing or removing it asks for an administrator password.",
   tunnelTest: "Tunnel test",
   testEvery: "Test every",
   seconds: "{count} s",
@@ -61,7 +76,6 @@ const en = {
   helperMissing: "Component not installed",
   helperHint: "Required to start tunnels",
   install: "Install",
-  removeHelper: "Remove component",
   installedHint: "Connect without entering your password",
   about: "About",
   aboutText:
@@ -80,8 +94,18 @@ const en = {
   type: "Type",
   gateway: "Gateway",
   username: "Username",
+  profileDetails: "Details for {name}",
+  usernameShellError:
+    "This looks like a shell expression; enter the literal username.",
+  secretShellWarning:
+    "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
+  dnsDomains: "Internal domains",
+  dnsDomainsHint:
+    "Optional. While connected, these domains use the VPN's DNS; everything else is unchanged. E.g. corp.example.com",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
+  networksHintSsl:
+    "Only these networks use the tunnel. Empty: the routes the gateway publishes.",
   probeHost: "Address",
   probeHostHint: "A destination machine, not the router.",
   method: "Method",
@@ -94,6 +118,7 @@ const en = {
   certificateHint: "Accepted server certificate fingerprint.",
   routes: "Routes",
   fullTunnel: "Full tunnel",
+  gatewayRoutes: "Gateway routes",
   secrets: "Secrets",
   psk: "Gateway key (PSK)",
   password: "User password",
@@ -121,10 +146,7 @@ const en = {
   welcomeTitle: "One step to go",
   welcomeHint:
     "Starting a tunnel requires administrator access. VPN Tray installs a small component so you do not need to enter your password every time.",
-  details: "View details",
   component: "Component",
-  installDetails:
-    "The component can only manage registered VPN profiles. Installing or removing it requires administrator confirmation.",
   installing: "Installing…",
   installConfirm:
     "Confirm with your administrator password in the system dialog.",
@@ -171,7 +193,7 @@ const en = {
     "The tunnel appears connected, but traffic is not getting through.",
   droppedHint: "The server closed the connection.",
   credentialsHint: "The server rejected your username or password.",
-  timeoutHint: "The gateway did not respond within 30 seconds.",
+  timeoutHint: "The gateway did not respond within 60 seconds.",
   secretHint: "The password for this VPN is not in the keychain.",
   programHint: "Install the VPN client and try again.",
   checked: "Tunnel checked",
@@ -193,17 +215,21 @@ const en = {
   "state.missing_program": "VPN client missing",
   "state.offline": "No network connection",
   "state.helper_missing": "Waiting for the component",
+  "state.cleanup_unconfirmed": "Cleanup unconfirmed",
 };
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
+  cleanupHint: "Limpando a tentativa anterior…",
+  cleanupUnconfirmedHint:
+    "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis.",
+  checkAgain: "Conferir de novo",
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",
-  componentInstallTitle: "Instalar o componente de VPN?",
   componentRemoveTitle: "Remover o componente de VPN?",
-  componentInstallHint:
-    "Os túneis atuais serão desligados. O Instalador do macOS abrirá e pedirá autorização de administrador. Perfis e credenciais salvas serão mantidos.",
+  componentUpdateBlocked: "Desligue as VPNs ativas para atualizar.",
+  componentInstallBlocked: "Desligue as VPNs ativas para instalar.",
   componentRemoveHint:
     "Os túneis atuais serão desligados e esta conta perderá o acesso aos túneis. Perfis e credenciais salvas serão mantidos. Outras contas cadastradas continuam com acesso.",
   componentInstallPending:
@@ -213,6 +239,10 @@ const pt: Record<MessageKey, string> = {
   componentSettling:
     "Aguardando o encerramento da operação anterior. Ainda não é possível iniciar outra instalação ou remoção.",
   componentBusy: "Uma alteração do componente ainda está pendente.",
+  helperPreviousSession:
+    "A sessão anterior ainda está terminando. O VPN Tray continua quando ela acabar.",
+  previousSessionFinishing:
+    "A sessão anterior ainda está terminando. Tente de novo em instantes.",
   componentExpired:
     "O prazo da operação venceu. Ela ainda pode estar terminando. Nenhum novo pedido será enviado automaticamente.",
   componentUnconfirmed:
@@ -243,6 +273,14 @@ const pt: Record<MessageKey, string> = {
   light: "Claro",
   dark: "Escuro",
   startAtLogin: "Abrir ao iniciar a sessão",
+  testEveryHelp:
+    "Intervalo em que o VPN Tray verifica se cada túnel conectado ainda passa tráfego.",
+  notifyStaleHelp:
+    "Mostra uma notificação quando um túnel conectado para de passar tráfego.",
+  autoReconnectHelp:
+    "Depois de 3 testes seguidos com falha, o VPN Tray desliga o túnel e conecta de novo.",
+  componentHelp:
+    "Um pequeno componente privilegiado inicia e encerra túneis somente dos perfis de VPN cadastrados. Instalar ou remover pede a senha de administrador.",
   tunnelTest: "Teste do túnel",
   testEvery: "Testar a cada",
   seconds: "{count} s",
@@ -254,7 +292,6 @@ const pt: Record<MessageKey, string> = {
   helperMissing: "Componente não instalado",
   helperHint: "Sem ele não dá para ligar túneis",
   install: "Instalar",
-  removeHelper: "Remover componente",
   installedHint: "Liga e desliga sem pedir senha",
   about: "Sobre",
   aboutText:
@@ -273,8 +310,18 @@ const pt: Record<MessageKey, string> = {
   type: "Tipo",
   gateway: "Gateway",
   username: "Usuário",
+  profileDetails: "Detalhes de {name}",
+  usernameShellError:
+    "Isto parece uma expressão de shell; informe o nome de usuário literal.",
+  secretShellWarning:
+    "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
+  dnsDomains: "Domínios internos",
+  dnsDomainsHint:
+    "Opcional. Com a VPN ligada, estes domínios usam o DNS da VPN; o resto não muda. Ex.: corp.example.com",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
+  networksHintSsl:
+    "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica.",
   probeHost: "Endereço",
   probeHostHint: "Uma máquina do destino, não o roteador.",
   method: "Método",
@@ -287,6 +334,7 @@ const pt: Record<MessageKey, string> = {
   certificateHint: "Impressão digital aceita do servidor.",
   routes: "Rotas",
   fullTunnel: "Túnel completo",
+  gatewayRoutes: "Rotas do gateway",
   secrets: "Segredos",
   psk: "Chave do gateway (PSK)",
   password: "Senha do usuário",
@@ -315,10 +363,7 @@ const pt: Record<MessageKey, string> = {
   welcomeTitle: "Falta um passo",
   welcomeHint:
     "Ligar um túnel exige acesso de administrador. O VPN Tray instala um componente pequeno para não pedir a senha toda vez.",
-  details: "Ver detalhes",
   component: "Componente",
-  installDetails:
-    "O componente só gerencia perfis de VPN cadastrados. Instalar ou remover exige confirmação de administrador.",
   installing: "Instalando…",
   installConfirm: "Confirme com a senha de administrador na janela do sistema.",
   installFailed: "Não foi possível instalar",
@@ -365,7 +410,7 @@ const pt: Record<MessageKey, string> = {
   staleHint: "O túnel parece ligado, mas nada passa por ele.",
   droppedHint: "O servidor encerrou a conexão.",
   credentialsHint: "O servidor recusou o usuário ou a senha.",
-  timeoutHint: "O gateway não respondeu em 30 segundos.",
+  timeoutHint: "O gateway não respondeu em 60 segundos.",
   secretHint: "A senha desta VPN não está no chaveiro.",
   programHint: "Instale o cliente de VPN e tente de novo.",
   checked: "Túnel testado",
@@ -387,6 +432,7 @@ const pt: Record<MessageKey, string> = {
   "state.missing_program": "Falta o cliente de VPN",
   "state.offline": "Sem rede no computador",
   "state.helper_missing": "Aguardando o componente",
+  "state.cleanup_unconfirmed": "Limpeza não confirmada",
 };
 
 export const catalogs: Record<Locale, Record<MessageKey, string>> = {

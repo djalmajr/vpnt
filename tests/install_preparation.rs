@@ -34,6 +34,16 @@ fn preparation_is_repeatable_parses_its_own_policy_and_refuses_to_replace_a_corr
     );
     let payload = PathBuf::from(result["payload"].as_str().unwrap());
     assert!(payload.starts_with(&repository.root));
+    let policy = fs::read_to_string(payload.join("policy/sudoers")).unwrap();
+    assert!(policy.contains(vpnt::helper::paths::HELPER));
+    assert!(policy.contains(vpnt::helper::paths::INSTALLER));
+    assert!(policy.contains(vpnt::identifiers::POLICY_ALIAS));
+    let runtime: serde_json::Value =
+        serde_json::from_slice(&fs::read(payload.join("runtime/manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        runtime["prefix"],
+        vpnt::helper::paths::runtime_directory().to_str().unwrap()
+    );
     assert_eq!(
         fs::read_dir(repository.root.join("target/vpnt-installation"))
             .unwrap()
@@ -90,7 +100,7 @@ fn read_only_preparation_has_no_environment_or_argument_switch_to_activation() {
     }
     assert_eq!(
         fs::read_dir(&repository.root).unwrap().count(),
-        3,
+        4,
         "read-only commands cannot create an installation tree"
     );
     let nested = repository.root.join("target/debug/payload-output");

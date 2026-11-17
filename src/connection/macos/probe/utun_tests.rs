@@ -43,6 +43,7 @@ impl Link for FakeLink {
 
 pub(super) fn profile(kind: VpnKind, host: &str, port: u16) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: "fixture".into(),
         name: "Fixture".into(),
         kind,

@@ -12,7 +12,7 @@ use security_framework_sys::base::{
 };
 use zeroize::Zeroizing;
 
-const SERVICE: &str = "dev.vpnt.credentials.v1";
+const SERVICE: &str = crate::identifiers::CREDENTIALS;
 // SecBase.h values absent from the sys crate's exported constants.
 const INTERACTION_NOT_ALLOWED: i32 = -25308;
 const USER_CANCELED: i32 = -128;

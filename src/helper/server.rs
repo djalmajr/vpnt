@@ -11,7 +11,7 @@ use crate::storage::{ProfileStore, StoreError};
 use caller::Caller;
 use std::{
     os::{
-        fd::{FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::{
@@ -20,8 +20,14 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+// Reserve 30 seconds for the planned cleanup budget plus scheduling margin.
+// The existing controller is still unbounded; this wait never signals it or
+// implies that cleanup succeeded.
+const PREVIOUS_SESSION_WAIT: Duration = Duration::from_secs(35);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -53,6 +59,96 @@ fn mode_lock(
     })
 }
 
+// Inspect only the first complete request without consuming it: a legacy v3
+// helper accepts and echoes this opaque ID, while an old client never sends it.
+// This is capability negotiation, not authentication or authority.
+fn supports_wait_notice(stream: &UnixStream, deadline: Instant) -> bool {
+    let mut bytes = zeroize::Zeroizing::new(vec![0u8; protocol::MAX_REQUEST_BYTES + 1]);
+    loop {
+        if interrupted() || Instant::now() >= deadline {
+            return false;
+        }
+        // SAFETY: bytes is writable for its length and the borrowed socket is live.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return false;
+        }
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                return false;
+            }
+        } else {
+            let seen = &bytes[..count as usize];
+            if let Some(end) = seen.iter().position(|byte| *byte == b'\n') {
+                return protocol::parse_request(&seen[..=end]).is_ok_and(|request| {
+                    request.id == protocol::WAIT_CAPABILITY_SNAPSHOT_ID
+                        && matches!(request.command, protocol::Command::Snapshot {})
+                });
+            }
+            if seen.len() == bytes.len() {
+                return false;
+            }
+        }
+        thread::sleep(LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn wait_for_mode_lock(
+    mode: Mode,
+    stream: &mut UnixStream,
+    budget: Duration,
+    announced: &mut bool,
+    mut acquire: impl FnMut() -> Result<ControllerLock, super::controller_lock::LockError>,
+) -> Result<Option<ControllerLock>, ErrorCode> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if interrupted() {
+            return Err(ErrorCode::Unavailable);
+        }
+        match mode_lock(mode, &mut acquire) {
+            Ok(lock) => return Ok(lock),
+            Err(ErrorCode::ProfileBusy) if mode == Mode::Runtime => {
+                if !*announced {
+                    if !supports_wait_notice(stream, deadline.min(Instant::now() + io::DEADLINE)) {
+                        return Err(ErrorCode::ProfileBusy);
+                    }
+                    send(
+                        stream,
+                        &Message::PreviousSessionFinishing {
+                            protocol_version: protocol::VERSION,
+                            version: env!("CARGO_PKG_VERSION").into(),
+                        },
+                    )?;
+                    *announced = true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ErrorCode::ProfileBusy);
+                }
+                thread::sleep(LOCK_POLL.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn send_admission_error(stream: &mut UnixStream, announced: bool, error: ErrorCode) {
+    if !(announced && error == ErrorCode::ProfileBusy) {
+        let _ = send(stream, &Message::Fatal { error });
+    }
+}
+
 /// Only for the standalone helper process, before it starts any threads.
 /// No path, target UID or ownership override is accepted.
 ///
@@ -69,27 +165,33 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     if unsafe { libc::fcntl(0, libc::F_GETFD) } < 0 {
         return Err(ErrorCode::PermissionDenied);
     }
-    let caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
+    let mut caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
         .map_err(|_| ErrorCode::PermissionDenied)?;
     let _signals = signals::Guard::install().map_err(|_| ErrorCode::Unavailable)?;
+    let mut announced = false;
     let admitted = (|| {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
-        let lock = mode_lock(mode, ControllerLock::acquire)?;
-        crate::install::engine::admit_uid(caller.uid)
+        let lock = wait_for_mode_lock(
+            mode,
+            &mut caller.stream,
+            PREVIOUS_SESSION_WAIT,
+            &mut announced,
+            ControllerLock::acquire,
+        )?;
+        let (build, _) = crate::install::engine::admit_uid(caller.uid)
             .map_err(|_| ErrorCode::UntrustedConfiguration)?;
-        Ok((store, lock))
+        Ok((store, lock, build))
     })();
-    let (store, lock) = match admitted {
+    let (store, lock, build) = match admitted {
         Ok(value) => value,
         Err(error) => {
-            let mut stream = caller.stream;
-            let _ = send(&mut stream, &Message::Fatal { error });
+            send_admission_error(&mut caller.stream, announced, error);
             return Err(error);
         }
     };
     match mode {
-        Mode::Runtime => runtime(caller, |uid, requests, output| {
+        Mode::Runtime => runtime_with_build(caller, Some(build), |uid, requests, output| {
             crate::connection::controller::run_ssl(
                 lock.as_ref().ok_or(ErrorCode::Unavailable)?,
                 uid,
@@ -164,8 +266,48 @@ fn admin(
     }
 }
 
+#[cfg(test)]
 fn runtime(
     caller: Caller,
+    run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
+) -> Result<(), ErrorCode> {
+    runtime_with_build(caller, None, run)
+}
+
+fn runtime_with_build(
+    caller: Caller,
+    build: Option<String>,
+    run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
+) -> Result<(), ErrorCode> {
+    runtime_with_diagnostics(caller, build, Arc::new(system_diagnostics), run)
+}
+
+type Diagnostics =
+    Arc<dyn Fn(u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) + Send + Sync>;
+fn system_diagnostics(uid: u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) {
+    gated_diagnostics(
+        || crate::install::engine::admit_uid(uid).map(|(_, sole)| sole),
+        || super::diagnostics::collect(std::path::Path::new(super::paths::STATE), 0, || true),
+    )
+}
+pub(crate) fn gated_diagnostics(
+    admit: impl FnOnce() -> Result<bool, crate::install::Error>,
+    read: impl FnOnce() -> Option<Vec<super::diagnostics::Log>>,
+) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) {
+    use protocol::DiagnosticsStatus as Status;
+    match admit() {
+        Ok(false) => (Status::Shared, vec![]),
+        Ok(true) => match read() {
+            Some(logs) => (Status::Ready, logs),
+            None => (Status::Unavailable, vec![]),
+        },
+        Err(_) => (Status::Unavailable, vec![]),
+    }
+}
+fn runtime_with_diagnostics(
+    caller: Caller,
+    build: Option<String>,
+    diagnostics: Diagnostics,
     run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
 ) -> Result<(), ErrorCode> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -186,10 +328,18 @@ fn runtime(
         let guard = Stop(stop.clone());
         let reader_output = output.clone();
         let reader_stop = stop.clone();
+        let uid = caller.uid;
         let reader = thread::Builder::new()
             .name("vpnt-input".into())
             .spawn_scoped(scope, move || {
-                read_requests(input, requests, reader_output, &reader_stop);
+                read_requests(
+                    input,
+                    requests,
+                    reader_output,
+                    &reader_stop,
+                    uid,
+                    diagnostics,
+                );
             })
             .map_err(|_| ErrorCode::Unavailable)?;
         let mut stream = caller.stream;
@@ -197,7 +347,10 @@ fn runtime(
         let writer = thread::Builder::new()
             .name("vpnt-output".into())
             .spawn_scoped(scope, move || {
-                for message in outgoing {
+                for mut message in outgoing {
+                    if let Message::Snapshot { build: field, .. } = &mut message {
+                        *field = build.clone();
+                    }
                     if send(&mut stream, &message).is_err() {
                         writer_stop.store(true, Ordering::Release);
                         return Err(ErrorCode::Unavailable);
@@ -222,6 +375,8 @@ fn read_requests(
     requests: SyncSender<Request>,
     output: SyncSender<Message>,
     stop: &AtomicBool,
+    uid: u32,
+    diagnostics: Diagnostics,
 ) {
     let mut reader = input;
     loop {
@@ -238,6 +393,26 @@ fn read_requests(
                 return;
             }
         };
+        if matches!(request.command, protocol::Command::Diagnostics {}) {
+            let (status, logs) = diagnostics(uid);
+            let mut message = Message::Diagnostics {
+                id: request.id,
+                status,
+                logs,
+            };
+            loop {
+                if stop.load(Ordering::Acquire) || interrupted() {
+                    return;
+                }
+                match output.try_send(message) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(value)) => message = value,
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            continue;
+        }
         let mut pending = request;
         loop {
             if stop.load(Ordering::Acquire) || interrupted() {
@@ -263,4 +438,4 @@ pub(crate) fn runtime_fixture(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

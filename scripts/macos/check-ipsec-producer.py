@@ -44,7 +44,15 @@ def main():
     config = 'src/connection/ipsec/producer/config.rs'
     process = 'src/helper/process.rs'
     registry = 'src/connection/ipsec/namespace.rs'
-    callback = '        self.observer\n            .completed(&reservation.owner, reservation.reqid)?;\n'
+    callback = '''        self.observer
+            .completed(&reservation.owner, reservation.reqid)
+            .inspect_err(|_| {
+                #[cfg(target_os = "macos")]
+                crate::helper::runtime::cleanup::mark(
+                    crate::helper::runtime::cleanup::Reason::DurableCompletion,
+                );
+            })?;
+'''
     phase_guard = '''        if !matches!(
             (self.record.stage, stage),
             (Stage::Prepared, Stage::Starting | Stage::Stopped)

@@ -4,6 +4,8 @@
 //! explicit stop, metadata retained across release. No route/namespace
 //! authority is granted here.
 use super::resource::Absence;
+use crate::helper::runtime::cleanup::{self as diagnostic, Reason};
+
 use crate::connection::{
     ipsec::Error,
     macos::{
@@ -93,7 +95,17 @@ impl<'a> PinState<'a> {
         &self,
         fallback: &dyn Absence,
     ) -> Result<Option<bool>, Error> {
-        self.claim_absence_with(fallback, RetiredUtun::gone)
+        let result = self.claim_absence_with(fallback, RetiredUtun::gone);
+        if !matches!(result, Ok(Some(true))) {
+            diagnostic::mark(match self {
+                Self::Captured(_) => Reason::PinStillOwned,
+                Self::RetiredCaptured(Some(_)) => Reason::AbsenceKnownUtun,
+                Self::Configured(hold) => hold.absence_reason(),
+                Self::Failed(hold) => hold.absence_reason(),
+                _ => Reason::AbsenceFallback,
+            });
+        }
+        result
     }
 
     fn claim_absence_with(

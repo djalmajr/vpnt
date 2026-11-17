@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Prepare and inspect a closed installation payload. Never install or elevate."""
+from identifiers import require_binary_channel
 import argparse
 import hashlib
 import json
@@ -37,16 +38,20 @@ def copy_file(source, destination):
 
 
 def inspect(binary, directory):
+    require_binary_channel(binary)
     result = subprocess.run([str(binary), 'inspect', str(directory)], capture_output=True, check=True)
     return json.loads(result.stdout)
 
 
-def prepare(uid, output):
-    binary = ROOT / 'target/debug/vpnt-install'
+def prepare(uid, output, build_dir=None):
+    build_dir = build_dir or ROOT / 'target/debug'
+    binary = build_dir / 'vpnt-install'
+    for executable in ADAPTERS.values():
+        require_binary_channel(build_dir / executable)
     runtime = ROOT / 'target/vpnt-runtime'
     output = output.absolute()
     canonical = output.resolve()
-    for source in [runtime, ROOT / 'target/debug']:
+    for source in [runtime, build_dir]:
         source = source.resolve()
         if canonical == source or source in canonical.parents or canonical in source.parents:
             raise RuntimeError('Output overlaps a build input')
@@ -59,7 +64,8 @@ def prepare(uid, output):
     with tempfile.TemporaryDirectory(prefix='vpnt-install-payload-', dir=output) as temporary:
         payload = Path(temporary)
         for name, executable in ADAPTERS.items():
-            copy_file(ROOT / 'target/debug' / executable, payload / 'adapters' / name)
+            copy_file(build_dir / executable, payload / 'adapters' / name)
+            require_binary_channel(payload / 'adapters' / name)
         # Copy the complete tree, including empty directories: the Rust consumer
         # rejects anything outside the manifest, rather than hiding extra files.
         for directory, folders, files in os.walk(runtime, followlinks=False):
@@ -102,8 +108,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--uid', type=int, default=os.getuid())
     parser.add_argument('--output', type=Path, default=ROOT / 'target/vpnt-installation')
+    parser.add_argument('--build-dir', type=Path, help='Directory of already-built debug adapters (for an isolated CARGO_TARGET_DIR)')
     args = parser.parse_args()
-    print(json.dumps(prepare(args.uid, args.output), indent=2))
+    print(json.dumps(prepare(args.uid, args.output, args.build_dir), indent=2))
 
 
 if __name__ == '__main__':

@@ -1,8 +1,10 @@
 """Unprivileged source builds needed by the macOS private VPN runtime."""
+from identifiers import tool
 import hashlib
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -15,6 +17,10 @@ TOOLS = [
     ("autoconf", "2.73", "gz", "259ddfa3bddc799cfb81489cc0f17dfdf1bd6d1505dda53c0f45ff60d6a4f9a7"),
     ("automake", "1.20", "xz", "f6f34dad4cbe395715762b0710f7c511e39bd5cf777e6b95818ccbecf7714248"),
 ]
+
+
+def supervisor_header(path):
+    path.write_text(f'#define VPNT_PPP_SUPERVISOR "{tool("pppd")}"\n')
 
 
 def verified_source(cache, name, version, suffix, url, expected, fresh=False):
@@ -62,8 +68,10 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     build = root / "target/runtime-build/openfortivpn"
     build.mkdir(parents=True, exist_ok=True)
     log = build.with_suffix(".log")
-    env.update(PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"), ACLOCAL_PATH=str(prefix / "share/aclocal"), CPPFLAGS=f"-I{openssl}/include", LDFLAGS=f"-L{openssl}/lib -Wl,-headerpad_max_install_names")
-    for patch in ["openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch"]:
+    channel_header = build / "vpnt-channel.h"
+    supervisor_header(channel_header)
+    env.update(PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"), ACLOCAL_PATH=str(prefix / "share/aclocal"), CPPFLAGS=f"-I{openssl}/include -include {shlex.quote(str(channel_header))}", LDFLAGS=f"-L{openssl}/lib -Wl,-headerpad_max_install_names")
+    for patch in ["openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch", "openfortivpn-split-routes.patch", "openfortivpn-split-dns.patch"]:
         run(["/usr/bin/patch", "-t", "-p1", "-i", root / "scripts/macos/patches" / patch], source, env, log)
     run(["/bin/sh", source / "autogen.sh"], source, env, log)
     run([source / "configure", f"--prefix={runtime_prefix}", "--with-pppd=/usr/sbin/pppd", "--with-netstat=/usr/sbin/netstat", "--with-resolvconf=DISABLED", "--with-systemdsystemunitdir=no", "--enable-legacy-pppd"], build, env, log)
@@ -71,9 +79,12 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     # Exercise the actual patched up callback with all route/DNS writes
     # intercepted. It can run without privilege and never creates an interface.
     checker = build / "check-routes"
-    run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_routes.c", "-o", checker], build, env, log)
+    run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-include", channel_header, "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_routes.c", "-o", checker], build, env, log)
     run([checker], build, env, log)
-    checker = build / "check-transport"
-    run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_transport.c", "-o", checker], build, env, log)
-    run([checker], build, env, log)
+    # Both values of HAVE_SO_BINDTODEVICE: current macOS SDKs declare the
+    # option, so configure sets 1 and the Darwin path must still bind the source.
+    for bindtodevice in ("0", "1"):
+        checker = build / f"check-transport-{bindtodevice}"
+        run(["/usr/bin/cc", "-ffunction-sections", "-Wl,-dead_strip", "-include", channel_header, f"-DHAVE_SO_BINDTODEVICE={bindtodevice}", "-DHAVE_USR_SBIN_PPPD=1", "-DHAVE_UTIL_H=1", "-DHAVE_STRUCT_TERMIOS=1", '-DPPP_PATH="/usr/sbin/pppd"', f"-I{source}/src", f"-I{openssl}/include", f"-L{openssl}/lib", "-lssl", "-lcrypto", root / "tests/fixtures/fortinet_transport.c", "-o", checker], build, env, log)
+        run([checker], build, env, log)
     return build / "openfortivpn", source

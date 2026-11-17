@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Snapshot } from "./model";
-import type { Route } from "./navigation";
+import { profileOriginRoute, type Route } from "./navigation";
 
 // The hook module imports the bridge, which registers its reply channel on
 // `window` at import time; the bridge itself is not exercised here. The stub
@@ -9,9 +9,41 @@ import type { Route } from "./navigation";
 const scope = globalThis as unknown as { window?: unknown };
 const previousWindow = scope.window;
 scope.window = {};
-const { reconcileRoute } = await import("./useAppState");
+const { reconcileRoute, reconcileComponentError, componentBlocked } =
+  await import("./useAppState");
 if (previousWindow === undefined) delete scope.window;
 else scope.window = previousWindow;
+
+test("só confirmação instalada real reconcilia erro de componente", () => {
+  for (const error of ["componentExpired", "componentUnconfirmed"] as const) {
+    expect(reconcileComponentError(error, snapshot())).toBeUndefined();
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "outdated" })),
+    ).toBe(error);
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "missing" })),
+    ).toBe(error);
+    expect(reconcileComponentError(error, snapshot({ demo: true }))).toBe(
+      error,
+    );
+    expect(
+      reconcileComponentError(
+        error,
+        snapshot({ componentOperation: "settling" }),
+      ),
+    ).toBeUndefined();
+  }
+  expect(reconcileComponentError("profileBusy", snapshot())).toBe(
+    "profileBusy",
+  );
+  expect(reconcileComponentError(undefined, snapshot())).toBeUndefined();
+});
+
+test("origem de perfil resolve Home, Preferências e fallback do host", () => {
+  expect(profileOriginRoute("home")).toEqual({ page: "panel" });
+  expect(profileOriginRoute("preferences")).toEqual({ page: "preferences" });
+  expect(profileOriginRoute()).toEqual({ page: "panel" });
+});
 
 const snapshot = (overrides: Partial<Snapshot> = {}): Snapshot => ({
   version: "0.1.0",
@@ -60,4 +92,16 @@ test("demo e helper ausente/desatualizado não redirecionam", () => {
   expect(reconcileRoute(onboarding, snapshot({ helper: "outdated" }))).toBe(
     onboarding,
   );
+});
+
+test("sessão anterior não é ausência nem permite operação de componente", () => {
+  const finishing = snapshot({ helper: "previous_session_finishing" });
+  expect(reconcileRoute({ page: "onboarding" }, finishing)).toEqual({
+    page: "panel",
+  });
+  expect(reconcileRoute({ page: "preferences" }, finishing)).toEqual({
+    page: "preferences",
+  });
+  expect(componentBlocked(finishing)).toBe(true);
+  expect(componentBlocked(snapshot({ helper: "missing" }))).toBe(false);
 });

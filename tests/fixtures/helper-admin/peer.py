@@ -1,11 +1,11 @@
 # Independent fictional administrative peer. No sudo, privileged paths or VPN.
 import json, os, select, socket, sys, time
-mode, marker = sys.argv[1:]
+mode, marker = sys.argv[1:3]
 s = socket.socket(fileno=0)
 assert s.getsockname()=="" and s.getpeername()==""
 assert os.getcwd()=="/" and os.environ["LANG"]=="C"
 assert os.environ.get("VPNT_MUST_NOT_REACH_HELPER") is None
-assert os.environ["SUDO_ASKPASS"]=="/Library/PrivilegedHelperTools/dev.vpnt.askpass"
+assert os.environ["SUDO_ASKPASS"]==sys.argv[3]
 assert os.environ["VPNT_AUTH_LOCALE"]=="pt-BR"
 assert int(os.environ["VPNT_AUTH_UNTIL_NS"])>0
 open(marker+".started","w").close()

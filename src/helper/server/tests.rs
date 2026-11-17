@@ -75,6 +75,105 @@ fn admin_does_not_take_the_network_lock_but_runtime_must() {
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn runtime_announces_busy_then_acquires_the_released_controller_lock() {
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Root(std::path::PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Root(
+        std::env::current_dir()
+            .unwrap()
+            .join("output/fixtures")
+            .join(format!("helper-wait-lock-{}", std::process::id())),
+    );
+    std::fs::create_dir_all(root.0.parent().unwrap()).unwrap();
+    std::fs::create_dir(&root.0).unwrap();
+    std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.0.join(".controller.lock"))
+        .unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let held = ControllerLock::fixture(&root.0, uid).unwrap();
+    let (mut server, client_stream) = UnixStream::pair().unwrap();
+    let mut reader = client(client_stream);
+    protocol::write_request(
+        reader.get_mut(),
+        &Request {
+            id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    thread::scope(|scope| {
+        let task = scope.spawn(|| {
+            let mut announced = false;
+            let lock = wait_for_mode_lock(
+                Mode::Runtime,
+                &mut server,
+                Duration::from_secs(2),
+                &mut announced,
+                || ControllerLock::fixture(&root.0, uid),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(announced);
+            lock.validate().unwrap();
+        });
+        assert!(matches!(
+            protocol::read_message(&mut reader),
+            Ok(Some(Message::PreviousSessionFinishing { .. }))
+        ));
+        drop(held);
+        task.join().unwrap();
+    });
+    let lock = ControllerLock::fixture(&root.0, uid).unwrap();
+    lock.validate().unwrap();
+    let request = protocol::read_request(&mut BufReader::new(&mut server))
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.id, protocol::WAIT_CAPABILITY_SNAPSHOT_ID);
+    assert!(matches!(request.command, protocol::Command::Snapshot {}));
+}
+
+#[test]
+fn runtime_busy_wait_is_bounded_and_does_not_send_fatal() {
+    let (mut server, client_stream) = UnixStream::pair().unwrap();
+    let mut reader = client(client_stream);
+    protocol::write_request(
+        reader.get_mut(),
+        &Request {
+            id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    let started = Instant::now();
+    let mut announced = false;
+    let result = wait_for_mode_lock(
+        Mode::Runtime,
+        &mut server,
+        Duration::from_millis(100),
+        &mut announced,
+        || Err(super::super::controller_lock::LockError::Busy),
+    );
+    assert!(matches!(result, Err(ErrorCode::ProfileBusy)));
+    assert!(announced);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    drop(server);
+    assert!(matches!(
+        protocol::read_message(&mut reader),
+        Ok(Some(Message::PreviousSessionFinishing { .. }))
+    ));
+    assert!(matches!(protocol::read_message(&mut reader), Ok(None)));
+}
+
+#[test]
 fn only_closed_modes_and_connected_unix_stream_capabilities_are_admitted() {
     for arguments in [
         vec![],
@@ -124,6 +223,107 @@ fn only_closed_modes_and_connected_unix_stream_capabilities_are_admitted() {
     let tcp = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     assert!(Caller::from_fd(tcp.into()).is_err());
 }
+#[test]
+fn runtime_attaches_admitted_build_to_controller_snapshots() {
+    let (a, b) = UnixStream::pair().unwrap();
+    let task = thread::spawn(move || {
+        runtime_with_build(caller(a), Some("a".repeat(64)), |_, requests, output| {
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            output
+                .send(Message::Snapshot {
+                    id: request.id,
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build: Some("b".repeat(64)),
+                    profiles: vec![],
+                    connections: vec![],
+                })
+                .unwrap();
+            Ok(())
+        })
+    });
+    let mut c = client(b);
+    protocol::write_request(
+        c.get_mut(),
+        &Request {
+            id: "first".into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(protocol::read_message(&mut c), Ok(Some(Message::Snapshot { build: Some(build), .. })) if build == "a".repeat(64))
+    );
+    drop(c);
+    assert!(task.join().unwrap().is_ok());
+}
+
+#[test]
+fn diagnostics_receipt_gate_refuses_before_reading_and_allows_only_verified_single_owner() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = AtomicUsize::new(0);
+    for (admission, expected) in [
+        (Ok(false), protocol::DiagnosticsStatus::Shared),
+        (
+            Err(crate::install::Error::PermissionDenied),
+            protocol::DiagnosticsStatus::Unavailable,
+        ),
+    ] {
+        let (status, logs) = gated_diagnostics(
+            || admission,
+            || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Some(vec![])
+            },
+        );
+        assert_eq!(status, expected);
+        assert!(logs.is_empty());
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+    let (status, _) = gated_diagnostics(
+        || Ok(true),
+        || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Some(vec![])
+        },
+    );
+    assert_eq!(status, protocol::DiagnosticsStatus::Ready);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn diagnostics_request_uses_the_authenticated_peer_uid_and_stays_out_of_controller() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (a, b) = UnixStream::pair().unwrap();
+    let seen = Arc::new(AtomicU32::new(0));
+    let observed = seen.clone();
+    let task = thread::spawn(move || {
+        let diagnostics: Diagnostics = Arc::new(move |uid| {
+            observed.store(uid, Ordering::Release);
+            (protocol::DiagnosticsStatus::Shared, vec![])
+        });
+        runtime_with_diagnostics(caller(a), None, diagnostics, |_, requests, _| {
+            assert!(requests.recv_timeout(Duration::from_secs(2)).is_err());
+            Ok(())
+        })
+    });
+    let mut c = client(b);
+    protocol::write_request(
+        c.get_mut(),
+        &Request {
+            id: "diagnostic-1".into(),
+            command: protocol::Command::Diagnostics {},
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(protocol::read_message(&mut c), Ok(Some(Message::Diagnostics { id, status: protocol::DiagnosticsStatus::Shared, logs })) if id == "diagnostic-1" && logs.is_empty())
+    );
+    assert_eq!(seen.load(Ordering::Acquire), unsafe { libc::geteuid() });
+    c.get_mut().shutdown(Shutdown::Write).unwrap();
+    assert!(task.join().unwrap().is_ok());
+}
+
 #[test]
 fn runtime_carries_fragmented_requests_and_replies_and_closes_on_injection() {
     let (a, b) = UnixStream::pair().unwrap();
@@ -326,4 +526,55 @@ fn an_admin_channel_kept_open_in_silence_expires_without_applying_an_operation()
     ));
     assert!(started.elapsed() >= Duration::from_millis(4500));
     assert!(started.elapsed() < Duration::from_secs(7));
+}
+
+pub(crate) fn busy_wire(id: &str) -> Vec<u8> {
+    use std::io::Read;
+    let (mut server, peer) = UnixStream::pair().unwrap();
+    let mut reader = client(peer);
+    protocol::write_request(
+        reader.get_mut(),
+        &Request {
+            id: id.into(),
+            command: protocol::Command::Snapshot {},
+        },
+    )
+    .unwrap();
+    let mut announced = false;
+    let result = wait_for_mode_lock(
+        Mode::Runtime,
+        &mut server,
+        Duration::from_millis(50),
+        &mut announced,
+        || Err(super::super::controller_lock::LockError::Busy),
+    );
+    assert!(matches!(result, Err(ErrorCode::ProfileBusy)));
+    send_admission_error(&mut server, announced, ErrorCode::ProfileBusy);
+    drop(server);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn legacy_client_gets_only_legacy_fatal_and_capable_client_gets_wait_notice() {
+    for (id, capable) in [
+        ("snapshot-1", false),
+        (protocol::WAIT_CAPABILITY_SNAPSHOT_ID, true),
+    ] {
+        let wire = busy_wire(id);
+        let mut input = &wire[..];
+        let message = protocol::read_message(&mut input).unwrap().unwrap();
+        if capable {
+            assert!(matches!(message, Message::PreviousSessionFinishing { .. }));
+        } else {
+            assert!(matches!(
+                message,
+                Message::Fatal {
+                    error: ErrorCode::ProfileBusy
+                }
+            ));
+        }
+        assert!(protocol::read_message(&mut input).unwrap().is_none());
+    }
 }

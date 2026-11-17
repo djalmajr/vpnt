@@ -20,13 +20,14 @@ pub enum Error {
     Io,
     PermissionDenied,
     Busy,
+    PreviousSessionFinishing,
     Conflict,
     RecoveryRequired,
     PolicyRejected,
     InvalidRequest,
 }
 
-fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

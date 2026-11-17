@@ -52,14 +52,58 @@ impl Fixture {
 fn update_refreshes_digests_for_registered_users_and_removing_one_preserves_the_other() {
     let mut f = Fixture::new();
     f.activate().unwrap();
+    let reads = std::cell::Cell::new(0usize);
+    let query = |uid| {
+        crate::helper::server::gated_diagnostics(
+            || access::admitted_details(&f.executor.tree, uid).map(|(_, sole)| sole),
+            || {
+                reads.set(reads.get() + 1);
+                Some(vec![])
+            },
+        )
+        .0
+    };
+    assert_eq!(
+        query(601),
+        crate::helper::protocol::DiagnosticsStatus::Ready
+    );
+    assert_eq!(
+        query(602),
+        crate::helper::protocol::DiagnosticsStatus::Unavailable
+    );
+    assert_eq!(reads.get(), 1);
+    assert!(access::admitted_details(&f.executor.tree, 601).unwrap().1);
+    assert_eq!(
+        access::admitted_details(&f.executor.tree, 602),
+        Err(Error::PermissionDenied)
+    );
     f.recipient(602);
     assert_eq!(f.activate().unwrap().users, vec![601, 602]);
+    assert!(!access::admitted_details(&f.executor.tree, 601).unwrap().1);
+    assert!(!access::admitted_details(&f.executor.tree, 602).unwrap().1);
+    let (status, _) = crate::helper::server::gated_diagnostics(
+        || access::admitted_details(&f.executor.tree, 601).map(|(_, sole)| sole),
+        || {
+            reads.set(reads.get() + 1);
+            Some(vec![])
+        },
+    );
+    assert_eq!(status, crate::helper::protocol::DiagnosticsStatus::Shared);
+    assert_eq!(reads.get(), 1);
     let original = fs::read(f.policy(601)).unwrap();
     f.revise();
     assert_eq!(f.activate().unwrap().users, vec![601, 602]);
     assert_ne!(fs::read(f.policy(601)).unwrap(), original);
     let receipt = Receipt::load(&f.executor.tree).unwrap().unwrap();
     receipt.verify(&f.executor.tree).unwrap();
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 601).unwrap(),
+        receipt.build
+    );
+    assert_eq!(
+        access::admitted_build(&f.executor.tree, 603),
+        Err(Error::PermissionDenied)
+    );
     access::admit(&f.executor.tree, 601).unwrap();
     access::admit(&f.executor.tree, 602).unwrap();
     assert_eq!(f.executor.remove(601).unwrap().users, vec![602]);
@@ -77,7 +121,7 @@ fn active_controller_unknown_files_and_corrupted_receipts_refuse_mutation() {
     let mut f = Fixture::new();
     let lock = f.executor.tree.bootstrap().unwrap();
     let before = files(&f.root);
-    assert!(matches!(f.activate(), Err(Error::Busy)));
+    assert!(matches!(f.activate(), Err(Error::PreviousSessionFinishing)));
     assert_eq!(files(&f.root), before);
     drop(lock);
     f.executor
@@ -282,4 +326,23 @@ fn a_sticky_public_tools_directory_traverses_install_update_rollback_and_remove_
     assert!(!f.executor.tree.resolve("adapters/helper").unwrap().exists());
     assert_eq!(mode(), 0o1755);
     assert!(tools.is_dir());
+}
+
+#[test]
+fn installer_waits_for_controller_release_and_distinguishes_timeout() {
+    use std::time::{Duration, Instant};
+    let mut f = Fixture::new();
+    let held = f.executor.tree.bootstrap().unwrap();
+    let started = Instant::now();
+    assert!(matches!(f.activate(), Err(Error::PreviousSessionFinishing)));
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    let (send, receive) = std::sync::mpsc::channel();
+    tree::LOCK_BUSY_SIGNAL.with(|slot| *slot.borrow_mut() = Some(send));
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(held);
+        });
+        assert!(f.activate().is_ok());
+    });
 }

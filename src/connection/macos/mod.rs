@@ -1,4 +1,5 @@
 pub mod egress;
+pub(crate) mod fence_recovery;
 mod interfaces;
 pub(crate) mod ipsec_early_cleanup;
 pub mod ipsec_egress;
@@ -11,7 +12,7 @@ pub(crate) mod process;
 mod resolve;
 pub mod routing;
 mod sink;
-mod store;
+pub(crate) mod store;
 mod tcp;
 pub(crate) mod utun_observer;
 pub(crate) mod utun_socket;

@@ -3,7 +3,7 @@
 mod ppp;
 mod registry;
 mod retained;
-mod retirement;
+pub(crate) mod retirement;
 mod utun_absence;
 mod utun_retirement;
 use super::{AddWriter, Error, Key, Route, Snapshot};
@@ -35,6 +35,38 @@ pub struct NativeBackend<'a> {
     utun_retired: UtunQueue<'a>,
 }
 impl<'a> NativeBackend<'a> {
+    #[cfg(test)]
+    pub(crate) fn fixture(controller: &'a ControllerLock) -> Result<Self, Error> {
+        controller.validate().map_err(|_| Error::Unavailable)?;
+        Ok(Self {
+            controller,
+            registry: Registry::new(NativeTable(controller))?,
+            retired: Arc::new(Mutex::new(Vec::new())),
+            utun_retired: Lifecycle::new(),
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_retired(&mut self, owner: Owner) {
+        self.retired.lock().unwrap().push(retirement::Retirement {
+            owner: Some(owner),
+            ppp: None,
+            sink: None,
+        });
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_scope(&mut self, owner: Owner, route: Route) {
+        self.registry
+            .register(
+                RegisteredScope::Fixture(route.interface),
+                owner,
+                vec![route],
+            )
+            .unwrap();
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_has_scope(&self, owner: &Owner) -> bool {
+        self.registry.owner_scope(owner).is_some()
+    }
     pub fn new(controller: &'a ControllerLock) -> Result<Self, Error> {
         // SAFETY: UID queries have no memory preconditions.
         if unsafe { libc::getuid() != 0 || libc::geteuid() != 0 } {
@@ -69,6 +101,7 @@ impl<'a> NativeBackend<'a> {
     pub fn ppp_cleanup_complete(&self, ppp: &Arc<OwnedPpp>) -> Result<bool, Error> {
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         retirement::Retirement {
+            owner: None,
             ppp: Some(ppp.clone()),
             sink: None,
         }
@@ -105,42 +138,56 @@ impl Backend for NativeBackend<'_> {
 enum RegisteredScope<'a> {
     Ppp(NativeScope<'a>),
     Utun(UtunScope<'a>),
+    #[cfg(test)]
+    Fixture(u16),
 }
 impl Scope for RegisteredScope<'_> {
     fn index(&self) -> u16 {
         match self {
             Self::Ppp(scope) => scope.index(),
             Self::Utun(scope) => scope.index(),
+            #[cfg(test)]
+            Self::Fixture(index) => *index,
         }
     }
     fn owns(&self, index: u16) -> bool {
         match self {
             Self::Ppp(scope) => scope.owns(index),
             Self::Utun(scope) => scope.owns(index),
+            #[cfg(test)]
+            Self::Fixture(value) => *value == index,
         }
     }
     fn active(&self) -> Result<(), Error> {
         match self {
             Self::Ppp(scope) => scope.active(),
             Self::Utun(scope) => scope.active(),
+            #[cfg(test)]
+            Self::Fixture(_) => Ok(()),
         }
     }
     fn add(&mut self, route: Route) -> Result<Attempt, Error> {
         match self {
             Self::Ppp(scope) => scope.add(route),
             Self::Utun(scope) => scope.add(route),
+            #[cfg(test)]
+            Self::Fixture(_) => Err(Error::Unavailable),
         }
     }
     fn detach_if_stopped(&mut self) -> Result<bool, Error> {
         match self {
             Self::Ppp(scope) => scope.detach_if_stopped(),
             Self::Utun(scope) => scope.detach_if_stopped(),
+            #[cfg(test)]
+            Self::Fixture(_) => Ok(false),
         }
     }
     fn cleanup_complete(&mut self) -> Result<bool, Error> {
         match self {
             Self::Ppp(scope) => scope.cleanup_complete(),
             Self::Utun(scope) => scope.cleanup_complete(),
+            #[cfg(test)]
+            Self::Fixture(_) => Ok(false),
         }
     }
 }

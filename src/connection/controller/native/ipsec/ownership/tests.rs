@@ -139,6 +139,7 @@ fn reservation_survives_successful_prepare_until_control_consumes_it() {
         }
     }
     let profile = Profile {
+        dns_domains: Vec::new(),
         id: "native".into(),
         name: "native".into(),
         kind: VpnKind::Ipsec,

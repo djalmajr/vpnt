@@ -63,7 +63,7 @@ impl Operation {
             return Err(Error::InvalidReply);
         }
         let remaining = expires.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || remaining > Duration::from_secs(120) {
+        if remaining.is_zero() || remaining > Duration::from_secs(600) {
             return Err(Error::Expired);
         }
         let state = Arc::new(State {

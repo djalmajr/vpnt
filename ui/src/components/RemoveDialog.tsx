@@ -1,7 +1,43 @@
 import { useState } from "react";
 import type { VpnView } from "../model";
 import type { Run } from "../navigation";
-import { Dialog, type T } from "./common";
+import { Dialog, Icon, type T } from "./common";
+
+/* Pure body so SSR tests cover the saving paint without a renderer: while
+   the profile removal is in flight, the spinner sits inside the danger
+   button, before its label, and the wait text carries no spinner. */
+export function RemoveDialogBody({
+  saving,
+  confirm,
+  close,
+  t,
+}: {
+  saving: boolean;
+  confirm: () => void;
+  close: () => void;
+  t: T;
+}) {
+  return (
+    <>
+      <p role="status">{t(saving ? "adminPending" : "removeHint")}</p>
+      <div className="actions end">
+        <button type="button" onClick={close} disabled={saving}>
+          {t("cancel")}
+        </button>
+        <button
+          type="button"
+          className="danger-fill"
+          disabled={saving}
+          aria-busy={saving || undefined}
+          onClick={confirm}
+        >
+          {saving && <Icon name="loader" />}
+          {t("remove")}
+        </button>
+      </div>
+    </>
+  );
+}
 
 export function RemoveDialog({
   vpn,
@@ -24,27 +60,19 @@ export function RemoveDialog({
       busy={saving}
       t={t}
     >
-      <p role="status">{t(saving ? "adminPending" : "removeHint")}</p>
-      <div className="actions end">
-        <button type="button" onClick={close} disabled={saving}>
-          {t("cancel")}
-        </button>
-        <button
-          type="button"
-          className="danger-fill"
-          disabled={saving}
-          onClick={() => {
-            setSaving(true);
-            void run({ type: "remove_profile", id: vpn.profile.id })
-              .then((ok) => {
-                if (ok) removed();
-              })
-              .finally(() => setSaving(false));
-          }}
-        >
-          {t("remove")}
-        </button>
-      </div>
+      <RemoveDialogBody
+        saving={saving}
+        close={close}
+        t={t}
+        confirm={() => {
+          setSaving(true);
+          void run({ type: "remove_profile", id: vpn.profile.id })
+            .then((ok) => {
+              if (ok) removed();
+            })
+            .finally(() => setSaving(false));
+        }}
+      />
     </Dialog>
   );
 }

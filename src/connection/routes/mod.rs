@@ -3,6 +3,8 @@
 mod lease;
 mod model;
 mod plan;
-pub use lease::{AcquireError, Backend, Cleanup, Coordinator, Lease, Owner, Presence};
+pub use lease::{
+    AbandonedRoute, AcquireError, Backend, Cleanup, Coordinator, Lease, Owner, Presence,
+};
 pub use model::{Address, Error, Key, Network, NextHop, Route};
 pub use plan::ppp_networks;

@@ -47,6 +47,7 @@ fn accepted(listener: &TcpListener, timeout: Duration) -> bool {
 }
 fn profile(host: &str, port: u16) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: "probe-fixture".into(),
         name: "Probe fixture".into(),
         kind: VpnKind::Ssl,

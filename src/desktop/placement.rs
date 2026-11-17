@@ -22,6 +22,9 @@ use tao::{platform::macos::WindowExtMacOS, window::Window};
 /// Desired panel width; only narrowed when the screen cannot hold it.
 const PANEL_WIDTH: f64 = 320.0;
 /// Bounds of the height the web UI may request (`Command::Resize`).
+/// Height the window opens with, before the web UI reports its own; equals the
+/// `panel-min-height` design token so the first report does not move it.
+pub(super) const DEFAULT_HEIGHT: u32 = 480;
 const MIN_HEIGHT: f64 = 180.0;
 const MAX_HEIGHT: f64 = 720.0;
 /// Inset from the left and right edges of the visible screen.
@@ -169,6 +172,19 @@ mod tests {
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
         Rect { x, y, w, h }
+    }
+
+    // Mutation captured: changing only one of the two makes the window open at
+    // one height and jump to the other on the first report from the web UI.
+    #[test]
+    fn the_opening_height_is_the_panel_min_height_token() {
+        let css = include_str!("../../ui/src/styles.css");
+        let token = css
+            .split_once("--panel-min-height:")
+            .and_then(|(_, rest)| rest.split_once("px;"))
+            .map(|(value, _)| value.trim())
+            .expect("styles.css declares --panel-min-height in px");
+        assert_eq!(token.parse::<u32>(), Ok(DEFAULT_HEIGHT));
     }
 
     fn at(x: f64, y: f64) -> Anchor {

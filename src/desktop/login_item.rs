@@ -17,7 +17,7 @@ use objc2_foundation::NSBundle;
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
 /// The only bundle this adapter admits as the main application.
-const BUNDLE_ID: &str = "dev.vpnt.app";
+const BUNDLE_ID: &str = crate::identifiers::APP;
 
 /// Login-item state reported by the SDK.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +56,7 @@ pub(super) struct Adapter {
 }
 
 impl Adapter {
-    /// Admits only the running `dev.vpnt.app` bundle. Constructors never change
+    /// Admits only the bundle selected at build time. Constructors never change
     /// login-item state; there is deliberately no `Default`.
     pub(super) fn current_bundle() -> Result<Self, Error> {
         if !available!(macos = 13.0) {

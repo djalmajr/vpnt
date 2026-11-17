@@ -30,6 +30,7 @@ impl Peer {
             )
             .arg(mode)
             .arg(root.join("peer"))
+            .arg(crate::helper::paths::ASKPASS)
             .env("VPNT_MUST_NOT_REACH_HELPER", "fictional");
         let admin =
             Admin::fixture(command, request(), Locale::PtBr, Instant::now() + deadline).unwrap();
@@ -134,12 +135,6 @@ fn elevation_command_is_closed_and_never_uses_shell_or_cached_authentication() {
     assert_eq!(command.get_program(), "/usr/bin/sudo");
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),
-        [
-            "-A",
-            "-k",
-            "--",
-            "/Library/PrivilegedHelperTools/dev.vpnt.helper",
-            "admin"
-        ]
+        ["-A", "-k", "--", crate::helper::paths::HELPER, "admin"]
     );
 }

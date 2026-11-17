@@ -9,6 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static LOCK_BUSY_SIGNAL: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) struct Tree {
     pub tools: PathBuf,
     pub state: PathBuf,
@@ -65,6 +70,33 @@ impl Tree {
                 Error::UntrustedPath
             }
         })
+    }
+    /// Retry only an occupied controller lock; all trust errors fail immediately.
+    pub fn bootstrap_wait(&self, budget: std::time::Duration) -> Result<ControllerLock, Error> {
+        let deadline = std::time::Instant::now() + budget;
+        let mut first = true;
+        loop {
+            if !first && std::time::Instant::now() >= deadline {
+                return Err(Error::PreviousSessionFinishing);
+            }
+            first = false;
+            match self.bootstrap() {
+                Err(Error::Busy) => {
+                    #[cfg(test)]
+                    LOCK_BUSY_SIGNAL.with(|slot| {
+                        if let Some(signal) = slot.borrow_mut().take() {
+                            let _ = signal.send(());
+                        }
+                    });
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Error::PreviousSessionFinishing);
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+                }
+                other => return other,
+            }
+        }
     }
     pub fn directory(&self, path: &Path, mode: u32) -> Result<(), Error> {
         match fs::symlink_metadata(path) {
@@ -130,7 +162,11 @@ impl Tree {
             if !version_ok(version) || (name != "manifest.json" && !runtime::valid_name(name)) {
                 return Err(Error::InvalidManifest);
             }
-            return Ok(self.tools.join("dev.vpnt.runtime").join(version).join(name));
+            return Ok(self
+                .tools
+                .join(crate::identifiers::RUNTIME)
+                .join(version)
+                .join(name));
         }
         if let Some(value) = key.strip_prefix("policy/") {
             let uid = value.parse::<u32>().map_err(|_| Error::InvalidManifest)?;
@@ -138,7 +174,9 @@ impl Tree {
                 return Err(Error::InvalidManifest);
             }
             policy::account(uid)?;
-            return Ok(self.policies.join(format!("dev_vpnt_{uid}")));
+            return Ok(self
+                .policies
+                .join(format!("{}_{uid}", crate::identifiers::POLICY_PREFIX)));
         }
         if key == "receipt" {
             return Ok(self.state.join(".installation.json"));

@@ -42,18 +42,26 @@ e `--vpnt-gateway-ip`. O IP já resolvido fixa o destino TCP; o hostname continu
 intacto para validação TLS/SNI. No Darwin, `--ifname` passa a exigir
 `IP_BOUND_IF`, além do bind da origem. Um índice divergente, erro de vínculo
 ou mudança de índice/origem após o connect fecha o socket sem fallback.
+No Darwin o bind da origem vale mesmo quando o SDK declara `SO_BINDTODEVICE`
+(macOS 27 em diante): essa opção só amarra o dispositivo, e sem o bind a
+checagem de origem recusaria toda conexão. A falha nomeia os dois endereços.
 O driver não permite que o peer de IPC forneça esses metadados: recebe um
 token de saída produzido por consultas nativas de rota/interface.
 
-O build executa o consumidor TCP C real com um listener em loopback. O script
-`../check-transport-consumer.py` repete os seis cenários e três mutações numa
-cópia descartável da fonte verificada; DNS é interceptado para que a mutação
-não faça lookup externo. O mesmo licenciamento do openfortivpn se aplica.
+O build executa o consumidor TCP C real com um listener em loopback, uma vez
+com `HAVE_SO_BINDTODEVICE=0` e outra com `1`, o valor que o configure detecta
+nos SDKs atuais. O script `../check-transport-consumer.py` repete os seis
+cenários nas duas variantes e quatro mutações, inclusive o bind da origem
+omitido, numa cópia descartável da fonte verificada; DNS é interceptado para
+que a mutação não faça lookup externo. O mesmo licenciamento do openfortivpn se aplica.
 O hash deste patch também é obrigatório na admissão do runtime.
 
 `openfortivpn-ppp-supervisor.patch` modifica o `pppd_run` Apple em `tunnel.c`
 da mesma versão: executa somente o caminho fixo
-`/Library/PrivilegedHelperTools/dev.vpnt.pppd`, sem fallback para pppd direto.
+derivado do canal (`/Library/PrivilegedHelperTools/dev.djalmajr.vpnt-dev.pppd`
+no desenvolvimento), sem fallback para pppd direto. O patch exige a macro
+`VPNT_PPP_SUPERVISOR`; `runtime_sources.py` gera seu header a partir da mesma
+base usada no build Rust e o fornece ao compilador, sem opção de runtime.
 Registra PID/PTY próprios antes de uma possível falha de fcntl. O supervisor
 recebe o FD 4 herdado; seu receptor e o canal de senha FD 3 são preparados
 juntos pelo driver. O hash deste terceiro patch do openfortivpn é obrigatório

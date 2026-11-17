@@ -3,7 +3,7 @@ import { invoke } from "./bridge";
 import { commandFlow } from "./commandFlow";
 import type { T } from "./components/common";
 import { type MessageKey, resolveLocale, translate } from "./i18n";
-import type { Snapshot } from "./model";
+import { active, type Snapshot } from "./model";
 import type { Route } from "./navigation";
 import { observePanelHeight } from "./panelSizing";
 import { createPreferencesFlow } from "./preferencesFlow";
@@ -20,11 +20,44 @@ import {
  * later authoritative `installed` confirmation leaves it stale (it keeps
  * offering Install after a late successful installation). Every explicit route
  * is the user's intent and must never be taken over by a snapshot: only
- * `onboarding` is reconciled, and only from a real (non-demo) snapshot.
+ * `onboarding` is reconciled, and only from a real (non-demo) snapshot that
+ * confirms installation or reports that an earlier session is still finishing.
  */
 export function reconcileRoute(previous: Route, snapshot: Snapshot): Route {
-  if (snapshot.demo || snapshot.helper !== "installed") return previous;
+  if (
+    snapshot.demo ||
+    (snapshot.helper !== "installed" &&
+      snapshot.helper !== "previous_session_finishing")
+  )
+    return previous;
   return previous.page === "onboarding" ? { page: "panel" } : previous;
+}
+
+export function reconcileComponentError(
+  error: MessageKey | undefined,
+  snapshot: Snapshot,
+): MessageKey | undefined {
+  if (
+    !snapshot.demo &&
+    snapshot.helper === "installed" &&
+    (error === "componentExpired" || error === "componentUnconfirmed")
+  ) {
+    return undefined;
+  }
+  return error;
+}
+
+export type InstallSource = "panel" | "onboarding" | "preferences";
+export type InstallAttempt = { source: InstallSource; updating: boolean };
+
+export function componentBlocked(snapshot: Snapshot): boolean {
+  return (
+    snapshot.helper === "previous_session_finishing" ||
+    snapshot.vpns.some(
+      (vpn) =>
+        active(vpn.state) || vpn.state === "disconnecting" || vpn.cleaning,
+    )
+  );
 }
 
 export function useAppState() {
@@ -46,9 +79,10 @@ export function useAppState() {
   const [preferencesPending, setPreferencesPending] = useState(false);
   const [route, navigate] = useState<Route>({ page: "panel" });
   const [error, setError] = useState<MessageKey>();
-  const [componentAction, setComponentAction] = useState<
-    "install" | "remove"
-  >();
+  const [componentAction, setComponentAction] = useState<"remove">();
+  const [installAttempt, setInstallAttempt] = useState<InstallAttempt>();
+  const [installFailure, setInstallFailure] = useState<InstallSource>();
+  const installLock = useRef(false);
   const [modal, setModal] = useState<{
     type: "secrets" | "remove";
     id: string;
@@ -57,6 +91,11 @@ export function useAppState() {
   const firstSnapshot = useRef(true);
   const receive = useCallback((snapshot: Snapshot) => {
     receivedSnapshot.current = snapshot;
+    if (snapshot.helper === "previous_session_finishing")
+      setComponentAction(undefined);
+    if (!snapshot.demo && snapshot.helper === "installed")
+      setInstallFailure(undefined);
+    setError((previous) => reconcileComponentError(previous, snapshot));
     setSnapshot((previous) =>
       JSON.stringify(previous) === JSON.stringify(snapshot)
         ? previous
@@ -66,15 +105,20 @@ export function useAppState() {
       firstSnapshot.current = false;
       if (
         !snapshot.demo &&
-        snapshot.helper !== "installed" &&
+        (snapshot.helper === "missing" || snapshot.helper === "outdated") &&
         !snapshot.vpns.length
       )
         navigate({ page: "onboarding" });
     }
-    // Late authoritative install: the automatic first-use screen is now stale.
-    // A functional updater reads the latest route, so this memoized callback
-    // never navigates away from a route the user chose meanwhile.
-    navigate((previous) => reconcileRoute(previous, snapshot));
+    // A successful in-flight install reconciles its own origin below. Capture
+    // this before scheduling the updater: the lock may be released before React
+    // runs it, and an automatic onboarding redirect would lose that origin.
+    const installing = installLock.current;
+    navigate((previous) =>
+      installing && snapshot.helper !== "previous_session_finishing"
+        ? previous
+        : reconcileRoute(previous, snapshot),
+    );
     // Fresh authoritative state: flush preference intent that was waiting for
     // one (first snapshot, or a reply that could not be reconciled in place).
     void preferencesRef.current?.sync();
@@ -100,6 +144,7 @@ export function useAppState() {
           admin_incompatible: "adminIncompatible",
           secret_cleanup_failed: "secretCleanupFailed",
           component_busy: "componentBusy",
+          previous_session_finishing: "previousSessionFinishing",
           component_expired: "componentExpired",
           component_canceled: "componentUnconfirmed",
           component_unconfirmed: "componentUnconfirmed",
@@ -108,6 +153,40 @@ export function useAppState() {
         setError(code ? (keys[code] ?? "error") : undefined);
       }),
     [receive],
+  );
+  const installComponent = useCallback(
+    async (source: InstallSource) => {
+      const current = receivedSnapshot.current;
+      if (
+        !current ||
+        current.helper === "installed" ||
+        current.componentOperation ||
+        componentBlocked(current) ||
+        installLock.current
+      )
+        return;
+      installLock.current = true;
+      setInstallAttempt({ source, updating: current.helper === "outdated" });
+      setInstallFailure(undefined);
+      try {
+        const ok = await flow.run({ type: "install_helper" });
+        if (!liveRef.current) return;
+        if (ok) {
+          const destination: Route = {
+            page: receivedSnapshot.current?.vpns.length ? "panel" : "new",
+          };
+          navigate((previous) =>
+            previous.page === source ? destination : previous,
+          );
+        } else {
+          setInstallFailure(source);
+        }
+      } finally {
+        installLock.current = false;
+        if (liveRef.current) setInstallAttempt(undefined);
+      }
+    },
+    [flow],
   );
   const preferences = useMemo(
     () =>
@@ -243,12 +322,9 @@ export function useAppState() {
     modalVpn,
     componentAction,
     setComponentAction,
-    componentInstalled: () => {
-      setComponentAction(undefined);
-      navigate({
-        page: receivedSnapshot.current?.vpns.length ? "panel" : "new",
-      });
-    },
+    installAttempt,
+    installFailure,
+    installComponent,
     run: flow.run,
   };
 }
