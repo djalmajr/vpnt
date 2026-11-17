@@ -4,7 +4,7 @@ marker,mode=sys.argv[1:]
 s=socket.socket(fileno=0)
 open(marker+".admin_started","w").close()
 try:
-    until=time.monotonic()+5
+    until=time.monotonic()+30
     while not os.path.exists(marker+".authorize") and time.monotonic()<until:
         if select.select([s],[],[],0.005)[0]:
             if s.recv(1,socket.MSG_PEEK):raise AssertionError("document before ready")

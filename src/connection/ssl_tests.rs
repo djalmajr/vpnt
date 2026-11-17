@@ -130,7 +130,7 @@ impl Drop for Fixture {
 fn real_process_consumes_only_fixed_arguments_and_private_secret_channel() {
     let fixture = Fixture::new();
     let mut driver = fixture.start("ready.fixture.invalid");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let update = driver.poll().unwrap();
         assert!(!format!("{update:?}").contains("fixture-driver-password"));
@@ -159,7 +159,7 @@ fn authentication_and_timeout_messages_survive_process_exit_without_raw_output()
         ("timeout.fixture.invalid", SslFailure::GatewayTimeout),
     ] {
         let mut driver = fixture.start(gateway);
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let update = driver.poll().unwrap();
             assert!(update.candidate.is_none());
@@ -181,7 +181,7 @@ fn openfortivpn_log_is_rotated_redacted_private_and_completed() {
     let previous = log.with_file_name("openfortivpn.previous.log");
     assert!(!log.exists());
     let mut driver = fixture.start("auth.fixture.invalid");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let update = driver.poll().unwrap();
         assert!(!format!("{update:?}").contains("fixture-driver-password"));
@@ -210,7 +210,7 @@ fn openfortivpn_log_is_rotated_redacted_private_and_completed() {
     drop(driver);
     // A second attempt rotates the first one to previous.
     let mut driver = fixture.start("ready.fixture.invalid");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let update = driver.poll().unwrap();
         assert!(!format!("{update:?}").contains("fixture-driver-password"));

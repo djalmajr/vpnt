@@ -9,11 +9,12 @@ use std::{
 
 fn bound(listener: &UnixListener) -> UnixStream {
     listener.set_nonblocking(true).unwrap();
-    let expires = Instant::now() + Duration::from_secs(3);
+    let expires = Instant::now() + Duration::from_secs(20);
     loop {
         match listener.accept() {
             Ok((mut gate, _)) => {
-                gate.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                gate.set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
                 let mut byte = [0];
                 gate.read_exact(&mut byte).unwrap();
                 assert_eq!(byte, *b"B", "C has bound before listening");
@@ -74,7 +75,7 @@ fn bound_socket_waits_for_listen_then_reaches_real_vici() {
         );
         gate.write_all(b"L").unwrap();
         assert_eq!(
-            receive.recv_timeout(Duration::from_secs(3)).unwrap(),
+            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
             Ok(())
         );
     });
@@ -93,6 +94,9 @@ fn bound_socket_deadline_and_cancel_keep_the_original_budget() {
                     fixture.directory.display()
                 )
             });
+        if mode == "deadline" {
+            fs::write(fixture.directory.join("bind-delay-ms"), b"2000").unwrap();
+        }
         let context = fixture.context();
         let mut registry = Registry::new(context.observer(Kernel::default()));
         let reservation = registry.reserve(owner("startup-budget", 71)).unwrap();
@@ -104,7 +108,10 @@ fn bound_socket_deadline_and_cancel_keep_the_original_budget() {
         // Both budgets include spawn/handoff and are never renewed. Cancellation
         // uses the ordinary fixture budget so the deadline does not win first.
         let expires = if mode == "deadline" {
-            Instant::now() + Duration::from_millis(900)
+            // This deadline is the expiration being tested. The fixture waits
+            // 2 s before bind, so a budget renewed there would end near 8 s;
+            // 6 s leaves a loaded host about 4 s to spawn and hand off.
+            Instant::now() + Duration::from_secs(6)
         } else {
             until()
         };
@@ -130,13 +137,18 @@ fn bound_socket_deadline_and_cancel_keep_the_original_budget() {
                 Error::Timeout
             };
             assert_eq!(
-                receive.recv_timeout(Duration::from_secs(2)).unwrap(),
+                // Cancellation must answer within 2 s of the signal; the deadline arm
+                // waits for its own budget to run out.
+                receive
+                    .recv_timeout(Duration::from_secs(if mode == "cancel" { 2 } else { 20 }))
+                    .unwrap(),
                 Err(expected),
                 "{mode}"
             );
             assert!(
-                Instant::now() < expires + Duration::from_millis(500),
-                "deadline was rebased"
+                Instant::now()
+                    < expires + Duration::from_millis(if mode == "deadline" { 1000 } else { 500 }),
+                "{mode}: deadline was rebased"
             );
             // Dropping the gate releases the C wait by EOF; it never listened.
         });

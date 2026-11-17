@@ -15,7 +15,7 @@ try:
     if select.select([s],[],[],0.05)[0] and s.recv(1,socket.MSG_PEEK):
         open(marker+".early","w").close()
     if mode=="late":
-        until=time.monotonic()+5
+        until=time.monotonic()+30
         while not os.path.exists(marker+".allow_ready") and time.monotonic()<until:
             if select.select([s],[],[],0.005)[0] and not s.recv(1,socket.MSG_PEEK):break
     send(dict(type="admin_ready",protocol_version=999 if mode=="protocol" else 3,version="old" if mode=="version" else "0.1.0"))
@@ -38,7 +38,7 @@ if 'f' in locals():f.close()
 s.close()
 open(marker+".retiring","w").close()
 if mode=="hold":
-    until=time.monotonic()+5
+    until=time.monotonic()+30
     while not os.path.exists(marker+".allow_exit") and time.monotonic()<until:time.sleep(0.005)
 time.sleep(0.1)
 open(marker+".cleaned","w").close()

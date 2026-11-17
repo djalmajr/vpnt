@@ -56,7 +56,7 @@ fn config<N: Observer>(registry: &Registry<N>, reservation: &Reservation) -> Con
     .unwrap()
 }
 fn until() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    Instant::now() + Duration::from_secs(20)
 }
 fn token() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))

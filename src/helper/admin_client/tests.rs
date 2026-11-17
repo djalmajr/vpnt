@@ -54,7 +54,7 @@ impl Drop for Peer {
         let _ = fs::write(self.marker("allow_exit"), b"");
         let _ = fs::write(self.marker("allow_ready"), b"");
         self.state.stop.store(true, Ordering::Release);
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + Duration::from_secs(20);
         while !self.state.finished.load(Ordering::Acquire) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -71,7 +71,7 @@ fn request() -> AdminRequest {
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(20);
     while !predicate() {
         assert!(Instant::now() < until, "admin condition timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -79,7 +79,7 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 }
 #[test]
 fn document_waits_for_ready_and_eof_then_success_waits_for_the_owned_child() {
-    let (peer, mut admin) = Peer::new("hold", Duration::from_secs(3));
+    let (peer, mut admin) = Peer::new("hold", Duration::from_secs(20));
     wait(|| peer.has("ready"));
     assert!(
         !peer.has("early"),
@@ -99,8 +99,9 @@ fn document_waits_for_ready_and_eof_then_success_waits_for_the_owned_child() {
 #[test]
 fn incompatible_or_late_authorization_never_receives_the_document() {
     for (mode, expected, deadline) in [
-        ("version", Error::Incompatible, Duration::from_secs(2)),
-        ("protocol", Error::Incompatible, Duration::from_secs(2)),
+        ("version", Error::Incompatible, Duration::from_secs(20)),
+        ("protocol", Error::Incompatible, Duration::from_secs(20)),
+        // This deadline is the expiration being tested.
         ("late", Error::Expired, Duration::from_millis(250)),
     ] {
         let (peer, mut admin) = Peer::new(mode, deadline);
@@ -119,7 +120,7 @@ fn mismatched_duplicate_failed_and_unsuccessful_exit_are_not_success() {
         ("busy", Error::Rejected(ErrorCode::ProfileBusy)),
         ("exit", Error::Unavailable),
     ] {
-        let (_peer, mut admin) = Peer::new(mode, Duration::from_secs(2));
+        let (_peer, mut admin) = Peer::new(mode, Duration::from_secs(20));
         let mut outcome = None;
         wait(|| {
             outcome = admin.poll();

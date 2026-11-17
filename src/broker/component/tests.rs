@@ -125,7 +125,7 @@ fn component_install_rechecks_activity_after_admission_before_runtime_handoff() 
     broker.connections.get_mut("one").unwrap().view.state = State::Connecting;
     let mut result = None;
     wait(|| {
-        broker.poll();
+        broker.poll_component();
         result = broker.take_component_result();
         result.is_some()
     });
