@@ -21,8 +21,14 @@ REPORTS = ROOT / "output/fixtures/ppp-supervisor"
 EXECUTIONS = {}
 
 
-def run(label, command, expected=0):
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=30)
+def run(label, command, expected=0, timeout=30):
+    try:
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        (REPORTS / f"{label}.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
+        EXECUTIONS[label] = {"timeout": timeout, "command": list(map(str, command))}
+        (REPORTS / "executions.json").write_text(json.dumps(EXECUTIONS, indent=2) + "\n")
+        raise RuntimeError(f"{label}: timed out after {timeout}s; see {REPORTS / (label+'.log')}") from error
     (REPORTS / f"{label}.log").write_bytes(result.stdout + result.stderr)
     EXECUTIONS[label] = {"exit": result.returncode, "command": list(map(str, command))}
     (REPORTS / "executions.json").write_text(json.dumps(EXECUTIONS, indent=2) + "\n")
@@ -37,8 +43,8 @@ def main():
     if not archive.is_file() or hashlib.sha256(archive.read_bytes()).hexdigest() != ARCHIVE_SHA:
         raise SystemExit("Prepare the verified openfortivpn archive with build-runtime.py first")
     REPORTS.mkdir(parents=True, exist_ok=True)
-    run("build", ["cargo", "build", "--locked", "--offline", "--no-default-features", "--lib", "--bin", "vpnt-pppd"])
-    run("configuration", ["cargo", "test", "--locked", "--offline", "--no-default-features", "--lib", "helper::ppp_config"])
+    run("build", ["cargo", "build", "--locked", "--offline", "--no-default-features", "--lib", "--bin", "vpnt-pppd"], timeout=600)
+    run("configuration", ["cargo", "test", "--locked", "--offline", "--no-default-features", "--lib", "helper::ppp_config"], timeout=600)
     library = ["--edition=2024", "--extern", f"vpnt={ROOT}/target/debug/libvpnt.rlib", "-L", f"dependency={ROOT}/target/debug/deps"]
     # The read-only observer used by the fixture also needs this same libc.
     libc = max((ROOT / "target/debug/deps").glob("liblibc-*.rlib"), key=lambda path: path.stat().st_mtime)

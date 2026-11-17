@@ -262,7 +262,7 @@ def main():
          lambda s: replace_once(s, "&& factory.idle()", "&& true"),
          ["--lib", "profiles_run_concurrently_and_eof"]),
         ("controller-untested-tunnel-connected", "src/connection/controller/worker.rs",
-         lambda s: replace_once(s, "send(ConnectionState::Verifying, 0)", "send(ConnectionState::Connected, 0)"),
+         lambda s: replace_once(s, "send(ConnectionState::Verifying, 0, false)", "send(ConnectionState::Connected, 0, false)"),
          ["--lib", "controller_connects_only_after_leases"]),
         ("controller-unresponsive-probe-accepted", "src/connection/controller/worker.rs",
          lambda s: replace_once(s, "send(\n                    if responsive {", "send(\n                    if true {"),

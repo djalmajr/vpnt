@@ -55,7 +55,7 @@ def main():
         ('namespace-not-rechecked', control, lambda s: replace(s, '        self.registry\n            .lock()\n            .map_err(|_| Error::Unavailable)?\n            .ensure_initiate_clear(&self.reservation)?;\n', ''), namespace),
         ('cleanup-replayed', control, lambda s: replace(s, '!self.cleanup_sent && admission.is_ok()', 'admission.is_ok()'), lifecycle),
         ('producer-retirement-not-required', control, lambda s: replace(s, 'if !retired {', 'if false {'), lifecycle),
-        ('kernel-absence-not-required', registry, lambda s: replace(s, '        self.ensure_clear(reservation)?;\n', ''), lifecycle),
+        ('kernel-absence-not-required', registry, lambda s: replace(s, '        self.ensure_clear(reservation).inspect_err(|_| {', '        Ok::<(), Error>(()).inspect_err(|_| {'), lifecycle),
         ('producer-observation-not-required', registry, lambda s: replace(s, '!self.observer.producer_stopped(&reservation.owner)?', 'false'), lifecycle),
         ('registry-failure-skips-retirement', control, lambda s: replace(s, 'let admission = self.validate();', 'self.validate()?; let admission: Result<(), Error> = Ok(());'), retire),
         ('transport-loses-cancellation', io, lambda s: replace(s, 'call.expires, call.cancel.clone()', 'call.expires, Arc::new(AtomicBool::new(false))'), cancel),

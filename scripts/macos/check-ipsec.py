@@ -50,14 +50,14 @@ def main():
         ('stale-token-accepted', namespace, lambda s: replace(s, '*serial == reservation.serial && ', ''), tokens),
         ('producer-stop-not-required', namespace, lambda s: replace(s, '!self.observer.producer_stopped(&reservation.owner)?', 'false'), reserve),
         ('kernel-conflict-not-rechecked', namespace, lambda s: replace(s, 'self.occupied()?.contains(&u32::from(reservation.reqid))', 'false'), reserve),
-        ('release-skips-kernel-confirmation', namespace, lambda s: replace(s, '        self.ensure_clear(reservation)?;\n', ''), reserve),
+        ('release-skips-kernel-confirmation', namespace, lambda s: replace(s, '        self.ensure_clear(reservation).inspect_err(|_| {', '        Ok::<(), Error>(()).inspect_err(|_| {'), reserve),
         ('failed-observation-becomes-empty', namespace, lambda s: replace(s, 'let occupied = self.observer.occupied()?;', 'let occupied = self.observer.occupied().unwrap_or_default();'), tokens),
         ('capacity-off-by-one', namespace, lambda s: replace(s, 'self.entries.len() >= 64', 'self.entries.len() > 64'), capacity),
         ('reservation-unlinked-before-confirmation', namespace, lambda s: replace(s, '        if !self.observer.producer_stopped', '        self.entries.remove(&reservation.reqid);\n        if !self.observer.producer_stopped'), reserve),
         ('config-accepts-foreign-token', config, lambda s: replace(s, '        registry.validate(reservation)?;\n', ''), invalid),
         ('config-crosses-profile', config, lambda s: replace(s, '            || profile.id != reservation.owner().profile\n', ''), invalid),
         ('ssl-profile-sent-to-ipsec', config, lambda s: replace(s, 'profile.kind != VpnKind::Ipsec', 'false'), invalid),
-        ('empty-eap-identity-accepted', config, lambda s: replace(s, '            || profile.username.is_empty()\n', ''), invalid),
+        ('empty-eap-identity-accepted', config, lambda s: replace(s, "    !username.is_empty()\n        && !username.starts_with('#')", "    !username.starts_with('#')"), invalid),
         ('endpoint-family-unchecked', config, lambda s: replace(s, '            || local.is_ipv4() != remote.is_ipv4()\n', ''), invalid),
         ('multicast-endpoint-accepted', config, lambda s: replace(s, '        && !ip.is_multicast()\n', ''), invalid),
         ('wrong-reqid-configured', config, lambda s: replace(s, '.value("reqid", self.reqid.to_string().as_bytes())', '.value("reqid", b"1")'), scope),
@@ -77,8 +77,8 @@ def main():
         ('profile-name-truncated', config, lambda s: replace(s, 'hex(&profile.id)?', 'hex(&profile.id.chars().take(8).collect::<String>())?'), identity),
         ('ipv6-default-selector-omitted', config, lambda s: replace(s, 'vec!["0.0.0.0/0".into(), "::/0".into()]', 'vec!["0.0.0.0/0".into()]'), identity),
         ('resolved-endpoint-not-pinned', config, lambda s: replace(s, '[self.remote.to_string().as_bytes()]', '[self.gateway.as_bytes()]'), identity),
-        ('username-reinterpreted-as-identity-pattern', config, lambda s: replace(s, 'identity: format!("keyid:#{}", hex(&profile.username)?),', 'identity: profile.username.clone(),'), prefix + 'identity::usernames_are_opaque_key_id_bytes_even_when_they_look_like_identity_patterns'),
-        ('unspecified-gateway-identity-accepted', config, lambda s: replace(s, '            || profile\n                .gateway\n                .parse::<IpAddr>()\n                .is_ok_and(|ip| ip.is_unspecified())\n', ''), prefix + 'identity::usernames_are_opaque_key_id_bytes_even_when_they_look_like_identity_patterns'),
+        ('username-reinterpreted-as-identity-pattern', config, lambda s: replace(s, 'identity: text_identity(&profile.username)?,', 'identity: profile.username.clone(),'), prefix + 'identity::usernames_have_explicit_text_types_and_the_same_eap_secret_owner'),
+        ('unspecified-gateway-identity-accepted', config, lambda s: replace(s, '            || profile\n                .gateway\n                .parse::<IpAddr>()\n                .is_ok_and(|ip| ip.is_unspecified())\n', ''), prefix + 'identity::unspecified_gateways_cannot_be_used_as_remote_identities'),
     ]
     for label, file, mutate, _ in mutations:
         source = (ROOT / file).read_text()

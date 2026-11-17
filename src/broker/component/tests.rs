@@ -215,6 +215,80 @@ fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authent
 }
 
 #[test]
+fn installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_installed() {
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"");
+        }
+    }
+
+    let mut old = Peer::new("flow");
+    let mut new = Peer::new("flow");
+    let mut broker = Broker::new(Some(old.take()), Secrets(Arc::new(AtomicUsize::new(0))));
+    wait(|| broker.snapshot().helper == "installed");
+    let old_epoch = broker.epoch;
+    assert!(broker.ready);
+    let mut next = Some(new.take());
+    broker.retry = Some(retry::Retry::fixture(move || {
+        next.take().ok_or(Error::Unavailable)
+    }));
+    let root = old.root().to_owned();
+    let script = root.join("fresh-snapshot-install.py");
+    fs::write(&script, "import pathlib,sys,time\np=pathlib.Path(sys.argv[1])\n(p/'started').touch()\ndeadline=time.monotonic()+10\nwhile not (p/'release').exists() and time.monotonic()<deadline: time.sleep(0.005)\nassert (p/'release').exists()\n").unwrap();
+    let release = Release(root.join("release"));
+    let directory = root.clone();
+    broker.component.connect = Box::new(move |kind, id, locale, expires| {
+        let mut command = Process::new("/usr/bin/python3");
+        command.arg(&script).arg(&directory);
+        Operation::fixture(kind, command, id, locale, expires)
+    });
+    let token = broker
+        .begin_component(
+            Command::InstallHelper {},
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(8),
+        )
+        .unwrap();
+    wait(|| {
+        broker.poll();
+        root.join("started").exists()
+    });
+    assert!(old.cleaned());
+    assert_eq!(broker.epoch, old_epoch);
+    // Reproduce a retained installed snapshot from the old epoch, without
+    // delivering a new helper message while the installer finishes.
+    broker.helper = "installed";
+    broker.ready = true;
+    fs::write(&release.0, b"").unwrap();
+    wait(|| {
+        broker.poll_component();
+        assert!(
+            broker.take_component_result().is_none(),
+            "old installed snapshot must not confirm installation"
+        );
+        broker
+            .component
+            .current
+            .as_ref()
+            .is_some_and(|op| op.phase == Phase::Verifying)
+    });
+    assert_eq!(broker.epoch, old_epoch);
+    assert_eq!(broker.component.current.as_ref().unwrap().epoch, old_epoch);
+    let mut completion = None;
+    wait(|| {
+        broker.poll();
+        completion = broker.take_component_result();
+        completion.is_some()
+    });
+    let (actual, result) = completion.unwrap();
+    assert_eq!(actual, token);
+    assert_eq!(result.unwrap().helper, "installed");
+    assert!(broker.ready);
+    assert!(broker.epoch > old_epoch);
+}
+
+#[test]
 fn previous_session_finishing_installer_error_round_trips_and_maps_distinctly() {
     let reply = crate::install::protocol::Reply::Failed {
         id: Some("fixture".into()),

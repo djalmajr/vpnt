@@ -22,7 +22,10 @@ spec.loader.exec_module(build_inputs)
 
 
 def without_eof(source):
-    start = source.index('    if read(stream, &mut input, deadline, state)?.is_some() {')
+    anchor = '    if read(stream, &mut input, expires, state)?.is_some() {'
+    if source.count(anchor) != 1:
+        raise RuntimeError(f'Changed mutation anchor: {anchor!r}')
+    start = source.index(anchor)
     end = source.index('    result\n', start)
     return source[:start] + source[end:]
 
@@ -74,7 +77,7 @@ def main():
         ('retry-during-component-change', coordinator, lambda s: replace(s, '.is_some_and(|p| p.phase != Phase::Verifying)', '.is_some_and(|_| false)'), flow, False),
         ('timed-out-child-forgotten', coordinator, lambda s: replace(s, 'if op.reported {\n            if op.client.finished()', 'if op.reported {\n            if true'), held, False),
         ('settling-hidden-from-ui', coordinator, lambda s: replace(s, '                "settling"', '                "installing"'), held, False),
-        ('fresh-snapshot-not-required', coordinator, lambda s: replace(s, 'op.phase == Phase::Verifying && self.ready && self.epoch > op.epoch', 'op.phase == Phase::Verifying'), lifecycle + 'an_incompatible_new_session_cannot_turn_installer_exit_into_installation_success', False),
+        ('fresh-snapshot-not-required', coordinator, lambda s: replace(s, 'op.phase == Phase::Verifying\n                && self.ready\n                && self.helper == "installed"\n                && self.epoch > op.epoch', 'op.phase == Phase::Verifying\n                && self.helper == "installed"'), broker + 'installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_installed', False),
         ('removed-user-reconnected', coordinator, lambda s: replace(s, 'self.component.disabled = true;', 'self.component.disabled = false;'), removed, False),
         ('removal-deletes-keychain', coordinator, lambda s: replace(s, '(Kind::Remove, Some(Ok(Receipt::Removed { .. }))) => {', '(Kind::Remove, Some(Ok(Receipt::Removed { .. }))) => {\n                        for c in self.connections.values() { let _ = self.secrets.remove(&c.view.profile.id, c.view.profile.kind); }'), removed, False),
         ('quit-allows-new-component-change', coordinator, lambda s: replace(s, '        self.closed = true;', '        self.closed = false;'), lifecycle + 'quitting_during_a_component_operation_never_restarts_runtime_or_admits_another_change', False),

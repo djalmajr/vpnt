@@ -52,7 +52,7 @@ def mutations():
     channel = prefix + 'channel::removal_channel_uses_kernel_identity_and_refuses_an_extra_uid_or_second_document'
     pending = prefix + 'pending::claims_without_a_controller_block_activation_removal_and_journal_recovery_in_every_phase'
     untrusted = prefix + 'pending::untrusted_ipsec_roots_are_refused_and_opaque_entries_cannot_be_interpreted_as_empty'
-    admission = 'let _guard = self.tree.bootstrap()?;\n        pending::clear(&self.tree, &_guard)?;'
+    admission = 'let _guard = self.tree.bootstrap_wait(CONTROLLER_WAIT)?;\n        pending::clear(&self.tree, &_guard)?;'
     gate = '        pending::clear(&self.tree, &_guard)?;\n'
     recovery_order = gate + '        Journal::recover(&self.tree)?;\n'
     cases = [
@@ -121,6 +121,7 @@ def main():
             for name in ['Cargo.toml', 'Cargo.lock']: shutil.copy2(ROOT / name, copy / name)
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name)
             shutil.copy2(ROOT / 'scripts/macos/prepare-installation.py', copy / 'scripts/macos/prepare-installation.py')
+            shutil.copy2(ROOT / 'scripts/macos/identifiers.py', copy / 'scripts/macos/identifiers.py')
             build_inputs.copy_into(ROOT, copy)
             for label, selector in baselines: receipt['baseline-' + label] = run(copy, 'baseline-' + label, selector)
             for label, file, mutate, selector, expected in mutants:
