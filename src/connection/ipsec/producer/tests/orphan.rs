@@ -260,3 +260,91 @@ fn startup_orphan_durable_link_survives_stopping_and_is_used_on_recovery() {
     assert!(recover(&fixture, &CURRENT, &mut LinkObservation(link)).is_empty());
     assert!(!lease.directory.path.exists());
 }
+
+#[test]
+fn startup_orphan_capture_records_the_utun_identity_before_configure() {
+    struct Linked(Option<record::LinkClaim>);
+    impl ObserveOrphan for Linked {
+        fn birth_absent(&mut self, _: &Birth) -> Result<bool, Error> {
+            Ok(true)
+        }
+        fn resources_absent(&mut self, record: &Record) -> Result<bool, Reason> {
+            self.0 = record.link.clone();
+            Ok(true)
+        }
+    }
+    let link = |name: &str, index: u16, vips: &[&str]| record::LinkClaim {
+        name: name.into(),
+        index: std::num::NonZeroU16::new(index).unwrap(),
+        vips: vips.iter().map(|vip| vip.parse().unwrap()).collect(),
+    };
+
+    let fixture = Fixture::new();
+    let mut starting = prepare(&fixture, Stage::Starting);
+    assert_eq!(
+        starting.record_interface("utun7", 7, until(), &token()),
+        Err(Error::Changed)
+    );
+    starting.stage(Stage::Stopped, None).unwrap();
+    starting.complete().unwrap();
+
+    let mut lease = prepare(&fixture, Stage::Running);
+    for (name, index) in [("utun7", 0), ("utun7", 65_536), ("en0", 7), ("utun07", 7)] {
+        assert_eq!(
+            lease.record_interface(name, index, until(), &token()),
+            Err(Error::Invalid),
+            "{name} {index}"
+        );
+    }
+    assert!(lease.record.link.is_none());
+    lease
+        .record_interface("utun7", 7, until(), &token())
+        .unwrap();
+    let captured = link("utun7", 7, &[]);
+    assert_eq!(lease.record.link.as_ref(), Some(&captured));
+    // Durable, not only in memory.
+    let path = lease.directory.path.join("claim.json");
+    let durable: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(durable.link.as_ref(), Some(&captured));
+    assert_eq!(
+        lease.record_interface("utun7", 7, until(), &token()),
+        Err(Error::Changed)
+    );
+    // Configure must name the captured interface, once.
+    for other in [
+        link("utun8", 7, &["192.0.2.10"]),
+        link("utun7", 8, &["192.0.2.10"]),
+    ] {
+        assert_eq!(
+            lease.record_link(other, until(), &token()),
+            Err(Error::Changed)
+        );
+    }
+    let configured = link("utun7", 7, &["192.0.2.10"]);
+    lease
+        .record_link(configured.clone(), until(), &token())
+        .unwrap();
+    assert_eq!(
+        lease.record_link(configured.clone(), until(), &token()),
+        Err(Error::Changed)
+    );
+    lease.stage(Stage::Stopped, Some(OLD_CHILD)).unwrap();
+    let mut observed = Linked(None);
+    assert!(recover(&fixture, &CURRENT, &mut observed).is_empty());
+    assert_eq!(observed.0, Some(configured));
+    assert!(!lease.directory.path.exists());
+}
+
+#[test]
+fn startup_orphan_reads_a_captured_claim_without_vips() {
+    let fixture = Fixture::new();
+    let mut lease = prepare(&fixture, Stage::Running);
+    lease
+        .record_interface("utun7", 7, until(), &token())
+        .unwrap();
+    lease.stage(Stage::Stopped, Some(OLD_CHILD)).unwrap();
+    let mut observation = Observation::default();
+    assert!(recover(&fixture, &CURRENT, &mut observation).is_empty());
+    assert!(observation.checked_resources);
+    assert!(!lease.directory.path.exists());
+}

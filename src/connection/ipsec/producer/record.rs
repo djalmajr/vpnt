@@ -32,6 +32,9 @@ pub(super) enum Stage {
     Stopped,
 }
 
+/// Durable identity of the retained UTUN. Capture records name and index with
+/// no VIPs (nothing configured yet); `configure` then records the whole VIP
+/// intention for the same name and index before any alias ioctl.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LinkClaim {
@@ -45,8 +48,8 @@ impl LinkClaim {
         let unit = self.name.strip_prefix("utun");
         unit.and_then(|unit| unit.parse::<u32>().ok())
             .is_some_and(|unit| self.name == format!("utun{unit}"))
-            && (1..=2).contains(&self.vips.len())
-            && (self.vips.len() == 1 || self.vips[0].is_ipv4() != self.vips[1].is_ipv4())
+            && self.vips.len() <= 2
+            && (self.vips.len() < 2 || self.vips[0].is_ipv4() != self.vips[1].is_ipv4())
             && self
                 .vips
                 .iter()

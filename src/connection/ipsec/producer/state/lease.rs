@@ -82,17 +82,54 @@ impl Lease {
         self.replace_record(next, prewrite)
     }
 
+    /// Capture: persist the retained UTUN's name and index (no VIPs yet), once.
+    pub(in crate::connection::ipsec::producer) fn record_interface(
+        &mut self,
+        name: &str,
+        index: u32,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), Error> {
+        let index = u16::try_from(index)
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or(Error::Invalid)?;
+        let link = LinkClaim {
+            name: name.into(),
+            index,
+            vips: Vec::new(),
+        };
+        self.write_link(link, expires, cancel, |current| current.is_none())
+    }
+
+    /// Configure: persist the whole VIP intention for the interface recorded at
+    /// capture (or, for a claim without one, the first identity), once.
     pub(in crate::connection::ipsec::producer) fn record_link(
         &mut self,
         link: LinkClaim,
         expires: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), Error> {
+        let (name, index) = (link.name.clone(), link.index);
+        self.write_link(link, expires, cancel, |current| {
+            current.is_none_or(|current| {
+                current.name == name && current.index == index && current.vips.is_empty()
+            })
+        })
+    }
+
+    fn write_link(
+        &mut self,
+        link: LinkClaim,
+        expires: Instant,
+        cancel: &AtomicBool,
+        allowed: impl FnOnce(Option<&LinkClaim>) -> bool,
+    ) -> Result<(), Error> {
         let store = self.store.clone();
         let _lock = budget::lock_until(expires, cancel, &store.io)?;
         budget::check_until(expires, cancel)?;
         self.validate_unlocked()?;
-        if self.record.stage != Stage::Running || self.record.link.is_some() {
+        if self.record.stage != Stage::Running || !allowed(self.record.link.as_ref()) {
             return Err(Error::Changed);
         }
         let mut next = self.record.clone();

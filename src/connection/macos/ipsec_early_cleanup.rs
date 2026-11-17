@@ -45,16 +45,8 @@ fn read_interfaces() -> Result<Interfaces, Error> {
 /// Startup has no in-memory route registry or pinned descriptor. The claim's
 /// networks cover both the retained backend's tunnel routes and its sink
 /// routes (including expanded defaults). An ambiguous match stays pending.
-pub(crate) fn orphan_absent(
-    link: Option<(&str, u16, &[IpAddr])>,
-    networks: &[String],
-) -> Result<bool, Error> {
-    let interfaces = read_interfaces()?;
-    let table = Snapshot::read()?;
-    orphan_observed(link, networks, &interfaces, &table)
-}
-
-fn orphan_observed(
+/// The caller supplies fresh reads; a read failure never reaches here as `true`.
+pub(crate) fn orphan_observed(
     link: Option<(&str, u16, &[IpAddr])>,
     networks: &[String],
     interfaces: &Interfaces,
@@ -78,10 +70,12 @@ fn orphan_observed(
         {
             return Ok(false);
         }
-        let sink_possible = vips.len() == 1
-            && networks
-                .iter()
-                .any(|text| text.parse::<Network>().is_ok_and(|n| n.prefix() == 0));
+        // Same condition as the retained backend (`networks.is_empty() &&
+        // ipv4 != ipv6` on the selected route networks): a full tunnel (both
+        // defaults, see `config::selection::is_full_tunnel`) with a single VIP
+        // family. That sink is its own UTUN with a private host address, which
+        // the planned destinations do not cover and the claim does not name.
+        let sink_possible = vips.len() == 1 && full_tunnel(networks);
         if !sink_possible {
             return Ok(true);
         }
@@ -103,6 +97,21 @@ fn orphan_observed(
                 });
             !index_known || orphan_local
         }))
+}
+
+fn full_tunnel(networks: &[String]) -> bool {
+    let parsed: Vec<Network> = networks
+        .iter()
+        .filter_map(|text| text.parse().ok())
+        .collect();
+    parsed.len() == 2
+        && parsed.len() == networks.len()
+        && parsed
+            .iter()
+            .any(|network| network.address().is_ipv4() && network.prefix() == 0)
+        && parsed
+            .iter()
+            .any(|network| !network.address().is_ipv4() && network.prefix() == 0)
 }
 
 /// Pure predicate shared by production `complete` and the synthetic tests.
@@ -230,6 +239,38 @@ mod orphan_tests {
         assert!(!gone(&foreign, &table(vec![route("10.20.0.0", 24, 7, 0)])));
         assert!(!gone(&foreign, &table(vec![route("10.20.0.0", 24, 2, 0)])));
         assert!(!gone(&foreign, &table(vec![route("10.30.0.0", 24, 7, 0)])));
+    }
+
+    #[test]
+    fn startup_orphan_sink_follows_the_retained_backend_condition() {
+        // A system UTUN is present: only a possible sink falls back to "busy".
+        let host = interfaces(&[("en0", 2, &[]), ("utun0", 9, &[])]);
+        let v4: [IpAddr; 1] = ["192.0.2.10".parse().unwrap()];
+        let dual: [IpAddr; 2] = [
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::10".parse().unwrap(),
+        ];
+        let captured: [IpAddr; 0] = [];
+        let full: [String; 2] = ["0.0.0.0/0".into(), "::/0".into()];
+        let explicit_v4: [String; 1] = ["0.0.0.0/0".into()];
+        let split: [String; 1] = ["10.20.0.0/24".into()];
+        let absent = |vips: &[IpAddr], networks: &[String]| {
+            orphan_observed(Some(("utun7", 7, vips)), networks, &host, &empty()).unwrap()
+        };
+        // Full tunnel with one VIP family: the backend creates a sink.
+        assert!(!absent(&v4, &full));
+        // No sink: an explicit single default, both families, a split, or a
+        // capture that never configured VIPs.
+        assert!(absent(&v4, &explicit_v4));
+        assert!(absent(&dual, &full));
+        assert!(absent(&v4, &split));
+        assert!(absent(&captured, &full));
+        assert!(!full_tunnel(&["0.0.0.0/0".into(), "0.0.0.0/0".into()]));
+        assert!(!full_tunnel(&[
+            "0.0.0.0/0".into(),
+            "::/0".into(),
+            "10.0.0.0/8".into()
+        ]));
     }
 
     #[test]

@@ -116,6 +116,11 @@ impl<'a> Producer<'a> {
         let retained = RetainedInterface::admit(descriptor, observation, expires, cancel)
             .map_err(map_observe)?;
         self.current(expires, cancel)?;
+        // Durable before the handoff: a helper that dies between capture and
+        // configure leaves a claim that names this UTUN. A failed write drops
+        // (closes) the retained descriptor and fails the capture.
+        self.lease
+            .record_interface(retained.name(), retained.index(), expires, cancel)?;
         Ok(retained)
     }
     #[cfg(test)]
