@@ -70,3 +70,76 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     });
   }
 }
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: dropped reason and log step`, async () => {
+    const { Log } = await import("./screens/Log");
+    const t: T = (key, values) => translate(locale, key, values);
+    const vpn: VpnView = {
+      profile: {
+        id: "fixture",
+        name: "Fixture",
+        kind: "ssl",
+        gateway: "vpn.example.com",
+        username: "fixture",
+        networks: [],
+        port: 443,
+        certificate: "",
+        probeHost: "corp.example.com",
+        probePort: 443,
+        probeMethod: "tcp",
+      },
+      state: "dropped",
+      cleaning: false,
+      cleanupVerifying: false,
+      hasPassword: true,
+      hasPsk: false,
+      log: [],
+    };
+    const renderCard = (value: VpnView) =>
+      renderToStaticMarkup(
+        createElement(VpnCard, {
+          vpn: value,
+          t,
+          run: async () => true,
+          navigate: () => {},
+          secrets: () => {},
+        }),
+      );
+    expect(renderCard(vpn)).toContain(t("droppedHint"));
+    const failure = { code: "backend_failure", step: "routes" as const };
+    const withFailure = {
+      ...vpn,
+      failure,
+      log: [{ timestamp: 1, state: "dropped" as const, failure }],
+    };
+    expect(renderCard(withFailure)).toContain(
+      t("failedAtHint", { step: t("step.routes") }),
+    );
+    expect(
+      renderCard({ ...vpn, failure: { ...failure, step: "health" } }),
+    ).toContain(t("droppedHint"));
+    const log = renderToStaticMarkup(
+      createElement(Log, {
+        snapshot: {
+          version: "test",
+          demo: false,
+          helper: "installed",
+          preferences: {
+            interval: 10,
+            notify: false,
+            reconnect: false,
+            startup: false,
+          },
+          vpns: [withFailure],
+        },
+        id: "fixture",
+        navigate: () => {},
+        run: async () => true,
+        t,
+        locale,
+      }),
+    );
+    expect(log).toContain(`${t("state.dropped")} · ${t("step.routes")}`);
+  });
+}

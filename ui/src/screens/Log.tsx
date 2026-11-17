@@ -29,7 +29,7 @@ export function Log({
   const lines =
     vpn?.log.map(
       (line) =>
-        `${new Date(line.timestamp * 1000).toLocaleTimeString(locale)} ${t(`state.${line.state}`)}`,
+        `${new Date(line.timestamp * 1000).toLocaleTimeString(locale)} ${t(`state.${line.state}`)}${line.failure ? ` · ${t(`step.${line.failure.step}`)}` : ""}`,
     ) ?? [];
   return (
     <>
