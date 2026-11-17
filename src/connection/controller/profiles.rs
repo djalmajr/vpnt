@@ -9,7 +9,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-type Reservations = Arc<Mutex<BTreeMap<(String, u64), ProfileReservation>>>;
+struct Reservation {
+    profile: ProfileReservation,
+    live: bool,
+    identity: Arc<()>,
+}
+type Reservations = Arc<Mutex<BTreeMap<(String, u64), Reservation>>>;
 pub(super) struct Profiles {
     store: ProfileStore,
     reservations: Reservations,
@@ -17,6 +22,7 @@ pub(super) struct Profiles {
 pub(super) struct ProfileUse {
     key: (String, u64),
     reservations: Reservations,
+    identity: Arc<()>,
 }
 impl Profiles {
     #[cfg(test)]
@@ -55,17 +61,40 @@ impl Profiles {
             return Err(StoreError::InvalidData);
         }
         let key = (profile.id.clone(), generation);
+        let identity = Arc::new(());
         self.reservations
             .lock()
             .map_err(|_| StoreError::Io)?
-            .insert(key.clone(), reservation);
+            .insert(
+                key.clone(),
+                Reservation {
+                    profile: reservation,
+                    live: true,
+                    identity: identity.clone(),
+                },
+            );
         Ok(ProfileUse {
             key,
             reservations: self.reservations.clone(),
+            identity,
         })
     }
     pub(super) fn idle(&self) -> bool {
         self.reservations.try_lock().is_ok_and(|r| r.is_empty())
+    }
+    /// Keep the reservation set stable throughout recovery's scan. A new
+    /// attempt cannot publish its journal until its reservation is present.
+    pub(super) fn with_live<T>(
+        &self,
+        action: impl FnOnce(&std::collections::BTreeSet<(String, u64)>) -> T,
+    ) -> Result<T, StoreError> {
+        let reservations = self.reservations.lock().map_err(|_| StoreError::Io)?;
+        let live = reservations
+            .iter()
+            .filter(|(_, reservation)| reservation.live)
+            .map(|(key, _)| key.clone())
+            .collect();
+        Ok(action(&live))
     }
 }
 impl ProfileUse {
@@ -90,12 +119,14 @@ impl ProfileUse {
             .map_err(|_| StoreError::Io)?
             .get(&self.key)
             .ok_or(StoreError::InvalidData)?
+            .profile
             .validate()
     }
     pub(super) fn complete(&self) -> Result<(), StoreError> {
         let mut all = self.reservations.lock().map_err(|_| StoreError::Io)?;
         all.get(&self.key)
             .ok_or(StoreError::InvalidData)?
+            .profile
             .validate()?;
         all.remove(&self.key);
         Ok(())
@@ -109,6 +140,19 @@ impl ProfileUse {
             .remove(&self.key)
             .map(|_| ())
             .ok_or(StoreError::InvalidData)
+    }
+}
+
+impl Drop for ProfileUse {
+    fn drop(&mut self) {
+        // The reservation deliberately outlives an unwound worker, but its
+        // fence must no longer be exempt from recovery after that worker dies.
+        if let Ok(mut all) = self.reservations.lock()
+            && let Some(reservation) = all.get_mut(&self.key)
+            && Arc::ptr_eq(&reservation.identity, &self.identity)
+        {
+            reservation.live = false;
+        }
     }
 }
 

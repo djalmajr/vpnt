@@ -107,7 +107,6 @@ struct NativeAttempt<'a> {
     owner: Owner,
     profile: Profile,
     profiles: Arc<Profiles>,
-    profile_use: Option<ProfileUse>,
     credentials: Option<Credentials>,
     routes: Routes<'a>,
     canceled: Arc<AtomicBool>,
@@ -123,6 +122,9 @@ struct NativeAttempt<'a> {
     uncertain_cleanup: bool,
     fence_root: std::path::PathBuf,
     fence_owner: u32,
+    // Last: recovery must not classify this attempt as dead while its other
+    // fields are still being dropped during unwind.
+    profile_use: Option<ProfileUse>,
 }
 impl NativeAttempt<'_> {
     fn client_health(&mut self) -> Result<(), Failure> {

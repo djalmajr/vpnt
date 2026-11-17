@@ -42,6 +42,11 @@ fn controller_retains_a_reservation_after_worker_unwind_until_explicit_cleanup_p
     let profiles = Profiles::new(f.store());
     let use_profile = profiles.begin(&p, 1).unwrap();
     use_profile.validate().unwrap();
+    assert!(
+        profiles
+            .with_live(|live| live.contains(&("one".into(), 1)))
+            .unwrap()
+    );
     assert!(!profiles.idle());
     assert_eq!(store.remove("one"), Err(StoreError::Busy));
     store.remove("two").unwrap();
@@ -54,6 +59,11 @@ fn controller_retains_a_reservation_after_worker_unwind_until_explicit_cleanup_p
     }));
     assert!(unwind.is_err());
     assert!(!profiles.idle());
+    assert!(
+        !profiles
+            .with_live(|live| live.contains(&("one".into(), 2)))
+            .unwrap()
+    );
     assert_eq!(store.save(p.clone()), Err(StoreError::Busy));
     drop(profiles);
     store.remove("one").unwrap();
@@ -95,4 +105,64 @@ fn changed_or_removed_metadata_cannot_start_the_cached_profile() {
     ));
     assert!(profiles.idle());
     assert!(profiles.load().unwrap().is_empty());
+}
+
+#[test]
+fn recovery_snapshot_keeps_live_reservations_locked_until_scan_finishes() {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let f = Fixture::new();
+    let store = f.store();
+    let p = profile("live");
+    store.save(p.clone()).unwrap();
+    let profiles = Profiles::new(f.store());
+    let reservation = profiles.begin(&p, 7).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let (seen, started, early, completed) = thread::scope(|scope| {
+        let profiles = &profiles;
+        scope.spawn(move || {
+            profiles.with_live(|live| {
+                let _ = entered_tx.send(live.contains(&("live".to_string(), 7)));
+                let _ = release_rx.recv();
+            })
+        });
+        let seen = entered_rx.recv_timeout(Duration::from_secs(5));
+        scope.spawn(move || {
+            let _ = started_tx.send(());
+            let result = reservation.complete();
+            let _ = done_tx.send(result);
+        });
+        let started = started_rx.recv_timeout(Duration::from_secs(5));
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        let _ = release_tx.send(());
+        let completed = done_rx.recv_timeout(Duration::from_secs(5));
+        (seen, started, early, completed)
+    });
+    assert!(seen.unwrap());
+    assert!(started.is_ok());
+    assert!(matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
+    assert!(completed.unwrap().is_ok());
+    assert!(profiles.idle());
+}
+
+#[test]
+fn dropping_completed_handle_does_not_mark_replacement_dead() {
+    let f = Fixture::new();
+    let store = f.store();
+    let p = profile("live");
+    store.save(p.clone()).unwrap();
+    let profiles = Profiles::new(f.store());
+    let previous = profiles.begin(&p, 7).unwrap();
+    previous.complete().unwrap();
+    let replacement = profiles.begin(&p, 7).unwrap();
+    drop(previous);
+    assert!(
+        profiles
+            .with_live(|live| live.contains(&("live".into(), 7)))
+            .unwrap()
+    );
+    replacement.complete().unwrap();
 }

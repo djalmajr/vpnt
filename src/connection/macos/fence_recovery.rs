@@ -175,18 +175,23 @@ impl Recovery {
             global: true,
             blocked: BTreeSet::new(),
         };
-        result.reconcile(None, &mut NativeObserver);
+        result.reconcile(None, &BTreeSet::new(), &mut NativeObserver);
         result
     }
     pub fn blocked(&self, profile: &Profile) -> bool {
         (self.global && profile.kind == VpnKind::Ssl) || self.blocked.contains(&profile.id)
     }
-    pub fn verify(&mut self, profile: &Profile) -> bool {
-        self.reconcile(Some(&profile.id), &mut NativeObserver);
+    pub fn verify(&mut self, profile: &Profile, live: &BTreeSet<(String, u64)>) -> bool {
+        self.reconcile(Some(&profile.id), live, &mut NativeObserver);
         !self.blocked(profile)
     }
-    fn reconcile(&mut self, target: Option<&str>, observer: &mut impl Observer) {
-        let records = match fence::scan(&self.root, self.owner, self.uid) {
+    fn reconcile(
+        &mut self,
+        target: Option<&str>,
+        live: &BTreeSet<(String, u64)>,
+        observer: &mut impl Observer,
+    ) {
+        let records = match fence::scan(&self.root, self.owner, self.uid, live) {
             Ok(records) => records,
             Err(_) => {
                 self.global = true;
@@ -465,7 +470,7 @@ pub(crate) mod tests {
                 global: true,
                 blocked: BTreeSet::new(),
             };
-            recovery.reconcile(None, &mut observer);
+            recovery.reconcile(None, &BTreeSet::new(), &mut observer);
             assert!(observer.destructive.borrow().is_empty());
             Self {
                 root,
@@ -492,7 +497,7 @@ pub(crate) mod tests {
             self.verifies.fetch_add(1, Ordering::SeqCst);
             let mut state = self.state.lock().unwrap();
             let (recovery, observer) = &mut *state;
-            recovery.reconcile(Some(&profile.id), observer);
+            recovery.reconcile(Some(&profile.id), &BTreeSet::new(), observer);
             assert!(observer.destructive.borrow().is_empty());
             !recovery.blocked(profile)
         }
@@ -537,18 +542,18 @@ pub(crate) mod tests {
             blocked: BTreeSet::new(),
         };
         observer.route_present = true;
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(recovery.blocked(&profile("two")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
         observer.fail = true;
         observer.route_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
         observer.fail = false;
         observer.route_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(&profile("one")));
         assert!(recovery.blocked(&profile("two")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
@@ -560,7 +565,7 @@ pub(crate) mod tests {
             .join(uid.to_string())
             .join("bad-1.json");
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("bad")));
         assert!(!recovery.blocked(&profile("two")));
         assert!(bad.exists());
@@ -585,12 +590,39 @@ pub(crate) mod tests {
             global: false,
             blocked: BTreeSet::new(),
         };
-        recovery.reconcile(None, &mut fake());
+        recovery.reconcile(None, &BTreeSet::new(), &mut fake());
         assert!(recovery.blocked(&profile("one")));
         assert!(path.exists());
         recovery.owner = uid.wrapping_add(1);
-        recovery.reconcile(None, &mut fake());
+        recovery.reconcile(None, &BTreeSet::new(), &mut fake());
         assert!(recovery.blocked(&profile("one")));
+        assert!(path.exists());
+    }
+    #[test]
+    fn verification_skips_live_fence_and_keeps_other_generations() {
+        let (root, uid) = root();
+        let mut recovery = Recovery::new(&root.0, uid, uid);
+        let active = record(uid, "live");
+        fence::write(&root.0, uid, &active).unwrap();
+        let path = root
+            .0
+            .join("fences")
+            .join(uid.to_string())
+            .join("live-1.json");
+        // If the active file is opened and validated, this mode is untrusted.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let live = BTreeSet::from([("live".to_string(), 1)]);
+        assert!(recovery.verify(&profile("other"), &live));
+        assert!(!recovery.blocked(&profile("live")));
+        assert!(path.exists());
+        assert!(recovery.verify(
+            &profile("other"),
+            &BTreeSet::from([("live".to_string(), 2)])
+        ));
+        assert!(
+            recovery.blocked(&profile("live")),
+            "a different generation must not exempt this fence"
+        );
         assert!(path.exists());
     }
 }

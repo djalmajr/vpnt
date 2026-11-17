@@ -537,6 +537,32 @@ mod abandon_tests {
             _ => panic!("SSL factory expected"),
         };
         attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
+        let live_fence = fence::Fence {
+            version: 1,
+            uid,
+            profile: profile.id.clone(),
+            generation: 1,
+            kind: fence::Kind::Ssl,
+            reason: "observation_failed".into(),
+            incomplete: false,
+            written_unix_ms: 1,
+            service_id: None,
+            processes: Vec::new(),
+            interface: None,
+            sink: None,
+            retired: Vec::new(),
+            routes: Vec::new(),
+        };
+        fence::write(&root.0, uid, &live_fence).unwrap();
+        let mut other = profile.clone();
+        other.id = "other".into();
+        assert!(factory.verify_cleanup(&other));
+        assert!(!factory.cleanup_blocked(&profile));
+        assert_eq!(
+            fence::read(&root.0, uid, uid, &profile.id, 1).unwrap(),
+            Some(live_fence)
+        );
+        fence::remove(&root.0, uid, uid, &profile.id, 1).unwrap();
         // The real cleanup path must reach and refuse a held coordinator lock.
         // The SSL child is the existing ordinary-user process fixture; the PPP
         // interface is synthetic but its process watches are real.

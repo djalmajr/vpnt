@@ -15,6 +15,9 @@ pub(super) struct NativeFactory<'a> {
 impl<'a> NativeFactory<'a> {
     #[cfg(test)]
     pub(super) fn fixture_fence_root(mut self, root: std::path::PathBuf, owner: u32) -> Self {
+        self.recovery = Mutex::new(crate::connection::macos::fence_recovery::Recovery::new(
+            &root, owner, owner,
+        ));
         self.fence_root = root;
         self.fence_owner = owner;
         self
@@ -132,9 +135,11 @@ impl<'a> Factory for NativeFactory<'a> {
             .map_or(true, |recovery| recovery.blocked(profile))
     }
     fn verify_cleanup(&self, profile: &Profile) -> bool {
-        self.recovery
-            .lock()
-            .is_ok_and(|mut recovery| recovery.verify(profile))
+        self.recovery.lock().is_ok_and(|mut recovery| {
+            self.profiles
+                .with_live(|live| recovery.verify(profile, live))
+                .unwrap_or(false)
+        })
     }
     fn create(
         &self,
