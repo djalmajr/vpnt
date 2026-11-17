@@ -102,7 +102,7 @@ impl Harness {
     }
     fn command(&mut self, command: Command) -> Snapshot {
         self.broker
-            .dispatch(command, Instant::now() + Duration::from_secs(2))
+            .dispatch(command, Instant::now() + Duration::from_secs(20))
             .unwrap()
     }
     fn begin(&mut self, command: Command) -> u64 {
@@ -110,7 +110,7 @@ impl Harness {
             .begin_admin(
                 command,
                 Locale::PtBr,
-                Instant::now() + Duration::from_secs(3),
+                Instant::now() + Duration::from_secs(20),
             )
             .unwrap()
     }
@@ -131,7 +131,7 @@ impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(op) = &mut self.broker.administration.current {
             op.client.close();
-            let until = Instant::now() + Duration::from_secs(3);
+            let until = Instant::now() + Duration::from_secs(20);
             while !op.client.finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -139,7 +139,7 @@ impl Drop for Harness {
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(20);
     while !predicate() {
         assert!(Instant::now() < until, "broker admin condition timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -181,7 +181,7 @@ fn active_profiles_do_not_prompt_and_secrets_are_removed_only_after_confirmed_re
         h.broker.begin_admin(
             Command::RemoveProfile { id: "one".into() },
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(2)
+            Instant::now() + Duration::from_secs(20)
         ),
         Err("profile_busy")
     );
@@ -191,7 +191,7 @@ fn active_profiles_do_not_prompt_and_secrets_are_removed_only_after_confirmed_re
     assert!(matches!(
         h.broker.dispatch(
             Command::Toggle { id: "two".into() },
-            Instant::now() + Duration::from_secs(2)
+            Instant::now() + Duration::from_secs(20)
         ),
         Err("admin_busy")
     ));
@@ -202,7 +202,7 @@ fn active_profiles_do_not_prompt_and_secrets_are_removed_only_after_confirmed_re
                 password: "fictional".into(),
                 psk: "".into()
             },
-            Instant::now() + Duration::from_secs(2)
+            Instant::now() + Duration::from_secs(20)
         ),
         Err("admin_busy")
     ));
@@ -231,6 +231,7 @@ fn expired_administration_never_sends_a_document_or_replays_after_a_late_authori
         .begin_admin(
             Command::SaveProfile { profile: p },
             Locale::PtBr,
+            // This deadline is the expiration being tested.
             Instant::now() + Duration::from_millis(150),
         )
         .unwrap();

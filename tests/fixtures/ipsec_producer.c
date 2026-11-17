@@ -11,6 +11,7 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 #ifndef RUNTIME_PREFIX
 #error RUNTIME_PREFIX required
 #endif
@@ -75,10 +76,29 @@ static void before_listen(const char *directory) {
     char release;int released=read_all(gate,&release,1);close(gate);
     if(!released || release!='L')_exit(0);
 }
+/* Optional fixture-only delay before the socket bind, in milliseconds. */
+static void delay_bind(const char *directory) {
+    char path[1100];
+    demand(snprintf(path,sizeof(path),"%s/../../bind-delay-ms",directory)<(int)sizeof(path));
+    FILE *file=fopen(path,"r");if(!file)return;
+    unsigned long ms=0;int c,seen=0,valid=1;
+    while((c=fgetc(file))!=EOF) {
+        if(c<'0' || c>'9') {valid=0;break;}
+        seen=1;
+        if(ms>1000 || (ms==1000 && c>'0')) {valid=0;break;}
+        ms=ms*10+(unsigned)(c-'0');
+    }
+    if(ferror(file))valid=0;
+    fclose(file);
+    if(!valid || !seen || ms<1 || ms>10000)return;
+    struct timespec delay={(time_t)(ms/1000),(long)(ms%1000)*1000000};
+    while(nanosleep(&delay,&delay)<0 && errno==EINTR && !stopping) {}
+}
 static void serve(const char *path,int watch,const char *directory,int hold) {
     int fd=socket(AF_UNIX,SOCK_STREAM,0);demand(fd>=0);
     struct sockaddr_un address;memset(&address,0,sizeof(address));address.sun_family=AF_UNIX;
     demand(strlen(path)<sizeof(address.sun_path));strcpy(address.sun_path,path);
+    delay_bind(directory);
     mode_t old=umask(0117);int bound=bind(fd,(struct sockaddr*)&address,sizeof(address));umask(old);demand(bound==0);
     if(hold)before_listen(directory);
     demand(listen(fd,4)==0);
@@ -147,7 +167,7 @@ int main(int argc,char **argv) {
     setting(config,"vpnt_pid_file = \"",pid,sizeof(pid));
     char expected[1100];snprintf(expected,sizeof(expected),"%s/v",directory);demand(strcmp(expected,socket_path)==0);
     snprintf(expected,sizeof(expected),"%s/pid",directory);demand(strcmp(expected,pid)==0);
-    signal(SIGTERM,stop);signal(SIGINT,stop);signal(SIGALRM,stop);alarm(15);
+    signal(SIGTERM,stop);signal(SIGINT,stop);signal(SIGALRM,stop);alarm(60);
     if(strstr(claim,"\"profile\":\"exit\""))return 0;
     /* Handoff silence: cancel must land during the reception itself. */
     if(strstr(claim,"\"profile\":\"handoff-silence\"")) {

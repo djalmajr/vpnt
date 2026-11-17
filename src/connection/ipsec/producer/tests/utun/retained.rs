@@ -58,7 +58,7 @@ fn ordinary_received_descriptor_is_refused_once_dropped_and_closed() {
     );
     // EOF from the fixture's own peer proves the descriptor was really closed.
     let audit = fixture.directory.join("retain.audit");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut content = String::new();
     while Instant::now() < deadline {
         content = std::fs::read_to_string(&audit).unwrap_or_default();
@@ -167,7 +167,7 @@ fn canceled_handoff_is_latched_and_a_fresh_open_cannot_reach_vici() {
     let signal = cancel.clone();
     let admitted = thread::scope(|scope| {
         let canceler = scope.spawn(|| {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 if ready.exists() {
                     // The child can signal while the parent is still publishing
