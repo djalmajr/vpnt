@@ -198,7 +198,8 @@ impl NativeAttempt<'_> {
         }
         Ok(())
     }
-    /// `step`: `Routes` while the plan is acquired, `Health` once connected.
+    /// `step`: `Egress` while the plan is acquired (the outgoing network moved
+    /// since start), `Health` once connected.
     fn validate_transport_egress(&self, step: Step) -> Result<(), Failure> {
         let at = || Failure::at(step);
         validate_ssl_egress(step, self.requires_transport_default, || {
@@ -433,7 +434,7 @@ impl Attempt for NativeAttempt<'_> {
                     self.token = Some(token); // retain before any fallible validation or ADD
                     // This is a dependency of the plan even if acquire borrows it.
                     self.requires_transport_default = plan_requires_transport_default(&plan);
-                    self.validate_transport_egress(Step::Routes)?;
+                    self.validate_transport_egress(Step::Egress)?;
                     self.lease = Some(
                         acquire_ssl_routes(
                             &mut routes,
