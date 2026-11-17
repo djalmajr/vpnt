@@ -776,3 +776,165 @@ fn omarchy_gap_and_frame_examples() {
 fn initial_height_matches_design_contract() {
     assert_eq!(super::DEFAULT_HEIGHT, 480);
 }
+
+/// One log for the window's size calls and the positioner's sends, so each test
+/// asserts their order.
+#[derive(Debug, PartialEq)]
+enum SizeOp {
+    SetHeight(u32),
+    Release,
+    Fix(u32),
+    Send(u32),
+}
+
+struct SizeRecorder {
+    ops: std::cell::RefCell<Vec<SizeOp>>,
+    supported: bool,
+    accepts: bool,
+}
+
+impl SizeRecorder {
+    fn new(supported: bool, accepts: bool) -> Self {
+        Self {
+            ops: std::cell::RefCell::new(Vec::new()),
+            supported,
+            accepts,
+        }
+    }
+
+    fn take(&self) -> Vec<SizeOp> {
+        self.ops.take()
+    }
+}
+
+impl super::PanelWindow for SizeRecorder {
+    fn set_height(&self, height: u32) {
+        self.ops.borrow_mut().push(SizeOp::SetHeight(height));
+    }
+
+    fn release_bounds(&self) {
+        self.ops.borrow_mut().push(SizeOp::Release);
+    }
+
+    fn fix_bounds(&self, height: u32) {
+        self.ops.borrow_mut().push(SizeOp::Fix(height));
+    }
+}
+
+impl super::Placer for SizeRecorder {
+    fn supported(&self) -> bool {
+        self.supported
+    }
+
+    fn send(&self, request: placement::PlacementRequest) -> Result<(), ()> {
+        self.ops.borrow_mut().push(SizeOp::Send(request.requested));
+        if self.accepts { Ok(()) } else { Err(()) }
+    }
+}
+
+#[test]
+fn visible_resize_leaves_the_size_to_hyprland_until_it_is_placed() {
+    // Measured on Hyprland: GTK fixed at 720 turned a 480 resize down and Hyprland
+    // re-centered the window, moving it from y=33 to y=-87 behind the bar.
+    let window = SizeRecorder::new(true, true);
+    super::resize_visible(&window, &window, placement::resize_request(5, 4, None, 480));
+    assert_eq!(window.take(), [SizeOp::Release, SizeOp::Send(480)]);
+    let mut anchor = None;
+    super::apply_placed(&window, 5, 5, 480, &mut anchor, None);
+    assert_eq!(window.take(), [SizeOp::SetHeight(480), SizeOp::Fix(480)]);
+}
+
+#[test]
+fn stale_placement_keeps_bounds_until_the_current_request_is_placed() {
+    let window = SizeRecorder::new(true, true);
+    let mut anchor = None;
+    super::apply_placed(&window, 6, 5, 720, &mut anchor, None);
+    assert_eq!(window.take(), []);
+    super::resize_visible(&window, &window, placement::resize_request(6, 4, None, 480));
+    super::apply_placed(&window, 6, 6, 480, &mut anchor, None);
+    assert_eq!(
+        window.take(),
+        [
+            SizeOp::Release,
+            SizeOp::Send(480),
+            SizeOp::SetHeight(480),
+            SizeOp::Fix(480),
+        ]
+    );
+}
+
+#[test]
+fn failed_placement_fixes_the_requested_height() {
+    let generation = placement::Generation::default();
+    let current = placement::advance(&generation);
+    let (tx, rx) = mpsc::channel();
+    tx.send(placement::resize_request(current, current, None, 1000))
+        .unwrap();
+    drop(tx);
+    let replies = std::cell::RefCell::new(Vec::new());
+    placement::worker_loop(
+        rx,
+        &generation,
+        || None,
+        |_| Err("hyprctl failed".into()),
+        |placed, height, _, opening| replies.borrow_mut().push((placed, height, opening)),
+    );
+    assert_eq!(replies.take(), [(current, 720, false)]);
+    let window = SizeRecorder::new(true, true);
+    let mut anchor = None;
+    super::apply_placed(&window, current, current, 720, &mut anchor, None);
+    assert_eq!(window.take(), [SizeOp::SetHeight(720), SizeOp::Fix(720)]);
+}
+
+#[test]
+fn visible_resize_without_a_positioner_sizes_gtk_directly() {
+    let unsupported = SizeRecorder::new(false, true);
+    super::resize_visible(
+        &unsupported,
+        &unsupported,
+        placement::resize_request(2, 1, None, 1000),
+    );
+    assert_eq!(
+        unsupported.take(),
+        [SizeOp::SetHeight(720), SizeOp::Fix(720)]
+    );
+    let refused = SizeRecorder::new(true, false);
+    super::resize_visible(
+        &refused,
+        &refused,
+        placement::resize_request(2, 1, None, 100),
+    );
+    assert_eq!(
+        refused.take(),
+        [
+            SizeOp::Release,
+            SizeOp::Send(100),
+            SizeOp::SetHeight(180),
+            SizeOp::Fix(180),
+        ]
+    );
+}
+
+#[test]
+fn hidden_panel_is_sized_before_its_placement_is_queued() {
+    let window = SizeRecorder::new(true, true);
+    assert!(super::reposition(
+        &window,
+        &window,
+        placement::click_request(3, None, 480),
+    ));
+    assert_eq!(
+        window.take(),
+        [SizeOp::Release, SizeOp::SetHeight(480), SizeOp::Send(480)]
+    );
+    let unsupported = SizeRecorder::new(false, true);
+    assert!(!super::reposition(
+        &unsupported,
+        &unsupported,
+        placement::click_request(3, None, 480),
+    ));
+    assert_eq!(
+        unsupported.take(),
+        [SizeOp::Release, SizeOp::SetHeight(480), SizeOp::Fix(480)]
+    );
+}

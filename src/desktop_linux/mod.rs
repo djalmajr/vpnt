@@ -273,8 +273,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                                 placement::resize_request(current, opening, anchor, height),
                             );
                         } else {
-                            window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
-                            fix_bounds(&window, height.clamp(180, 720));
+                            fix_height(&window, height.clamp(180, 720));
                         }
                     }
                     let id = request.id.clone();
@@ -324,8 +323,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                         anchor = used_anchor;
                     }
                     if decision == ShowDecision::Show {
-                        window.set_inner_size(LogicalSize::new(320, placed_height));
-                        fix_bounds(&window, placed_height);
+                        fix_height(&window, placed_height);
                         window.set_visible(true);
                         window.set_focus();
                         visible = true;
@@ -344,12 +342,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 anchor: used_anchor,
             }) => {
                 let current = placement::current(&generation);
-                if let Some(height) =
-                    accept_placement(current, placed, height, &mut anchor, used_anchor)
-                {
-                    window.set_inner_size(LogicalSize::new(320, height));
-                    fix_bounds(&window, height);
-                }
+                apply_placed(&window, current, placed, height, &mut anchor, used_anchor);
             }
             Event::WindowEvent {
                 event: WindowEvent::Focused(false) | WindowEvent::CloseRequested,
@@ -404,16 +397,68 @@ fn accept_placement(
     Some(height)
 }
 
+/// Size operations of the panel window. The resize sequence goes through this
+/// trait so tests can record its order without a display.
+trait PanelWindow {
+    /// Asks GTK for this height. On a visible floating window, Hyprland treats it
+    /// as a client resize and keeps the window's center.
+    fn set_height(&self, height: u32);
+    fn release_bounds(&self);
+    fn fix_bounds(&self, height: u32);
+}
+
+impl PanelWindow for Window {
+    fn set_height(&self, height: u32) {
+        self.set_inner_size(LogicalSize::new(320, height));
+    }
+
+    fn release_bounds(&self) {
+        self.set_min_inner_size(None::<LogicalSize<u32>>);
+        self.set_max_inner_size(None::<LogicalSize<u32>>);
+        self.set_resizable(true);
+    }
+
+    fn fix_bounds(&self, height: u32) {
+        let fixed = LogicalSize::new(320, height);
+        self.set_min_inner_size(Some(fixed));
+        self.set_max_inner_size(Some(fixed));
+        self.set_resizable(false);
+    }
+}
+
+/// Where placement requests go: the Hyprland positioner, or a test double.
+trait Placer {
+    fn supported(&self) -> bool;
+    fn send(&self, request: placement::PlacementRequest) -> Result<(), ()>;
+}
+
+impl Placer for placement::Positioner {
+    fn supported(&self) -> bool {
+        placement::Positioner::supported(self)
+    }
+
+    fn send(&self, request: placement::PlacementRequest) -> Result<(), ()> {
+        placement::Positioner::send(self, request)
+    }
+}
+
+fn fix_height(window: &impl PanelWindow, height: u32) {
+    window.set_height(height);
+    window.fix_bounds(height);
+}
+
+/// Sizes the hidden panel and queues its placement; false when nothing will
+/// answer and the caller shows it at once.
 fn reposition(
-    window: &Window,
-    positioner: &placement::Positioner,
+    window: &impl PanelWindow,
+    positioner: &impl Placer,
     request: placement::PlacementRequest,
 ) -> bool {
     let height = request.requested.clamp(180, 720);
-    release_bounds(window);
-    window.set_inner_size(LogicalSize::new(320, height));
+    window.release_bounds();
+    window.set_height(height);
     if !positioner.supported() || positioner.send(request).is_err() {
-        fix_bounds(window, height);
+        window.fix_bounds(height);
         false
     } else {
         true
@@ -424,34 +469,35 @@ fn reposition(
 /// center when the client changes its own size. A GTK window still fixed at the
 /// old height turns the compositor's resize down and commits the old size back,
 /// so the panel grows around its center and slides under the bar. The bounds are
-/// released and GTK is not resized here; `Placed` fixes them at the applied height.
+/// released and GTK is not resized here; `apply_placed` fixes them at the applied
+/// height.
 fn resize_visible(
-    window: &Window,
-    positioner: &placement::Positioner,
+    window: &impl PanelWindow,
+    positioner: &impl Placer,
     request: placement::PlacementRequest,
 ) {
     if positioner.supported() {
-        release_bounds(window);
+        window.release_bounds();
         if positioner.send(request).is_ok() {
             return;
         }
     }
-    let height = request.requested.clamp(180, 720);
-    window.set_inner_size(LogicalSize::new(320, height));
-    fix_bounds(window, height);
+    fix_height(window, request.requested.clamp(180, 720));
 }
 
-fn release_bounds(window: &Window) {
-    window.set_min_inner_size(None::<LogicalSize<u32>>);
-    window.set_max_inner_size(None::<LogicalSize<u32>>);
-    window.set_resizable(true);
-}
-
-fn fix_bounds(window: &Window, height: u32) {
-    let fixed = LogicalSize::new(320, height);
-    window.set_min_inner_size(Some(fixed));
-    window.set_max_inner_size(Some(fixed));
-    window.set_resizable(false);
+/// Fixes the panel at the height the positioner applied, or at the requested one
+/// when it failed; a stale generation changes nothing.
+fn apply_placed(
+    window: &impl PanelWindow,
+    current: u64,
+    placed: u64,
+    height: u32,
+    anchor: &mut Option<placement::Anchor>,
+    used_anchor: Option<placement::Anchor>,
+) {
+    if let Some(height) = accept_placement(current, placed, height, anchor, used_anchor) {
+        fix_height(window, height);
+    }
 }
 
 fn suppress_click(hidden_at: Option<Instant>, now: Instant) -> bool {
