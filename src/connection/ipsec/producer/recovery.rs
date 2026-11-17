@@ -686,6 +686,16 @@ mod tests {
             Ok(true)
         );
         assert_eq!(unreadable.log, ["boot", "launchd", "sad", "spd"]);
+        // A backward clock step between launchd's start and the controller's
+        // start leaves the controller between the two: the earlier boottime
+        // denies the reboot and launchd's later start is never read.
+        let mut backward = Fake {
+            boot: (START.0 - 10, 0),
+            launchd: Ok((START.0 + 10, 0)),
+            ..Default::default()
+        };
+        assert_eq!(rebooted(&record(None), &mut backward), Ok(false));
+        assert_eq!(backward.log, ["boot"]);
     }
 
     #[test]
