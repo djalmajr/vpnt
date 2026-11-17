@@ -206,6 +206,7 @@ fn ssl_networks(
 }
 
 fn apply_dns(
+    configured: &[String],
     observation: &crate::connection::ssl_output::Observation,
     publish: impl FnOnce(&[std::net::Ipv4Addr], &[String]) -> Result<(), ()>,
 ) -> Result<bool, ()> {
@@ -215,10 +216,15 @@ fn apply_dns(
     {
         return Err(());
     }
-    if observation.dns_domains.is_empty() || observation.dns_servers.is_empty() {
+    let domains = if configured.is_empty() {
+        &observation.dns_domains
+    } else {
+        configured
+    };
+    if domains.is_empty() || observation.dns_servers.is_empty() {
         return Ok(false);
     }
-    publish(&observation.dns_servers, &observation.dns_domains)?;
+    publish(&observation.dns_servers, domains)?;
     Ok(true)
 }
 fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
@@ -332,17 +338,24 @@ impl Attempt for NativeAttempt<'_> {
                     .map_err(|_| Failure::unavailable())?,
             );
             let observation = client.split_observation();
-            apply_dns(&observation, |servers, domains| {
-                let proof = client.supervised_ppp().ok_or(())?;
-                self.dns = Some(DnsLease::new(proof.child().service().clone()).map_err(|_| ())?);
-                self.dns
-                    .as_ref()
-                    .ok_or(())?
-                    .publish(servers, domains)
-                    .map_err(|_| ())
-            })
+            apply_dns(
+                &self.profile.dns_domains,
+                &observation,
+                |servers, domains| {
+                    let proof = client.supervised_ppp().ok_or(())?;
+                    self.dns =
+                        Some(DnsLease::new(proof.child().service().clone()).map_err(|_| ())?);
+                    self.dns
+                        .as_ref()
+                        .ok_or(())?
+                        .publish(servers, domains)
+                        .map_err(|_| ())
+                },
+            )
             .map_err(|_| Failure::unavailable())?;
-            if observation.dns_domains.is_empty() {
+            if !self.profile.dns_domains.is_empty() && observation.dns_servers.is_empty() {
+                client.note_no_dns_servers();
+            } else if self.profile.dns_domains.is_empty() && observation.dns_domains.is_empty() {
                 client.note_no_dns_domain();
             }
         }
@@ -410,7 +423,7 @@ mod split_tests {
         };
         let mut calls = Vec::new();
         assert!(
-            apply_dns(&value, |servers, domains| {
+            apply_dns(&[], &value, |servers, domains| {
                 calls.push((servers.to_vec(), domains.to_vec()));
                 Ok(())
             })
@@ -420,7 +433,7 @@ mod split_tests {
         value.dns_domains.clear();
         value.dns_count = Some((1, 0));
         assert!(
-            !apply_dns(&value, |_, _| {
+            !apply_dns(&[], &value, |_, _| {
                 calls.push((vec![], vec![]));
                 Ok(())
             })
@@ -428,7 +441,41 @@ mod split_tests {
         );
         assert_eq!(calls.len(), 1);
         value.dns_count = Some((1, 1));
-        assert!(apply_dns(&value, |_, _| Ok(())).is_err());
+        assert!(apply_dns(&[], &value, |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn configured_domains_override_gateway_and_require_servers() {
+        let mut value = Observation {
+            dns_servers: vec!["172.20.0.4".parse().unwrap()],
+            dns_domains: vec!["gateway.example".into()],
+            dns_count: Some((1, 1)),
+            ..Observation::default()
+        };
+        let configured = vec!["corp.example.com".to_owned()];
+        assert!(
+            apply_dns(&configured, &value, |servers, domains| {
+                assert_eq!(servers, value.dns_servers);
+                assert_eq!(domains, configured);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert!(
+            apply_dns(&[], &value, |_, domains| {
+                assert_eq!(domains, ["gateway.example"]);
+                Ok(())
+            })
+            .unwrap()
+        );
+        value.dns_servers.clear();
+        value.dns_count = Some((0, 1));
+        assert!(
+            !apply_dns(&configured, &value, |_, _| panic!(
+                "must not publish without servers"
+            ))
+            .unwrap()
+        );
     }
 
     fn observation(routes: &[(&str, u8)], count: Option<usize>) -> Observation {

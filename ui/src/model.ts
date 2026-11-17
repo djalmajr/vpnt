@@ -23,6 +23,7 @@ export type Profile = {
   gateway: string;
   username: string;
   networks: string[];
+  dnsDomains?: string[];
   port: number;
   certificate: string;
   probeHost: string;

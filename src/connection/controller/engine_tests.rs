@@ -706,6 +706,7 @@ impl Drop for Harness {
 }
 fn profile(id: &str) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: id.into(),
         name: id.into(),
         kind: VpnKind::Ssl,

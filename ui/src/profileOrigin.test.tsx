@@ -304,6 +304,9 @@ for (const locale of ["pt-BR", "en-US"] as const) {
   test(`${locale}: tipo SSL permite editar e salvar as redes exibidas`, async () => {
     await mount(locale);
     await openProfile(locale, "home");
+    expect(
+      document.querySelector("form.profile-form")?.textContent,
+    ).not.toContain(t(locale, "dnsDomains"));
     const typeLabel = [
       ...document.querySelectorAll<HTMLLabelElement>("label.field"),
     ].find(
@@ -322,12 +325,20 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     expect(document.querySelector("form.profile-form")?.textContent).toContain(
       expectedHint,
     );
+    expect(document.querySelector("form.profile-form")?.textContent).toContain(
+      t(locale, "dnsDomainsHint"),
+    );
+    await edit(locale, "dnsDomains", " CORP.Example.Com, Sub.Example ");
     await edit(locale, "networks", "10.0.0.0/8, 192.168.0.0/16");
     await click(byText(t(locale, "save")));
     const saved = actions().find((command) => command.type === "save_profile");
     expect(saved?.type).toBe("save_profile");
     if (saved?.type !== "save_profile")
       throw new Error("Profile was not saved");
+    expect(saved.profile.dnsDomains).toEqual([
+      "corp.example.com",
+      "sub.example",
+    ]);
     expect(saved.profile.kind).toBe("ssl");
     expect(saved.profile.networks).toEqual(["10.0.0.0/8", "192.168.0.0/16"]);
   });

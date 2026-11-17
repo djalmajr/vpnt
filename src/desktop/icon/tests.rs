@@ -13,6 +13,7 @@ const INSTALLED: &str = "installed";
 
 fn profile(id: &str, kind: VpnKind) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: id.into(),
         name: id.into(),
         kind,

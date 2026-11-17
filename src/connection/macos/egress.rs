@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     fn profile(host: &str) -> Profile {
         Profile {
+            dns_domains: Vec::new(),
             id: "egress-fixture".into(),
             name: "Egress fixture".into(),
             kind: VpnKind::Ssl,

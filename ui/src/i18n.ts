@@ -99,6 +99,9 @@ const en = {
     "This looks like a shell expression; enter the literal username.",
   secretShellWarning:
     "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
+  dnsDomains: "Internal domains",
+  dnsDomainsHint:
+    "Optional. While connected, these domains use the VPN's DNS; everything else is unchanged. E.g. corp.example.com",
   networks: "Networks",
   networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
   networksHintSsl:
@@ -312,6 +315,9 @@ const pt: Record<MessageKey, string> = {
     "Isto parece uma expressão de shell; informe o nome de usuário literal.",
   secretShellWarning:
     "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
+  dnsDomains: "Domínios internos",
+  dnsDomainsHint:
+    "Opcional. Com a VPN ligada, estes domínios usam o DNS da VPN; o resto não muda. Ex.: corp.example.com",
   networks: "Redes",
   networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
   networksHintSsl:

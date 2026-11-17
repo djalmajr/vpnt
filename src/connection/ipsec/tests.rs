@@ -51,6 +51,7 @@ fn owner(id: &str, generation: u64) -> Owner {
 }
 fn profile() -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: "Case".into(),
         name: "Fixture VPN".into(),
         kind: VpnKind::Ipsec,

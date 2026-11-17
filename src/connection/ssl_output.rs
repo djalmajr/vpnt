@@ -62,6 +62,15 @@ pub(super) struct Output {
 }
 
 impl Output {
+    pub fn note_no_dns_servers(&self) {
+        if let Some(log) = &self.log {
+            log.push_line(
+                "vpnt: domínios internos configurados, mas o gateway não publicou servidores DNS"
+                    .as_bytes(),
+                false,
+            );
+        }
+    }
     pub fn note_no_dns_domain(&self) {
         if let Some(log) = &self.log {
             log.push_line(

@@ -5,6 +5,7 @@ use std::{fs, num::NonZeroU16};
 
 pub(super) fn profile(id: &str) -> Profile {
     Profile {
+        dns_domains: Vec::new(),
         id: id.into(),
         name: "Bound fixture".into(),
         kind: VpnKind::Ipsec,
