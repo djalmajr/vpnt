@@ -12,7 +12,7 @@ pub(crate) mod process;
 mod resolve;
 pub mod routing;
 mod sink;
-mod store;
+pub(crate) mod store;
 mod tcp;
 pub(crate) mod utun_observer;
 pub(crate) mod utun_socket;

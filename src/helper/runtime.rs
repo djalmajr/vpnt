@@ -205,6 +205,15 @@ impl Runtime {
                             ))
                         ),
                     ),
+                    (
+                        "openfortivpn-split-dns.patch".into(),
+                        format!(
+                            "{:x}",
+                            Sha256::digest(include_bytes!(
+                                "../../scripts/macos/patches/openfortivpn-split-dns.patch"
+                            ))
+                        ),
+                    ),
                 ])
             || manifest.files.len() > 64
             || !valid_version(&manifest.minimum_macos)

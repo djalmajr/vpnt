@@ -71,7 +71,7 @@ def build_fortinet(root, cache, openssl, pkgconf, jobs, run, runtime_prefix):
     channel_header = build / "vpnt-channel.h"
     supervisor_header(channel_header)
     env.update(PKG_CONFIG=str(pkgconf), PKG_CONFIG_PATH=str(openssl / "lib/pkgconfig"), ACLOCAL_PATH=str(prefix / "share/aclocal"), CPPFLAGS=f"-I{openssl}/include -include {shlex.quote(str(channel_header))}", LDFLAGS=f"-L{openssl}/lib -Wl,-headerpad_max_install_names")
-    for patch in ["openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch", "openfortivpn-split-routes.patch"]:
+    for patch in ["openfortivpn-no-routes.patch", "openfortivpn-bound-transport.patch", "openfortivpn-ppp-supervisor.patch", "openfortivpn-split-routes.patch", "openfortivpn-split-dns.patch"]:
         run(["/usr/bin/patch", "-t", "-p1", "-i", root / "scripts/macos/patches" / patch], source, env, log)
     run(["/bin/sh", source / "autogen.sh"], source, env, log)
     run([source / "configure", f"--prefix={runtime_prefix}", "--with-pppd=/usr/sbin/pppd", "--with-netstat=/usr/sbin/netstat", "--with-resolvconf=DISABLED", "--with-systemdsystemunitdir=no", "--enable-legacy-pppd"], build, env, log)

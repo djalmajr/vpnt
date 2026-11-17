@@ -38,6 +38,7 @@ FORTI_PATCH = ROOT / "scripts/macos/patches/openfortivpn-no-routes.patch"
 TRANSPORT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-bound-transport.patch"
 SUPERVISOR_PATCH = ROOT / "scripts/macos/patches/openfortivpn-ppp-supervisor.patch"
 SPLIT_PATCH = ROOT / "scripts/macos/patches/openfortivpn-split-routes.patch"
+DNS_PATCH = ROOT / "scripts/macos/patches/openfortivpn-split-dns.patch"
 
 
 def digest(path):
@@ -199,7 +200,7 @@ def verify_runtime(root):
         raise RuntimeError("Runtime manifest does not declare the kernel-libipsec backend")
     if manifest["strongswan"]["patches"] != expected_swan_patches():
         raise RuntimeError("Runtime does not include the exact strongSwan patch set")
-    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH]}:
+    if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]}:
         raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
@@ -463,7 +464,7 @@ def main():
                 "version": FORTI_VERSION,
                 "source": FORTI_URL,
                 "sha256": FORTI_SHA,
-                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH]},
+                "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]},
             },
             "files": files,
         }

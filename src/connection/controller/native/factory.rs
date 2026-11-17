@@ -183,6 +183,7 @@ impl<'a> Factory for NativeFactory<'a> {
             link: None,
             token: None,
             lease: None,
+            dns: None,
             spawn_attempted: false,
             stopped: false,
             uncertain_cleanup: false,

@@ -32,6 +32,8 @@ pub struct Fence {
     pub incomplete: bool,
     pub written_unix_ms: u64,
     pub service_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_key: Option<String>,
     pub processes: Vec<ProcessIdentity>,
     pub interface: Option<Interface>,
     pub sink: Option<Sink>,
@@ -570,6 +572,7 @@ mod tests {
                 incomplete: false,
                 written_unix_ms: 123456,
                 service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
+                dns_key: None,
                 processes: vec![ProcessIdentity {
                     pid: 123,
                     start_sec: 456,

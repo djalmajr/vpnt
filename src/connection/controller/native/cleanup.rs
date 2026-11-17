@@ -64,6 +64,7 @@ impl NativeAttempt<'_> {
             incomplete,
             written_unix_ms,
             service_id,
+            dns_key: self.dns.as_ref().map(|dns| dns.key()),
             processes,
             interface,
             sink: None,
@@ -101,11 +102,18 @@ impl NativeAttempt<'_> {
         self.token = None;
         self.link = None;
         self.client = None;
+        self.dns = None;
         self.credentials = None;
         self.profile_use = None;
         Ok(())
     }
     pub(super) fn cleanup_network(&mut self) -> bool {
+        if let Some(dns) = &mut self.dns {
+            if !dns.close_and_observe().unwrap_or(false) {
+                return diagnostic::refuse(Reason::UncertainCleanup);
+            }
+            self.dns = None;
+        }
         // A canceled connection may have reached PPP before the last poll.
         // Capture proof while its original parent is still alive, if possible.
         if self.link.is_none() && self.client.is_some() && !self.stopped {
@@ -595,6 +603,7 @@ mod abandon_tests {
             incomplete: false,
             written_unix_ms: 123,
             service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
+            dns_key: None,
             processes: vec![fence::ProcessIdentity {
                 pid: 42,
                 start_sec: 123,

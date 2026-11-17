@@ -11,6 +11,7 @@ use crate::{
             ppp::{OwnedPpp, OwnershipError},
             ppp_early_cleanup, probe,
             routing::{InterfaceToken, NativeBackend, Snapshot},
+            store::DnsLease,
         },
         routes::{Coordinator, Lease, Owner},
         ssl::{SslDriver, SslFailure, StartError},
@@ -112,6 +113,7 @@ struct NativeAttempt<'a> {
     link: Option<Arc<OwnedPpp>>,
     token: Option<InterfaceToken>,
     lease: Option<Lease>,
+    dns: Option<DnsLease>,
     spawn_attempted: bool,
     stopped: bool,
     uncertain_cleanup: bool,
@@ -201,6 +203,23 @@ fn ssl_networks(
         networks.push(format!("{ip}/{prefix}"));
     }
     Some(networks)
+}
+
+fn apply_dns(
+    observation: &crate::connection::ssl_output::Observation,
+    publish: impl FnOnce(&[std::net::Ipv4Addr], &[String]) -> Result<(), ()>,
+) -> Result<bool, ()> {
+    if observation.dns_invalid
+        || observation.dns_count
+            != Some((observation.dns_servers.len(), observation.dns_domains.len()))
+    {
+        return Err(());
+    }
+    if observation.dns_domains.is_empty() || observation.dns_servers.is_empty() {
+        return Ok(false);
+    }
+    publish(&observation.dns_servers, &observation.dns_domains)?;
+    Ok(true)
 }
 fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
     if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
@@ -312,6 +331,20 @@ impl Attempt for NativeAttempt<'_> {
                     .acquire(self.owner.clone(), &plan)
                     .map_err(|_| Failure::unavailable())?,
             );
+            let observation = client.split_observation();
+            apply_dns(&observation, |servers, domains| {
+                let proof = client.supervised_ppp().ok_or(())?;
+                self.dns = Some(DnsLease::new(proof.child().service().clone()).map_err(|_| ())?);
+                self.dns
+                    .as_ref()
+                    .ok_or(())?
+                    .publish(servers, domains)
+                    .map_err(|_| ())
+            })
+            .map_err(|_| Failure::unavailable())?;
+            if observation.dns_domains.is_empty() {
+                client.note_no_dns_domain();
+            }
         }
         routes
             .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
@@ -366,6 +399,37 @@ impl Attempt for NativeAttempt<'_> {
 mod split_tests {
     use super::*;
     use crate::connection::ssl_output::Observation;
+
+    #[test]
+    fn dns_requires_both_a_domain_and_a_server() {
+        let mut value = Observation {
+            dns_servers: vec!["172.20.0.4".parse().unwrap()],
+            dns_domains: vec!["cit.example".into()],
+            dns_count: Some((1, 1)),
+            ..Observation::default()
+        };
+        let mut calls = Vec::new();
+        assert!(
+            apply_dns(&value, |servers, domains| {
+                calls.push((servers.to_vec(), domains.to_vec()));
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(calls.len(), 1);
+        value.dns_domains.clear();
+        value.dns_count = Some((1, 0));
+        assert!(
+            !apply_dns(&value, |_, _| {
+                calls.push((vec![], vec![]));
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(calls.len(), 1);
+        value.dns_count = Some((1, 1));
+        assert!(apply_dns(&value, |_, _| Ok(())).is_err());
+    }
 
     fn observation(routes: &[(&str, u8)], count: Option<usize>) -> Observation {
         Observation {

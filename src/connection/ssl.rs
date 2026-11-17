@@ -102,6 +102,11 @@ impl SslDriver {
     pub(super) fn note_invalid_split(&self) {
         self.output.note_invalid_split();
     }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_no_dns_domain(&self) {
+        self.output.note_no_dns_domain();
+    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     #[cfg(target_os = "macos")]

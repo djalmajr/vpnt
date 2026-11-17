@@ -16,6 +16,7 @@ use std::{
 trait Observer {
     fn process_absent(&mut self, process: &ProcessIdentity) -> Result<bool, ()>;
     fn service_absent(&mut self, service: &str) -> Result<bool, ()>;
+    fn dns_absent(&mut self, key: &str) -> Result<bool, ()>;
     fn interface_absent(&mut self, name: &str, index: u32) -> Result<bool, ()>;
     fn route_absent(&mut self, route: Route) -> Result<bool, ()>;
     #[cfg(test)]
@@ -67,6 +68,14 @@ impl Observer for NativeObserver {
         let service = ServiceId::parse(service).ok_or(())?;
         Ok(!store::has_attempt_key(&service).map_err(|_| ())?)
     }
+    fn dns_absent(&mut self, key: &str) -> Result<bool, ()> {
+        let id = key
+            .strip_prefix("State:/Network/Service/")
+            .and_then(|v| v.strip_suffix("/DNS"))
+            .ok_or(())?;
+        let service = ServiceId::parse(id).ok_or(())?;
+        Ok(!store::has_dns_attempt_key(&service).map_err(|_| ())?)
+    }
     fn interface_absent(&mut self, name: &str, index: u32) -> Result<bool, ()> {
         let interfaces = Interfaces::read().map_err(|_| ())?;
         Ok(!interfaces
@@ -107,6 +116,18 @@ fn absent(record: &Fence, observer: &mut impl Observer) -> Result<bool, ()> {
         && !observer.service_absent(service)?
     {
         return Ok(false);
+    }
+    if let Some(key) = &record.dns_key {
+        let id = key
+            .strip_prefix("State:/Network/Service/")
+            .and_then(|v| v.strip_suffix("/DNS"))
+            .ok_or(())?;
+        if record.service_id.as_deref() != Some(id) || ServiceId::parse(id).is_none() {
+            return Err(());
+        }
+        if !observer.dns_absent(key)? {
+            return Ok(false);
+        }
     }
     if let Some(interface) = &record.interface
         && !interface_absent(observer, interface)?
@@ -216,6 +237,7 @@ pub(crate) mod tests {
         process: Option<(bool, (u64, u64))>,
         fail: bool,
         route_present: bool,
+        dns_present: bool,
         snapshot: Option<Snapshot>,
         calls: RefCell<Vec<&'static str>>,
         destructive: RefCell<Vec<&'static str>>,
@@ -233,6 +255,14 @@ pub(crate) mod tests {
         fn service_absent(&mut self, _: &str) -> Result<bool, ()> {
             self.calls.borrow_mut().push("service");
             if self.fail { Err(()) } else { Ok(true) }
+        }
+        fn dns_absent(&mut self, _: &str) -> Result<bool, ()> {
+            self.calls.borrow_mut().push("dns");
+            if self.fail {
+                Err(())
+            } else {
+                Ok(!self.dns_present)
+            }
         }
         fn interface_absent(&mut self, _: &str, _: u32) -> Result<bool, ()> {
             self.calls.borrow_mut().push("interface");
@@ -269,6 +299,7 @@ pub(crate) mod tests {
             process: None,
             fail: false,
             route_present: false,
+            dns_present: false,
             snapshot: None,
             calls: RefCell::new(vec![]),
             destructive: RefCell::new(vec![]),
@@ -288,6 +319,7 @@ pub(crate) mod tests {
             incomplete: false,
             written_unix_ms: 1,
             service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
+            dns_key: None,
             processes: vec![ProcessIdentity {
                 pid: 42,
                 start_sec: 123,
@@ -332,6 +364,35 @@ pub(crate) mod tests {
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         (Root(path), unsafe { libc::geteuid() })
+    }
+    #[test]
+    fn persisted_dns_key_blocks_recovery_until_absent() {
+        let (root, uid) = root();
+        let mut item = record(uid, "one");
+        item.dns_key =
+            Some("State:/Network/Service/12345678-1234-4123-8123-123456789ABC/DNS".into());
+        fence::write(&root.0, uid, &item).unwrap();
+        let loaded = fence::read(&root.0, uid, uid, "one", 1).unwrap().unwrap();
+        assert_eq!(loaded.dns_key, item.dns_key);
+        let mut recovery = Recovery {
+            root: root.0.clone(),
+            owner: uid,
+            uid,
+            global: false,
+            blocked: BTreeSet::new(),
+        };
+        let mut observer = fake();
+        observer.dns_present = true;
+        recovery.reconcile(None, &mut observer);
+        assert!(recovery.blocked(&profile("one")));
+        assert!(observer.calls.borrow().contains(&"dns"));
+        observer.dns_present = false;
+        recovery.reconcile(Some("one"), &mut observer);
+        assert!(!recovery.blocked(&profile("one")));
+        assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
+        item.dns_key =
+            Some("State:/Network/Service/12345678-1234-4123-8123-123456789ABB/DNS".into());
+        assert!(absent(&item, &mut observer).is_err());
     }
     /// Persisted fence plus a routing snapshot, consumed through the actual
     /// recovery reconciliation and the controller dispatcher.

@@ -1,6 +1,6 @@
-//! Read only PPP ownership records from configd. Apple's pppd may omit `pid`
-//! while publishing InterfaceName in State:/Network/Service/<service>/PPP. We never mutate
-//! the dynamic store or trust a pidfile in the group-writable /var/run directory.
+//! Read PPP ownership records and publish attempt-scoped temporary DNS in configd.
+//! Apple's pppd may omit `pid` while publishing InterfaceName. DNS publication
+//! uses an add-if-absent session and cleanup observes the key after closing it.
 use crate::connection::ssl::InterfaceName;
 use core_foundation::{
     array::{CFArray, CFArrayRef},
@@ -19,7 +19,7 @@ pub(super) struct Record {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Unavailable;
+pub(crate) struct Unavailable;
 
 #[link(name = "SystemConfiguration", kind = "framework")]
 unsafe extern "C" {
@@ -34,6 +34,156 @@ unsafe extern "C" {
         keys: CFArrayRef,
         patterns: CFArrayRef,
     ) -> CFTypeRef;
+    fn SCDynamicStoreAddTemporaryValue(store: CFTypeRef, key: CFStringRef, value: CFTypeRef) -> u8;
+}
+
+fn dns_key(service: &crate::helper::ppp_supervisor::ServiceId) -> String {
+    format!("State:/Network/Service/{}/DNS", service.as_str())
+}
+
+enum DnsCommand {
+    Publish(
+        Vec<std::net::Ipv4Addr>,
+        Vec<String>,
+        std::sync::mpsc::SyncSender<Result<(), Unavailable>>,
+    ),
+}
+
+pub(crate) struct DnsLease {
+    sender: Option<std::sync::mpsc::Sender<DnsCommand>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    service: crate::helper::ppp_supervisor::ServiceId,
+}
+impl DnsLease {
+    pub fn key(&self) -> String {
+        dns_key(&self.service)
+    }
+    pub fn new(service: crate::helper::ppp_supervisor::ServiceId) -> Result<Self, Unavailable> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let key = dns_key(&service);
+        let worker = std::thread::Builder::new()
+            .name("vpnt-dns-store".into())
+            .spawn(move || {
+                let name = CFString::new("vpnt split DNS");
+                // SAFETY: name remains live; session stays on this thread.
+                let reference = unsafe {
+                    SCDynamicStoreCreate(
+                        ptr::null(),
+                        name.as_concrete_TypeRef(),
+                        None,
+                        ptr::null_mut(),
+                    )
+                };
+                if reference.is_null() {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                // SAFETY: non-null Create transfers one retained session.
+                let session = unsafe { CFType::wrap_under_create_rule(reference) };
+                if ready_tx.send(true).is_err() {
+                    return;
+                }
+                while let Ok(DnsCommand::Publish(servers, domains, reply)) = receiver.recv() {
+                    let _ = reply.send(publish_dns(&session, &key, &servers, &domains));
+                }
+                // Dropping the owned session removes its temporary values.
+            })
+            .map_err(|_| Unavailable)?;
+        if !ready_rx.recv().map_err(|_| Unavailable)? {
+            let _ = worker.join();
+            return Err(Unavailable);
+        }
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            service,
+        })
+    }
+    pub fn publish(
+        &self,
+        servers: &[std::net::Ipv4Addr],
+        domains: &[String],
+    ) -> Result<(), Unavailable> {
+        if servers.is_empty() || domains.is_empty() {
+            return Err(Unavailable);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .as_ref()
+            .ok_or(Unavailable)?
+            .send(DnsCommand::Publish(servers.to_vec(), domains.to_vec(), tx))
+            .map_err(|_| Unavailable)?;
+        rx.recv().map_err(|_| Unavailable)?
+    }
+    pub fn close_and_observe(&mut self) -> Result<bool, Unavailable> {
+        self.close_and_observe_using(has_dns_attempt_key)
+    }
+    fn close_and_observe_using(
+        &mut self,
+        has_key: impl FnOnce(&crate::helper::ppp_supervisor::ServiceId) -> Result<bool, Unavailable>,
+    ) -> Result<bool, Unavailable> {
+        self.close()?;
+        Ok(!has_key(&self.service)?)
+    }
+    fn close(&mut self) -> Result<(), Unavailable> {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| Unavailable)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for DnsLease {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn dns_dictionary(
+    servers: &[std::net::Ipv4Addr],
+    domains: &[String],
+) -> CFDictionary<CFString, CFType> {
+    let servers: Vec<_> = servers
+        .iter()
+        .map(|s| CFString::new(&s.to_string()))
+        .collect();
+    let domains: Vec<_> = domains.iter().map(|s| CFString::new(s)).collect();
+    CFDictionary::from_CFType_pairs(&[
+        (
+            CFString::new("ServerAddresses"),
+            CFArray::from_CFTypes(&servers).as_CFType(),
+        ),
+        (
+            CFString::new("SupplementalMatchDomains"),
+            CFArray::from_CFTypes(&domains).as_CFType(),
+        ),
+    ])
+}
+
+fn publish_dns(
+    session: &CFType,
+    name: &str,
+    servers: &[std::net::Ipv4Addr],
+    domains: &[String],
+) -> Result<(), Unavailable> {
+    if servers.is_empty() || domains.is_empty() {
+        return Err(Unavailable);
+    }
+    let value = dns_dictionary(servers, domains);
+    let key = CFString::new(name);
+    // SAFETY: session, key and property-list dictionary are live for the call.
+    if unsafe {
+        SCDynamicStoreAddTemporaryValue(
+            session.as_CFTypeRef(),
+            key.as_concrete_TypeRef(),
+            value.as_CFTypeRef(),
+        )
+    } == 0
+    {
+        return Err(Unavailable);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -86,8 +236,17 @@ fn read_query(key: Option<&str>) -> Result<Vec<Record>, Unavailable> {
 pub(super) fn has_attempt_key(
     service: &crate::helper::ppp_supervisor::ServiceId,
 ) -> Result<bool, Unavailable> {
-    let expected = service.key();
-    let value = query(Some(&expected))?;
+    has_key(&service.key())
+}
+
+pub(super) fn has_dns_attempt_key(
+    service: &crate::helper::ppp_supervisor::ServiceId,
+) -> Result<bool, Unavailable> {
+    has_key(&dns_key(service))
+}
+
+fn has_key(expected: &str) -> Result<bool, Unavailable> {
+    let value = query(Some(expected))?;
     let dictionary = value.downcast::<CFDictionary>().ok_or(Unavailable)?;
     let (keys, _) = dictionary.get_keys_and_values();
     if keys.len() > 1 {
@@ -97,7 +256,7 @@ pub(super) fn has_attempt_key(
         let key = unsafe { CFType::wrap_under_get_rule(key) }
             .downcast::<CFString>()
             .ok_or(Unavailable)?;
-        if key != CFString::new(&expected) {
+        if key != CFString::new(expected) {
             return Err(Unavailable);
         }
         return Ok(true);
@@ -212,6 +371,64 @@ fn parse(value: &CFType) -> Result<Vec<Record>, Unavailable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fake_temporary_dns_lease_publishes_and_closes() {
+        use std::sync::{Arc, Mutex, mpsc};
+        let service =
+            crate::helper::ppp_supervisor::ServiceId::parse("12345678-1234-4123-8123-123456789ABC")
+                .unwrap();
+        let state = Arc::new(Mutex::new(None));
+        let state_worker = state.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok(DnsCommand::Publish(servers, domains, reply)) = receiver.recv() {
+                *state_worker.lock().unwrap() = Some((servers, domains));
+                reply.send(Ok(())).unwrap();
+            }
+            *state_worker.lock().unwrap() = None;
+        });
+        let mut lease = DnsLease {
+            sender: Some(sender),
+            worker: Some(worker),
+            service: service.clone(),
+        };
+        let servers = ["172.20.0.4".parse().unwrap(), "172.20.0.3".parse().unwrap()];
+        let domains = vec!["cit.example".to_owned()];
+        assert!(lease.publish(&servers, &[]).is_err());
+        assert!(state.lock().unwrap().is_none());
+        lease.publish(&servers, &domains).unwrap();
+        assert_eq!(
+            *state.lock().unwrap(),
+            Some((servers.to_vec(), domains.clone()))
+        );
+        let dictionary = dns_dictionary(&servers, &domains).as_CFType();
+        let dictionary = dictionary.downcast::<CFDictionary>().unwrap();
+        let expected_servers =
+            CFArray::from_CFTypes(&[CFString::new("172.20.0.4"), CFString::new("172.20.0.3")])
+                .as_CFType();
+        let expected_domains = CFArray::from_CFTypes(&[CFString::new("cit.example")]).as_CFType();
+        assert_eq!(
+            field(&dictionary, "ServerAddresses"),
+            Some(expected_servers)
+        );
+        assert_eq!(
+            field(&dictionary, "SupplementalMatchDomains"),
+            Some(expected_domains)
+        );
+        assert!(field(&dictionary, "SearchDomains").is_none());
+        assert_eq!(
+            lease.key(),
+            format!("State:/Network/Service/{}/DNS", service.as_str())
+        );
+        assert!(
+            lease
+                .close_and_observe_using(|id| {
+                    assert_eq!(id, &service);
+                    Ok(state.lock().unwrap().is_some())
+                })
+                .unwrap()
+        );
+    }
     fn record(name: CFType, pid: CFType) -> CFType {
         CFDictionary::from_CFType_pairs(&[
             (CFString::new("InterfaceName"), name),
