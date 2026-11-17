@@ -34,6 +34,28 @@ pub(super) enum Stage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct LinkClaim {
+    pub name: String,
+    pub index: NonZeroU16,
+    pub vips: Vec<std::net::IpAddr>,
+}
+
+impl LinkClaim {
+    fn valid(&self) -> bool {
+        let unit = self.name.strip_prefix("utun");
+        unit.and_then(|unit| unit.parse::<u32>().ok())
+            .is_some_and(|unit| self.name == format!("utun{unit}"))
+            && (1..=2).contains(&self.vips.len())
+            && (self.vips.len() == 1 || self.vips[0].is_ipv4() != self.vips[1].is_ipv4())
+            && self
+                .vips
+                .iter()
+                .all(|vip| crate::connection::routes::Address::unscoped(*vip).valid_gateway())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Record {
     pub version: u32,
     pub session: String,
@@ -54,6 +76,8 @@ pub(super) struct Record {
     pub transport_interface: Option<NonZeroU16>,
     pub stage: Stage,
     pub child: Option<Birth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkClaim>,
 }
 impl Record {
     pub fn owner(&self) -> Owner {
@@ -87,6 +111,10 @@ impl Record {
             || self.child.as_ref().is_some_and(|c| !c.valid())
             || (self.stage == Stage::Running && self.child.is_none())
             || (matches!(self.stage, Stage::Prepared | Stage::Starting) && self.child.is_some())
+            || self
+                .link
+                .as_ref()
+                .is_some_and(|link| self.child.is_none() || !link.valid())
         {
             return Err(Error::Invalid);
         }
@@ -97,8 +125,10 @@ impl Record {
         let mut b = other.clone();
         a.stage = Stage::Prepared;
         a.child = None;
+        a.link = None;
         b.stage = Stage::Prepared;
         b.child = None;
+        b.link = None;
         a == b
     }
 }

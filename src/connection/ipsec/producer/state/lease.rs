@@ -2,7 +2,7 @@
 //! entrypoints use the caller's budget, while the wrappers without a call
 //! budget (teardown/completed/metadata Observer/tests) stay exactly as before
 //! and are intentionally unbudgeted.
-use super::super::bound::budget;
+use super::super::{bound::budget, record::LinkClaim};
 use super::{Birth, CLAIM, CONFIG, Error, Lease, MAX, Stage, digest, fs, inventory};
 use std::{sync::atomic::AtomicBool, time::Instant};
 
@@ -79,12 +79,39 @@ impl Lease {
         let mut next = self.record.clone();
         next.stage = stage;
         next.child = child;
+        self.replace_record(next, prewrite)
+    }
+
+    pub(in crate::connection::ipsec::producer) fn record_link(
+        &mut self,
+        link: LinkClaim,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), Error> {
+        let store = self.store.clone();
+        let _lock = budget::lock_until(expires, cancel, &store.io)?;
+        budget::check_until(expires, cancel)?;
+        self.validate_unlocked()?;
+        if self.record.stage != Stage::Running || self.record.link.is_some() {
+            return Err(Error::Changed);
+        }
+        let mut next = self.record.clone();
+        next.link = Some(link);
+        self.replace_record(next, || budget::check_until(expires, cancel))
+    }
+
+    fn replace_record(
+        &mut self,
+        next: super::Record,
+        prewrite: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
         next.valid()?;
+        let bytes = serde_json::to_vec(&next).map_err(|_| Error::Invalid)?;
+        if bytes.len() as u64 > MAX {
+            return Err(Error::Invalid);
+        }
         prewrite()?;
-        let stamp = self.directory.write_new(
-            ".next",
-            &serde_json::to_vec(&next).map_err(|_| Error::Invalid)?,
-        )?;
+        let stamp = self.directory.write_new(".next", &bytes)?;
         fs::rename(
             self.directory.path.join(".next"),
             self.directory.path.join(CLAIM),

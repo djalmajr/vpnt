@@ -22,6 +22,7 @@ mod diagnostic;
 mod files;
 mod ledger;
 mod record;
+mod recovery;
 mod socket;
 mod state;
 mod userspace;
