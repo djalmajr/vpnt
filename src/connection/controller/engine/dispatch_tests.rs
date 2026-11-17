@@ -360,96 +360,102 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
     assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
 }
 
-struct ObservingFactory(crate::connection::macos::fence_recovery::tests::RecoveryFixture);
-impl Factory for ObservingFactory {
-    type Attempt = InertAttempt;
-    fn create(
-        &self,
-        _: Profile,
-        _: u32,
-        _: u64,
-        _: Credentials,
-        _: Arc<AtomicBool>,
-    ) -> Self::Attempt {
-        InertAttempt
-    }
-    fn idle(&self) -> bool {
-        true
-    }
-    fn cleanup_blocked(&self, profile: &Profile) -> bool {
-        self.0.blocked(profile)
-    }
-    fn verify_cleanup(&self, profile: &Profile) -> bool {
-        self.0.verify(profile)
-    }
-}
+#[cfg(target_os = "macos")]
+mod recovery {
+    use super::*;
 
-#[test]
-fn recovery_snapshot_dispatch_blocks_one_profile_then_verify_releases_it() {
-    let factory =
-        ObservingFactory(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
-    let mut slots = BTreeMap::from([
-        ("one".into(), slot("one", 10)),
-        ("two".into(), slot("two", 10)),
-    ]);
-    let mut out = VecDeque::new();
-    let clock = ProbeClock::new(Duration::from_secs(10));
-    let send = |id: &str, command, slots: &mut _, out: &mut _| {
-        dispatch(
-            Request {
-                id: id.into(),
-                command,
+    struct ObservingFactory(crate::connection::macos::fence_recovery::tests::RecoveryFixture);
+    impl Factory for ObservingFactory {
+        type Attempt = InertAttempt;
+        fn create(
+            &self,
+            _: Profile,
+            _: u32,
+            _: u64,
+            _: Credentials,
+            _: Arc<AtomicBool>,
+        ) -> Self::Attempt {
+            InertAttempt
+        }
+        fn idle(&self) -> bool {
+            true
+        }
+        fn cleanup_blocked(&self, profile: &Profile) -> bool {
+            self.0.blocked(profile)
+        }
+        fn verify_cleanup(&self, profile: &Profile) -> bool {
+            self.0.verify(profile)
+        }
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_blocks_one_profile_then_verify_releases_it() {
+        let factory = ObservingFactory(
+            crate::connection::macos::fence_recovery::tests::RecoveryFixture::new(),
+        );
+        let mut slots = BTreeMap::from([
+            ("one".into(), slot("one", 10)),
+            ("two".into(), slot("two", 10)),
+        ]);
+        let mut out = VecDeque::new();
+        let clock = ProbeClock::new(Duration::from_secs(10));
+        let send = |id: &str, command, slots: &mut _, out: &mut _| {
+            dispatch(
+                Request {
+                    id: id.into(),
+                    command,
+                },
+                &factory,
+                slots,
+                out,
+                &clock,
+                true,
+            )
+        };
+        send("snap", Command::Snapshot {}, &mut slots, &mut out);
+        let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
+            panic!("snapshot")
+        };
+        assert_eq!(
+            connections.iter().find(|c| c.id == "one").unwrap().state,
+            ConnectionState::CleanupUnconfirmed
+        );
+        assert!(factory.0.fence_exists());
+        let connect = |id: &str| Command::Connect {
+            id: id.into(),
+            generation: 1,
+            interval: ProbeInterval::TEN,
+            credentials: credentials(),
+        };
+        send("one-request", connect("one"), &mut slots, &mut out);
+        assert!(matches!(
+            out.pop_front(),
+            Some(Message::Failed {
+                error: ErrorCode::ProfileBusy,
+                ..
+            })
+        ));
+        send("two-request", connect("two"), &mut slots, &mut out);
+        assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
+        out.clear();
+        factory.0.remove_observed_route();
+        send(
+            "verify",
+            Command::VerifyCleanup {
+                profile: "one".into(),
             },
-            &factory,
-            slots,
-            out,
-            &clock,
-            true,
-        )
-    };
-    send("snap", Command::Snapshot {}, &mut slots, &mut out);
-    let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
-        panic!("snapshot")
-    };
-    assert_eq!(
-        connections.iter().find(|c| c.id == "one").unwrap().state,
-        ConnectionState::CleanupUnconfirmed
-    );
-    assert!(factory.0.fence_exists());
-    let connect = |id: &str| Command::Connect {
-        id: id.into(),
-        generation: 1,
-        interval: ProbeInterval::TEN,
-        credentials: credentials(),
-    };
-    send("one-request", connect("one"), &mut slots, &mut out);
-    assert!(matches!(
-        out.pop_front(),
-        Some(Message::Failed {
-            error: ErrorCode::ProfileBusy,
-            ..
-        })
-    ));
-    send("two-request", connect("two"), &mut slots, &mut out);
-    assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
-    out.clear();
-    factory.0.remove_observed_route();
-    send(
-        "verify",
-        Command::VerifyCleanup {
-            profile: "one".into(),
-        },
-        &mut slots,
-        &mut out,
-    );
-    let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
-        panic!("verified snapshot")
-    };
-    assert_eq!(
-        connections.iter().find(|c| c.id == "one").unwrap().state,
-        ConnectionState::Off
-    );
-    assert!(!factory.0.fence_exists());
-    send("one-retry", connect("one"), &mut slots, &mut out);
-    assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
+            &mut slots,
+            &mut out,
+        );
+        let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
+            panic!("verified snapshot")
+        };
+        assert_eq!(
+            connections.iter().find(|c| c.id == "one").unwrap().state,
+            ConnectionState::Off
+        );
+        assert!(!factory.0.fence_exists());
+        send("one-retry", connect("one"), &mut slots, &mut out);
+        assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
+    }
 }

@@ -18,182 +18,187 @@ use std::{
     time::Instant,
 };
 
-struct RecoveryEngine(Arc<crate::connection::macos::fence_recovery::tests::RecoveryFixture>);
-struct RecoveryAttempt;
-impl Attempt for RecoveryAttempt {
-    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
-        Ok(())
-    }
-    fn ready(&mut self) -> Result<bool, Failure> {
-        Ok(true)
-    }
-    fn healthy(&mut self) -> Result<(), Failure> {
-        Ok(())
-    }
-    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
-        Ok(true)
-    }
-    fn cleanup(&mut self) -> bool {
-        true
-    }
-}
-impl Factory for RecoveryEngine {
-    type Attempt = RecoveryAttempt;
-    fn create(
-        &self,
-        _: Profile,
-        _: u32,
-        _: u64,
-        _: Credentials,
-        _: Arc<AtomicBool>,
-    ) -> Self::Attempt {
-        RecoveryAttempt
-    }
-    fn idle(&self) -> bool {
-        true
-    }
-    fn cleanup_blocked(&self, profile: &Profile) -> bool {
-        self.0.blocked(profile)
-    }
-    fn verify_cleanup(&self, profile: &Profile) -> bool {
-        self.0.verify(profile)
-    }
-}
-struct EngineGuard(Option<JoinHandle<Result<(), ErrorCode>>>);
-impl Drop for EngineGuard {
-    fn drop(&mut self) {
-        if let Some(worker) = self.0.take() {
-            let _ = worker.join();
-        }
-    }
-}
-struct FixtureSecrets;
-impl crate::secrets::SecretStore for FixtureSecrets {
-    fn contains(&self, _: &str, _: VpnKind) -> Result<bool, crate::secrets::SecretError> {
-        Ok(true)
-    }
-    fn load(&self, _: &str, _: VpnKind) -> Result<Credentials, crate::secrets::SecretError> {
-        Ok(Credentials {
-            password: "fictional".into(),
-            psk: "".into(),
-        })
-    }
-    fn save(
-        &self,
-        _: &str,
-        _: VpnKind,
-        _: &Credentials,
-    ) -> Result<(), crate::secrets::SecretError> {
-        Ok(())
-    }
-    fn remove(&self, _: &str, _: VpnKind) -> Result<(), crate::secrets::SecretError> {
-        Ok(())
-    }
-}
+#[cfg(target_os = "macos")]
+mod recovery {
+    use super::*;
 
-#[test]
-fn broker_and_engine_negotiate_cleanup_and_legacy_snapshots_stay_off() {
-    use crate::{bridge::Command as UiCommand, broker::Broker, helper::client::Client};
-    let recovery =
-        Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
-    let (input, requests) = mpsc::sync_channel(32);
-    let (output, replies) = mpsc::sync_channel(64);
-    let state = recovery.clone();
-    let guard = EngineGuard(Some(thread::spawn(move || {
-        run(
-            RecoveryEngine(state),
-            unsafe { libc::geteuid() },
-            vec![profile("one")],
-            requests,
-            output,
-            Timing::default(),
-        )
-    })));
-    let client = Client::fixture_channels(input, replies);
-    let mut broker = Broker::fixture(client, FixtureSecrets);
-    let until = Instant::now() + Duration::from_secs(5);
-    loop {
-        let snapshot = broker.snapshot();
-        if snapshot
-            .vpns
-            .iter()
-            .any(|v| v.profile.id == "one" && v.state == ConnectionState::CleanupUnconfirmed)
-        {
-            break;
+    struct RecoveryEngine(Arc<crate::connection::macos::fence_recovery::tests::RecoveryFixture>);
+    struct RecoveryAttempt;
+    impl Attempt for RecoveryAttempt {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            Ok(())
         }
-        assert!(
-            Instant::now() < until,
-            "new broker never received negotiated cleanup state"
-        );
-        thread::sleep(Duration::from_millis(2));
-    }
-    recovery.remove_observed_route();
-    broker
-        .dispatch(
-            UiCommand::Probe { id: "one".into() },
-            Instant::now() + Duration::from_secs(2),
-        )
-        .unwrap();
-    loop {
-        let snapshot = broker.snapshot();
-        if snapshot
-            .vpns
-            .iter()
-            .any(|v| v.profile.id == "one" && v.state == ConnectionState::Off)
-        {
-            break;
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(true)
         }
-        assert!(
-            Instant::now() < until,
-            "VerifyCleanup did not release the profile"
-        );
-        thread::sleep(Duration::from_millis(2));
+        fn healthy(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn cleanup(&mut self) -> bool {
+            true
+        }
     }
-    assert_eq!(recovery.verifies(), 1);
-    assert!(!recovery.fence_exists());
-    drop(broker);
-    drop(guard);
-
-    let recovery =
-        Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
-    let (input, requests) = mpsc::sync_channel(32);
-    let (output, replies) = mpsc::sync_channel(64);
-    let state = recovery.clone();
-    let guard = EngineGuard(Some(thread::spawn(move || {
-        run(
-            RecoveryEngine(state),
-            unsafe { libc::geteuid() },
-            vec![profile("one")],
-            requests,
-            output,
-            Timing::default(),
-        )
-    })));
-    for id in [
-        crate::helper::protocol::WAIT_CAPABILITY_SNAPSHOT_ID,
-        "legacy-query",
-    ] {
-        input
-            .send(Request {
-                id: id.into(),
-                command: Command::Snapshot {},
+    impl Factory for RecoveryEngine {
+        type Attempt = RecoveryAttempt;
+        fn create(
+            &self,
+            _: Profile,
+            _: u32,
+            _: u64,
+            _: Credentials,
+            _: Arc<AtomicBool>,
+        ) -> Self::Attempt {
+            RecoveryAttempt
+        }
+        fn idle(&self) -> bool {
+            true
+        }
+        fn cleanup_blocked(&self, profile: &Profile) -> bool {
+            self.0.blocked(profile)
+        }
+        fn verify_cleanup(&self, profile: &Profile) -> bool {
+            self.0.verify(profile)
+        }
+    }
+    struct EngineGuard(Option<JoinHandle<Result<(), ErrorCode>>>);
+    impl Drop for EngineGuard {
+        fn drop(&mut self) {
+            if let Some(worker) = self.0.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    struct FixtureSecrets;
+    impl crate::secrets::SecretStore for FixtureSecrets {
+        fn contains(&self, _: &str, _: VpnKind) -> Result<bool, crate::secrets::SecretError> {
+            Ok(true)
+        }
+        fn load(&self, _: &str, _: VpnKind) -> Result<Credentials, crate::secrets::SecretError> {
+            Ok(Credentials {
+                password: "fictional".into(),
+                psk: "".into(),
             })
-            .unwrap();
-        let message = replies.recv_timeout(Duration::from_secs(5)).unwrap();
-        let Message::Snapshot { connections, .. } = message else {
-            panic!("legacy snapshot expected")
-        };
-        assert!(
-            connections
-                .iter()
-                .all(|status| status.state == ConnectionState::Off)
-        );
+        }
+        fn save(
+            &self,
+            _: &str,
+            _: VpnKind,
+            _: &Credentials,
+        ) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: VpnKind) -> Result<(), crate::secrets::SecretError> {
+            Ok(())
+        }
     }
-    assert_eq!(recovery.verifies(), 0);
-    assert!(recovery.fence_exists());
-    drop(input);
-    drop(replies);
-    drop(guard);
+
+    #[test]
+    fn broker_and_engine_negotiate_cleanup_and_legacy_snapshots_stay_off() {
+        use crate::{bridge::Command as UiCommand, broker::Broker, helper::client::Client};
+        let recovery =
+            Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
+        let (input, requests) = mpsc::sync_channel(32);
+        let (output, replies) = mpsc::sync_channel(64);
+        let state = recovery.clone();
+        let guard = EngineGuard(Some(thread::spawn(move || {
+            run(
+                RecoveryEngine(state),
+                unsafe { libc::geteuid() },
+                vec![profile("one")],
+                requests,
+                output,
+                Timing::default(),
+            )
+        })));
+        let client = Client::fixture_channels(input, replies);
+        let mut broker = Broker::fixture(client, FixtureSecrets);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = broker.snapshot();
+            if snapshot
+                .vpns
+                .iter()
+                .any(|v| v.profile.id == "one" && v.state == ConnectionState::CleanupUnconfirmed)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "new broker never received negotiated cleanup state"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        recovery.remove_observed_route();
+        broker
+            .dispatch(
+                UiCommand::Probe { id: "one".into() },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        loop {
+            let snapshot = broker.snapshot();
+            if snapshot
+                .vpns
+                .iter()
+                .any(|v| v.profile.id == "one" && v.state == ConnectionState::Off)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "VerifyCleanup did not release the profile"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(recovery.verifies(), 1);
+        assert!(!recovery.fence_exists());
+        drop(broker);
+        drop(guard);
+
+        let recovery =
+            Arc::new(crate::connection::macos::fence_recovery::tests::RecoveryFixture::new());
+        let (input, requests) = mpsc::sync_channel(32);
+        let (output, replies) = mpsc::sync_channel(64);
+        let state = recovery.clone();
+        let guard = EngineGuard(Some(thread::spawn(move || {
+            run(
+                RecoveryEngine(state),
+                unsafe { libc::geteuid() },
+                vec![profile("one")],
+                requests,
+                output,
+                Timing::default(),
+            )
+        })));
+        for id in [
+            crate::helper::protocol::WAIT_CAPABILITY_SNAPSHOT_ID,
+            "legacy-query",
+        ] {
+            input
+                .send(Request {
+                    id: id.into(),
+                    command: Command::Snapshot {},
+                })
+                .unwrap();
+            let message = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+            let Message::Snapshot { connections, .. } = message else {
+                panic!("legacy snapshot expected")
+            };
+            assert!(
+                connections
+                    .iter()
+                    .all(|status| status.state == ConnectionState::Off)
+            );
+        }
+        assert_eq!(recovery.verifies(), 0);
+        assert!(recovery.fence_exists());
+        drop(input);
+        drop(replies);
+        drop(guard);
+    }
 }
 
 #[derive(Default)]
