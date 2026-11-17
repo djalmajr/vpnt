@@ -28,9 +28,17 @@ fn persist_claims<B: crate::connection::routes::Backend>(
     Ok(())
 }
 
+/// `try_lock` contention is `Busy`; a poisoned lock is a failure.
+fn contended<T>(held: std::sync::TryLockError<T>) -> AbandonError {
+    match held {
+        std::sync::TryLockError::WouldBlock => AbandonError::Busy,
+        std::sync::TryLockError::Poisoned(_) => AbandonError::Unsupported,
+    }
+}
+
 impl<'a> NativeAttempt<'a> {
     /// The abandonment's locks in its order: reservation, coordinator,
-    /// retirement queue, each with `try_lock`. Contention is an error and the
+    /// retirement queue, each with `try_lock`. Contention is `Busy` and the
     /// caller decides. Only `release` lets a successful action free the
     /// reservation; the claims and the queue are whatever `action` does.
     fn with_claims<T>(
@@ -42,17 +50,16 @@ impl<'a> NativeAttempt<'a> {
         ) -> Result<T, AbandonError>,
     ) -> Result<T, AbandonError> {
         let locked = || {
-            let mut routes = self
-                .routes
-                .try_lock()
-                .map_err(|_| AbandonError::Unsupported)?;
+            let mut routes = self.routes.try_lock().map_err(contended)?;
             let queue = routes.backend_mut().retirement_queue();
-            let mut retired = queue.try_lock().map_err(|_| AbandonError::Unsupported)?;
+            let mut retired = queue.try_lock().map_err(contended)?;
             action(&mut routes, &mut retired)
         };
+        let busy = || AbandonError::Busy;
+        let error = || AbandonError::Unsupported;
         match &self.profile_use {
-            Some(profile) if release => profile.abandon_after(|| AbandonError::Unsupported, locked),
-            Some(profile) => profile.hold(|| AbandonError::Unsupported, locked),
+            Some(profile) if release => profile.abandon_after(busy, error, locked),
+            Some(profile) => profile.hold(busy, error, locked),
             None => locked(),
         }
     }
@@ -127,7 +134,7 @@ impl<'a> NativeAttempt<'a> {
         })
     }
     /// Write `fence_record` as this generation's journal. Success marks the
-    /// attempt journaled; a failure leaves the flag as it was.
+    /// attempt journaled; a failure, `Busy` included, leaves the flag as it was.
     pub(super) fn journal(&mut self, reason: Reason) -> Result<(), AbandonError> {
         let record = self.fence_record(reason)?;
         crate::connection::fence::write(&self.fence_root, self.fence_owner, &record)
@@ -175,6 +182,7 @@ impl<'a> NativeAttempt<'a> {
             let _ = client.stop();
         }
         let journaled = self.journaled.load(Ordering::Acquire);
+        // Contention stays a plain refusal here; the worker retries it.
         self.with_claims(true, |routes, retired| {
             let mut record = self.record_under(reason, routes, retired)?;
             persist_claims(
@@ -188,6 +196,10 @@ impl<'a> NativeAttempt<'a> {
                 },
                 |backend| backend.abandon_owner(&self.owner, retired),
             )
+        })
+        .map_err(|error| match error {
+            AbandonError::Busy => AbandonError::Unsupported,
+            error => error,
         })?;
         self.lease = None;
         self.token = None;
@@ -541,10 +553,15 @@ mod abandon_tests {
             attempt.link = Some(Arc::new(link));
             READY_DNS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let _capture = Capture;
+            let journal = || fence::read(&root.0, uid, uid, &profile.id, 1).unwrap();
+            assert!(journal().is_none());
             assert!(
                 attempt.ready().is_ok_and(|ready| ready),
                 "ready fixture server={has_server}"
             );
+            // The first Ok(true) went through the journal (i).
+            assert!(journal().is_some(), "journal at (i) server={has_server}");
+            assert!(attempt.journaled.load(Ordering::Acquire));
             let calls = READY_DNS.with(|slot| slot.borrow().clone().unwrap());
             if has_server {
                 assert_eq!(
@@ -946,6 +963,7 @@ mod abandon_tests {
         let attempt = |routes: &mut Coordinator<Fake>, record: &mut fence::Fence, owner_uid| {
             reservation.abandon_after(
                 || AbandonError::Unsupported,
+                || AbandonError::Unsupported,
                 || {
                     persist_claims(
                         routes,
@@ -1155,19 +1173,66 @@ mod abandon_tests {
         assert_eq!(native.retired(&routes), 1);
         assert!(!native.profiles.idle());
         assert_eq!(state.lock().unwrap().as_deref(), Some(key.as_str()));
-        // Contention is an error the caller decides on; (i) fails the connection.
+        // A failed write fails the connection and leaves the attempt unjournaled.
         attempt.journaled.store(false, Ordering::Release);
         fence::remove(&native.root.0, native.uid, native.uid, "example", 1).unwrap();
-        let held = routes.lock().unwrap();
-        assert!(attempt.established().is_err());
-        drop(held);
-        assert!(native.journal().is_none());
-        // A failed write fails the connection and leaves the attempt unjournaled.
         attempt.fence_owner = native.uid.wrapping_add(1);
         assert!(attempt.established().is_err());
         assert!(!attempt.journaled.load(Ordering::Acquire));
         assert!(native.journal().is_none());
         assert!(native.held(&routes));
+    }
+
+    #[test]
+    fn established_waits_while_a_lock_is_held_and_journals_once_it_is_free() {
+        fn not_yet(native: &Native, attempt: &mut NativeAttempt<'_>, held: &str) {
+            assert!(matches!(attempt.established(), Ok(false)), "{held} held");
+            assert!(!attempt.journaled.load(Ordering::Acquire), "{held} held");
+            assert!(native.journal().is_none(), "{held} held");
+        }
+        let native = Native::new("journal-busy");
+        let routes = native.routes(true);
+        let ssl = crate::connection::ssl::tests::Fixture::new();
+        let (mut attempt, _, _) = native.attempt(&routes, &ssl, true);
+        // The coordinator, as another profile's ready() or healthy() holds it.
+        let held = routes.lock().unwrap();
+        not_yet(&native, &mut attempt, "coordinator");
+        drop(held);
+        // The reservations, as recovery's scan holds them.
+        native
+            .profiles
+            .with_live(|_| not_yet(&native, &mut attempt, "reservations"))
+            .unwrap();
+        let queue = routes.lock().unwrap().backend_mut().retirement_queue();
+        let held = queue.lock().unwrap();
+        not_yet(&native, &mut attempt, "retirement queue");
+        drop(held);
+        // Contention released nothing and cost nothing; free, the same
+        // attempt journals and only then reports the connection established.
+        assert!(native.held(&routes));
+        assert!(matches!(attempt.established(), Ok(true)));
+        assert!(attempt.journaled.load(Ordering::Acquire));
+        let record = native
+            .journal()
+            .expect("journal written once the locks are free");
+        assert_eq!(record.routes.len(), 1);
+        assert_eq!(record.retired.len(), 1);
+        assert!(native.held(&routes));
+        // A poisoned coordinator never frees up: a failure, not "not yet".
+        attempt.journaled.store(false, Ordering::Release);
+        fence::remove(&native.root.0, native.uid, native.uid, "example", 1).unwrap();
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = routes.lock().unwrap();
+                    panic!("poison the coordinator");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err() && routes.is_poisoned());
+        assert!(attempt.established().is_err());
+        assert!(!attempt.journaled.load(Ordering::Acquire));
+        assert!(native.journal().is_none());
     }
 
     #[test]

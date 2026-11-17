@@ -175,12 +175,17 @@ impl NativeAttempt<'_> {
         }
     }
     /// (i) The first `Ok(true)` journals the established connection, with
-    /// everything acquired, DNS included. A failed write fails the connection,
-    /// which then takes the ordinary cleanup.
+    /// everything acquired, DNS included. A lock held elsewhere is "not yet":
+    /// the next poll tries again within the connect deadline. A failed write,
+    /// or a record that cannot be built, fails the connection, which then
+    /// takes the ordinary cleanup.
     fn established(&mut self) -> Result<bool, Failure> {
         if !self.journaled.load(Ordering::Acquire) {
-            self.journal(Reason::Journal)
-                .map_err(|_| Failure::unavailable())?;
+            match self.journal(Reason::Journal) {
+                Ok(()) => {}
+                Err(AbandonError::Busy) => return Ok(false),
+                Err(_) => return Err(Failure::unavailable()),
+            }
         }
         Ok(true)
     }
@@ -400,13 +405,19 @@ impl Attempt for NativeAttempt<'_> {
                 client.note_no_dns_domain();
             }
         }
+        // The DNS seam skipped `register_ppp`, so it has no lease to validate;
+        // it still reaches the journal (i) below.
         #[cfg(test)]
-        if READY_DNS.with(|slot| slot.borrow().is_some()) {
-            return Ok(true);
-        }
-        let valid = routes
-            .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
-            .map_err(|_| Failure::unavailable());
+        let unleased = READY_DNS.with(|slot| slot.borrow().is_some());
+        #[cfg(not(test))]
+        let unleased = false;
+        let valid = if unleased {
+            Ok(())
+        } else {
+            routes
+                .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)
+                .map_err(|_| Failure::unavailable())
+        };
         // The journal takes the coordinator again with try_lock.
         drop(routes);
         valid?;

@@ -99,29 +99,36 @@ impl Profiles {
 }
 impl ProfileUse {
     /// Hold the reservation through the durable write and release only after
-    /// the action commits successfully.
+    /// the action commits successfully. `busy` is the error when the
+    /// reservations are locked elsewhere; `error` covers the rest.
     pub(super) fn abandon_after<T, E>(
         &self,
+        busy: impl FnOnce() -> E,
         error: impl Fn() -> E,
         action: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        self.locked(error, true, action)
+        self.locked(busy, error, true, action)
     }
     /// Same lock and check as `abandon_after`, but the reservation stays.
     pub(super) fn hold<T, E>(
         &self,
+        busy: impl FnOnce() -> E,
         error: impl Fn() -> E,
         action: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        self.locked(error, false, action)
+        self.locked(busy, error, false, action)
     }
     fn locked<T, E>(
         &self,
+        busy: impl FnOnce() -> E,
         error: impl Fn() -> E,
         release: bool,
         action: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        let mut all = self.reservations.try_lock().map_err(|_| error())?;
+        let mut all = self.reservations.try_lock().map_err(|held| match held {
+            std::sync::TryLockError::WouldBlock => busy(),
+            std::sync::TryLockError::Poisoned(_) => error(),
+        })?;
         if !all.contains_key(&self.key) {
             return Err(error());
         }
@@ -227,14 +234,15 @@ mod abandon_tests {
             let first_use = &first_use;
             scope.spawn(move || {
                 let idle = profiles.idle();
-                let abandon = first_use.abandon_after(|| StoreError::Io, || Ok(()));
+                let abandon =
+                    first_use.abandon_after(|| StoreError::Busy, || StoreError::Io, || Ok(()));
                 let _ = send.send((idle, abandon));
             });
             let observed = receive.recv_timeout(std::time::Duration::from_millis(250));
             drop(held);
             observed
         });
-        assert_eq!(observed.unwrap(), (false, Err(StoreError::Io)));
+        assert_eq!(observed.unwrap(), (false, Err(StoreError::Busy)));
         assert_eq!(store.remove("first"), Err(StoreError::Busy));
         first_use.abandon().unwrap();
         assert_eq!(store.remove("second"), Err(StoreError::Busy));

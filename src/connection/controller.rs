@@ -20,6 +20,9 @@ use crate::{
 enum AbandonError {
     Unsupported,
     Persist,
+    /// A lock taken with `try_lock` was held elsewhere; the same call can
+    /// succeed later. Only the journal (i) retries on it.
+    Busy,
 }
 #[cfg(target_os = "macos")]
 pub use native::run_ssl;
