@@ -244,6 +244,119 @@ mod abandon_tests {
             && routes.backend_mut().retired.is_empty()
             && profiles.idle()
     }
+
+    #[test]
+    fn ready_passes_gateway_or_profile_networks_to_real_backend() {
+        use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+        use crate::helper::controller_lock::ControllerLock;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct Capture;
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                READY_NETWORKS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(
+            uid, 0,
+            "fixture requires an ordinary user; never create routes or a sink"
+        );
+        for (own_networks, expected) in [
+            (vec![], vec!["10.0.0.0/8", "172.20.0.0/16"]),
+            (vec!["192.168.64.0/20"], vec!["192.168.64.0/20"]),
+        ] {
+            let root = Root(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("output/fixtures")
+                    .join(format!(
+                        "ready-networks-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    )),
+            );
+            fs::create_dir_all(&root.0).unwrap();
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+            let lock_dir = root.0.join("controller");
+            fs::create_dir(&lock_dir).unwrap();
+            fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(lock_dir.join(".controller.lock"))
+                .unwrap();
+            let controller = ControllerLock::fixture(&lock_dir, uid).unwrap();
+            let mut profile: Profile = serde_json::from_value(serde_json::json!({"id":"example","name":"example","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
+            profile.networks = own_networks.into_iter().map(str::to_owned).collect();
+            let store = ProfileStore::open(&root.0, uid).unwrap();
+            store.save(profile.clone()).unwrap();
+            let profiles = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+            let routes = Arc::new(Mutex::new(
+                Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+            ));
+            let factory = NativeFactory::new(routes.clone(), profiles.clone(), None, uid)
+                .fixture_fence_root(root.0.clone(), uid);
+            // The fixture must outlive the driver, including during unwind.
+            let fixture = crate::connection::ssl::tests::Fixture::new();
+            let mut attempt = match factory.create(
+                profile.clone(),
+                uid,
+                1,
+                Credentials {
+                    password: "fictional".into(),
+                    psk: "".into(),
+                },
+                Arc::new(AtomicBool::new(false)),
+            ) {
+                AttemptKind::Ssl(attempt) => attempt,
+                _ => panic!("SSL factory expected"),
+            };
+            attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
+            let mut driver = fixture.start("ready.fixture.invalid");
+            driver.fixture_output(b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0\nINFO:   vpnt: split-route 172.20.0.0/255.255.0.0\nINFO:   vpnt: split-routes 2\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let observation = driver.split_observation();
+                if observation.split_count == Some(2) {
+                    assert!(!observation.split_invalid);
+                    assert_eq!(observation.split.len(), 2);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "split batch not observed from fixture pipe"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let link = OwnedPpp::fixture_with_child(driver.fixture_child_id()).unwrap();
+            attempt.client = Some(driver);
+            attempt.link = Some(Arc::new(link));
+            attempt.spawn_attempted = true;
+            READY_NETWORKS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            let _capture = Capture;
+            assert!(
+                attempt.ready().is_err(),
+                "the actual native writer must reject an unprivileged fixture"
+            );
+            let observed = READY_NETWORKS.with(|slot| slot.borrow().clone().unwrap());
+            assert_eq!(observed, expected);
+            let plan =
+                crate::connection::routes::ppp_networks(&observed, 42, true, false, None).unwrap();
+            assert_eq!(plan.len(), expected.len());
+            assert!(plan.iter().all(|route| route.key.network.prefix() > 1
+                && route.next_hop == crate::connection::routes::NextHop::Interface));
+            assert!(!routes.lock().unwrap().has_resources());
+            assert!(
+                !routes
+                    .lock()
+                    .unwrap()
+                    .backend_mut()
+                    .fixture_has_scope(&attempt.owner)
+            );
+        }
+    }
     #[test]
     fn native_abandon_persists_before_releasing_claim_and_reservation() {
         use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};

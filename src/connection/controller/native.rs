@@ -32,6 +32,36 @@ use std::sync::{
 };
 
 type Routes<'a> = Arc<Mutex<Coordinator<NativeBackend<'a>>>>;
+
+#[cfg(test)]
+thread_local! {
+    static READY_NETWORKS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+// Forward the exact call to the real backend while observing its input in a
+// fixture. The native attachment itself remains subject to the real root gate.
+#[cfg(test)]
+struct ObservedBackend<'b, 'a>(&'b mut NativeBackend<'a>);
+#[cfg(test)]
+impl ObservedBackend<'_, '_> {
+    fn register_ppp(
+        &mut self,
+        link: &Arc<OwnedPpp>,
+        owner: Owner,
+        networks: &[String],
+        canceled: &Arc<AtomicBool>,
+    ) -> Result<
+        (InterfaceToken, Vec<crate::connection::routes::Route>),
+        crate::connection::routes::Error,
+    > {
+        READY_NETWORKS.with(|slot| {
+            if let Some(observed) = slot.borrow_mut().as_mut() {
+                *observed = networks.to_vec();
+            }
+        });
+        self.0.register_ppp(link, owner, networks, canceled)
+    }
+}
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
 /// The prepared helper binds uid to its inherited caller and keeps this
 /// controller/lock alive through EOF and every outstanding cleanup. Installed
@@ -269,8 +299,11 @@ impl Attempt for NativeAttempt<'_> {
                     client.note_invalid_split();
                     Failure::unavailable()
                 })?;
-            let (token, plan) = routes
-                .backend_mut()
+            #[cfg(test)]
+            let mut backend = ObservedBackend(routes.backend_mut());
+            #[cfg(not(test))]
+            let backend = routes.backend_mut();
+            let (token, plan) = backend
                 .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
                 .map_err(|_| Failure::unavailable())?;
             self.token = Some(token); // retain before any fallible ADD/lease

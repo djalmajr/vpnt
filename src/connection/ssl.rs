@@ -84,6 +84,15 @@ impl SslDriver {
         self.child.id()
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fixture_output(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::{io::Write, net::Shutdown, os::unix::net::UnixStream};
+        let (reader, mut writer) = UnixStream::pair()?;
+        self.output.attach(reader)?;
+        writer.write_all(bytes)?;
+        writer.shutdown(Shutdown::Write)
+    }
+
     #[cfg(target_os = "macos")]
     pub(super) fn split_observation(&self) -> super::ssl_output::Observation {
         self.output.snapshot()
