@@ -29,6 +29,11 @@ struct Pending {
     previous: (u64, State),
     accepted: bool,
 }
+struct CleanupVerify {
+    request: String,
+    profile: String,
+    observed: BTreeMap<String, u64>,
+}
 struct Connection {
     view: VpnView,
     generation: u64,
@@ -59,7 +64,7 @@ pub struct Broker<S: SecretStore> {
     sent_interval: Option<crate::preferences::ProbeInterval>,
     cleanup_capable: bool,
     cleanup_probe: Option<BTreeMap<String, u64>>,
-    cleanup_verify: Option<(String, BTreeMap<String, u64>)>,
+    cleanup_verify: Option<CleanupVerify>,
     preferences_host: Box<dyn crate::preferences::host::Host>,
 }
 impl<S: SecretStore> Broker<S> {
@@ -313,7 +318,7 @@ impl<S: SecretStore> Broker<S> {
                 if self
                     .cleanup_verify
                     .as_ref()
-                    .is_some_and(|(request, _)| *request == id)
+                    .is_some_and(|pending| pending.request == id)
                 {
                     self.cleanup_verify = None;
                     return Ok(());
@@ -363,13 +368,25 @@ impl<S: SecretStore> Broker<S> {
     }
     pub fn snapshot(&mut self) -> Snapshot {
         self.poll();
+        let verifying = self
+            .cleanup_verify
+            .as_ref()
+            .map(|pending| pending.profile.as_str());
         Snapshot {
             version: env!("CARGO_PKG_VERSION"),
             demo: false,
             helper: self.helper,
             component_operation: self.component.status(),
             preferences: self.preferences,
-            vpns: self.connections.values().map(|c| c.view.clone()).collect(),
+            vpns: self
+                .connections
+                .values()
+                .map(|c| {
+                    let mut view = c.view.clone();
+                    view.cleanup_verifying = verifying == Some(view.profile.id.as_str());
+                    view
+                })
+                .collect(),
         }
     }
 }

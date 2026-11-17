@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, createElement } from "react";
 import type { Root } from "react-dom/client";
+import { VpnCard } from "./components/VpnCard";
 import { type Locale, type MessageKey, translate } from "./i18n";
 import type { Command, Snapshot, VpnView } from "./model";
 import { defaultPreferences } from "./settings";
@@ -59,6 +60,7 @@ const vpn: VpnView = {
   },
   state: "off",
   cleaning: false,
+  cleanupVerifying: false,
   hasPassword: false,
   hasPsk: false,
   log: [],
@@ -296,6 +298,53 @@ function componentSnapshot(
     preferences: defaultPreferences,
     vpns,
   };
+}
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: verificação continua ocupada após run resolver até o snapshot terminar`, async () => {
+    let current: VpnView = { ...vpn, state: "cleanup_unconfirmed" };
+    const sent: Command[] = [];
+    let resolved = false;
+    const render = () =>
+      root?.render(
+        createElement(VpnCard, {
+          vpn: current,
+          t: (key, values) => translate(locale, key, values),
+          run: async (command) => {
+            sent.push(command);
+            current = { ...current, cleanupVerifying: true };
+            render();
+            resolved = true;
+            return true;
+          },
+          navigate: () => {},
+          secrets: () => {},
+        }),
+      );
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => render());
+    const button = byText(
+      locale === "pt-BR" ? "Conferir de novo" : "Check again",
+      container,
+    );
+    expect(button.disabled).toBe(false);
+    await act(async () => button.click());
+    expect(resolved).toBe(true);
+    expect(sent).toEqual([{ type: "probe", id: vpn.profile.id }]);
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(button.querySelector("svg.spin")).not.toBeNull();
+    await act(async () => button.click());
+    expect(sent).toHaveLength(1);
+    current = { ...current, cleanupVerifying: false };
+    await act(async () => render());
+    expect(current.state).toBe("cleanup_unconfirmed");
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-busy")).toBeNull();
+    expect(button.querySelector("svg.spin")).toBeNull();
+  });
 }
 
 for (const locale of ["pt-BR", "en-US"] as const) {

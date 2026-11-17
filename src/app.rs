@@ -88,6 +88,7 @@ impl App {
                 .iter()
                 .map(|connection| VpnView {
                     cleaning: false,
+                    cleanup_verifying: false,
                     profile: connection.profile.clone(),
                     state: connection.session.state(),
                     has_password: connection.has_password,

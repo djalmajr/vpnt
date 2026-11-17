@@ -343,3 +343,128 @@ s.close()
     assert_eq!(broker.snapshot().helper, "missing");
     assert!(!broker.ready);
 }
+
+#[test]
+fn cleanup_verification_snapshot_tracks_correlation_failure_and_channel_loss() {
+    let profiles: Vec<crate::model::Profile> = ["one", "two"].into_iter().map(|id| {
+        serde_json::from_value(serde_json::json!({"id":id,"name":id,"kind":"ssl","gateway":"vpn.example.test","username":"fixture","networks":[],"port":443,"certificate":"","probeHost":"192.0.2.1","probePort":8443,"probeMethod":"tcp"})).unwrap()
+    }).collect();
+    let (send_request, requests) = std::sync::mpsc::sync_channel(32);
+    let (send_reply, replies) = std::sync::mpsc::sync_channel(64);
+    let client = Client::fixture_channels(send_request, replies);
+    let mut broker = Broker::new(Some(client), Secrets::new());
+    let initial = requests.recv().unwrap();
+    let response = |id: String, blocked: bool| Message::Snapshot {
+        id,
+        protocol_version: protocol::VERSION,
+        version: env!("CARGO_PKG_VERSION").into(),
+        build: None,
+        profiles: profiles.clone(),
+        connections: profiles
+            .iter()
+            .map(|profile| protocol::TunnelStatus {
+                id: profile.id.clone(),
+                generation: 0,
+                state: if blocked && profile.id == "one" {
+                    State::CleanupUnconfirmed
+                } else {
+                    State::Off
+                },
+                failures: 0,
+                cleaning: false,
+            })
+            .collect(),
+    };
+    send_reply.send(response(initial.id, false)).unwrap();
+    broker.poll();
+    let capability = requests.recv().unwrap();
+    assert_eq!(capability.id, protocol::CLEANUP_PROBE_SNAPSHOT_ID);
+    send_reply
+        .send(response(protocol::CLEANUP_ACK_SNAPSHOT_ID.into(), true))
+        .unwrap();
+    broker.poll();
+    let started = broker
+        .dispatch(
+            Command::Probe { id: "one".into() },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    let verify = requests.recv().unwrap();
+    assert!(
+        matches!(verify.command, protocol::Command::VerifyCleanup { ref profile } if profile == "one")
+    );
+    assert!(
+        started
+            .vpns
+            .iter()
+            .find(|v| v.profile.id == "one")
+            .unwrap()
+            .cleanup_verifying
+    );
+    assert!(
+        !started
+            .vpns
+            .iter()
+            .find(|v| v.profile.id == "two")
+            .unwrap()
+            .cleanup_verifying
+    );
+    let json = serde_json::to_value(&started).unwrap();
+    assert_eq!(json["vpns"][0]["cleanupVerifying"], true);
+    assert!(json["vpns"][0].get("cleanup_verifying").is_none());
+    send_reply
+        .send(Message::Accepted {
+            id: "unrelated".into(),
+        })
+        .unwrap();
+    assert!(broker.snapshot().vpns[0].cleanup_verifying);
+    send_reply.send(response(verify.id, true)).unwrap();
+    let completed = broker.snapshot();
+    assert_eq!(completed.vpns[0].state, State::CleanupUnconfirmed);
+    assert!(!completed.vpns[0].cleanup_verifying);
+    let started = broker
+        .dispatch(
+            Command::Probe { id: "one".into() },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(started.vpns[0].cleanup_verifying);
+    let verify = requests.recv().unwrap();
+    send_reply
+        .send(Message::Failed {
+            id: verify.id,
+            error: protocol::ErrorCode::Unavailable,
+        })
+        .unwrap();
+    assert!(!broker.snapshot().vpns[0].cleanup_verifying);
+    assert_eq!(broker.snapshot().vpns[0].state, State::CleanupUnconfirmed);
+    // Replace the channel fixture with an owned real child that closes its
+    // transport while the verification is pending.
+    let mut command = std::process::Command::new("/usr/bin/python3");
+    command.args(["-c", "import time; time.sleep(0.5)"]);
+    let client = Client::fixture(command).unwrap();
+    let finished = client.fixture_finished();
+    broker.client = Some(client);
+    let started = broker
+        .dispatch(
+            Command::Probe { id: "one".into() },
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(started.vpns[0].cleanup_verifying);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let lost = loop {
+        let snapshot = broker.snapshot();
+        if snapshot.helper == "missing" {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "helper channel did not close");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(lost.helper, "missing");
+    assert!(lost.vpns.iter().all(|v| !v.cleanup_verifying));
+    while !finished() {
+        assert!(Instant::now() < deadline, "fixture child did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

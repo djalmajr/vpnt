@@ -31,6 +31,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
         },
         state,
         cleaning: true,
+        cleanupVerifying: false,
         hasPassword: true,
         hasPsk: true,
         log: [],

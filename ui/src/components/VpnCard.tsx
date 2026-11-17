@@ -8,16 +8,19 @@ function VerifyCleanup({
   t,
   run,
   cleaning,
+  cleanupVerifying,
 }: {
   id: string;
   t: T;
   run: Run;
   cleaning: boolean;
+  cleanupVerifying: boolean;
 }) {
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
+  const busy = pending || cleanupVerifying;
   const verify = async () => {
-    if (cleaning || inFlight.current) return;
+    if (cleaning || cleanupVerifying || inFlight.current) return;
     inFlight.current = true;
     setPending(true);
     try {
@@ -31,11 +34,11 @@ function VerifyCleanup({
     <button
       type="button"
       className="primary"
-      disabled={cleaning || pending}
-      aria-busy={pending || undefined}
+      disabled={cleaning || busy}
+      aria-busy={busy || undefined}
       onClick={() => void verify()}
     >
-      {pending && <Icon name="loader" />}
+      {busy && <Icon name="loader" />}
       {t("checkAgain")}
     </button>
   );
@@ -197,6 +200,7 @@ export function VpnCard({
                 t={t}
                 run={run}
                 cleaning={cleaning}
+                cleanupVerifying={vpn.cleanupVerifying}
               />
             ) : state === "missing_program" ? (
               <button

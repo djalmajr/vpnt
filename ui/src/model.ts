@@ -31,6 +31,7 @@ export type Profile = {
 };
 export type VpnView = {
   cleaning: boolean;
+  cleanupVerifying: boolean;
   profile: Profile;
   state: ConnectionState;
   hasPassword: boolean;

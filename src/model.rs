@@ -113,6 +113,7 @@ fn valid_network(value: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct VpnView {
     pub cleaning: bool,
+    pub cleanup_verifying: bool,
     pub profile: Profile,
     pub state: ConnectionState,
     pub has_password: bool,

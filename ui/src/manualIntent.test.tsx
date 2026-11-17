@@ -33,6 +33,7 @@ const view = (state: ConnectionState): VpnView => ({
   profile,
   state,
   cleaning: false,
+  cleanupVerifying: false,
   hasPassword: true,
   hasPsk: true,
   log: [],

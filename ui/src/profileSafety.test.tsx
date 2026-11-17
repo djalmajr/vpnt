@@ -18,6 +18,7 @@ const fixture = (kind: "ipsec" | "ssl", username = "fixture"): VpnView => ({
   },
   state: "off",
   cleaning: false,
+  cleanupVerifying: false,
   hasPassword: false,
   hasPsk: false,
   log: [],

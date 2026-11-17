@@ -37,7 +37,7 @@ impl<S: SecretStore> Broker<S> {
         let verify = self
             .cleanup_verify
             .as_ref()
-            .is_some_and(|(request, _)| *request == id);
+            .is_some_and(|pending| pending.request == id);
         let observed = if initial {
             if id != protocol::WAIT_CAPABILITY_SNAPSHOT_ID {
                 return Err(());
@@ -47,7 +47,7 @@ impl<S: SecretStore> Broker<S> {
             self.cleanup_capable = id == protocol::CLEANUP_ACK_SNAPSHOT_ID;
             Some(self.cleanup_probe.take().ok_or(())?)
         } else if verify {
-            Some(self.cleanup_verify.take().ok_or(())?.1)
+            Some(self.cleanup_verify.take().ok_or(())?.observed)
         } else {
             Some(self.admin_query(&id).ok_or(())?)
         };
@@ -130,6 +130,7 @@ impl<S: SecretStore> Broker<S> {
                     Connection {
                         view: VpnView {
                             cleaning: status.cleaning,
+                            cleanup_verifying: false,
                             has_password: present,
                             has_psk: present && profile.kind == VpnKind::Ipsec,
                             profile,

@@ -171,7 +171,11 @@ impl<S: SecretStore> Broker<S> {
             })
             .map_err(|_| "backend_unavailable")?;
         self.next = next;
-        self.cleanup_verify = Some((request, observed));
+        self.cleanup_verify = Some(CleanupVerify {
+            request,
+            profile: id.into(),
+            observed,
+        });
         Ok(())
     }
     pub(super) fn connect_guarded(
