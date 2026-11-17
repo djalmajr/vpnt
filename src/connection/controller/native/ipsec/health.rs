@@ -2,7 +2,11 @@
 //! The connection deadline governs only start/ready; maintenance uses a fresh
 //! short budget and the existing probe keeps its own timeout.
 use super::*;
-use crate::connection::macos::probe::{self, Outcome};
+use crate::connection::macos::{
+    probe::{self, Outcome},
+    routing::TunnelPlan,
+};
+use std::net::IpAddr;
 
 impl NativeIpsecAttempt<'_> {
     /// IKE selection and the owned utun are `Tunnel`; route registration and
@@ -31,9 +35,33 @@ impl NativeIpsecAttempt<'_> {
             };
             check(expires, &self.canceled, Step::Tunnel)?;
             let admission = self.admission.as_mut().ok_or_else(unavailable)?;
-            let link = admission
-                .configure(&candidate, expires, self.canceled.clone())
-                .map_err(|_| unavailable())?;
+            let egress = self.egress.as_deref().ok_or_else(unavailable)?;
+            let families = (
+                candidate.vips.iter().any(IpAddr::is_ipv4),
+                candidate.vips.iter().any(IpAddr::is_ipv6),
+            );
+            // The plan and the transport decision are `Routes`, as they were
+            // inside `register_utun`; configuring the owned utun is `Tunnel`.
+            let mut configuring = false;
+            let (route_plan, link) = TunnelPlan::prepare(
+                &networks,
+                families,
+                || egress.transport_default(),
+                |plan| {
+                    configuring = true;
+                    let link = admission
+                        .configure(&candidate, expires, self.canceled.clone())
+                        .map_err(|_| crate::connection::routes::Error::Unavailable)?;
+                    Ok((plan, link))
+                },
+            )
+            .map_err(|_| {
+                if configuring {
+                    unavailable()
+                } else {
+                    routing()
+                }
+            })?;
             self.selected_vips = candidate.vips.clone();
             self.selected_networks = networks.clone();
             self.configured = Some(link.clone());
@@ -55,7 +83,7 @@ impl NativeIpsecAttempt<'_> {
                         &link,
                         (context, peer),
                         owner.clone(),
-                        &networks,
+                        route_plan,
                         &canceled,
                         work,
                     )
@@ -75,7 +103,7 @@ impl NativeIpsecAttempt<'_> {
                             Ok(())
                         }
                     })
-                    .map_err(|_| routing())?
+                    .map_err(route_acquire_failure)?
             };
             self.lease = Some(OwnedLease::new(lease, owner));
             check(expires, &self.canceled, Step::Routes)?;

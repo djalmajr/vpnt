@@ -12,7 +12,7 @@ use crate::connection::{
         Admission, Candidate, Control, NativeContext, NativeLedger, Registry, Reservation,
         UserspaceObserver,
     },
-    macos::{routing::InterfaceToken, vip::ConfiguredUtun},
+    macos::{ipsec_egress::IpsecEgress, routing::InterfaceToken, vip::ConfiguredUtun},
     routes::Owner,
 };
 pub(super) use domain::NativeDomain;
@@ -38,6 +38,7 @@ pub(super) struct NativeIpsecAttempt<'a> {
     pub(super) reservation: Option<Reservation>,
     pub(super) admission: Option<Admission<'a>>,
     pub(super) control: Option<IpsecControl<'a>>,
+    pub(super) egress: Option<Arc<IpsecEgress>>,
     pub(super) configured: Option<Arc<ConfiguredUtun<'a>>>,
     pub(super) token: Option<InterfaceToken>,
     pub(super) lease: Option<OwnedLease>,
@@ -68,6 +69,7 @@ impl<'a> NativeIpsecAttempt<'a> {
             reservation: None,
             admission: None,
             control: None,
+            egress: None,
             configured: None,
             token: None,
             lease: None,

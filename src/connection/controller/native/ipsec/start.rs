@@ -3,7 +3,6 @@
 //! before the guarded operation.
 use super::*;
 use crate::connection::ipsec::{Observer, Peer};
-use crate::connection::macos::ipsec_egress::IpsecEgress;
 
 impl NativeIpsecAttempt<'_> {
     pub(super) fn start_driver(
@@ -27,6 +26,8 @@ impl NativeIpsecAttempt<'_> {
             bounded(expires, canceled, Step::Egress)?,
         )
         .map_err(|_| Failure::at(Step::Egress))?;
+        let egress = Arc::new(egress);
+        self.egress = Some(egress.clone());
         // Reservation, admission, opening the producer and Control's start up
         // to `initiate` are the IPsec equivalent of the SSL client start. The
         // interface capture and IKE (`initiate`) belong to the tunnel.
@@ -43,7 +44,7 @@ impl NativeIpsecAttempt<'_> {
             &registry,
             self.reservation.as_ref().ok_or_else(unavailable)?,
             &self.profile,
-            Arc::new(egress),
+            egress,
             (expires, self.canceled.clone()),
         );
         let (config, admission) = keep_for_control(&mut self.reservation, prepared)?;

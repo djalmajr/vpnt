@@ -239,7 +239,7 @@ impl<B: Backend> Coordinator<B> {
         }
         Ok(())
     }
-    pub(super) fn admit(&mut self, owner: &Owner, route: Route) -> Result<(), Error> {
+    pub(super) fn admit(&mut self, owner: &Owner, route: Route) -> Result<Option<Route>, Error> {
         self.backend.authorize(owner, route)?;
         if let Some(entry) = self.entries.get(&route.key) {
             if entry.route != route || entry.users.is_empty() {
@@ -254,15 +254,15 @@ impl<B: Backend> Coordinator<B> {
         match self.backend.existing(route.key)? {
             Some(old) if old != route => Err(Error::Conflict),
             None if self.entries.contains_key(&route.key) => Err(Error::Changed),
-            _ => Ok(()),
+            existing => Ok(existing),
         }
     }
     pub(super) fn attach(&mut self, token: u64, route: Route) -> Result<(), Error> {
         // State may have changed since preflight; never replace on create.
         let owner = self.claims.get(&token).ok_or(Error::Invalid)?.owner.clone();
-        self.admit(&owner, route)?;
+        let existing = self.admit(&owner, route)?;
         if !self.entries.contains_key(&route.key) {
-            let receipt = if self.backend.existing(route.key)?.is_some() {
+            let receipt = if existing.is_some() {
                 None
             } else {
                 Some(self.backend.create(route)?)

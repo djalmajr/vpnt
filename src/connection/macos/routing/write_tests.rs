@@ -207,3 +207,222 @@ fn cancellation_after_dispatch_keeps_a_receipt_and_precancel_sends_nothing() {
         io::ErrorKind::WouldBlock
     );
 }
+
+struct ScopedFixture(PathBuf);
+
+impl ScopedFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".vpnt-scoped-writer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let fixture = Self(directory);
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(fixture.0.join(".controller.lock"))
+            .unwrap();
+        fixture
+    }
+
+    fn lock(&self) -> ControllerLock {
+        // SAFETY: geteuid has no memory preconditions.
+        ControllerLock::fixture(&self.0, unsafe { libc::geteuid() }).unwrap()
+    }
+}
+
+impl Drop for ScopedFixture {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).expect("remove scoped writer fixture");
+    }
+}
+
+fn datagrams() -> (OwnedFd, UnixDatagram) {
+    let (client, peer) = UnixDatagram::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    (client.into(), peer)
+}
+
+fn receive(peer: &UnixDatagram, opcode: i32) -> Vec<u8> {
+    let mut bytes = vec![0; 1024];
+    let length = peer.recv(&mut bytes).unwrap();
+    bytes.truncate(length);
+    assert!(length >= size_of::<libc::rt_msghdr>());
+    assert_eq!(bytes[3], opcode as u8);
+    bytes
+}
+
+fn set_errno(bytes: &mut [u8], errno: i32) {
+    let offset = offset_of!(libc::rt_msghdr, rtm_errno);
+    bytes[offset..offset + size_of::<i32>()].copy_from_slice(&errno.to_ne_bytes());
+}
+
+fn reply_id(bytes: &[u8]) -> (i32, i32) {
+    (
+        codec::signed(bytes, offset_of!(libc::rt_msghdr, rtm_pid)).unwrap(),
+        codec::signed(bytes, offset_of!(libc::rt_msghdr, rtm_seq)).unwrap(),
+    )
+}
+
+fn scoped_route() -> TransportDefault {
+    TransportDefault::from_egress(
+        7,
+        NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap())),
+    )
+    .unwrap()
+}
+
+#[test]
+fn scoped_get_ignores_a_queued_reader_reply() {
+    // Neither allocator has history in this child. Separate counters would
+    // assign the same ID to the first GET on each socket.
+    const CHILD: &str = "VPNT_SCOPED_GET_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::scoped_get_ignores_a_queued_reader_reply"),
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let fixture = ScopedFixture::new();
+    let controller = fixture.lock();
+    let (fd, write_peer) = datagrams();
+    let mut writer = AddWriter {
+        fd,
+        controller: &controller,
+    };
+    let (fd, read_peer) = datagrams();
+    let mut reader = Reader { fd };
+    let canceled = AtomicBool::new(false);
+    let route = scoped_route();
+
+    thread::scope(|scope| {
+        let peer = scope.spawn(move || {
+            let mut query = receive(&read_peer, libc::RTM_GET);
+            set_errno(&mut query, libc::ESRCH);
+            // Queue the broadcast on the writer before letting the reader return.
+            write_peer.send(&query).unwrap();
+            read_peer.send(&query).unwrap();
+            let get = receive(&write_peer, libc::RTM_GET);
+            let (pid, seq) = reply_id(&get);
+            let mut response =
+                add_codec::scoped_default(add_codec::DefaultRequest::Add, route, pid, seq).unwrap();
+            response[3] = libc::RTM_GET as u8;
+            write_peer.send(&response).unwrap();
+        });
+        assert_eq!(
+            reader.lookup(
+                Address::unscoped("198.51.100.40".parse().unwrap()),
+                0,
+                Duration::from_secs(2),
+                &canceled
+            ),
+            Err(Error::Changed)
+        );
+        let result = writer.get_transport_default(route);
+        peer.join().unwrap();
+        assert!(route.matches_static(&result.unwrap().expect("exact reply must win")));
+    });
+}
+
+#[test]
+fn scoped_writer_uses_exact_get_and_reports_unowned_add_and_uncertain_delete() {
+    let fixture = ScopedFixture::new();
+    let controller = fixture.lock();
+    let (fd, peer) = datagrams();
+    let mut writer = AddWriter {
+        fd,
+        controller: &controller,
+    };
+    let route = scoped_route();
+
+    thread::scope(|scope| {
+        let (finished, wait_for_delete) = std::sync::mpsc::channel();
+        let peer = scope.spawn(move || {
+            let mut add = receive(&peer, libc::RTM_ADD);
+            set_errno(&mut add, libc::EEXIST);
+            peer.send(&add).unwrap();
+
+            let mut get = receive(&peer, libc::RTM_GET);
+            let address_size = size_of::<libc::sockaddr_in>();
+            let mask_offset = size_of::<libc::rt_msghdr>() + address_size;
+            assert_eq!(
+                codec::signed(&get, offset_of!(libc::rt_msghdr, rtm_addrs)).unwrap(),
+                libc::RTA_DST | libc::RTA_NETMASK
+            );
+            assert_eq!(
+                u16::from_ne_bytes(
+                    get[offset_of!(libc::rt_msghdr, rtm_index)..][..2]
+                        .try_into()
+                        .unwrap()
+                ),
+                route.route().key.scope
+            );
+            assert_eq!(get.len(), mask_offset + address_size);
+            assert_eq!(
+                &get[mask_offset..],
+                &[
+                    address_size as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            );
+            set_errno(&mut get, libc::ESRCH);
+            peer.send(&get).unwrap();
+
+            let delete = receive(&peer, libc::RTM_DELETE);
+            assert_eq!(
+                &delete[size_of::<libc::rt_msghdr>()..],
+                &add[size_of::<libc::rt_msghdr>()..]
+            );
+            // Hold the peer open and let the writer's ACK deadline expire.
+            wait_for_delete
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+        });
+        assert_eq!(
+            writer.add_transport_default(route, &AtomicBool::new(false)),
+            Err(Error::Conflict)
+        );
+        assert_eq!(writer.get_transport_default(route), Ok(None));
+        let deleted = writer.delete_transport_default(route);
+        finished.send(()).unwrap();
+        peer.join().unwrap();
+        assert_eq!(deleted, Ok(Err(Error::TimedOut)));
+    });
+}

@@ -8,3 +8,6 @@ pub use lease::{
 };
 pub use model::{Address, Error, Key, Network, NextHop, Route};
 pub use plan::ppp_networks;
+
+#[cfg(target_os = "macos")]
+pub(crate) use plan::PppPlan;

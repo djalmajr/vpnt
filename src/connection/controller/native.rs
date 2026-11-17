@@ -7,10 +7,10 @@ use crate::{
     connection::{
         macos::{
             Interfaces,
-            egress::Egress,
+            egress::{Egress, acquire_ssl_routes},
             ppp::{OwnedPpp, OwnershipError},
             ppp_early_cleanup, probe,
-            routing::{InterfaceToken, NativeBackend, Snapshot},
+            routing::{InterfaceToken, NativeBackend, Snapshot, TransportDefault},
             store::DnsLease,
         },
         routes::{Coordinator, Lease, Owner},
@@ -55,6 +55,7 @@ impl ObservedBackend<'_, '_> {
         owner: Owner,
         networks: &[String],
         canceled: &Arc<AtomicBool>,
+        egress: Option<&Egress>,
     ) -> Result<
         (InterfaceToken, Vec<crate::connection::routes::Route>),
         crate::connection::routes::Error,
@@ -64,7 +65,7 @@ impl ObservedBackend<'_, '_> {
                 *observed = networks.to_vec();
             }
         });
-        self.0.register_ppp(link, owner, networks, canceled)
+        self.0.register_ppp(link, owner, networks, canceled, egress)
     }
 }
 
@@ -144,8 +145,10 @@ struct NativeAttempt<'a> {
     before: Option<Interfaces>,
     before_routes: Option<Snapshot>,
     client: Option<SslDriver>,
+    egress: Option<Box<Egress>>,
     link: Option<Arc<OwnedPpp>>,
     token: Option<InterfaceToken>,
+    requires_transport_default: bool,
     lease: Option<Lease>,
     dns: Option<DnsLease>,
     spawn_attempted: bool,
@@ -195,6 +198,18 @@ impl NativeAttempt<'_> {
         }
         Ok(())
     }
+    /// `step`: `Routes` while the plan is acquired, `Health` once connected.
+    fn validate_transport_egress(&self, step: Step) -> Result<(), Failure> {
+        let at = || Failure::at(step);
+        validate_ssl_egress(step, self.requires_transport_default, || {
+            self.egress
+                .as_ref()
+                .ok_or_else(at)?
+                .is_current(&self.profile)
+                .map_err(|_| at())
+        })
+    }
+
     fn discover(&mut self) -> Result<bool, Failure> {
         if self.link.is_some() {
             return Ok(true);
@@ -381,6 +396,7 @@ impl Attempt for NativeAttempt<'_> {
                 },
             )?,
         );
+        self.egress = Some(Box::new(egress));
         self.spawn_attempted = true;
         Ok(())
     }
@@ -406,13 +422,27 @@ impl Attempt for NativeAttempt<'_> {
                     #[cfg(not(test))]
                     let backend = routes.backend_mut();
                     let (token, plan) = backend
-                        .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
+                        .register_ppp(
+                            link,
+                            self.owner.clone(),
+                            &networks,
+                            &self.canceled,
+                            self.egress.as_deref(),
+                        )
                         .map_err(|_| at())?;
-                    self.token = Some(token); // retain before any fallible ADD/lease
+                    self.token = Some(token); // retain before any fallible validation or ADD
+                    // This is a dependency of the plan even if acquire borrows it.
+                    self.requires_transport_default = plan_requires_transport_default(&plan);
+                    self.validate_transport_egress(Step::Routes)?;
                     self.lease = Some(
-                        routes
-                            .acquire(self.owner.clone(), &plan)
-                            .map_err(|_| at())?,
+                        acquire_ssl_routes(
+                            &mut routes,
+                            self.owner.clone(),
+                            &plan,
+                            self.egress.as_deref(),
+                            Snapshot::read,
+                        )
+                        .map_err(route_acquire_failure)?,
                     );
                 }};
             }
@@ -479,6 +509,7 @@ impl Attempt for NativeAttempt<'_> {
         if !link.is_current().unwrap_or(false) {
             return Err(at());
         }
+        self.validate_transport_egress(Step::Health)?;
         self.routes
             .lock()
             .map_err(|_| at())?
@@ -509,10 +540,76 @@ impl Attempt for NativeAttempt<'_> {
     }
 }
 
+fn plan_requires_transport_default(plan: &[crate::connection::routes::Route]) -> bool {
+    plan.iter()
+        .any(|route| TransportDefault::try_from(*route).is_ok())
+}
+
+fn validate_ssl_egress(
+    step: Step,
+    requires_transport_default: bool,
+    is_current: impl FnOnce() -> Result<bool, Failure>,
+) -> Result<(), Failure> {
+    if requires_transport_default && !is_current()? {
+        return Err(Failure::at(step));
+    }
+    Ok(())
+}
+
+/// SSL and IPsec both acquire the plan at the routes step.
+fn route_acquire_failure(error: crate::connection::routes::AcquireError) -> Failure {
+    if error.reason == crate::connection::routes::Error::Conflict {
+        // SAFETY: the format string is fixed and has no conversion specifiers.
+        unsafe {
+            libc::syslog(
+                libc::LOG_WARNING,
+                c"vpnt: route plan conflicts with an existing route".as_ptr(),
+            )
+        };
+    }
+    Failure::at(Step::Routes)
+}
+
 #[cfg(test)]
 mod split_tests {
     use super::*;
     use crate::connection::ssl_output::Observation;
+
+    #[test]
+    fn connected_split_stays_healthy_after_physical_ipv6_renewal() {
+        use std::net::IpAddr;
+        let before: [IpAddr; 2] = ["192.0.2.2".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        let after: [IpAddr; 2] = ["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+        assert_eq!(before[0], after[0]);
+        assert_ne!(before[1], after[1]);
+        use crate::connection::routes::{Address, Key, NextHop, Route, ppp_networks};
+        let split = ppp_networks(&["10.0.0.0/8".into()], 3, true, true, None).unwrap();
+        let mut full = ppp_networks(&[], 3, true, true, None).unwrap();
+        let ipv6_renewal = || Ok(before == after);
+        let health = Step::Health;
+        let split_default = plan_requires_transport_default(&split);
+        assert!(validate_ssl_egress(health, split_default, ipv6_renewal).is_ok());
+        let full_default = plan_requires_transport_default(&full);
+        assert!(validate_ssl_egress(health, full_default, ipv6_renewal).is_ok());
+
+        let router = Address::unscoped("192.0.2.1".parse().unwrap());
+        full.insert(
+            0,
+            Route {
+                key: Key {
+                    network: "0.0.0.0/0".parse().unwrap(),
+                    scope: 7,
+                },
+                interface: 7,
+                next_hop: NextHop::Gateway(router),
+            },
+        );
+        let depends_on_default = plan_requires_transport_default(&full);
+        assert!(depends_on_default);
+        let failure = validate_ssl_egress(health, depends_on_default, ipv6_renewal).unwrap_err();
+        assert_eq!(failure.step, Step::Health);
+        assert!(validate_ssl_egress(health, depends_on_default, || Ok(true)).is_ok());
+    }
 
     #[test]
     fn dns_requires_both_a_domain_and_a_server() {
