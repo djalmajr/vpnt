@@ -6,11 +6,11 @@ mod retained;
 pub(crate) mod retirement;
 mod utun_absence;
 mod utun_retirement;
-use super::{AddWriter, Error, Key, Record, Route, Snapshot, TransportDefault};
+use super::{AddWriter, Error, Key, Record, Route, Snapshot, TransportDefault, TunnelPlan};
 use crate::{
     connection::{
         macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink},
-        routes::{Backend, NextHop, Owner, Presence, ppp_networks},
+        routes::{Backend, NextHop, Owner, Presence},
     },
     helper::controller_lock::ControllerLock,
 };

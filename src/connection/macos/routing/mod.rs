@@ -12,7 +12,7 @@ pub(crate) use backend::retirement;
 pub use backend::{InterfaceToken, NativeBackend, NativeReceipt};
 pub use read::{Reader, Snapshot};
 pub use resource_fence::{ResourceFence, RouteWork};
-pub(crate) use transport_default::TransportDefault;
+pub(crate) use transport_default::{TransportDefault, TunnelPlan, covers_ipv4};
 pub use write::{AddReceipt, AddWriter};
 
 // PF_ROUTE can deliver a GET reply to multiple sockets in this process.

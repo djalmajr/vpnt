@@ -1,5 +1,6 @@
 //! The only physical-interface route that this backend may mutate.
 use super::{Error, Gateway, Key, Network, NextHop, Record, Route};
+use crate::connection::routes::PppPlan;
 use std::net::Ipv4Addr;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,22 +44,18 @@ impl TransportDefault {
         Self::from_egress(index, next_hop).map(Some)
     }
 
+    #[cfg(test)]
     pub(super) fn add_to_plan(
         plan: &mut Vec<Route>,
         egress: impl FnOnce() -> Result<Option<Self>, Error>,
     ) -> Result<Option<Self>, Error> {
-        let lower = Network::new(Ipv4Addr::UNSPECIFIED.into(), 1)?;
-        let upper = Network::new(Ipv4Addr::new(128, 0, 0, 0).into(), 1)?;
-        let has = |network| plan.iter().any(|route| route.key.network == network);
-        if has(lower)
-            && has(upper)
-            && let Some(default) = egress()?
-        {
-            // The coordinator acquires in plan order and releases in reverse.
-            plan.insert(0, default.0);
-            return Ok(Some(default));
-        }
-        Ok(None)
+        let default = if covers_ipv4(plan.iter().map(|route| route.key.network)) {
+            egress()?
+        } else {
+            None
+        };
+        prepend(plan, default);
+        Ok(default)
     }
 
     pub(in crate::connection::macos) fn route(self) -> Route {
@@ -77,6 +74,63 @@ impl TransportDefault {
         record.flags & required == required
             && record.gateway == Some(Gateway::Address(self.gateway()))
             && record.route() == Ok(self.0)
+    }
+}
+
+pub(crate) struct TunnelPlan {
+    routes: PppPlan,
+    default: Option<TransportDefault>,
+}
+
+impl TunnelPlan {
+    // The callback can configure a VIP or allocate a sink. The transport
+    // decision must succeed before either operation.
+    pub(crate) fn prepare<T>(
+        networks: &[String],
+        (ipv4, ipv6): (bool, bool),
+        egress: impl FnOnce() -> Result<Option<TransportDefault>, Error>,
+        apply: impl FnOnce(Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let routes = PppPlan::new(networks, ipv4, ipv6)?;
+        let default = if covers_ipv4(routes.networks()) {
+            egress()?
+        } else {
+            None
+        };
+        apply(Self { routes, default })
+    }
+
+    pub(in crate::connection::macos) fn sink_ipv4(&self) -> Option<bool> {
+        self.routes.sink_ipv4()
+    }
+
+    pub(in crate::connection::macos) fn bind(
+        self,
+        index: u16,
+        sink: Option<u16>,
+    ) -> Result<(Vec<Route>, Option<TransportDefault>), Error> {
+        let mut routes = self.routes.bind(index, sink)?;
+        prepend(&mut routes, self.default);
+        Ok((routes, self.default))
+    }
+}
+
+pub(crate) fn covers_ipv4(networks: impl Iterator<Item = Network>) -> bool {
+    let mut lower = false;
+    let mut upper = false;
+    for network in networks {
+        if network.prefix() == 1 {
+            lower |= network.address() == Ipv4Addr::UNSPECIFIED;
+            upper |= network.address() == Ipv4Addr::new(128, 0, 0, 0);
+        }
+    }
+    lower && upper
+}
+
+fn prepend(plan: &mut Vec<Route>, default: Option<TransportDefault>) {
+    if let Some(default) = default {
+        // The coordinator acquires in plan order and releases in reverse.
+        plan.insert(0, default.route());
     }
 }
 

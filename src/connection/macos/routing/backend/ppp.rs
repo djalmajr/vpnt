@@ -65,59 +65,53 @@ impl<'a> NativeBackend<'a> {
         if self.registry.len() >= 64 {
             return Err(Error::Limit);
         }
-        let index = u16::try_from(ppp.index()).map_err(|_| Error::Invalid)?;
+        let index = u16::try_from(ppp.index())
+            .ok()
+            .filter(|index| *index != 0)
+            .ok_or(Error::Invalid)?;
         let ipv4 = ppp.addresses().any(|ip| ip.is_ipv4());
         let ipv6 = ppp.addresses().any(|ip| ip.is_ipv6());
-        let needs_sink = networks.is_empty() && ipv4 != ipv6;
-        // Validate split inputs before native allocation. Full/missing family
-        // is planned only after its actual, owned sink index is known.
-        let plan = if needs_sink {
-            None
-        } else {
-            Some(ppp_networks(networks, index, ipv4, ipv6, None)?)
-        };
-        let writer = AddWriter::open(self.controller)?;
-        let attachment =
-            PppAttachment::retain(ppp, self.controller).map_err(|_| Error::Unavailable)?;
-        let mut scope = NativeScope {
-            ppp: ppp.clone(),
-            attachment: Some(attachment),
-            index,
-            writer,
-            canceled: canceled.clone(),
-            sink: None,
-            transport_default: None,
-            retirement: Guard::new(ppp.clone(), owner.clone(), self.retired.clone()),
-        };
-        if needs_sink {
-            match OwnedSink::create(!ipv4, self.controller) {
-                Ok(sink) => {
-                    scope.retirement.set_sink(Some(sink.identity()));
-                    scope.sink = Some(sink);
+        TunnelPlan::prepare(
+            networks,
+            (ipv4, ipv6),
+            || egress.ok_or(Error::Invalid)?.transport_default(),
+            |plan| {
+                let writer = AddWriter::open(self.controller)?;
+                let attachment =
+                    PppAttachment::retain(ppp, self.controller).map_err(|_| Error::Unavailable)?;
+                let mut scope = NativeScope {
+                    ppp: ppp.clone(),
+                    attachment: Some(attachment),
+                    index,
+                    writer,
+                    canceled: canceled.clone(),
+                    sink: None,
+                    transport_default: None,
+                    retirement: Guard::new(ppp.clone(), owner.clone(), self.retired.clone()),
+                };
+                if let Some(sink_ipv4) = plan.sink_ipv4() {
+                    match OwnedSink::create(sink_ipv4, self.controller) {
+                        Ok(sink) => {
+                            scope.retirement.set_sink(Some(sink.identity()));
+                            scope.sink = Some(sink);
+                        }
+                        Err(failure) => {
+                            scope.retirement.set_sink(failure.retired);
+                            return Err(failure.error); // Scope Drop preserves retirement
+                        }
+                    }
                 }
-                Err(failure) => {
-                    scope.retirement.set_sink(failure.retired);
-                    return Err(failure.error); // Scope Drop preserves retirement
-                }
-            }
-        }
-        let mut plan = match plan {
-            Some(plan) => plan,
-            None => ppp_networks(
-                networks,
-                index,
-                ipv4,
-                ipv6,
-                scope.retirement.sink().map(|sink| sink.index),
-            )?,
-        };
-        scope.transport_default = TransportDefault::add_to_plan(&mut plan, || {
-            egress.ok_or(Error::Invalid)?.transport_default()
-        })?;
-        let token =
-            self.registry
-                .register(super::RegisteredScope::Ppp(scope), owner, plan.clone())?;
-        Ok((token, plan))
+                let (plan, transport_default) =
+                    plan.bind(index, scope.retirement.sink().map(|sink| sink.index))?;
+                scope.transport_default = transport_default;
+                let token = self.registry.register(
+                    super::RegisteredScope::Ppp(scope),
+                    owner,
+                    plan.clone(),
+                )?;
+                Ok((token, plan))
+            },
+        )
     }
 }
 

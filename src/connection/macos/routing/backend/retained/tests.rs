@@ -2,11 +2,12 @@
 //! adapter. No configured UTUN is fabricated and no RTM_ADD is attempted.
 use super::*;
 use crate::connection::{
+    macos::ipsec_egress::ipsec_transport_default,
     macos::routing::backend::{
         registry::{Registry, Scope, Table},
         utun_retirement::{Guard, Lifecycle, Pin, Retire, Sink},
     },
-    routes::{Backend, Key, Network},
+    routes::{Backend, Key, Network, ppp_networks},
 };
 use std::sync::{
     Weak,

@@ -7,7 +7,7 @@ use crate::{
     connection::{
         macos::{
             Interfaces,
-            egress::Egress,
+            egress::{Egress, acquire_ssl_routes},
             ppp::{OwnedPpp, OwnershipError},
             ppp_early_cleanup, probe,
             routing::{InterfaceToken, NativeBackend, Snapshot, TransportDefault},
@@ -356,9 +356,14 @@ impl Attempt for NativeAttempt<'_> {
             self.requires_transport_default = plan_requires_transport_default(&plan);
             self.validate_transport_egress()?;
             self.lease = Some(
-                routes
-                    .acquire(self.owner.clone(), &plan)
-                    .map_err(route_acquire_failure)?,
+                acquire_ssl_routes(
+                    &mut routes,
+                    self.owner.clone(),
+                    &plan,
+                    self.egress.as_deref(),
+                    Snapshot::read,
+                )
+                .map_err(route_acquire_failure)?,
             );
             let observation = client.split_observation();
             apply_dns(
