@@ -1,0 +1,107 @@
+import { expect, test } from "bun:test";
+import type { Snapshot } from "./model";
+import { profileOriginRoute, type Route } from "./navigation";
+
+// The hook module imports the bridge, which registers its reply channel on
+// `window` at import time; the bridge itself is not exercised here. The stub
+// exists only for that import and is removed again so it cannot leak into
+// other test files sharing the process.
+const scope = globalThis as unknown as { window?: unknown };
+const previousWindow = scope.window;
+scope.window = {};
+const { reconcileRoute, reconcileComponentError, componentBlocked } =
+  await import("./useAppState");
+if (previousWindow === undefined) delete scope.window;
+else scope.window = previousWindow;
+
+test("só confirmação instalada real reconcilia erro de componente", () => {
+  for (const error of ["componentExpired", "componentUnconfirmed"] as const) {
+    expect(reconcileComponentError(error, snapshot())).toBeUndefined();
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "outdated" })),
+    ).toBe(error);
+    expect(
+      reconcileComponentError(error, snapshot({ helper: "missing" })),
+    ).toBe(error);
+    expect(reconcileComponentError(error, snapshot({ demo: true }))).toBe(
+      error,
+    );
+    expect(
+      reconcileComponentError(
+        error,
+        snapshot({ componentOperation: "settling" }),
+      ),
+    ).toBeUndefined();
+  }
+  expect(reconcileComponentError("profileBusy", snapshot())).toBe(
+    "profileBusy",
+  );
+  expect(reconcileComponentError(undefined, snapshot())).toBeUndefined();
+});
+
+test("origem de perfil resolve Home, Preferências e fallback do host", () => {
+  expect(profileOriginRoute("home")).toEqual({ page: "panel" });
+  expect(profileOriginRoute("preferences")).toEqual({ page: "preferences" });
+  expect(profileOriginRoute()).toEqual({ page: "panel" });
+});
+
+const snapshot = (overrides: Partial<Snapshot> = {}): Snapshot => ({
+  version: "0.1.0",
+  demo: false,
+  helper: "installed",
+  preferences: { interval: 10, notify: true, reconnect: false, startup: false },
+  vpns: [],
+  ...overrides,
+});
+
+// Regression guard (no mutation campaign was run): the first-use screen kept
+// offering Install because a later authoritative installation never
+// reconciled the route it had derived from an earlier snapshot.
+test("onboarding deixa de existir após confirmação tardia de instalado", () => {
+  expect(reconcileRoute({ page: "onboarding" }, snapshot())).toEqual({
+    page: "panel",
+  });
+});
+
+// Regression guard (no mutation campaign was run): the snapshot must not
+// navigate every route, which would discard explicit destinations and profile
+// drafts.
+test("rotas explícitas preservam a intenção do usuário", () => {
+  const routes: Route[] = [
+    { page: "preferences" },
+    { page: "profile", kind: "ipsec" },
+    { page: "profile", id: "p1" },
+    { page: "log", id: "p1" },
+    { page: "about" },
+    { page: "new" },
+    { page: "panel" },
+  ];
+  for (const route of routes)
+    expect(reconcileRoute(route, snapshot())).toBe(route);
+});
+
+// Regression guard (no mutation campaign was run): demo snapshots are retained
+// and marked and must never move the user, and a missing/outdated helper keeps
+// onboarding offering its own action.
+test("demo e helper ausente/desatualizado não redirecionam", () => {
+  const onboarding: Route = { page: "onboarding" };
+  expect(reconcileRoute(onboarding, snapshot({ demo: true }))).toBe(onboarding);
+  expect(reconcileRoute(onboarding, snapshot({ helper: "missing" }))).toBe(
+    onboarding,
+  );
+  expect(reconcileRoute(onboarding, snapshot({ helper: "outdated" }))).toBe(
+    onboarding,
+  );
+});
+
+test("sessão anterior não é ausência nem permite operação de componente", () => {
+  const finishing = snapshot({ helper: "previous_session_finishing" });
+  expect(reconcileRoute({ page: "onboarding" }, finishing)).toEqual({
+    page: "panel",
+  });
+  expect(reconcileRoute({ page: "preferences" }, finishing)).toEqual({
+    page: "preferences",
+  });
+  expect(componentBlocked(finishing)).toBe(true);
+  expect(componentBlocked(snapshot({ helper: "missing" }))).toBe(false);
+});

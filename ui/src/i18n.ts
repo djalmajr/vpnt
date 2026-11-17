@@ -1,0 +1,463 @@
+import nativeCatalogs from "./locales/native.json";
+
+export type Locale = "pt-BR" | "en-US";
+export type LocalePreference = Locale | "system";
+
+const en = {
+  cleanupHint: "Cleaning up the previous attempt…",
+  cleanupUnconfirmedHint:
+    "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.",
+  checkAgain: "Check again",
+  ...nativeCatalogs["en-US"],
+  appName: "VPN Tray",
+  vpns: "VPNs",
+  componentRemoveTitle: "Remove the VPN component?",
+  componentUpdateBlocked: "Disconnect active VPNs to update.",
+  componentInstallBlocked: "Disconnect active VPNs to install.",
+  componentRemoveHint:
+    "Current tunnels will disconnect and this account will lose tunnel access. Profiles and saved credentials are kept. Other registered accounts keep access.",
+  componentInstallPending:
+    "Complete or cancel in macOS Installer, then close its window. Waiting for the installed component to confirm it is ready.",
+  componentRemovePending:
+    "Authorize or cancel in the macOS password dialog. Waiting for removal to finish.",
+  componentSettling:
+    "Waiting for the previous operation to finish. Another installation or removal cannot start yet.",
+  componentBusy: "A component change is still pending.",
+  helperPreviousSession:
+    "The previous session is still finishing. VPN Tray will continue when it ends.",
+  previousSessionFinishing:
+    "The previous session is still finishing. Try again in a moment.",
+  componentExpired:
+    "The operation timed out. It may still be finishing. No new request will be sent automatically.",
+  componentUnconfirmed:
+    "The component change could not be confirmed. Check its status before trying again.",
+  componentIncompatible:
+    "This app cannot use its component package or the installed component. Reopen a complete, compatible VPN Tray app.",
+  adminPending:
+    "Waiting for authorization and confirmation. To cancel, use the macOS authorization dialog.",
+  adminBusy: "Another administrative change is still pending.",
+  profileBusy: "Disconnect this VPN before changing its profile.",
+  adminExpired: "Authorization timed out. No new request will be sent.",
+  adminUnconfirmed:
+    "The change could not be confirmed. Check the profile before trying again.",
+  adminIncompatible:
+    "Update the administrator component before changing profiles.",
+  secretCleanupFailed:
+    "The profile was removed, but its saved credentials could not be deleted.",
+  preferences: "Preferences",
+  back: "Back",
+  options: "Options",
+  close: "Close",
+  loading: "Loading…",
+  remove: "Remove",
+  general: "General",
+  language: "Language",
+  system: "System",
+  theme: "Theme",
+  light: "Light",
+  dark: "Dark",
+  startAtLogin: "Open at login",
+  testEveryHelp:
+    "How often VPN Tray checks that each connected tunnel still carries traffic.",
+  notifyStaleHelp:
+    "Shows a notification when a connected tunnel stops carrying traffic.",
+  autoReconnectHelp:
+    "After 3 failed checks in a row, VPN Tray disconnects the tunnel and connects it again.",
+  componentHelp:
+    "A small privileged component starts and stops tunnels only for the registered VPN profiles. Installing or removing it asks for an administrator password.",
+  tunnelTest: "Tunnel test",
+  testEvery: "Test every",
+  seconds: "{count} s",
+  notifyStale: "Notify when unresponsive",
+  autoReconnect: "Reconnect automatically",
+  afterThree: "After 3 failed checks",
+  administrator: "Administrator access",
+  helperInstalled: "Component installed",
+  helperMissing: "Component not installed",
+  helperHint: "Required to start tunnels",
+  install: "Install",
+  installedHint: "Connect without entering your password",
+  about: "About",
+  aboutText:
+    "Connect and monitor VPNs from the menu bar. Open source, MIT license.",
+  projectPage: "Project page",
+  version: "VPN Tray {version}",
+  addVpn: "Add VPN",
+  newVpn: "New VPN",
+  chooseType: "Choose a type",
+  ipsec: "IPsec IKEv2",
+  ssl: "Fortinet SSL VPN",
+  ipsecHint: "strongSwan: username, password and key",
+  sslHint: "openfortivpn: username and password",
+  programsHint: "The VPN component includes the required clients.",
+  name: "Name",
+  type: "Type",
+  gateway: "Gateway",
+  username: "Username",
+  profileDetails: "Details for {name}",
+  usernameShellError:
+    "This looks like a shell expression; enter the literal username.",
+  secretShellWarning:
+    "This looks like a shell expression. Secrets are used literally; check that this is the intended value.",
+  dnsDomains: "Internal domains",
+  dnsDomainsHint:
+    "Optional. While connected, these domains use the VPN's DNS; everything else is unchanged. E.g. corp.example.com",
+  networks: "Networks",
+  networksHint: "Only these networks use the tunnel. Empty: full tunnel.",
+  networksHintSsl:
+    "Only these networks use the tunnel. Empty: the routes the gateway publishes.",
+  probeHost: "Address",
+  probeHostHint: "A destination machine, not the router.",
+  method: "Method",
+  pingTcp: "Ping, then TCP",
+  tcp: "TCP only",
+  tcpPort: "TCP port",
+  probePortHint: "Never port 22: the server may block your address.",
+  port: "Port",
+  certificate: "Certificate",
+  certificateHint: "Accepted server certificate fingerprint.",
+  routes: "Routes",
+  fullTunnel: "Full tunnel",
+  gatewayRoutes: "Gateway routes",
+  secrets: "Secrets",
+  psk: "Gateway key (PSK)",
+  password: "User password",
+  stored: "Stored in the keychain",
+  notStored: "Not provided",
+  change: "Change",
+  provide: "Provide",
+  save: "Save",
+  saveRequiresAdmin: "Saving requires an administrator password.",
+  removeVpn: "Remove VPN",
+  cancel: "Cancel",
+  reconnect: "Reconnect",
+  disconnect: "Disconnect",
+  tryAgain: "Try again",
+  changePassword: "Change password",
+  providePassword: "Provide password",
+  viewLog: "View log",
+  disconnectAll: "Disconnect all",
+  testNow: "Test now",
+  quit: "Quit",
+  emptyTitle: "No VPNs configured",
+  emptyHint: "Add an IPsec IKEv2 or Fortinet SSL VPN to connect here.",
+  helperBanner:
+    "Install the component that starts tunnels. It requires your administrator password once.",
+  welcomeTitle: "One step to go",
+  welcomeHint:
+    "Starting a tunnel requires administrator access. VPN Tray installs a small component so you do not need to enter your password every time.",
+  component: "Component",
+  installing: "Installing…",
+  installConfirm:
+    "Confirm with your administrator password in the system dialog.",
+  installFailed: "Could not install",
+  installedTitle: "Component installed",
+  installedNext: "Now add your first VPN.",
+  log: "Log",
+  noLog: "No log yet",
+  noLogHint: "No connections have been made with this VPN.",
+  loadingLog: "Reading log…",
+  lastLines: "Last 60 lines",
+  copy: "Copy",
+  copied: "Copied",
+  refresh: "Refresh",
+  removeTitle: "Remove {name}?",
+  removeHint:
+    "The profile and its keychain secrets will be deleted. The tunnel is disconnected first.",
+  discardTitle: "Discard changes?",
+  discardHint: "Your changes have not been saved.",
+  keepEditing: "Keep editing",
+  discard: "Discard",
+  secretsTitle: "Secrets for {name}",
+  secretsHint: "Stored in the system keychain, never in a profile file.",
+  store: "Store",
+  storeConnect: "Store and connect",
+  demo: "Demonstration",
+  demoHint: "Fictional profiles. No VPN connection is made.",
+  demoState: "Demonstration state",
+  backendUnavailable:
+    "Could not reach VPN Tray. Reopen the panel to try again.",
+  preferencesNotConfirmed:
+    "The change was not confirmed. It may still be applied.",
+  preferencesUnavailable: "Could not save the preferences.",
+  startupRequiresApproval:
+    "Allow VPN Tray to open at login in System Settings.",
+  startupUnavailable: "Opening at login is not available in this version.",
+  invalidName: "Enter a name.",
+  invalidGateway: "Enter a valid gateway.",
+  invalidNetwork: "Invalid network. Example: 10.20.0.0/24",
+  invalidProbe: "Enter a destination and a port from 1 to 65535, except 22.",
+  error: "Could not complete the action.",
+  notImplemented: "This feature is not available in this development version.",
+  staleHint:
+    "The tunnel appears connected, but traffic is not getting through.",
+  droppedHint: "The server closed the connection.",
+  credentialsHint: "The server rejected your username or password.",
+  timeoutHint: "The gateway did not respond within 60 seconds.",
+  secretHint: "The password for this VPN is not in the keychain.",
+  programHint: "Install the VPN client and try again.",
+  checked: "Tunnel checked",
+  noNetwork: "No network connection",
+  waitingHelper: "Waiting for the component",
+  update: "Update",
+  helperOutdated: "The installed component needs an update.",
+  "state.off": "Disconnected",
+  "state.connecting": "Connecting…",
+  "state.verifying": "Connected · testing the tunnel…",
+  "state.connected": "Connected",
+  "state.unresponsive": "No response through the tunnel",
+  "state.reconnecting": "Reconnecting…",
+  "state.disconnecting": "Disconnecting…",
+  "state.dropped": "Connection dropped",
+  "state.credentials_rejected": "Could not connect",
+  "state.gateway_timeout": "Gateway did not respond",
+  "state.missing_secret": "Password required",
+  "state.missing_program": "VPN client missing",
+  "state.offline": "No network connection",
+  "state.helper_missing": "Waiting for the component",
+  "state.cleanup_unconfirmed": "Cleanup unconfirmed",
+};
+
+export type MessageKey = keyof typeof en;
+const pt: Record<MessageKey, string> = {
+  cleanupHint: "Limpando a tentativa anterior…",
+  cleanupUnconfirmedHint:
+    "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis.",
+  checkAgain: "Conferir de novo",
+  ...nativeCatalogs["pt-BR"],
+  appName: "VPN Tray",
+  vpns: "VPNs",
+  componentRemoveTitle: "Remover o componente de VPN?",
+  componentUpdateBlocked: "Desligue as VPNs ativas para atualizar.",
+  componentInstallBlocked: "Desligue as VPNs ativas para instalar.",
+  componentRemoveHint:
+    "Os túneis atuais serão desligados e esta conta perderá o acesso aos túneis. Perfis e credenciais salvas serão mantidos. Outras contas cadastradas continuam com acesso.",
+  componentInstallPending:
+    "Conclua ou cancele no Instalador do macOS e feche a janela dele. Aguardando o componente instalado confirmar que está pronto.",
+  componentRemovePending:
+    "Autorize ou cancele no diálogo de senha do macOS. Aguardando o término da remoção.",
+  componentSettling:
+    "Aguardando o encerramento da operação anterior. Ainda não é possível iniciar outra instalação ou remoção.",
+  componentBusy: "Uma alteração do componente ainda está pendente.",
+  helperPreviousSession:
+    "A sessão anterior ainda está terminando. O VPN Tray continua quando ela acabar.",
+  previousSessionFinishing:
+    "A sessão anterior ainda está terminando. Tente de novo em instantes.",
+  componentExpired:
+    "O prazo da operação venceu. Ela ainda pode estar terminando. Nenhum novo pedido será enviado automaticamente.",
+  componentUnconfirmed:
+    "Não foi possível confirmar a alteração do componente. Confira o estado dele antes de tentar novamente.",
+  componentIncompatible:
+    "Este app não pode usar seu pacote ou o componente instalado. Abra novamente um app VPN Tray completo e compatível.",
+  adminPending:
+    "Aguardando autorização e confirmação. Para cancelar, use o diálogo de autorização do macOS.",
+  adminBusy: "Outra alteração administrativa ainda está pendente.",
+  profileBusy: "Desligue esta VPN antes de alterar seu perfil.",
+  adminExpired: "A autorização expirou. Nenhum novo pedido será enviado.",
+  adminUnconfirmed:
+    "Não foi possível confirmar a alteração. Confira o perfil antes de tentar novamente.",
+  adminIncompatible:
+    "Atualize o componente de administrador antes de alterar os perfis.",
+  secretCleanupFailed:
+    "O perfil foi removido, mas não foi possível apagar suas credenciais salvas.",
+  preferences: "Preferências",
+  back: "Voltar",
+  options: "Opções",
+  close: "Fechar",
+  loading: "Carregando…",
+  remove: "Remover",
+  general: "Geral",
+  language: "Idioma",
+  system: "Sistema",
+  theme: "Tema",
+  light: "Claro",
+  dark: "Escuro",
+  startAtLogin: "Abrir ao iniciar a sessão",
+  testEveryHelp:
+    "Intervalo em que o VPN Tray verifica se cada túnel conectado ainda passa tráfego.",
+  notifyStaleHelp:
+    "Mostra uma notificação quando um túnel conectado para de passar tráfego.",
+  autoReconnectHelp:
+    "Depois de 3 testes seguidos com falha, o VPN Tray desliga o túnel e conecta de novo.",
+  componentHelp:
+    "Um pequeno componente privilegiado inicia e encerra túneis somente dos perfis de VPN cadastrados. Instalar ou remover pede a senha de administrador.",
+  tunnelTest: "Teste do túnel",
+  testEvery: "Testar a cada",
+  seconds: "{count} s",
+  notifyStale: "Avisar se ficar sem resposta",
+  autoReconnect: "Reconectar sozinho",
+  afterThree: "Depois de 3 testes sem resposta",
+  administrator: "Acesso de administrador",
+  helperInstalled: "Componente instalado",
+  helperMissing: "Componente não instalado",
+  helperHint: "Sem ele não dá para ligar túneis",
+  install: "Instalar",
+  installedHint: "Liga e desliga sem pedir senha",
+  about: "Sobre",
+  aboutText:
+    "Liga, desliga e acompanha VPNs pela barra de menus. Código aberto, licença MIT.",
+  projectPage: "Página do projeto",
+  version: "VPN Tray {version}",
+  addVpn: "Adicionar VPN",
+  newVpn: "Nova VPN",
+  chooseType: "Escolha o tipo",
+  ipsec: "IPsec IKEv2",
+  ssl: "SSL VPN Fortinet",
+  ipsecHint: "strongSwan: usuário, senha e chave",
+  sslHint: "openfortivpn: usuário e senha",
+  programsHint: "O componente de VPN inclui os clientes necessários.",
+  name: "Nome",
+  type: "Tipo",
+  gateway: "Gateway",
+  username: "Usuário",
+  profileDetails: "Detalhes de {name}",
+  usernameShellError:
+    "Isto parece uma expressão de shell; informe o nome de usuário literal.",
+  secretShellWarning:
+    "Isto parece uma expressão de shell. Os segredos são usados literalmente; confira se este é o valor desejado.",
+  dnsDomains: "Domínios internos",
+  dnsDomainsHint:
+    "Opcional. Com a VPN ligada, estes domínios usam o DNS da VPN; o resto não muda. Ex.: corp.example.com",
+  networks: "Redes",
+  networksHint: "Só estas redes passam pelo túnel. Vazio: túnel completo.",
+  networksHintSsl:
+    "Só estas redes passam pelo túnel. Vazio: as rotas que o gateway publica.",
+  probeHost: "Endereço",
+  probeHostHint: "Uma máquina do destino, não o roteador.",
+  method: "Método",
+  pingTcp: "Ping, depois TCP",
+  tcp: "Só TCP",
+  tcpPort: "Porta TCP",
+  probePortHint: "Nunca a 22: o servidor pode banir o endereço.",
+  port: "Porta",
+  certificate: "Certificado",
+  certificateHint: "Impressão digital aceita do servidor.",
+  routes: "Rotas",
+  fullTunnel: "Túnel completo",
+  gatewayRoutes: "Rotas do gateway",
+  secrets: "Segredos",
+  psk: "Chave do gateway (PSK)",
+  password: "Senha do usuário",
+  stored: "Guardada no chaveiro",
+  notStored: "Não informada",
+  change: "Trocar",
+  provide: "Informar",
+  save: "Salvar",
+  saveRequiresAdmin: "Salvar pede a senha de administrador.",
+  removeVpn: "Remover VPN",
+  cancel: "Cancelar",
+  reconnect: "Reconectar",
+  disconnect: "Desligar",
+  tryAgain: "Tentar de novo",
+  changePassword: "Trocar senha",
+  providePassword: "Informar senha",
+  viewLog: "Ver log",
+  disconnectAll: "Desligar tudo",
+  testNow: "Testar agora",
+  quit: "Sair",
+  emptyTitle: "Nenhuma VPN cadastrada",
+  emptyHint:
+    "Cadastre uma VPN IPsec IKEv2 ou SSL VPN Fortinet para ligar por aqui.",
+  helperBanner:
+    "Falta instalar o componente que liga os túneis. É uma vez só, com a senha de administrador.",
+  welcomeTitle: "Falta um passo",
+  welcomeHint:
+    "Ligar um túnel exige acesso de administrador. O VPN Tray instala um componente pequeno para não pedir a senha toda vez.",
+  component: "Componente",
+  installing: "Instalando…",
+  installConfirm: "Confirme com a senha de administrador na janela do sistema.",
+  installFailed: "Não foi possível instalar",
+  installedTitle: "Componente instalado",
+  installedNext: "Agora cadastre a primeira VPN.",
+  log: "Log",
+  noLog: "Ainda não há log",
+  noLogHint: "Nenhuma conexão foi feita com esta VPN.",
+  loadingLog: "Lendo o log…",
+  lastLines: "Últimas 60 linhas",
+  copy: "Copiar",
+  copied: "Copiado",
+  refresh: "Atualizar",
+  removeTitle: "Remover a VPN {name}?",
+  removeHint:
+    "O perfil e os segredos dela no chaveiro são apagados. O túnel é desligado antes.",
+  discardTitle: "Descartar as mudanças?",
+  discardHint: "As alterações ainda não foram salvas.",
+  keepEditing: "Continuar editando",
+  discard: "Descartar",
+  secretsTitle: "Segredos de {name}",
+  secretsHint: "Ficam no chaveiro do sistema, nunca em um arquivo de perfil.",
+  store: "Guardar",
+  storeConnect: "Guardar e conectar",
+  demo: "Demonstração",
+  demoHint: "Perfis fictícios. Nenhuma conexão de VPN é feita.",
+  demoState: "Estado da demonstração",
+  backendUnavailable:
+    "Não foi possível falar com o VPN Tray. Abra o painel de novo para tentar.",
+  preferencesNotConfirmed:
+    "A alteração não foi confirmada. Ela ainda pode ser aplicada.",
+  preferencesUnavailable: "Não foi possível salvar as preferências.",
+  startupRequiresApproval:
+    "Permita a abertura no login nos Ajustes do Sistema.",
+  startupUnavailable:
+    "Abrir ao iniciar a sessão ainda não está disponível nesta versão.",
+  invalidName: "Informe um nome.",
+  invalidGateway: "Informe um gateway válido.",
+  invalidNetwork: "Rede inválida. Exemplo: 10.20.0.0/24",
+  invalidProbe: "Informe um destino e uma porta de 1 a 65535, exceto 22.",
+  error: "Não foi possível concluir a ação.",
+  notImplemented:
+    "Esta função ainda não está disponível nesta versão de desenvolvimento.",
+  staleHint: "O túnel parece ligado, mas nada passa por ele.",
+  droppedHint: "O servidor encerrou a conexão.",
+  credentialsHint: "O servidor recusou o usuário ou a senha.",
+  timeoutHint: "O gateway não respondeu em 60 segundos.",
+  secretHint: "A senha desta VPN não está no chaveiro.",
+  programHint: "Instale o cliente de VPN e tente de novo.",
+  checked: "Túnel testado",
+  noNetwork: "Sem rede no computador",
+  waitingHelper: "Aguardando o componente",
+  update: "Atualizar",
+  helperOutdated: "O componente instalado precisa ser atualizado.",
+  "state.off": "Desligado",
+  "state.connecting": "Conectando…",
+  "state.verifying": "Conectado · testando o túnel…",
+  "state.connected": "Conectado",
+  "state.unresponsive": "Sem resposta pelo túnel",
+  "state.reconnecting": "Reconectando…",
+  "state.disconnecting": "Desligando…",
+  "state.dropped": "A conexão caiu",
+  "state.credentials_rejected": "Não conectou",
+  "state.gateway_timeout": "O gateway não respondeu",
+  "state.missing_secret": "Falta a senha",
+  "state.missing_program": "Falta o cliente de VPN",
+  "state.offline": "Sem rede no computador",
+  "state.helper_missing": "Aguardando o componente",
+  "state.cleanup_unconfirmed": "Limpeza não confirmada",
+};
+
+export const catalogs: Record<Locale, Record<MessageKey, string>> = {
+  "pt-BR": pt,
+  "en-US": en,
+};
+
+export function resolveLocale(
+  preference: LocalePreference,
+  languages: readonly string[],
+): Locale {
+  if (preference !== "system") return preference;
+  for (const language of languages) {
+    if (/^pt(?:-|$)/i.test(language)) return "pt-BR";
+    if (/^en(?:-|$)/i.test(language)) return "en-US";
+  }
+  return "en-US";
+}
+
+export function translate(
+  locale: Locale,
+  key: MessageKey,
+  values: Record<string, string | number> = {},
+): string {
+  return catalogs[locale][key].replace(/\{(\w+)\}/g, (match, name: string) =>
+    String(values[name] ?? match),
+  );
+}

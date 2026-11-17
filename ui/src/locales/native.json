@@ -1,0 +1,18 @@
+{
+  "en-US": {
+    "authTitle": "VPN Tray — Administrator access",
+    "authPrompt": "Enter your account password to authorize this VPN administration change.",
+    "authConfirm": "Authorize",
+    "authCancel": "Cancel",
+    "unresponsiveTitle": "VPN is not responding",
+    "unresponsiveBody": "Traffic is not getting through the {profile} tunnel."
+  },
+  "pt-BR": {
+    "authTitle": "VPN Tray — Acesso de administrador",
+    "authPrompt": "Digite a senha da sua conta para autorizar esta alteração administrativa de VPN.",
+    "authConfirm": "Autorizar",
+    "authCancel": "Cancelar",
+    "unresponsiveTitle": "VPN sem resposta",
+    "unresponsiveBody": "O tráfego não está passando pelo túnel de {profile}."
+  }
+}

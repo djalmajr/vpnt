@@ -1,0 +1,91 @@
+--- a/src/charon/charon.c
++++ b/src/charon/charon.c
+@@ -42,6 +42,9 @@
+  * PID file, in which charon stores its process id
+  */
+ #define PID_FILE IPSEC_PIDDIR "/charon.pid"
++
++/* vpnt: configured only by the root helper, one instance per profile. */
++static char *vpnt_pid_file = PID_FILE;
+ 
+ /**
+  * Default user and group
+@@ -191,7 +194,7 @@
+ #ifndef WIN32
+ 	flags |= O_NOFOLLOW;
+ #endif
+-	fd = open(PID_FILE, O_RDONLY | flags);
++	fd = open(vpnt_pid_file, O_RDONLY | flags);
+ 	if (fd != -1)
+ 	{
+ 		if (fstat(fd, &stb) == 0 && S_ISREG(stb.st_mode))
+@@ -217,7 +220,7 @@
+ 			}
+ 			if (pid && pid != getpid() && kill(pid, 0) == 0)
+ 			{
+-				DBG1(DBG_DMN, "charon already running ('"PID_FILE"' exists)");
++				DBG1(DBG_DMN, "charon already running ('%s' exists)", vpnt_pid_file);
+ 				return TRUE;
+ 			}
+ 		}
+@@ -229,21 +232,21 @@
+ 
+ 	if (fd != -1 || errno != ENOENT)
+ 	{
+-		DBG1(DBG_DMN, "removing pidfile '"PID_FILE"', process not running");
+-		unlink(PID_FILE);
++		DBG1(DBG_DMN, "removing pidfile '%s', process not running", vpnt_pid_file);
++		unlink(vpnt_pid_file);
+ 	}
+ 
+ 	/* create new pidfile securely without following symlinks */
+-	fd = open(PID_FILE, O_CREAT | O_EXCL | O_WRONLY, 0644);
++	fd = open(vpnt_pid_file, O_CREAT | O_EXCL | O_WRONLY, 0644);
+ 	if (fd == -1)
+ 	{
+-		DBG1(DBG_DMN, "unable to create pidfile '"PID_FILE"'");
++		DBG1(DBG_DMN, "unable to create pidfile '%s'", vpnt_pid_file);
+ 		return TRUE;
+ 	}
+ 	if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1)
+ 	{
+-		DBG1(DBG_LIB, "setting FD_CLOEXEC for '"PID_FILE"' failed: %s",
+-			 strerror(errno));
++		DBG1(DBG_LIB, "setting FD_CLOEXEC for '%s' failed: %s",
++			 vpnt_pid_file, strerror(errno));
+ 	}
+ 	/* Only change owner of the pidfile if we have CAP_CHOWN. Otherwise,
+ 	 * attempt to change group of pidfile to group under which charon
+@@ -266,10 +269,10 @@
+ 	pidfile = fdopen(fd, "w");
+ 	if (!pidfile)
+ 	{
+-		DBG1(DBG_DMN, "unable to open pidfile '"PID_FILE"': %s",
+-			 strerror(errno));
++		DBG1(DBG_DMN, "unable to open pidfile '%s': %s",
++			 vpnt_pid_file, strerror(errno));
+ 		close(fd);
+-		unlink(PID_FILE);
++		unlink(vpnt_pid_file);
+ 		return TRUE;
+ 	}
+ 	fprintf(pidfile, "%d\n", getpid());
+@@ -290,7 +293,7 @@
+ 	{
+ 		ignore_result(ftruncate(fileno(pidfile), 0));
+ 		fclose(pidfile);
+-		unlink(PID_FILE);
++		unlink(vpnt_pid_file);
+ 	}
+ }
+ 
+@@ -435,6 +438,9 @@
+ 		DBG1(DBG_DMN, "daemon 'charon': passed file integrity test");
+ 	}
+ 
++	vpnt_pid_file = lib->settings->get_str(lib->settings,
++										 "charon.vpnt_pid_file", PID_FILE);
++
+ 	/* initialize daemon */
+ 	if (!charon->initialize(charon,
+ 				lib->settings->get_str(lib->settings, "charon.load", PLUGINS)))

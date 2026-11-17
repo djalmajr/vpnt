@@ -1,0 +1,120 @@
+[package]
+name = "vpnt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "A menu bar app for configurable VPN connections"
+repository = "https://github.com/djalmajr/vpnt"
+default-run = "vpnt"
+
+[features]
+default = ["desktop"]
+desktop = [
+    "dep:tao",
+    "dep:wry",
+    "dep:tray-icon",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-quartz-core",
+    "dep:objc2-foundation",
+    "dep:objc2-service-management",
+    "dep:objc2-user-notifications",
+    "dep:block2",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+tiny_http = "0.12"
+zeroize = { version = "1", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
+tray-icon = { version = "0.26.1", optional = true }
+security-framework = "3.7"
+security-framework-sys = "2.17"
+core-foundation = "0.10"
+# Login item (SMAppService). Locked versions only: objc2 0.6.5, objc2-foundation 0.3.2.
+objc2 = { version = "0.6", optional = true }
+# Native SF Symbols and outer popover clipping. Use the already-locked AppKit
+# and QuartzCore versions, declaring the bindings these adapters consume.
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+    "NSButton",
+    "NSCell",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSImage",
+    "NSResponder",
+    "NSScreen",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "NSWindow",
+] }
+objc2-quartz-core = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CALayer",
+    "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSString",
+    "NSUserDefaults",
+    "NSDictionary",
+    "NSError",
+    "NSGeometry",
+] }
+objc2-service-management = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "SMAppService",
+    "objc2",
+    "objc2-foundation",
+] }
+
+# User notifications (UNUserNotificationCenter). Locked transitive versions only:
+# objc2-user-notifications 0.3.2, block2 0.6.2.
+objc2-user-notifications = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "UNUserNotificationCenter",
+    "UNNotificationSettings",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "block2",
+] }
+block2 = { version = "0.6.2", optional = true }
+
+[build-dependencies]
+# Locked transitive version; builds only the macOS SDK utun shim.
+cc = "=1.11.1"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[[bin]]
+name = "vpnt"
+path = "src/main.rs"
+
+[[bin]]
+name = "vpnt-pinentry"
+path = "src/bin/vpnt-pinentry.rs"
+
+[[bin]]
+name = "vpnt-pppd"
+path = "src/bin/vpnt-pppd.rs"
+
+[[bin]]
+name = "vpnt-helper"
+path = "src/bin/vpnt-helper.rs"
