@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-struct Fixture {
+pub(crate) struct Fixture {
     fd: RefCell<Option<OwnedFd>>,
     peer: RefCell<UnixStream>,
     interfaces: RefCell<Interfaces>,
@@ -27,7 +27,7 @@ struct Fixture {
     randoms: Cell<usize>,
 }
 impl Fixture {
-    fn new(failure: &'static str) -> Self {
+    pub(crate) fn new(failure: &'static str) -> Self {
         let (fd, peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         Self {
@@ -45,6 +45,23 @@ impl Fixture {
             randoms: Cell::new(0),
         }
     }
+    pub(crate) fn with_sink<T>(&self, ipv4: bool, use_sink: impl FnOnce(u16) -> T) -> T {
+        let sink = create_using(ipv4, self, || Ok(())).ok().unwrap();
+        let result = use_sink(sink.identity.index);
+        drop(sink);
+        self.closed();
+        result
+    }
+
+    pub(crate) fn connections_and_aliases(&self) -> (usize, usize) {
+        let calls = self.calls.borrow();
+        let count = |name| calls.iter().filter(|&&call| call == name).count();
+        (
+            count("connect-new-unit"),
+            count("assign-only-own-interface"),
+        )
+    }
+
     fn closed(&self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -256,23 +273,7 @@ fn transport_refusal_precedes_sink_creation_and_alias_assignment() {
                 plan.bind(3, Some(sink.identity.index))
             });
             assert_eq!(result, Err(Error::Conflict));
-            assert_eq!(
-                (
-                    fixture
-                        .calls
-                        .borrow()
-                        .iter()
-                        .filter(|&&call| call == "connect-new-unit")
-                        .count(),
-                    fixture
-                        .calls
-                        .borrow()
-                        .iter()
-                        .filter(|&&call| call == "assign-only-own-interface")
-                        .count()
-                ),
-                (0, 0),
-            );
+            assert_eq!(fixture.connections_and_aliases(), (0, 0));
             assert!(fixture.calls.borrow().is_empty());
         }
 

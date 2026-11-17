@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::macos::egress::prepare_ssl_plan;
 
 impl<'a> NativeBackend<'a> {
     pub(crate) fn retirement_queue(&self) -> retirement::Queue {
@@ -71,10 +72,12 @@ impl<'a> NativeBackend<'a> {
             .ok_or(Error::Invalid)?;
         let ipv4 = ppp.addresses().any(|ip| ip.is_ipv4());
         let ipv6 = ppp.addresses().any(|ip| ip.is_ipv6());
-        TunnelPlan::prepare(
+        prepare_ssl_plan(
             networks,
             (ipv4, ipv6),
-            || egress.ok_or(Error::Invalid)?.transport_default(),
+            egress,
+            // ready holds the coordinator lock through registration and acquire.
+            Snapshot::read,
             |plan| {
                 let writer = AddWriter::open(self.controller)?;
                 let attachment =

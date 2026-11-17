@@ -225,3 +225,6 @@ fn address_unused(source: IpAddr, interfaces: &Interfaces, table: &Snapshot) -> 
 #[cfg(test)]
 #[path = "sink/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::Fixture as SinkFixture;

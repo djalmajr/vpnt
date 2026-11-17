@@ -3,7 +3,7 @@
 use super::{
     interfaces::{Interface, Interfaces},
     resolve,
-    routing::{Reader, Snapshot, TransportDefault, covers_ipv4},
+    routing::{Reader, Snapshot, TransportDefault, TunnelPlan, covers_ipv4},
     tcp,
 };
 use crate::{
@@ -138,11 +138,6 @@ impl Egress {
             && route.next_hop == self.next_hop
             && record.source == self.source)
     }
-    pub(crate) fn transport_default(&self) -> Result<Option<TransportDefault>, Error> {
-        let index = u16::try_from(self.interface.index).map_err(|_| Error::Invalid)?;
-        TransportDefault::for_plan(index, self.next_hop, self.observed_key)
-    }
-
     fn validate_on_link_transport(
         &self,
         snapshot: impl FnOnce() -> Result<Snapshot, Error>,
@@ -172,6 +167,29 @@ impl Egress {
             gateway: self.gateway,
         })
     }
+}
+
+pub(crate) fn prepare_ssl_plan<T>(
+    networks: &[String],
+    families: (bool, bool),
+    egress: Option<&Egress>,
+    snapshot: impl FnOnce() -> Result<Snapshot, Error>,
+    apply: impl FnOnce(TunnelPlan) -> Result<T, Error>,
+) -> Result<T, Error> {
+    TunnelPlan::prepare(
+        networks,
+        families,
+        || {
+            let egress = egress.ok_or(Error::Invalid)?;
+            if egress.next_hop == NextHop::Interface {
+                egress.validate_on_link_transport(snapshot)?;
+                return Ok(None);
+            }
+            let index = u16::try_from(egress.interface.index).map_err(|_| Error::Invalid)?;
+            TransportDefault::from_egress(index, egress.next_hop).map(Some)
+        },
+        apply,
+    )
 }
 
 pub(crate) fn acquire_ssl_routes<B: Backend>(
@@ -263,10 +281,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn review_ssl_full_plan_uses_stale_on_link_prefix() {
-        use crate::connection::{macos::routing::TunnelPlan, routes::ppp_networks};
-
+    fn on_link_fixture() -> (Egress, Record, Snapshot, Owner) {
         let direct = Record {
             key: Key {
                 network: "192.0.2.0/24".parse().unwrap(),
@@ -281,7 +296,7 @@ mod tests {
         let before = Snapshot {
             records: vec![direct.clone()],
         };
-        let mut egress = Egress {
+        let egress = Egress {
             profile: "review-fixture".into(),
             host: "192.0.2.90".into(),
             port: 443,
@@ -297,7 +312,15 @@ mod tests {
             source: direct.source,
         };
         assert_eq!(egress.observed_key, Some(old.key));
-        assert_eq!(egress.transport_default(), Ok(None));
+        let owner = Owner {
+            uid: 501,
+            profile: "review-fixture".into(),
+            generation: 1,
+        };
+        (egress, direct, before, owner)
+    }
+
+    fn changed_on_link_routes(direct: &Record) -> [(&'static str, Vec<Record>); 5] {
         let fallback = Record {
             key: Key {
                 network: "0.0.0.0/0".parse().unwrap(),
@@ -305,16 +328,7 @@ mod tests {
             },
             ..direct.clone()
         };
-        assert!(fallback.key.network.contains(egress.gateway.into()));
-        assert_eq!(fallback.route().unwrap().next_hop, old.next_hop);
-        let full = ppp_networks(&[], 3, true, false, Some(4)).unwrap();
-        let owner = Owner {
-            uid: 501,
-            profile: "review-fixture".into(),
-            generation: 1,
-        };
-        let mut routes = Coordinator::new(RouteFixture::default()).unwrap();
-        for (name, records) in [
+        [
             ("only /0", vec![fallback]),
             ("missing", vec![]),
             ("duplicate", vec![direct.clone(), direct.clone()]),
@@ -329,10 +343,20 @@ mod tests {
                 "different next hop",
                 vec![Record {
                     flags: direct.flags | libc::RTF_BLACKHOLE,
-                    ..direct
+                    ..direct.clone()
                 }],
             ),
-        ] {
+        ]
+    }
+
+    #[test]
+    fn review_ssl_full_plan_uses_stale_on_link_prefix() {
+        use crate::connection::routes::ppp_networks;
+
+        let (mut egress, direct, before, owner) = on_link_fixture();
+        let full = ppp_networks(&[], 3, true, false, Some(4)).unwrap();
+        let mut routes = Coordinator::new(RouteFixture::default()).unwrap();
+        for (name, records) in changed_on_link_routes(&direct) {
             let result =
                 acquire_ssl_routes(&mut routes, owner.clone(), &full, Some(&egress), || {
                     Ok(Snapshot { records })
@@ -355,7 +379,15 @@ mod tests {
         assert_eq!(routes.backend_mut().installed, full);
         assert_eq!(routes.release(lease).unwrap().removed, full.len());
 
-        let split = ppp_networks(&["10.0.0.0/8".into()], 3, true, false, None).unwrap();
+        let (split, default) = prepare_ssl_plan(
+            &["10.0.0.0/8".into()],
+            (true, false),
+            Some(&egress),
+            || panic!("split preparation has no on-link proof dependency"),
+            |plan| plan.bind(3, None),
+        )
+        .unwrap();
+        assert_eq!(default, None);
         let lease = acquire_ssl_routes(&mut routes, owner.clone(), &split, Some(&egress), || {
             panic!("split has no on-link proof dependency")
         })
@@ -363,10 +395,11 @@ mod tests {
         assert_eq!(routes.release(lease).unwrap().removed, split.len());
 
         egress.next_hop = NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap()));
-        let (scoped, default) = TunnelPlan::prepare(
+        let (scoped, default) = prepare_ssl_plan(
             &[],
             (true, false),
-            || egress.transport_default(),
+            Some(&egress),
+            || panic!("scoped default preparation uses the existing egress check"),
             |plan| plan.bind(3, Some(4)),
         )
         .unwrap();
@@ -377,6 +410,65 @@ mod tests {
         .unwrap();
         assert_eq!(routes.release(lease).unwrap().removed, scoped.len());
         assert!(routes.backend_mut().installed.is_empty());
+    }
+
+    #[test]
+    fn review_sink_alias_precedes_fresh_ssl_refusal() {
+        use crate::connection::macos::sink::SinkFixture;
+
+        let (egress, direct, before, owner) = on_link_fixture();
+        for (name, records) in changed_on_link_routes(&direct) {
+            let fixture = SinkFixture::new("");
+            let mut routes = Coordinator::new(RouteFixture::default()).unwrap();
+            let result = prepare_ssl_plan(
+                &[],
+                (true, false),
+                Some(&egress),
+                || {
+                    Ok(Snapshot {
+                        records: records.clone(),
+                    })
+                },
+                |plan| {
+                    fixture.with_sink(plan.sink_ipv4().unwrap(), |index| {
+                        let (plan, _) = plan.bind(3, Some(index))?;
+                        acquire_ssl_routes(&mut routes, owner.clone(), &plan, Some(&egress), || {
+                            Ok(Snapshot {
+                                records: records.clone(),
+                            })
+                        })
+                        .map_err(|error| error.reason)
+                    })
+                },
+            );
+            assert_eq!(result.err(), Some(Error::Conflict), "{name}");
+            assert_eq!(fixture.connections_and_aliases(), (0, 0), "{name}");
+            assert_eq!(routes.backend_mut().adds, 0, "{name}");
+        }
+
+        // The first snapshot can pass, then the route can disappear while the
+        // sink is created. The second read must still refuse before any ADD.
+        let fixture = SinkFixture::new("");
+        let mut routes = Coordinator::new(RouteFixture::default()).unwrap();
+        let result = prepare_ssl_plan(
+            &[],
+            (true, false),
+            Some(&egress),
+            || Ok(before),
+            |plan| {
+                fixture.with_sink(plan.sink_ipv4().unwrap(), |index| {
+                    assert_eq!(fixture.connections_and_aliases(), (1, 1));
+                    let (plan, _) = plan.bind(3, Some(index))?;
+                    acquire_ssl_routes(&mut routes, owner, &plan, Some(&egress), || {
+                        Ok(Snapshot { records: vec![] })
+                    })
+                    .map_err(|error| error.reason)
+                })
+            },
+        );
+        assert_eq!(result.err(), Some(Error::Conflict));
+        assert_eq!(fixture.connections_and_aliases(), (1, 1));
+        assert_eq!(routes.backend_mut().adds, 0);
     }
 
     #[test]
