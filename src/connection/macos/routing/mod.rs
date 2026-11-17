@@ -1,16 +1,18 @@
 //! Native routing. Reader stays GET-only; the separate privileged writer can
-//! only ADD to a retained, verified PPP interface. No DELETE/CHANGE API exists.
+//! adds retained interface routes and manages one typed egress default.
 mod add_codec;
 mod backend;
 mod codec;
 mod read;
 mod resource_fence;
+mod transport_default;
 mod write;
 use crate::connection::routes::{Address, Error, Key, Network, NextHop, Route};
 pub(crate) use backend::retirement;
 pub use backend::{InterfaceToken, NativeBackend, NativeReceipt};
 pub use read::{Reader, Snapshot};
 pub use resource_fence::{ResourceFence, RouteWork};
+pub(crate) use transport_default::TransportDefault;
 pub use write::{AddReceipt, AddWriter};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]

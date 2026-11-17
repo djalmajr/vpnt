@@ -2,10 +2,11 @@
 //! typed registration entry point. Nothing here fabricates a configured link.
 use super::super::resource_fence::RouteWork;
 use super::utun_retirement::{Guard, Lifecycle, Pin, Retire, UtunPin};
-use super::{AddWriter, Error, NativeBackend, Route, retirement};
+use super::{AddWriter, Error, NativeBackend, Route, TransportDefault, retirement};
 use crate::connection::{
     ipsec::{self, NativeContext, NativePeer, Peer},
     macos::{
+        ipsec_egress::IpsecEgress,
         sink::{OwnedSink, RetiredSink},
         vip::{ConfiguredUtun, Family},
     },
@@ -38,6 +39,7 @@ pub(super) struct UtunScope<'a> {
     writer: AddWriter<'a>,
     canceled: Arc<AtomicBool>,
     sink: Option<OwnedSink<'a>>,
+    transport_default: Option<TransportDefault>,
     // Last: descriptors above close before pending metadata enters the queue.
     retirement: Guard<UtunPin<'a>, Arc<Mutex<NativePeer<'a>>>, RetiredSink>,
 }
@@ -48,6 +50,10 @@ impl super::registry::Scope for UtunScope<'_> {
     }
     fn owns(&self, index: u16) -> bool {
         self.index == index || self.sink.as_ref().is_some_and(|sink| sink.index() == index)
+    }
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        self.transport_default
+            .map(|route| (route, self.canceled.as_ref()))
     }
     fn active(&self) -> Result<(), Error> {
         // Total budget is fixed before any check and shared by every call.
@@ -132,7 +138,7 @@ impl<'a> NativeBackend<'a> {
         link: &Arc<ConfiguredUtun<'a>>,
         producer: (Arc<NativeContext<'a>>, Arc<Mutex<NativePeer<'a>>>),
         owner: Owner,
-        networks: &[String],
+        (networks, egress): (&[String], &IpsecEgress),
         canceled: &Arc<AtomicBool>,
         work: RouteWork,
     ) -> Result<(super::InterfaceToken, Vec<Route>), Error> {
@@ -205,7 +211,7 @@ impl<'a> NativeBackend<'a> {
         } else {
             None
         };
-        let plan = match plan {
+        let mut plan = match plan {
             Some(plan) => plan,
             None => ppp_networks(
                 networks,
@@ -215,6 +221,17 @@ impl<'a> NativeBackend<'a> {
                 sink.as_ref().map(|sink| sink.index()),
             )?,
         };
+        let transport_default = TransportDefault::add_to_plan(&mut plan, || {
+            if egress.remote().is_ipv4() {
+                TransportDefault::from_egress(
+                    egress.interface_index(),
+                    egress.gateway_route().next_hop,
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            }
+        })?;
         let scope = UtunScope {
             pin,
             peer,
@@ -224,6 +241,7 @@ impl<'a> NativeBackend<'a> {
             writer,
             canceled: canceled.clone(),
             sink,
+            transport_default,
             retirement,
         };
         let token =

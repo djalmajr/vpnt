@@ -50,7 +50,7 @@ impl NativeIpsecAttempt<'_> {
                         &link,
                         (context, peer),
                         owner.clone(),
-                        &networks,
+                        (&networks, self.egress.as_deref().ok_or_else(unavailable)?),
                         &canceled,
                         work,
                     )
@@ -69,7 +69,7 @@ impl NativeIpsecAttempt<'_> {
                             Ok(())
                         }
                     })
-                    .map_err(|_| unavailable())?
+                    .map_err(route_acquire_failure)?
             };
             self.lease = Some(OwnedLease::new(lease, owner));
             check(expires, &self.canceled)?;

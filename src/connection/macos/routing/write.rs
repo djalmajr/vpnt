@@ -1,4 +1,7 @@
-use super::{Address, Error, Key, Network, NextHop, Reader, Route, add_codec, codec};
+use super::{
+    Address, Error, Key, Network, NextHop, Reader, Record, Route, TransportDefault, add_codec,
+    codec,
+};
 use crate::{
     connection::macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink, tcp},
     helper::controller_lock::ControllerLock,
@@ -13,7 +16,7 @@ use std::{
 
 static NEXT_ADD: AtomicI32 = AtomicI32::new(1);
 /// An attempted ADD must stay in the cleanup plan even if its ACK is lost.
-/// This is not an identity for a route object and never authorizes DELETE.
+/// The acknowledgement records the dispatch outcome, not a kernel route ID.
 #[must_use = "retain attempted routes until interface teardown and observed cleanup"]
 pub struct AddReceipt {
     route: Route,
@@ -118,6 +121,79 @@ impl<'a> AddWriter<'a> {
         }
         Ok(receipt)
     }
+
+    pub(super) fn add_transport_default(
+        &mut self,
+        route: TransportDefault,
+        canceled: &AtomicBool,
+    ) -> Result<Result<(), Error>, Error> {
+        let confirmation = self.scoped_exchange(add_codec::DefaultRequest::Add, route, canceled)?;
+        let confirmation = confirmation.and_then(|frame| {
+            if route.matches_static(&codec::record(&frame, codec::CLASSIC)?) {
+                Ok(())
+            } else {
+                Err(Error::Changed)
+            }
+        });
+        match confirmation {
+            // The kernel rejected this ADD. A pre-existing row is not ours.
+            Err(Error::Conflict) => Err(Error::Conflict),
+            other => Ok(other),
+        }
+    }
+
+    pub(super) fn get_transport_default(
+        &mut self,
+        route: TransportDefault,
+    ) -> Result<Option<Record>, Error> {
+        let reply = self.scoped_exchange(
+            add_codec::DefaultRequest::Get,
+            route,
+            &AtomicBool::new(false),
+        )?;
+        match reply {
+            Ok(frame) => codec::record(&frame, codec::CLASSIC).map(Some),
+            // No exact route matched; there is no authority to delete.
+            Err(Error::Changed) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn delete_transport_default(
+        &mut self,
+        route: TransportDefault,
+    ) -> Result<Result<(), Error>, Error> {
+        self.scoped_exchange(
+            add_codec::DefaultRequest::Delete,
+            route,
+            &AtomicBool::new(false),
+        )
+        .map(|reply| reply.map(|_| ()))
+    }
+
+    fn scoped_exchange(
+        &mut self,
+        request: add_codec::DefaultRequest,
+        route: TransportDefault,
+        canceled: &AtomicBool,
+    ) -> Result<Result<Vec<u8>, Error>, Error> {
+        self.controller.validate().map_err(|_| Error::Unavailable)?;
+        let pid = i32::try_from(std::process::id()).map_err(|_| Error::Invalid)?;
+        let sequence = sequence()?;
+        let packet = add_codec::scoped_default(request, route, pid, sequence)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reply = send_packet(&self.fd, &packet, deadline, canceled)?.and_then(|()| {
+            reply(
+                &self.fd,
+                request.opcode(),
+                pid,
+                sequence,
+                deadline,
+                canceled,
+            )
+        });
+        Ok(reply)
+    }
 }
 fn sequence() -> Result<i32, Error> {
     let mut value = NEXT_ADD.load(Ordering::Relaxed);
@@ -146,12 +222,26 @@ fn exchange(
     let sequence = sequence()?;
     let packet = add_codec::add(route, source, pid, sequence)?;
     let deadline = Instant::now() + timeout;
+    let confirmation = send_packet(fd, &packet, deadline, canceled)?
+        .and_then(|()| confirm(fd, route, source, pid, sequence, deadline, canceled));
+    Ok(AddReceipt {
+        route,
+        confirmation,
+    })
+}
+
+fn send_packet(
+    fd: &OwnedFd,
+    packet: &[u8],
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Result<Result<(), Error>, Error> {
     tcp::wait(fd.as_raw_fd(), libc::POLLOUT, deadline, canceled).map_err(wait_error)?;
     if canceled.load(Ordering::Acquire) {
         return Err(Error::Canceled);
     }
-    // SAFETY: the owned nonblocking socket and complete ADD packet are live.
-    // Every result after this point retains an attempted-route receipt.
+    // SAFETY: the owned nonblocking socket and complete packet are live.
+    // Dispatch outcomes stay inside the outer Ok so ADD retains a receipt.
     let sent = unsafe {
         libc::send(
             fd.as_raw_fd(),
@@ -160,20 +250,17 @@ fn exchange(
             libc::MSG_NOSIGNAL,
         )
     };
-    let confirmation = if sent < 0 {
+    Ok(if sent < 0 {
         Err(kernel_error(
             io::Error::last_os_error().raw_os_error().unwrap_or(0),
         ))
     } else if sent != packet.len() as isize {
         Err(Error::Unavailable)
     } else {
-        confirm(fd, route, source, pid, sequence, deadline, canceled)
-    };
-    Ok(AddReceipt {
-        route,
-        confirmation,
+        Ok(())
     })
 }
+
 fn confirm(
     fd: &OwnedFd,
     route: Route,
@@ -183,6 +270,22 @@ fn confirm(
     deadline: Instant,
     canceled: &AtomicBool,
 ) -> Result<(), Error> {
+    let frame = reply(fd, libc::RTM_ADD as u8, pid, sequence, deadline, canceled)?;
+    let actual = codec::record(&frame, codec::CLASSIC)?;
+    if actual.route()? != route || actual.source != Some(source) {
+        return Err(Error::Changed);
+    }
+    Ok(())
+}
+
+fn reply(
+    fd: &OwnedFd,
+    opcode: u8,
+    pid: i32,
+    sequence: i32,
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Result<Vec<u8>, Error> {
     let mut bytes = vec![0; 65_536];
     for _ in 0..4096 {
         tcp::wait(fd.as_raw_fd(), libc::POLLIN, deadline, canceled).map_err(wait_error)?;
@@ -203,7 +306,7 @@ fn confirm(
         if frame.len() != length as usize {
             return Err(Error::Invalid);
         }
-        if frame[3] != libc::RTM_ADD as u8 {
+        if frame[3] != opcode {
             continue;
         }
         if frame.len() < size_of::<libc::rt_msghdr>() {
@@ -224,19 +327,16 @@ fn confirm(
         if Instant::now() >= deadline {
             return Err(Error::TimedOut);
         }
-        let actual = codec::record(frame, codec::CLASSIC)?;
-        if actual.route()? != route || actual.source != Some(source) {
-            return Err(Error::Changed);
-        }
-        return Ok(());
+        bytes.truncate(length as usize);
+        return Ok(bytes);
     }
     Err(Error::Limit)
 }
 fn kernel_error(errno: i32) -> Error {
-    if errno == libc::EEXIST {
-        Error::Conflict
-    } else {
-        Error::Unavailable
+    match errno {
+        libc::EEXIST => Error::Conflict,
+        libc::ESRCH => Error::Changed,
+        _ => Error::Unavailable,
     }
 }
 fn wait_error(error: tcp::Error) -> Error {

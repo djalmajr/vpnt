@@ -52,6 +52,7 @@ impl<'a> NativeBackend<'a> {
         owner: Owner,
         networks: &[String],
         canceled: &Arc<AtomicBool>,
+        egress: Option<&crate::connection::macos::egress::Egress>,
     ) -> Result<(InterfaceToken, Vec<Route>), Error> {
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         if canceled.load(Ordering::Acquire) {
@@ -85,6 +86,7 @@ impl<'a> NativeBackend<'a> {
             writer,
             canceled: canceled.clone(),
             sink: None,
+            transport_default: None,
             retirement: Guard::new(ppp.clone(), owner.clone(), self.retired.clone()),
         };
         if needs_sink {
@@ -99,7 +101,7 @@ impl<'a> NativeBackend<'a> {
                 }
             }
         }
-        let plan = match plan {
+        let mut plan = match plan {
             Some(plan) => plan,
             None => ppp_networks(
                 networks,
@@ -109,6 +111,9 @@ impl<'a> NativeBackend<'a> {
                 scope.retirement.sink().map(|sink| sink.index),
             )?,
         };
+        scope.transport_default = TransportDefault::add_to_plan(&mut plan, || {
+            egress.ok_or(Error::Invalid)?.transport_default().map(Some)
+        })?;
         let token =
             self.registry
                 .register(super::RegisteredScope::Ppp(scope), owner, plan.clone())?;
@@ -123,6 +128,7 @@ pub(super) struct NativeScope<'a> {
     writer: AddWriter<'a>,
     canceled: Arc<AtomicBool>,
     sink: Option<OwnedSink<'a>>,
+    transport_default: Option<TransportDefault>,
     // Last: descriptors above close before pending metadata enters the queue.
     retirement: Guard,
 }
@@ -136,6 +142,10 @@ impl Scope for NativeScope<'_> {
                 .retirement
                 .sink()
                 .is_some_and(|sink| sink.index == index)
+    }
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        self.transport_default
+            .map(|route| (route, self.canceled.as_ref()))
     }
     fn active(&self) -> Result<(), Error> {
         if self.canceled.load(Ordering::Acquire) {

@@ -51,6 +51,7 @@ impl ObservedBackend<'_, '_> {
         owner: Owner,
         networks: &[String],
         canceled: &Arc<AtomicBool>,
+        egress: Option<&Egress>,
     ) -> Result<
         (InterfaceToken, Vec<crate::connection::routes::Route>),
         crate::connection::routes::Error,
@@ -60,7 +61,7 @@ impl ObservedBackend<'_, '_> {
                 *observed = networks.to_vec();
             }
         });
-        self.0.register_ppp(link, owner, networks, canceled)
+        self.0.register_ppp(link, owner, networks, canceled, egress)
     }
 }
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
@@ -110,6 +111,7 @@ struct NativeAttempt<'a> {
     before: Option<Interfaces>,
     before_routes: Option<Snapshot>,
     client: Option<SslDriver>,
+    egress: Option<Box<Egress>>,
     link: Option<Arc<OwnedPpp>>,
     token: Option<InterfaceToken>,
     lease: Option<Lease>,
@@ -307,6 +309,7 @@ impl Attempt for NativeAttempt<'_> {
                 },
             )?,
         );
+        self.egress = Some(Box::new(egress));
         self.spawn_attempted = true;
         Ok(())
     }
@@ -324,18 +327,31 @@ impl Attempt for NativeAttempt<'_> {
                     client.note_invalid_split();
                     Failure::unavailable()
                 })?;
+            if let Some(egress) = self.egress.as_ref()
+                && !egress
+                    .is_current(&self.profile)
+                    .map_err(|_| Failure::unavailable())?
+            {
+                return Err(Failure::unavailable());
+            }
             #[cfg(test)]
             let mut backend = ObservedBackend(routes.backend_mut());
             #[cfg(not(test))]
             let backend = routes.backend_mut();
             let (token, plan) = backend
-                .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
+                .register_ppp(
+                    link,
+                    self.owner.clone(),
+                    &networks,
+                    &self.canceled,
+                    self.egress.as_deref(),
+                )
                 .map_err(|_| Failure::unavailable())?;
             self.token = Some(token); // retain before any fallible ADD/lease
             self.lease = Some(
                 routes
                     .acquire(self.owner.clone(), &plan)
-                    .map_err(|_| Failure::unavailable())?,
+                    .map_err(route_acquire_failure)?,
             );
             let observation = client.split_observation();
             apply_dns(
@@ -367,7 +383,14 @@ impl Attempt for NativeAttempt<'_> {
     fn healthy(&mut self) -> Result<(), Failure> {
         self.client_health()?;
         let link = self.link.as_ref().ok_or_else(Failure::unavailable)?;
-        if !link.is_current().unwrap_or(false) {
+        if !link.is_current().unwrap_or(false)
+            || !self
+                .egress
+                .as_ref()
+                .ok_or_else(Failure::unavailable)?
+                .is_current(&self.profile)
+                .map_err(|_| Failure::unavailable())?
+        {
             return Err(Failure::unavailable());
         }
         self.routes
@@ -406,6 +429,19 @@ impl Attempt for NativeAttempt<'_> {
         );
         complete
     }
+}
+
+fn route_acquire_failure(error: crate::connection::routes::AcquireError) -> Failure {
+    if error.reason == crate::connection::routes::Error::Conflict {
+        // SAFETY: the format string is fixed and has no conversion specifiers.
+        unsafe {
+            libc::syslog(
+                libc::LOG_WARNING,
+                c"vpnt: route plan conflicts with an existing route".as_ptr(),
+            )
+        };
+    }
+    Failure::unavailable()
 }
 
 #[cfg(test)]

@@ -129,6 +129,25 @@ impl Table for TestTable {
     fn exact(&mut self, _key: Key) -> Result<Option<Route>, Error> {
         Ok(self.0)
     }
+    fn add_default(
+        &mut self,
+        _: TransportDefault,
+        _: &AtomicBool,
+    ) -> Result<crate::connection::macos::routing::backend::Attempt, Error> {
+        panic!("fixture has no transport default")
+    }
+    fn get_default(
+        &mut self,
+        _: TransportDefault,
+    ) -> Result<Option<crate::connection::macos::routing::Record>, Error> {
+        panic!("fixture has no transport default")
+    }
+    fn delete_default(
+        &mut self,
+        _: TransportDefault,
+    ) -> Result<crate::connection::macos::routing::backend::Attempt, Error> {
+        panic!("fixture has no transport default")
+    }
 }
 
 fn scope(

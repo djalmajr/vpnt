@@ -180,6 +180,7 @@ impl<'a> Factory for NativeFactory<'a> {
             before: None,
             before_routes: None,
             client: None,
+            egress: None,
             link: None,
             token: None,
             lease: None,

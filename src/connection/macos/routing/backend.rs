@@ -1,12 +1,12 @@
-//! Native routes for owned PPP and retained IPsec UTUN scopes. No per-key
-//! delete exists: retire only original processes/pins and observe fresh absence.
+//! Native routes for owned PPP and retained IPsec UTUN scopes, including
+//! the scoped default used by a full tunnel’s physical transport.
 mod ppp;
 mod registry;
 mod retained;
 pub(crate) mod retirement;
 mod utun_absence;
 mod utun_retirement;
-use super::{AddWriter, Error, Key, Route, Snapshot};
+use super::{AddWriter, Error, Key, Record, Route, Snapshot, TransportDefault};
 use crate::{
     connection::{
         macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink},
@@ -40,7 +40,10 @@ impl<'a> NativeBackend<'a> {
         controller.validate().map_err(|_| Error::Unavailable)?;
         Ok(Self {
             controller,
-            registry: Registry::new(NativeTable(controller))?,
+            registry: Registry::new(NativeTable {
+                controller,
+                writer: None,
+            })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
         })
@@ -75,7 +78,10 @@ impl<'a> NativeBackend<'a> {
         controller.validate().map_err(|_| Error::Unavailable)?;
         Ok(Self {
             controller,
-            registry: Registry::new(NativeTable(controller))?,
+            registry: Registry::new(NativeTable {
+                controller,
+                writer: None,
+            })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
         })
@@ -158,6 +164,14 @@ impl Scope for RegisteredScope<'_> {
             Self::Fixture(value) => *value == index,
         }
     }
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        match self {
+            Self::Ppp(scope) => scope.transport_default(),
+            Self::Utun(scope) => scope.transport_default(),
+            #[cfg(test)]
+            Self::Fixture(_) => None,
+        }
+    }
     fn active(&self) -> Result<(), Error> {
         match self {
             Self::Ppp(scope) => scope.active(),
@@ -192,13 +206,41 @@ impl Scope for RegisteredScope<'_> {
     }
 }
 
-struct NativeTable<'a>(&'a ControllerLock);
+struct NativeTable<'a> {
+    controller: &'a ControllerLock,
+    writer: Option<AddWriter<'a>>,
+}
+impl<'a> NativeTable<'a> {
+    fn writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
+        if self.writer.is_none() {
+            self.writer = Some(AddWriter::open(self.controller)?);
+        }
+        Ok(self.writer.as_mut().expect("writer just initialized"))
+    }
+}
 impl Table for NativeTable<'_> {
     fn exact(&mut self, key: Key) -> Result<Option<Route>, Error> {
-        self.0.validate().map_err(|_| Error::Unavailable)?;
+        self.controller.validate().map_err(|_| Error::Unavailable)?;
         Snapshot::read()?
             .exact(key)?
             .map(|record| record.route())
             .transpose()
+    }
+    fn add_default(
+        &mut self,
+        route: TransportDefault,
+        canceled: &AtomicBool,
+    ) -> Result<Attempt, Error> {
+        self.writer()?
+            .add_transport_default(route, canceled)
+            .map(|confirmation| Attempt { confirmation })
+    }
+    fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error> {
+        self.writer()?.get_transport_default(route)
+    }
+    fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error> {
+        self.writer()?
+            .delete_transport_default(route)
+            .map(|confirmation| Attempt { confirmation })
     }
 }

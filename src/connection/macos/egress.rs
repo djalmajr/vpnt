@@ -3,7 +3,7 @@
 use super::{
     interfaces::{Interface, Interfaces},
     resolve,
-    routing::Reader,
+    routing::{Reader, TransportDefault},
     tcp,
 };
 use crate::{
@@ -132,6 +132,11 @@ impl Egress {
             && route.next_hop == self.next_hop
             && record.source == self.source)
     }
+    pub(crate) fn transport_default(&self) -> Result<TransportDefault, Error> {
+        let index = u16::try_from(self.interface.index).map_err(|_| Error::Invalid)?;
+        TransportDefault::from_egress(index, self.next_hop)
+    }
+
     pub(crate) fn binding(&self, profile: &Profile) -> Result<Binding, Error> {
         if !self.is_current(profile)? {
             return Err(Error::Changed);

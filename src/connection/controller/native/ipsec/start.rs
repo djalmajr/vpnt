@@ -3,7 +3,6 @@
 //! before the guarded operation.
 use super::*;
 use crate::connection::ipsec::Peer;
-use crate::connection::macos::ipsec_egress::IpsecEgress;
 
 impl NativeIpsecAttempt<'_> {
     pub(super) fn start_driver(
@@ -23,6 +22,8 @@ impl NativeIpsecAttempt<'_> {
         self.profile_use = Some(profile_use);
         let egress = IpsecEgress::select(&self.profile, canceled, bounded(expires, canceled)?)
             .map_err(|_| unavailable())?;
+        let egress = Arc::new(egress);
+        self.egress = Some(egress.clone());
         let domain = self.domain.clone();
         let ledger = domain.ledger().clone();
         let mut registry = lock_until(domain.registry(), expires, canceled)?;
@@ -34,7 +35,7 @@ impl NativeIpsecAttempt<'_> {
             &registry,
             self.reservation.as_ref().ok_or_else(unavailable)?,
             &self.profile,
-            Arc::new(egress),
+            egress,
             (expires, self.canceled.clone()),
         );
         let (config, admission) = keep_for_control(&mut self.reservation, prepared)?;

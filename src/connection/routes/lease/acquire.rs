@@ -103,7 +103,7 @@ impl<B: Backend> Coordinator<B> {
             .clone();
         for route in desired.values() {
             check()?;
-            self.admit(&owner, *route)?;
+            let _ = self.admit(&owner, *route)?;
             check()?;
         }
         for key in keys {

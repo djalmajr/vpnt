@@ -1,5 +1,5 @@
 use super::{
-    Address, Error, NextHop, Route,
+    Address, Error, NextHop, Route, TransportDefault,
     codec::{self, put16, put32},
 };
 use std::{
@@ -37,7 +37,7 @@ pub(super) fn add(
         || (source.zone != 0 && source.zone != route.interface as u32)
         || source.ip.is_ipv4() != ipv4
         || matches!(route.next_hop, NextHop::Gateway(_))
-        || (route.key.scope != 0 && route.key.scope != route.interface)
+        || route.key.scope != 0
     {
         return Err(Error::Invalid);
     }
@@ -75,11 +75,6 @@ pub(super) fn add(
     );
     let flags = libc::RTF_UP
         | libc::RTF_STATIC
-        | if route.key.scope != 0 {
-            libc::RTF_IFSCOPE
-        } else {
-            0
-        }
         | if prefix == if ipv4 { 32 } else { 128 } {
             libc::RTF_HOST
         } else {
@@ -108,4 +103,131 @@ pub(super) fn add(
         sequence as u32,
     );
     Ok(bytes)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultRequest {
+    Add,
+    Get,
+    Delete,
+}
+
+impl DefaultRequest {
+    pub(super) fn opcode(self) -> u8 {
+        match self {
+            Self::Add => libc::RTM_ADD as u8,
+            Self::Get => libc::RTM_GET as u8,
+            Self::Delete => libc::RTM_DELETE as u8,
+        }
+    }
+}
+
+/// Destination and netmask are fixed at IPv4 /0. Only ADD and DELETE carry
+/// the expected gateway. The interface is encoded in rtm_index and IFSCOPE.
+pub(super) fn scoped_default(
+    request: DefaultRequest,
+    route: TransportDefault,
+    pid: i32,
+    sequence: i32,
+) -> Result<Vec<u8>, Error> {
+    if pid <= 0 || sequence <= 0 {
+        return Err(Error::Invalid);
+    }
+    let route_value = route.route();
+    let zero = Address::unscoped(route_value.key.network.address());
+    let mut bytes = vec![0; codec::CLASSIC];
+    bytes.extend_from_slice(&sockaddr(zero));
+
+    let mut flags = libc::RTF_UP | libc::RTF_IFSCOPE;
+    let mut addrs = libc::RTA_DST | libc::RTA_NETMASK;
+    if !matches!(request, DefaultRequest::Get) {
+        flags |= libc::RTF_GATEWAY | libc::RTF_STATIC;
+        addrs |= libc::RTA_GATEWAY;
+        bytes.extend_from_slice(&sockaddr(route.gateway()));
+    }
+    let mut mask = sockaddr(zero);
+    mask[1] = 0;
+    bytes.extend_from_slice(&mask);
+
+    let length = bytes.len() as u16;
+    put16(&mut bytes, 0, length);
+    bytes[2] = libc::RTM_VERSION as u8;
+    bytes[3] = request.opcode();
+    put16(
+        &mut bytes,
+        offset_of!(libc::rt_msghdr, rtm_index),
+        route_value.key.scope,
+    );
+    put32(
+        &mut bytes,
+        offset_of!(libc::rt_msghdr, rtm_flags),
+        flags as u32,
+    );
+    put32(
+        &mut bytes,
+        offset_of!(libc::rt_msghdr, rtm_addrs),
+        addrs as u32,
+    );
+    put32(&mut bytes, offset_of!(libc::rt_msghdr, rtm_pid), pid as u32);
+    put32(
+        &mut bytes,
+        offset_of!(libc::rt_msghdr, rtm_seq),
+        sequence as u32,
+    );
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_default_packets_use_exact_network_gateway_and_interface_scope() {
+        let router = Address::unscoped("192.0.2.1".parse().unwrap());
+        let default = TransportDefault::from_egress(7, NextHop::Gateway(router)).unwrap();
+        for (request, opcode, has_gateway) in [
+            (DefaultRequest::Add, libc::RTM_ADD, true),
+            (DefaultRequest::Get, libc::RTM_GET, false),
+            (DefaultRequest::Delete, libc::RTM_DELETE, true),
+        ] {
+            let packet = scoped_default(request, default, 11, 19).unwrap();
+            let frame = codec::frame(&packet).unwrap();
+            assert_eq!(frame[3], opcode as u8);
+            let flags = codec::signed(frame, offset_of!(libc::rt_msghdr, rtm_flags)).unwrap();
+            assert_ne!(flags & libc::RTF_IFSCOPE, 0);
+            let addrs = codec::signed(frame, offset_of!(libc::rt_msghdr, rtm_addrs)).unwrap();
+            assert_ne!(addrs & libc::RTA_NETMASK, 0);
+            assert_eq!(addrs & libc::RTA_GATEWAY != 0, has_gateway);
+            let record = codec::record(frame, codec::CLASSIC).unwrap();
+            assert_eq!(record.key, default.route().key);
+            assert_eq!(record.interface, 7);
+            assert_eq!(default.matches_static(&record), has_gateway);
+        }
+        let mut bad = default.route();
+        bad.key.scope = 0;
+        assert!(TransportDefault::try_from(bad).is_err());
+        bad.key.scope = 8;
+        assert!(TransportDefault::try_from(bad).is_err());
+        bad.key.scope = 7;
+        bad.key.network = "192.0.2.0/24".parse().unwrap();
+        assert!(TransportDefault::try_from(bad).is_err());
+        let noncanonical = serde_json::from_value(serde_json::json!({
+            "address": "192.0.2.9",
+            "prefix": 0
+        }))
+        .unwrap();
+        assert!(
+            TransportDefault::try_from(Route {
+                key: super::super::Key {
+                    network: noncanonical,
+                    ..default.route().key
+                },
+                ..default.route()
+            })
+            .is_err()
+        );
+        assert!(add(bad, router, 11, 19).is_err());
+        bad.next_hop = NextHop::Interface;
+        assert!(add(bad, router, 11, 19).is_err());
+    }
 }
