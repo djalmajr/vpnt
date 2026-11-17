@@ -718,6 +718,24 @@ fn prepare_rule_registers_with_omarchy_or_falls_back_to_hyprland() {
 }
 
 #[test]
+fn omarchy_gap_adds_the_window_border_hyprland_draws_outside() {
+    assert_eq!(
+        placement::parse_border(r#"{"option":"general:border_size","int":2}"#),
+        2
+    );
+    assert_eq!(placement::parse_border(r#"{"int":-1}"#), 0);
+    assert_eq!(placement::parse_border("bad"), 0);
+    // The values on this machine: gaps_out 10 and border_size 2 keep the
+    // 5 px visible gap Omarchy's popovers have, with the panel 7 px away.
+    let gaps_out = r#"{"option":"general:gaps_out","css":"10 10 10 10"}"#;
+    let border = r#"{"option":"general:border_size","int":2}"#;
+    assert_eq!(placement::outer_gap(Some(gaps_out), Some(border)), 7);
+    assert_eq!(placement::outer_gap(Some(gaps_out), None), 5);
+    assert_eq!(placement::outer_gap(None, Some(border)), 7);
+    assert_eq!(placement::outer_gap(None, None), 5);
+}
+
+#[test]
 fn omarchy_gap_and_frame_examples() {
     assert_eq!(placement::parse_gap(r#"{"css":"10 10 10 10"}"#), 5);
     assert_eq!(placement::parse_gap(r#"{"int":7}"#), 4);

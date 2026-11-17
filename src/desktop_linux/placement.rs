@@ -187,8 +187,28 @@ pub(super) fn parse_gap(json: &str) -> u32 {
     n.map(|n| (n / 2.0).round() as u32).unwrap_or(5)
 }
 
+/// Width of the border Hyprland draws around a window, from
+/// `hyprctl getoption general:border_size -j`; 0 when unreadable.
+pub(super) fn parse_border(json: &str) -> u32 {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("int")?.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0)
+}
+
+/// Distance from the bar and screen edges to the window geometry. Omarchy's
+/// popovers draw their border inside the card, half of gaps_out away from the
+/// bar; Hyprland draws a window's border outside its geometry, so the border
+/// is added to keep the same visible gap.
+pub(super) fn outer_gap(gaps_out: Option<&str>, border_size: Option<&str>) -> u32 {
+    gaps_out.map_or(5, parse_gap) + border_size.map_or(0, parse_border)
+}
+
 fn gap() -> u32 {
-    command(&["getoption", "general:gaps_out", "-j"]).map_or(5, |s| parse_gap(&s))
+    let gaps_out = command(&["getoption", "general:gaps_out", "-j"]).ok();
+    let border_size = command(&["getoption", "general:border_size", "-j"]).ok();
+    outer_gap(gaps_out.as_deref(), border_size.as_deref())
 }
 
 pub(super) fn parse_anchor(json: &str) -> Result<Anchor, serde_json::Error> {
