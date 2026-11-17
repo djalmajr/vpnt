@@ -298,6 +298,109 @@ function componentSnapshot(
   };
 }
 
+for (const locale of ["pt-BR", "en-US"] as const) {
+  test(`${locale}: limpeza não confirmada permite conferir novamente sem bloquear outro perfil`, async () => {
+    const blocked: VpnView = {
+      ...vpn,
+      state: "cleanup_unconfirmed" as VpnView["state"],
+      hasPassword: true,
+      hasPsk: true,
+    };
+    const other: VpnView = {
+      ...vpn,
+      profile: { ...vpn.profile, id: "other", name: "Other VPN" },
+      hasPassword: true,
+      hasPsk: true,
+    };
+    await mountComponentScenario(
+      componentSnapshot("installed", [blocked, other]),
+      false,
+      locale,
+    );
+    const card = document.querySelector(
+      '[data-testid="vpn-card-profile-fixture"]',
+    );
+    const otherCard = document.querySelector('[data-testid="vpn-card-other"]');
+    if (!card || !otherCard) throw new Error("fixture cards missing");
+    const title =
+      locale === "pt-BR" ? "Limpeza não confirmada" : "Cleanup unconfirmed";
+    const hint =
+      locale === "pt-BR"
+        ? "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis."
+        : "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.";
+    const label = locale === "pt-BR" ? "Conferir de novo" : "Check again";
+    expect(card.textContent).toContain(title);
+    expect(card.textContent).toContain(hint);
+    expect(card.textContent).not.toContain(
+      locale === "pt-BR" ? "Conectar" : "Connect",
+    );
+    expect(
+      card.querySelector<HTMLButtonElement>("button.switch")?.disabled,
+    ).toBe(true);
+    expect(
+      otherCard.querySelector<HTMLButtonElement>("button.switch")?.disabled,
+    ).toBe(false);
+
+    let release: ((value: Response) => void) | undefined;
+    let requestId = "";
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const request = JSON.parse(String(init?.body)) as {
+        id: string;
+        command: Command;
+      };
+      commands.push(request.command);
+      requestId = request.id;
+      if (request.command.type !== "probe") {
+        return new Response(JSON.stringify({ id: request.id, snapshot }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return await new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+    }) as typeof fetch;
+    try {
+      const button = byText(label, card);
+      act(() => button.click());
+      expect(actions()).toEqual([{ type: "probe", id: blocked.profile.id }]);
+      expect(button.disabled).toBe(true);
+      expect(button.getAttribute("aria-busy")).toBe("true");
+      expect(button.querySelector("svg.spin")).not.toBeNull();
+      act(() => button.click());
+      expect(actions()).toHaveLength(1);
+      await act(async () => {
+        release?.(
+          new Response(JSON.stringify({ id: requestId, snapshot }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      });
+      expect(button.disabled).toBe(false);
+      expect(button.querySelector("svg.spin")).toBeNull();
+      const otherSwitch =
+        otherCard.querySelector<HTMLButtonElement>("button.switch");
+      if (!otherSwitch) throw new Error("other profile control missing");
+      await click(otherSwitch);
+      expect(actions()).toEqual([
+        { type: "probe", id: blocked.profile.id },
+        { type: "connect", id: other.profile.id },
+      ]);
+    } finally {
+      release?.(
+        new Response(JSON.stringify({ id: requestId, snapshot }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+  });
+}
+
 test("aviso Update envia uma vez, permanece na tela e libera retry após falha", async () => {
   await mountComponentScenario(componentSnapshot("outdated"));
   const button = byText(t("en-US", "update"));

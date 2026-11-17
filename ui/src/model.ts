@@ -13,6 +13,7 @@ export const states = [
   "missing_program",
   "offline",
   "helper_missing",
+  "cleanup_unconfirmed",
 ] as const;
 export type ConnectionState = (typeof states)[number];
 export type Profile = {

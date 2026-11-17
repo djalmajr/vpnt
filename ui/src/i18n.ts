@@ -5,6 +5,9 @@ export type LocalePreference = Locale | "system";
 
 const en = {
   cleanupHint: "Cleaning up the previous attempt…",
+  cleanupUnconfirmedHint:
+    "The previous session left resources VPN Tray could not confirm as removed. Other profiles stay available.",
+  checkAgain: "Check again",
   ...nativeCatalogs["en-US"],
   appName: "VPN Tray",
   vpns: "VPNs",
@@ -206,11 +209,15 @@ const en = {
   "state.missing_program": "VPN client missing",
   "state.offline": "No network connection",
   "state.helper_missing": "Waiting for the component",
+  "state.cleanup_unconfirmed": "Cleanup unconfirmed",
 };
 
 export type MessageKey = keyof typeof en;
 const pt: Record<MessageKey, string> = {
   cleanupHint: "Limpando a tentativa anterior…",
+  cleanupUnconfirmedHint:
+    "A sessão anterior deixou recursos que o VPN Tray não conseguiu confirmar como removidos. Os outros perfis continuam disponíveis.",
+  checkAgain: "Conferir de novo",
   ...nativeCatalogs["pt-BR"],
   appName: "VPN Tray",
   vpns: "VPNs",
@@ -413,6 +420,7 @@ const pt: Record<MessageKey, string> = {
   "state.missing_program": "Falta o cliente de VPN",
   "state.offline": "Sem rede no computador",
   "state.helper_missing": "Aguardando o componente",
+  "state.cleanup_unconfirmed": "Limpeza não confirmada",
 };
 
 export const catalogs: Record<Locale, Record<MessageKey, string>> = {

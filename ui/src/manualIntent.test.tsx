@@ -151,6 +151,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
               "offline",
               "helper_missing",
               "missing_program",
+              "cleanup_unconfirmed",
               "disconnecting",
               "connecting",
               "reconnecting",
@@ -208,6 +209,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
             "credentials_rejected",
             "gateway_timeout",
             "missing_program",
+            "cleanup_unconfirmed",
           ].includes(state)
         ) {
           const lines: ReactElement[] = [];
