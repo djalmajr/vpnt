@@ -387,12 +387,12 @@ pub(crate) mod tests {
         assert_eq!(state.lock().unwrap().as_deref(), Some(expected_key));
         let mut observer = fake();
         observer.dns_present = state.lock().unwrap().is_some();
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(profile));
         assert!(observer.calls.borrow().contains(&"dns"));
         *state.lock().unwrap() = None;
         observer.dns_present = state.lock().unwrap().is_some();
-        recovery.reconcile(Some(&profile.id), &mut observer);
+        recovery.reconcile(Some(&profile.id), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(profile));
         assert!(
             fence::read(root, uid, uid, &profile.id, 1)
@@ -418,11 +418,11 @@ pub(crate) mod tests {
         };
         let mut observer = fake();
         observer.dns_present = true;
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(observer.calls.borrow().contains(&"dns"));
         observer.dns_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(&profile("one")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
         item.dns_key =

@@ -100,18 +100,36 @@ impl Profiles {
 impl ProfileUse {
     /// Hold the reservation through the durable write and release only after
     /// the action commits successfully.
-    pub(super) fn abandon_after<E>(
+    pub(super) fn abandon_after<T, E>(
         &self,
         error: impl Fn() -> E,
-        action: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), E> {
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.locked(error, true, action)
+    }
+    /// Same lock and check as `abandon_after`, but the reservation stays.
+    pub(super) fn hold<T, E>(
+        &self,
+        error: impl Fn() -> E,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.locked(error, false, action)
+    }
+    fn locked<T, E>(
+        &self,
+        error: impl Fn() -> E,
+        release: bool,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         let mut all = self.reservations.try_lock().map_err(|_| error())?;
         if !all.contains_key(&self.key) {
             return Err(error());
         }
-        action()?;
-        all.remove(&self.key);
-        Ok(())
+        let value = action()?;
+        if release {
+            all.remove(&self.key);
+        }
+        Ok(value)
     }
     pub(super) fn validate(&self) -> Result<(), StoreError> {
         self.reservations

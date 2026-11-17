@@ -30,8 +30,12 @@ impl ExitRequested {
             self.wake.notify_all();
         }
     }
-    fn at(&self) -> Option<Instant> {
+    /// Monotonic instant of the first request, if any.
+    pub(super) fn at(&self) -> Option<Instant> {
         *self.at.lock().unwrap_or_else(|error| error.into_inner())
+    }
+    pub(super) fn budget(&self) -> Duration {
+        self.budget
     }
     fn wait(&self, delay: Duration, seen: Option<Instant>) {
         let at = self.at.lock().unwrap_or_else(|error| error.into_inner());

@@ -166,6 +166,12 @@ impl<B: Backend> Coordinator<B> {
         owner: &Owner,
         persist: impl FnOnce(&[AbandonedRoute]) -> Result<(), E>,
     ) -> Result<Vec<AbandonedRoute>, E> {
+        persist(&self.inventory(owner))?;
+        Ok(self.abandon(owner))
+    }
+    /// The inventory `try_abandon` persists, read without detaching anything:
+    /// the claims, entries and backend stay exactly as they were.
+    pub fn inventory(&self, owner: &Owner) -> Vec<AbandonedRoute> {
         let mut inventory = BTreeMap::new();
         for claim in self.claims.values().filter(|claim| claim.owner == *owner) {
             for key in &claim.keys {
@@ -180,9 +186,7 @@ impl<B: Backend> Coordinator<B> {
                 }
             }
         }
-        let inventory: Vec<_> = inventory.into_values().collect();
-        persist(&inventory)?;
-        Ok(self.abandon(owner))
+        inventory.into_values().collect()
     }
     /// Detach only this exact owner, without consulting or modifying the backend.
     /// The caller must durably record a conservative inventory before using this.

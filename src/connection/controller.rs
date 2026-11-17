@@ -82,6 +82,11 @@ trait Factory: Sync {
     ) -> Self::Attempt;
     /// Includes failed admissions with no public lease/token.
     fn idle(&self) -> bool;
+    /// Whether a live attempt has no journal on disk, for the exit watchdog's
+    /// last diagnostic line. Never blocks.
+    fn unjournaled(&self) -> bool {
+        false
+    }
 }
 #[derive(Clone, Copy)]
 struct Timing {

@@ -43,6 +43,8 @@ pub(crate) enum Reason {
     NamespaceOccupied,
     DurableCompletion,
     ObservationFailed,
+    /// Fence reason of a preventive journal; never a cleanup refusal.
+    Journal,
 }
 impl Reason {
     pub(crate) fn id(self) -> &'static str {
@@ -72,6 +74,7 @@ impl Reason {
             Self::NamespaceOccupied => "namespace_occupied",
             Self::DurableCompletion => "durable_completion_failed",
             Self::ObservationFailed => "observation_failed",
+            Self::Journal => "journal",
         }
     }
 }
@@ -80,10 +83,25 @@ struct Diagnostic {
     reason: Option<Reason>,
     attempts: u64,
     last: Option<(Reason, Instant)>,
+    journal: bool,
+    journal_last: Option<Instant>,
 }
 thread_local! { static DIAGNOSTIC: RefCell<Diagnostic> = RefCell::default(); }
 pub(crate) fn begin() {
-    DIAGNOSTIC.with(|d| d.borrow_mut().reason = None);
+    DIAGNOSTIC.with(|d| {
+        let mut d = d.borrow_mut();
+        d.reason = None;
+        d.journal = false;
+    });
+}
+/// A preventive journal write failed. `finish` logs it on its own line and
+/// never lets it replace the refusal reason, which also names an abandonment.
+pub(crate) fn journal_failed() {
+    DIAGNOSTIC.with(|d| d.borrow_mut().journal = true);
+}
+#[cfg(test)]
+pub(crate) fn journal_failure() -> bool {
+    DIAGNOSTIC.with(|d| d.borrow().journal)
 }
 pub(crate) fn current_reason() -> Option<Reason> {
     DIAGNOSTIC.with(|d| d.borrow().reason)
@@ -113,7 +131,41 @@ fn finish_at(state: &Path, uid: u32, owner: &Owner, complete: bool, now: Instant
                 d.last = Some((reason, now));
             }
         }
+        if d.journal
+            && d.journal_last
+                .is_none_or(|at| now.saturating_duration_since(at) >= REPEAT_AFTER)
+            && valid_profile_id(&owner.profile)
+            && write_line(
+                state,
+                uid,
+                &format!(
+                    "{} profile={} attempt={} journal=failed\n",
+                    timestamp(),
+                    owner.profile,
+                    d.attempts
+                ),
+            )
+            .is_ok()
+        {
+            d.journal_last = Some(now);
+        }
     });
+}
+/// The exit watchdog's last line: whether a live attempt had no journal.
+/// It runs before `_exit` and takes the same writer lock as every append.
+pub(crate) fn deadline(state: &Path, unjournaled: bool) {
+    let _ = deadline_at(state, 0, unjournaled);
+}
+pub(crate) fn deadline_at(state: &Path, uid: u32, unjournaled: bool) -> io::Result<()> {
+    write_line(
+        state,
+        uid,
+        &format!(
+            "{} exit=deadline unjournaled={}\n",
+            timestamp(),
+            if unjournaled { "yes" } else { "no" }
+        ),
+    )
 }
 fn due(last: Option<(Reason, Instant)>, reason: Reason, now: Instant) -> bool {
     last.is_none_or(|(previous, at)| {
@@ -133,6 +185,16 @@ fn append(state: &Path, uid: u32, owner: &Owner, attempt: u64, reason: Reason) -
     if !valid_profile_id(&owner.profile) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
+    let line = format!(
+        "{} profile={} attempt={} reason={}\n",
+        timestamp(),
+        owner.profile,
+        attempt,
+        reason.id()
+    );
+    write_line(state, uid, &line)
+}
+fn write_line(state: &Path, uid: u32, line: &str) -> io::Result<()> {
     let _guard = WRITER.lock().map_err(|_| io::ErrorKind::Other)?;
     let path = paths::cleanup_log(state);
     let directory = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
@@ -183,13 +245,6 @@ fn append(state: &Path, uid: u32, owner: &Owner, attempt: u64, reason: Reason) -
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     crate::fs_permissions::check_file(&file, true).map_err(|_| io::ErrorKind::PermissionDenied)?;
-    let line = format!(
-        "{} profile={} attempt={} reason={}\n",
-        timestamp(),
-        owner.profile,
-        attempt,
-        reason.id()
-    );
     if meta.len().saturating_add(line.len() as u64) <= CLEANUP_LOG_MAX_BYTES {
         file.write_all(line.as_bytes())?;
     }

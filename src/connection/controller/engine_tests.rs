@@ -1325,6 +1325,227 @@ fn idle_helper_releases_lock_after_eof_and_sigterm() {
     }
 }
 
+/// A cleanup call that stays in flight until the test opens it, so the worker
+/// can neither finish nor reach its own budget check.
+#[derive(Default)]
+struct InFlight {
+    open: Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: AtomicBool,
+    active: AtomicBool,
+}
+impl InFlight {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+    fn entered(&self) {
+        let until = Instant::now() + Duration::from_secs(3);
+        while !self.entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "cleanup never started");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+struct InFlightFactory(Arc<InFlight>);
+struct InFlightAttempt(Arc<InFlight>);
+impl Attempt for InFlightAttempt {
+    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn ready(&mut self) -> Result<bool, Failure> {
+        Ok(false)
+    }
+    fn healthy(&mut self) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+        Ok(false)
+    }
+    fn cleanup(&mut self) -> bool {
+        self.0.entered.store(true, Ordering::Release);
+        // Bounded so a broken watchdog fails the test instead of hanging it.
+        let until = Instant::now() + Duration::from_secs(10);
+        let mut open = self.0.open.lock().unwrap();
+        while !*open && Instant::now() < until {
+            open = self
+                .0
+                .wake
+                .wait_timeout(open, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+        self.0.active.store(false, Ordering::Release);
+        true
+    }
+}
+impl Factory for InFlightFactory {
+    type Attempt = InFlightAttempt;
+    fn create(
+        &self,
+        _: Profile,
+        _: u32,
+        _: u64,
+        _: Credentials,
+        _: Arc<AtomicBool>,
+    ) -> InFlightAttempt {
+        self.0.active.store(true, Ordering::Release);
+        InFlightAttempt(self.0.clone())
+    }
+    fn idle(&self) -> bool {
+        !self.0.active.load(Ordering::Acquire)
+    }
+    fn unjournaled(&self) -> bool {
+        true
+    }
+}
+/// Runs the engine with an injected deadline whose action records when it
+/// fired, then puts one generation in cleanup and waits for the call to start.
+struct InFlightEngine {
+    hold: Arc<InFlight>,
+    input: mpsc::SyncSender<Request>,
+    fires: mpsc::Receiver<(Instant, bool)>,
+    engine: JoinHandle<Result<(), ErrorCode>>,
+}
+fn in_flight_engine(budget: Duration, margin: Duration) -> InFlightEngine {
+    let hold = Arc::new(InFlight::default());
+    let (fired, fires) = mpsc::channel();
+    let deadline = Deadline::new(
+        Arc::new(ExitRequested::new(budget)),
+        margin,
+        move |unjournaled| {
+            let _ = fired.send((Instant::now(), unjournaled));
+        },
+    );
+    let (input, requests) = mpsc::sync_channel(8);
+    let (output, replies) = mpsc::sync_channel(64);
+    let factory = InFlightFactory(hold.clone());
+    let engine = thread::spawn(move || {
+        // Replies are drained so a full pipe never closes the engine early.
+        let drain = thread::spawn(move || while replies.recv().is_ok() {});
+        let result = run_with_exit(
+            factory,
+            unsafe { libc::geteuid() }.max(1),
+            vec![profile("one")],
+            requests,
+            output,
+            Timing {
+                connect: Duration::from_secs(5),
+                probe: Duration::from_secs(1),
+                interval: Duration::from_secs(60),
+                health: Duration::from_millis(2),
+                poll: Duration::from_millis(2),
+            },
+            deadline,
+        );
+        let _ = drain.join();
+        result
+    });
+    input
+        .send(Request {
+            id: "connect".into(),
+            command: Command::Connect {
+                id: "one".into(),
+                generation: 1,
+                interval: ProbeInterval::TEN,
+                credentials: Credentials {
+                    password: Secret::from("fixture-password"),
+                    psk: Secret::from(""),
+                },
+            },
+        })
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while !hold.active.load(Ordering::Acquire) {
+        assert!(Instant::now() < until, "attempt never created");
+        thread::sleep(Duration::from_millis(2));
+    }
+    input
+        .send(Request {
+            id: "disconnect".into(),
+            command: Command::Disconnect {
+                id: "one".into(),
+                generation: 2,
+            },
+        })
+        .unwrap();
+    hold.entered();
+    InFlightEngine {
+        hold,
+        input,
+        fires,
+        engine,
+    }
+}
+
+#[test]
+fn exit_watchdog_fires_at_its_deadline_only_after_an_exit_request() {
+    let (budget, margin) = (Duration::from_millis(150), Duration::from_millis(150));
+    let InFlightEngine {
+        hold,
+        input,
+        fires,
+        engine,
+    } = in_flight_engine(budget, margin);
+    struct Open(Arc<InFlight>);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let _open = Open(hold.clone());
+    // No exit request: a cleanup in flight past budget + margin never fires.
+    assert!(
+        fires
+            .recv_timeout(budget + margin + Duration::from_millis(300))
+            .is_err(),
+        "the watchdog fired without an exit request"
+    );
+    assert!(!engine.is_finished());
+    // EOF is the exit request; the cleanup call is still in flight.
+    let requested = Instant::now();
+    drop(input);
+    let (fired, unjournaled) = fires
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the watchdog never fired with the cleanup in flight");
+    let elapsed = fired.duration_since(requested);
+    eprintln!("deadline_elapsed={elapsed:?}");
+    assert!(elapsed >= budget + margin, "fired early: {elapsed:?}");
+    assert!(
+        elapsed < budget + margin + Duration::from_millis(500),
+        "fired late: {elapsed:?}"
+    );
+    assert!(unjournaled, "the action receives Factory::unjournaled");
+    assert!(!engine.is_finished(), "the engine had not returned");
+    hold.release();
+    assert_eq!(engine.join().unwrap(), Ok(()));
+    assert!(fires.try_recv().is_err(), "the watchdog fires at most once");
+}
+
+#[test]
+fn exit_watchdog_stops_when_the_engine_returns_first() {
+    let (budget, margin) = (Duration::from_millis(100), Duration::from_millis(900));
+    let InFlightEngine {
+        hold,
+        input,
+        fires,
+        engine,
+    } = in_flight_engine(budget, margin);
+    let requested = Instant::now();
+    drop(input);
+    thread::sleep(Duration::from_millis(20));
+    hold.release();
+    assert_eq!(engine.join().unwrap(), Ok(()));
+    // The scope joined the watchdog long before its deadline.
+    assert!(requested.elapsed() < budget + margin);
+    assert!(
+        fires
+            .recv_timeout(budget + margin + Duration::from_millis(300))
+            .is_err(),
+        "the watchdog fired after the engine returned"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn stuck_helper_process_fixture() {
@@ -1412,6 +1633,18 @@ fn stuck_helper_process_fixture() {
         active: Arc::new(AtomicBool::new(false)),
         persist_fails: std::env::var_os("VPNT_STUCK_PERSIST").is_some(),
     };
+    let exit = Arc::new(ExitRequested::new(Duration::from_millis(300)));
+    // The real `_exit(DEADLINE_EXIT)`, with its line in the fixture's log.
+    let deadline = match std::env::var("VPNT_STUCK_DEADLINE_MS") {
+        Ok(margin) => {
+            let (root, margin) = (root.clone(), margin.parse().unwrap());
+            Deadline::new(exit, Duration::from_millis(margin), move |unjournaled| {
+                crate::helper::runtime::cleanup::deadline_at(&root, uid, unjournaled).unwrap();
+                crate::helper::fd_guard::deadline_exit()
+            })
+        }
+        Err(_) => Deadline::process(exit),
+    };
     let result = crate::helper::server::runtime_fixture(server, |actual, requests, output| {
         run_with_exit(
             fixture,
@@ -1426,7 +1659,7 @@ fn stuck_helper_process_fixture() {
                 health: Duration::from_millis(2),
                 poll: Duration::from_millis(2),
             },
-            Arc::new(ExitRequested::new(Duration::from_millis(300))),
+            deadline,
         )
     });
     assert!(result.is_ok(), "stuck helper fixture failed: {result:?}");
@@ -1481,9 +1714,16 @@ fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
                 thread::sleep(Duration::from_millis(5));
             }
         }
-        fn wait_marker(&self, name: &str, timeout: Duration) {
+        /// Markers are written by create-and-truncate, then write; an empty
+        /// read is not the marker yet. Returns the content it saw.
+        fn wait_marker(&self, name: &str, timeout: Duration) -> String {
             let until = Instant::now() + timeout;
-            while !self.root.join(name).exists() {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(self.root.join(name))
+                    && !text.is_empty()
+                {
+                    return text;
+                }
                 assert!(Instant::now() < until, "fixture marker {name} timed out");
                 thread::sleep(Duration::from_millis(5));
             }
@@ -1512,12 +1752,17 @@ fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
             }
         }
     }
-    for (signal, persist_fails) in [(false, false), (true, false), (false, true)] {
+    for (signal, persist_fails, stuck) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
         let root = std::env::current_dir()
             .unwrap()
             .join("output/fixtures")
             .join(format!(
-                "stuck-helper-{}-{signal}-{persist_fails}",
+                "stuck-helper-{}-{signal}-{persist_fails}-{stuck}",
                 std::process::id()
             ));
         std::fs::create_dir_all(root.parent().unwrap()).unwrap();
@@ -1543,6 +1788,9 @@ fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
             .stderr(Stdio::null());
         if persist_fails {
             command.env("VPNT_STUCK_PERSIST", "1");
+        }
+        if stuck {
+            command.env("VPNT_STUCK_DEADLINE_MS", "400");
         }
         let child = command.spawn().unwrap();
         let recorded = identity(child.id()).expect("ps must capture the fixture child identity");
@@ -1593,9 +1841,9 @@ fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
         } else {
             f.client.shutdown(Shutdown::Write).unwrap();
         }
-        f.wait_marker("abandoned", Duration::from_secs(3));
+        let abandoned = f.wait_marker("abandoned", Duration::from_secs(3));
         assert_eq!(
-            std::fs::read_to_string(f.root.join("abandoned")).unwrap(),
+            abandoned,
             if persist_fails {
                 "UncertainCleanup"
             } else {
@@ -1612,6 +1860,28 @@ fn stuck_helper_exit_budget_preserves_lock_on_write_failure() {
                 "write failure released the helper"
             );
             assert!(f.lock_busy(), "write failure released the lock");
+        }
+        if stuck {
+            // The cleanup never finishes: only the watchdog ends the helper,
+            // at request + 300 ms budget + 400 ms margin.
+            let until = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = f.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "the watchdog never ended the helper"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            let elapsed = start.elapsed();
+            eprintln!("stuck_exit={:?} elapsed={elapsed:?}", status.code());
+            assert_eq!(status.code(), Some(crate::helper::fd_guard::DEADLINE_EXIT));
+            assert!(elapsed >= Duration::from_millis(700), "{elapsed:?}");
+            let log = std::fs::read_to_string(crate::helper::paths::cleanup_log(&f.root)).unwrap();
+            assert!(log.ends_with(" exit=deadline unjournaled=no\n"), "{log}");
+        } else if persist_fails {
             std::fs::write(f.root.join("allow-cleanup"), b"1").unwrap();
         }
         assert!(
