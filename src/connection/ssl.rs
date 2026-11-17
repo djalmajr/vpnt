@@ -83,6 +83,16 @@ impl SslDriver {
     pub(crate) fn fixture_child_id(&self) -> u32 {
         self.child.id()
     }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn split_observation(&self) -> super::ssl_output::Observation {
+        self.output.snapshot()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn note_invalid_split(&self) {
+        self.output.note_invalid_split();
+    }
     /// Called by the privileged helper with its own stored profile. No paths or
     /// executable names are accepted from the IPC request.
     #[cfg(target_os = "macos")]

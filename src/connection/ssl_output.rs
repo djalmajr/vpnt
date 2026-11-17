@@ -13,6 +13,7 @@ use crate::helper::{
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
+    net::Ipv4Addr,
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -40,6 +41,9 @@ const PREVIOUS_NAME: &str = "openfortivpn.previous.log";
 pub(super) struct Observation {
     pub candidate: Option<InterfaceName>,
     pub failure: Option<SslFailure>,
+    pub split: Vec<(Ipv4Addr, u8)>,
+    pub split_count: Option<usize>,
+    pub split_invalid: bool,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +58,14 @@ pub(super) struct Output {
 }
 
 impl Output {
+    pub fn note_invalid_split(&self) {
+        if let Some(log) = &self.log {
+            log.push_line(
+                "vpnt: o gateway não publicou rotas válidas".as_bytes(),
+                false,
+            );
+        }
+    }
     /// Enable per-attempt diagnostic logging. Never fails: any failure leaves
     /// logging disabled and the connection proceeds without it.
     pub fn open_log(&mut self, state: &Path, owner: u32) {
@@ -525,6 +537,43 @@ fn drain(
 }
 
 fn parse(line: &[u8], observed: &mut Observation) {
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: split-route ") {
+        if observed.split_count.is_some() || observed.split.len() >= 64 {
+            observed.split_invalid = true;
+            return;
+        }
+        let parsed = std::str::from_utf8(value).ok().and_then(|text| {
+            let (addr, mask) = text.split_once('/')?;
+            let addr = addr.parse::<Ipv4Addr>().ok()?;
+            let mask = mask.parse::<Ipv4Addr>().ok()?;
+            let bits = u32::from(mask);
+            let prefix = bits.leading_ones() as u8;
+            if bits != u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)
+                || u32::from(addr) & bits != u32::from(addr)
+            {
+                return None;
+            }
+            Some((addr, prefix))
+        });
+        if let Some(route) = parsed {
+            observed.split.push(route);
+        } else {
+            observed.split_invalid = true;
+        }
+        return;
+    }
+    if let Some(value) = line.strip_prefix(b"INFO:   vpnt: split-routes ") {
+        let count = std::str::from_utf8(value).ok().and_then(|s| {
+            let n = s.parse::<usize>().ok()?;
+            (s == n.to_string() && n <= 64).then_some(n)
+        });
+        if observed.split_count.is_some() || count.is_none() {
+            observed.split_invalid = true;
+        } else {
+            observed.split_count = count;
+        }
+        return;
+    }
     if line==b"ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc." {
         observed.failure=Some(SslFailure::CredentialsRejected);
     } else if (line==b"ERROR:  connect: Connection timed out" || line==b"ERROR:  connect: Operation timed out") && observed.failure.is_none() {
@@ -551,6 +600,54 @@ mod tests {
         sync::atomic::AtomicU64,
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn split_output_is_bounded_and_strict() {
+        let mut observation = Observation::default();
+        for line in [
+            "INFO:   Connected to gateway.",
+            "INFO:   Authenticated.",
+            "INFO:   Remote gateway has allocated a VPN.",
+            "INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
+            "INFO:   vpnt: split-route 172.20.0.0/255.255.0.0",
+            "INFO:   vpnt: split-route 192.168.1.0/255.255.255.0",
+            "INFO:   vpnt: split-routes 3",
+            "INFO:   Interface ppp0 is UP.",
+            "INFO:   Tunnel is up and running.",
+        ] {
+            parse(line.as_bytes(), &mut observation);
+        }
+        assert_eq!(observation.split_count, Some(3));
+        assert_eq!(observation.candidate.as_ref().unwrap().as_str(), "ppp0");
+        assert_eq!(
+            observation.split,
+            vec![
+                ("10.0.0.0".parse().unwrap(), 8),
+                ("172.20.0.0".parse().unwrap(), 16),
+                ("192.168.1.0".parse().unwrap(), 24)
+            ]
+        );
+        assert!(!observation.split_invalid);
+
+        for line in [
+            "INFO:   vpnt: split-route 10.0.0.0/255.0.255.0",
+            "INFO:   vpnt: split-route 10.1.0.1/255.255.0.0",
+            "INFO:   vpnt: split-routes invalid",
+        ] {
+            let mut observation = Observation::default();
+            parse(line.as_bytes(), &mut observation);
+            assert!(observation.split_invalid, "{line}");
+        }
+        let mut observation = Observation::default();
+        for _ in 0..65 {
+            parse(
+                b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
+                &mut observation,
+            );
+        }
+        assert!(observation.split_invalid);
+        assert_eq!(observation.split.len(), 64);
+    }
     struct State {
         directory: std::path::PathBuf,
     }

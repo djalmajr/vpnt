@@ -134,6 +134,44 @@ impl NativeAttempt<'_> {
         }
     }
 }
+
+fn ssl_networks(
+    profile: &[String],
+    observation: &crate::connection::ssl_output::Observation,
+) -> Option<Vec<String>> {
+    use crate::connection::routes::Network;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    if !profile.is_empty() {
+        return Some(profile.to_vec());
+    }
+    if observation.split_invalid || observation.split_count != Some(observation.split.len()) {
+        return None;
+    }
+    if observation.split.is_empty()
+        || observation
+            .split
+            .iter()
+            .any(|(ip, prefix)| ip.is_unspecified() && *prefix == 0)
+    {
+        return Some(Vec::new());
+    }
+    let forbidden: [Network; 3] = ["127.0.0.0/8", "224.0.0.0/4", "169.254.0.0/16"]
+        .map(|value| value.parse().expect("fixed network"));
+    let mut networks = Vec::with_capacity(observation.split.len());
+    for &(ip, prefix) in &observation.split {
+        let network = Network::new(IpAddr::V4(ip), prefix).ok()?;
+        if ip == Ipv4Addr::UNSPECIFIED
+            || forbidden.iter().any(|blocked| {
+                blocked.contains(network.address()) || network.contains(blocked.address())
+            })
+        {
+            return None;
+        }
+        networks.push(format!("{ip}/{prefix}"));
+    }
+    Some(networks)
+}
 fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
     if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
         return Err(Failure::unavailable());
@@ -225,14 +263,15 @@ impl Attempt for NativeAttempt<'_> {
         let link = self.link.as_ref().unwrap();
         let mut routes = self.routes.lock().map_err(|_| Failure::unavailable())?;
         if self.token.is_none() {
+            let client = self.client.as_ref().ok_or_else(Failure::unavailable)?;
+            let networks = ssl_networks(&self.profile.networks, &client.split_observation())
+                .ok_or_else(|| {
+                    client.note_invalid_split();
+                    Failure::unavailable()
+                })?;
             let (token, plan) = routes
                 .backend_mut()
-                .register_ppp(
-                    link,
-                    self.owner.clone(),
-                    &self.profile.networks,
-                    &self.canceled,
-                )
+                .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
                 .map_err(|_| Failure::unavailable())?;
             self.token = Some(token); // retain before any fallible ADD/lease
             self.lease = Some(
@@ -287,5 +326,75 @@ impl Attempt for NativeAttempt<'_> {
             complete,
         );
         complete
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::connection::ssl_output::Observation;
+
+    fn observation(routes: &[(&str, u8)], count: Option<usize>) -> Observation {
+        Observation {
+            split: routes
+                .iter()
+                .map(|(ip, prefix)| (ip.parse().unwrap(), *prefix))
+                .collect(),
+            split_count: count,
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn selection_honors_profile_and_complete_gateway_routes() {
+        let split = observation(
+            &[("10.0.0.0", 8), ("172.20.0.0", 16), ("192.168.1.0", 24)],
+            Some(3),
+        );
+        let chosen = ssl_networks(&[], &split).unwrap();
+        assert_eq!(chosen, ["10.0.0.0/8", "172.20.0.0/16", "192.168.1.0/24"]);
+        let plan = crate::connection::routes::ppp_networks(&chosen, 9, true, false, None).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!(plan.iter().all(|route| route.interface == 9
+            && route.next_hop == crate::connection::routes::NextHop::Interface));
+        assert_eq!(
+            ssl_networks(
+                &["10.1.0.0/16".into()],
+                &Observation {
+                    split_invalid: true,
+                    ..Observation::default()
+                }
+            )
+            .unwrap(),
+            ["10.1.0.0/16"]
+        );
+        assert!(
+            ssl_networks(&[], &observation(&[], Some(0)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            ssl_networks(&[], &observation(&[("0.0.0.0", 0)], Some(1)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(ssl_networks(&[], &observation(&[("10.0.0.0", 8)], None)).is_none());
+        assert!(ssl_networks(&[], &observation(&[("10.0.0.0", 8)], Some(2))).is_none());
+        for (ip, prefix) in [
+            ("127.0.0.0", 8),
+            ("224.0.0.0", 4),
+            ("169.254.0.0", 16),
+            ("0.0.0.0", 8),
+        ] {
+            assert!(ssl_networks(&[], &observation(&[(ip, prefix)], Some(1))).is_none());
+        }
+    }
+
+    #[test]
+    fn selection_refuses_mismatched_count() {
+        let mismatch = observation(&[("10.0.0.0", 8)], Some(2));
+        assert!(ssl_networks(&[], &mismatch).is_none());
+        let control = observation(&[("10.0.0.0", 8)], Some(1));
+        assert_eq!(ssl_networks(&[], &control).unwrap(), ["10.0.0.0/8"]);
     }
 }
