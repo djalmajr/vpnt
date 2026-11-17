@@ -11,6 +11,7 @@ use crate::{
     },
     helper::{
         paths,
+        protocol::Step,
         runtime::{Program, Runtime, RuntimeError},
     },
     model::{Profile, VpnKind},
@@ -76,12 +77,23 @@ pub struct SslDriver {
     #[cfg(target_os = "macos")]
     supervision: Control,
     start_error: Option<StartError>,
+    /// Where a retained start error was born: a setup error after spawn keeps
+    /// `spawn`; a supervision failure seen by `poll` has none and takes the
+    /// caller's step.
+    #[cfg(target_os = "macos")]
+    start_step: Option<Step>,
 }
 
 impl SslDriver {
     #[cfg(test)]
     pub(crate) fn fixture_child_id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Retains a setup error the same way the real start does after spawn.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn fixture_retain_start_error(&mut self) {
+        self.retain_start_error(StartError::Unavailable);
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -142,9 +154,21 @@ impl SslDriver {
             unsafe { libc::geteuid() },
         )?;
         if !egress.is_current(profile).unwrap_or(false) {
-            driver.start_error = Some(StartError::Unavailable);
+            driver.retain_start_error(StartError::Unavailable);
         }
         Ok(driver)
+    }
+    /// After spawn the driver is kept for cleanup even when its start fails:
+    /// the error waits for the first poll and carries the `spawn` step.
+    #[cfg(target_os = "macos")]
+    fn retain_start_error(&mut self, error: StartError) {
+        self.start_error = Some(error);
+        self.start_step = Some(Step::Spawn);
+    }
+    /// The step of a retained start error; `None` when it came from `poll`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn start_step(&self) -> Option<Step> {
+        self.start_step
     }
     #[cfg(target_os = "macos")]
     fn start_using(
@@ -188,6 +212,7 @@ impl SslDriver {
             output: Output::default(),
             supervision,
             start_error: None,
+            start_step: None,
         };
         let setup = (|| {
             // Logging never fails setup: a missing log keeps the drain running.
@@ -204,7 +229,9 @@ impl SslDriver {
                 .map_err(|_| StartError::Unavailable)
         })();
         // After spawn, retain the driver/receipts even when setup fails.
-        driver.start_error = setup.err();
+        if let Err(error) = setup {
+            driver.retain_start_error(error);
+        }
         Ok(driver)
     }
     pub fn poll(&mut self) -> io::Result<Update> {

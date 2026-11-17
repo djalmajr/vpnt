@@ -92,6 +92,8 @@ impl App {
                     cleanup_verifying: false,
                     profile: connection.profile.clone(),
                     state: connection.session.state(),
+                    // The demo schedule simulates states; it carries no helper note.
+                    failure: None,
                     has_password: connection.has_password,
                     has_psk: connection.has_psk,
                     log: connection.log.clone(),
@@ -307,6 +309,7 @@ impl App {
                 .unwrap_or_default()
                 .as_secs(),
             state: connection.session.state(),
+            failure: None,
         });
         if connection.log.len() > 60 {
             connection.log.remove(0);

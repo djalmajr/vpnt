@@ -107,20 +107,22 @@ impl Attempt for AttemptKind<'_> {
 /// operation, but never pretends readiness or success.
 pub(super) struct DeniedAttempt;
 impl Attempt for DeniedAttempt {
+    /// Without a domain the host has no usable IPsec component.
     fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
         Err(Failure {
             state: ConnectionState::MissingProgram,
             error: ErrorCode::MissingProgram,
+            step: Step::Runtime,
         })
     }
     fn ready(&mut self) -> Result<bool, Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Tunnel))
     }
     fn healthy(&mut self) -> Result<(), Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Health))
     }
     fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Health))
     }
     fn cleanup(&mut self) -> bool {
         true
@@ -253,6 +255,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.state, ConnectionState::MissingProgram);
         assert_eq!(failure.error, ErrorCode::MissingProgram);
+        assert_eq!(failure.step, Step::Runtime);
         assert!(denied.ready().is_err());
         assert!(denied.healthy().is_err());
         assert!(

@@ -18,6 +18,11 @@ pub const VERSION: u32 = 3;
 pub const WAIT_CAPABILITY_SNAPSHOT_ID: &str = "snapshot-wait-v1";
 pub const CLEANUP_PROBE_SNAPSHOT_ID: &str = "snapshot-cleanup-v1";
 pub const CLEANUP_ACK_SNAPSHOT_ID: &str = "snapshot-cleanup-ack-v1";
+/// Same probe/ack pattern as cleanup: only an app that sends this snapshot ID
+/// receives failure notes; the helper answers with the ack ID. A helper that
+/// predates it echoes the probe ID and never sends a note.
+pub const FAILURE_NOTE_PROBE_SNAPSHOT_ID: &str = "failure-note-v1";
+pub const FAILURE_NOTE_ACK_SNAPSHOT_ID: &str = "failure-note-ack-v1";
 pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
@@ -95,6 +100,29 @@ pub enum ErrorCode {
     BackendFailure,
 }
 
+/// Step of a local attempt where its failure was born.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Step {
+    Profile,
+    Runtime,
+    Egress,
+    Spawn,
+    Tunnel,
+    Routes,
+    Dns,
+    Verify,
+    Health,
+}
+
+/// The helper's note on a failed attempt. A new attempt clears it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureNote {
+    pub code: ErrorCode,
+    pub step: Step,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelStatus {
@@ -105,6 +133,9 @@ pub struct TunnelStatus {
     pub failures: u32,
     #[serde(default)]
     pub cleaning: bool,
+    /// Sent only after `FAILURE_NOTE_PROBE_SNAPSHOT_ID`; absent from older helpers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureNote>,
 }
 
 /// No variant contains credentials or raw client output.
@@ -148,6 +179,8 @@ pub enum Message {
         failures: u32,
         #[serde(default)]
         cleaning: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureNote>,
     },
     Fatal {
         error: ErrorCode,
@@ -286,7 +319,12 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
                 || connections.iter().any(|status| {
                     !ids.contains(&status.id)
                         || !running.insert(&status.id)
-                        || !coherent_progress(status.state, status.failures, status.cleaning)
+                        || !coherent_progress(
+                            status.state,
+                            status.failures,
+                            status.cleaning,
+                            status.failure.is_some(),
+                        )
                 })
             {
                 return Err(ProtocolError::InvalidRequest);
@@ -328,9 +366,10 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
             state,
             failures,
             cleaning,
+            failure,
         } => {
             validate_operation(profile_id, *generation)?;
-            if !coherent_progress(*state, *failures, *cleaning) {
+            if !coherent_progress(*state, *failures, *cleaning, failure.is_some()) {
                 return Err(ProtocolError::InvalidRequest);
             }
         }
@@ -363,9 +402,10 @@ fn validate_operation(id: &str, generation: u64) -> Result<(), ProtocolError> {
 
 /// Every state except `Unresponsive` means zero consecutive traffic failures.
 /// `Unresponsive` always follows at least one actual failed probe, so a counter
-/// outside 1..=3 (including zero) is an incoherent wire payload.
-fn coherent_progress(state: ConnectionState, failures: u32, cleaning: bool) -> bool {
-    if cleaning
+/// outside 1..=3 (including zero) is an incoherent wire payload. Cleanup and a
+/// failure note belong only to the states a failed attempt ends in.
+fn coherent_progress(state: ConnectionState, failures: u32, cleaning: bool, noted: bool) -> bool {
+    if (cleaning || noted)
         && !matches!(
             state,
             ConnectionState::Dropped
@@ -552,6 +592,7 @@ mod cleanup_tests {
                     state,
                     failures: 0,
                     cleaning,
+                    failure: None,
                 };
                 let mut bytes = vec![];
                 write_message(&mut bytes, &message).unwrap();
@@ -574,7 +615,8 @@ mod cleanup_tests {
                 } else {
                     0
                 },
-                true
+                true,
+                false
             ));
         }
         let status: TunnelStatus =

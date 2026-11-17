@@ -7,7 +7,7 @@ use super::{
 #[cfg(test)]
 use crate::model::VpnKind;
 use crate::{
-    helper::protocol::{Command, Message, Request, TunnelStatus, VERSION},
+    helper::protocol::{Command, FailureNote, Message, Request, TunnelStatus, VERSION},
     model::valid_profile_id,
 };
 use dispatch::dispatch;
@@ -123,6 +123,8 @@ struct Slot<'scope> {
     state: ConnectionState,
     failures: u32,
     cleaning: bool,
+    /// Note of this generation's failed attempt; a new attempt clears it.
+    failure: Option<FailureNote>,
     interval: ProbeClock,
     worker: Option<Worker<'scope>>,
     pending: Option<Pending>,
@@ -133,13 +135,15 @@ impl Slot<'_> {
             worker.signals.canceled.store(true, Ordering::Release);
         }
     }
-    fn changed(&self) -> Message {
+    /// `notes`: the peer announced `FAILURE_NOTE_PROBE_SNAPSHOT_ID`.
+    fn changed(&self, notes: bool) -> Message {
         Message::Changed {
             profile_id: self.profile.id.clone(),
             generation: self.generation,
             state: self.state,
             failures: self.failures,
             cleaning: self.cleaning,
+            failure: self.failure.filter(|_| notes),
         }
     }
 }
@@ -241,6 +245,7 @@ fn run_with_exit<F: Factory>(
                         state: ConnectionState::Off,
                         failures: 0,
                         cleaning: false,
+                        failure: None,
                         interval: ProbeClock::new(interval.get()),
                         worker: None,
                         pending: None,
@@ -251,6 +256,7 @@ fn run_with_exit<F: Factory>(
         let mut outgoing = VecDeque::new();
         let mut closing = false;
         let mut cleanup_capable = false;
+        let mut failure_capable = false;
         let mut panicked = false;
         loop {
             if crate::helper::ppp_supervisor::signals::INTERRUPTED.load(Ordering::Acquire) {
@@ -269,6 +275,13 @@ fn run_with_exit<F: Factory>(
                             cleanup_capable = true;
                             request.id = crate::helper::protocol::CLEANUP_ACK_SNAPSHOT_ID.into();
                         }
+                        let note_probe = matches!(request.command, Command::Snapshot {})
+                            && request.id
+                                == crate::helper::protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID;
+                        if note_probe {
+                            request.id =
+                                crate::helper::protocol::FAILURE_NOTE_ACK_SNAPSHOT_ID.into();
+                        }
                         let refreshed = if matches!(request.command, Command::Snapshot {}) {
                             factory.profiles().and_then(|profiles| {
                                 if let Some(profiles) = profiles {
@@ -285,6 +298,12 @@ fn run_with_exit<F: Factory>(
                                 error,
                             });
                         } else {
+                            // The broker turns the note on only when the ack
+                            // snapshot arrives; a `Failed` keeps it off on
+                            // both sides, so only a successful ack enables it.
+                            if note_probe {
+                                failure_capable = true;
+                            }
                             dispatch(
                                 request,
                                 &factory,
@@ -292,6 +311,7 @@ fn run_with_exit<F: Factory>(
                                 &mut outgoing,
                                 &interval,
                                 cleanup_capable,
+                                failure_capable,
                             );
                         }
                     }
@@ -324,7 +344,8 @@ fn run_with_exit<F: Factory>(
                     slot.state = progress.state;
                     slot.failures = progress.failures;
                     slot.cleaning = progress.cleaning;
-                    outgoing.push_back(slot.changed());
+                    slot.failure = progress.failure;
+                    outgoing.push_back(slot.changed(failure_capable));
                 }
                 if closing {
                     slot.pending = None; // drops queued secrets before waiting
@@ -344,19 +365,26 @@ fn run_with_exit<F: Factory>(
                             Finished {
                                 state: ConnectionState::Dropped,
                                 error: Some(ErrorCode::BackendFailure),
+                                step: None,
                             }
                         }
                     };
                     if slot.pending.is_none() {
-                        slot.state = if slot.generation == worker.generation {
+                        let current = slot.generation == worker.generation;
+                        slot.state = if current {
                             finished.state
                         } else {
                             ConnectionState::Off
                         };
                         slot.failures = 0;
                         slot.cleaning = false;
+                        slot.failure = finished
+                            .error
+                            .zip(finished.step)
+                            .filter(|_| current)
+                            .map(|(code, step)| FailureNote { code, step });
                         if !closing {
-                            outgoing.push_back(slot.changed());
+                            outgoing.push_back(slot.changed(failure_capable));
                         }
                     }
                     if slot.generation == worker.generation
@@ -384,6 +412,7 @@ fn run_with_exit<F: Factory>(
                     state,
                     failures,
                     cleaning,
+                    ..
                 } = &message
                     && !slots.get(profile_id).is_some_and(|slot| {
                         slot.generation == *generation

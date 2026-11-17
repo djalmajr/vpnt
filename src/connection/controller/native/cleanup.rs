@@ -447,10 +447,13 @@ mod abandon_tests {
             attempt.spawn_attempted = true;
             READY_NETWORKS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
             let _capture = Capture;
-            assert!(
-                attempt.ready().is_err(),
-                "the actual native writer must reject an unprivileged fixture"
-            );
+            let failure = attempt
+                .ready()
+                .expect_err("the actual native writer must reject an unprivileged fixture");
+            // The real route registration failed: the note names `Routes`.
+            assert_eq!(failure.step, Step::Routes);
+            assert_eq!(failure.state, ConnectionState::Dropped);
+            assert_eq!(failure.error, ErrorCode::BackendFailure);
             let observed = READY_NETWORKS.with(|slot| slot.borrow().clone().unwrap());
             assert_eq!(observed, expected);
             let plan =
@@ -466,7 +469,121 @@ mod abandon_tests {
                     .backend_mut()
                     .fixture_has_scope(&attempt.owner)
             );
+            // The same native attempt checked as a live connection: whatever
+            // its link or lease check finds, the failure is `Health`.
+            assert_eq!(attempt.healthy().unwrap_err().step, Step::Health);
         }
+    }
+    /// The native SSL attempt the factory builds for an ordinary user, with a
+    /// stored generic profile; nothing here reaches root-only state.
+    fn with_ssl_attempt(
+        label: &str,
+        run: impl FnOnce(&mut NativeAttempt<'_>, &Arc<Profiles>, &Profile),
+    ) {
+        use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+        use crate::helper::controller_lock::ControllerLock;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(
+            uid, 0,
+            "fixture requires an ordinary user; never create routes or a sink"
+        );
+        let root = Root(
+            std::env::current_dir()
+                .unwrap()
+                .join("output/fixtures")
+                .join(format!(
+                    "{label}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )),
+        );
+        fs::create_dir_all(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock_dir = root.0.join("controller");
+        fs::create_dir(&lock_dir).unwrap();
+        fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(lock_dir.join(".controller.lock"))
+            .unwrap();
+        let controller = ControllerLock::fixture(&lock_dir, uid).unwrap();
+        let profile: Profile = serde_json::from_value(serde_json::json!({"id":"example","name":"example","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
+        ProfileStore::open(&root.0, uid)
+            .unwrap()
+            .save(profile.clone())
+            .unwrap();
+        let profiles = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+        let routes = Arc::new(Mutex::new(
+            Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+        ));
+        let factory = NativeFactory::new(routes, profiles.clone(), None, uid)
+            .fixture_fence_root(root.0.clone(), uid);
+        let mut attempt = match factory.create(
+            profile.clone(),
+            uid,
+            1,
+            Credentials {
+                password: "fictional".into(),
+                psk: "".into(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            AttemptKind::Ssl(attempt) => attempt,
+            _ => panic!("SSL factory expected"),
+        };
+        run(&mut attempt, &profiles, &profile);
+    }
+
+    /// A setup error the SSL start retains after spawn (kept for cleanup)
+    /// reaches the first `ready` with the step it was born in, `spawn`, not
+    /// the `tunnel` step `ready` polls the client under.
+    #[test]
+    fn retained_ssl_setup_error_reaches_ready_as_spawn() {
+        // The fixture must outlive the driver, including during unwind.
+        let fixture = crate::connection::ssl::tests::Fixture::new();
+        with_ssl_attempt("retained-start", |attempt, profiles, profile| {
+            attempt.profile_use = Some(profiles.begin(profile, 1).unwrap());
+            let mut driver = fixture.start("ready.fixture.invalid");
+            driver.fixture_retain_start_error();
+            attempt.client = Some(driver);
+            attempt.spawn_attempted = true;
+            let failure = attempt.ready().unwrap_err();
+            assert_eq!(failure.step, Step::Spawn);
+            assert_eq!(failure.state, ConnectionState::Dropped);
+            assert_eq!(failure.error, ErrorCode::BackendFailure);
+        });
+    }
+
+    /// `Egress::select` failing in the real SSL start maps to `egress`. The
+    /// test seam skips the installed runtime checks and injects the error.
+    /// The IPsec call site (`IpsecEgress::select` in `ipsec/start.rs`) needs a
+    /// `NativeContext`, which requires root, so it stays static.
+    #[test]
+    fn ssl_start_maps_an_egress_selection_failure_to_egress() {
+        struct Injected;
+        impl Drop for Injected {
+            fn drop(&mut self) {
+                EGRESS_FAILURE.with(|slot| slot.set(None));
+            }
+        }
+        with_ssl_attempt("egress", |attempt, _, _| {
+            EGRESS_FAILURE.with(|slot| slot.set(Some(Error::Unavailable)));
+            let _injected = Injected;
+            let failure = attempt
+                .start(
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .unwrap_err();
+            assert_eq!(failure.step, Step::Egress);
+            assert_eq!(failure.state, ConnectionState::Dropped);
+            assert_eq!(failure.error, ErrorCode::BackendFailure);
+            assert!(attempt.client.is_none() && !attempt.spawn_attempted);
+        });
     }
     #[test]
     fn ready_delivers_profile_dns_and_logs_missing_gateway_servers() {
@@ -1177,7 +1294,7 @@ mod abandon_tests {
         attempt.journaled.store(false, Ordering::Release);
         fence::remove(&native.root.0, native.uid, native.uid, "example", 1).unwrap();
         attempt.fence_owner = native.uid.wrapping_add(1);
-        assert!(attempt.established().is_err());
+        assert_eq!(attempt.established().unwrap_err().step, Step::Routes);
         assert!(!attempt.journaled.load(Ordering::Acquire));
         assert!(native.journal().is_none());
         assert!(native.held(&routes));

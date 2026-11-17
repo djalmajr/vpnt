@@ -277,7 +277,7 @@ impl<S: SecretStore> Broker<S> {
         let c = self.connections.get_mut(id).ok_or("not_found")?;
         c.pending = Some(Pending {
             id: request,
-            previous: (c.generation, c.view.state),
+            previous: (c.generation, c.view.state, c.view.failure),
             accepted: false,
         });
         c.generation = generation;

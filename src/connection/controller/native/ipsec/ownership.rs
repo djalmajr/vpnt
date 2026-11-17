@@ -8,14 +8,17 @@ use crate::connection::{
 
 /// Keep the non-Clone Reservation alive across a successful prepare result.
 /// Only Control construction may consume it later; this helper never takes it.
+/// Its failures belong to the IPsec start (`Spawn`).
 pub(super) fn keep_for_control<T>(
     reservation: &mut Option<Reservation>,
     prepared: Result<T, IpsecError>,
 ) -> Result<T, Failure> {
-    reservation.as_ref().ok_or_else(Failure::unavailable)?;
+    reservation
+        .as_ref()
+        .ok_or_else(|| Failure::at(Step::Spawn))?;
     match prepared {
         Ok(value) => Ok(value),
-        Err(_) => Err(Failure::unavailable()),
+        Err(_) => Err(Failure::at(Step::Spawn)),
     }
 }
 

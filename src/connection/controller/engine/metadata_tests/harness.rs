@@ -54,7 +54,7 @@ impl Attempt for Connection {
         self.reservation = Some(
             self.profiles
                 .begin(&self.profile, self.generation)
-                .map_err(|_| Failure::unavailable())?,
+                .map_err(|_| Failure::at(Step::Profile))?,
         );
         Ok(())
     }
@@ -66,7 +66,7 @@ impl Attempt for Connection {
             .as_ref()
             .unwrap()
             .validate()
-            .map_err(|_| Failure::unavailable())
+            .map_err(|_| Failure::at(Step::Health))
     }
     fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
         Ok(true)
