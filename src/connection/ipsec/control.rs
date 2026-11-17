@@ -40,6 +40,7 @@ pub struct Control<N: Observer, P: Peer> {
     phase: Phase,
     version_verified: bool,
     loaded: bool,
+    initiate_sent: bool,
     cleanup_sent: bool,
 }
 
@@ -69,11 +70,18 @@ impl<N: Observer, P: Peer> Control<N, P> {
             phase: Phase::Prepared,
             version_verified: false,
             loaded: false,
+            initiate_sent: false,
             cleanup_sent: false,
         })
     }
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+    /// True once `start` began the `initiate` exchange, which asks charon to
+    /// negotiate IKE: a later failure of that `start` (a refusal, a lost reply)
+    /// belongs to the tunnel, every earlier one to the client start.
+    pub fn initiate_sent(&self) -> bool {
+        self.initiate_sent
     }
 
     /// Initiation is not kernel admission, traffic proof, or Connected.
@@ -118,6 +126,7 @@ impl<N: Observer, P: Peer> Control<N, P> {
             .map_err(|_| Error::Unavailable)?
             .ensure_initiate_clear(&self.reservation)?;
         let request = self.config.initiate(call.remaining()?)?;
+        self.initiate_sent = true;
         self.ack(&call, "initiate", request)?;
         self.phase = Phase::Initiated;
         Ok(())

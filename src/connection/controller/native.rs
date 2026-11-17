@@ -63,6 +63,37 @@ impl ObservedBackend<'_, '_> {
         self.0.register_ppp(link, owner, networks, canceled)
     }
 }
+
+// Test-only seam: with an injected egress error, an unprivileged fixture
+// passes the installed runtime checks and `Egress::select` returns that error,
+// so the real consumer in `start` maps it. Builds without `cfg(test)` always
+// run both real calls.
+#[cfg(test)]
+thread_local! {
+    static EGRESS_FAILURE: std::cell::Cell<Option<crate::connection::routes::Error>> = const { std::cell::Cell::new(None) };
+}
+
+fn installed_runtime() -> Result<(), RuntimeError> {
+    #[cfg(test)]
+    if EGRESS_FAILURE.with(std::cell::Cell::get).is_some() {
+        return Ok(());
+    }
+    Runtime::installed()
+        .and_then(|_| Runtime::verify_pinentry())
+        .and_then(|_| Runtime::verify_ppp_supervisor())
+}
+
+fn select_egress(
+    profile: &Profile,
+    canceled: &AtomicBool,
+    timeout: Duration,
+) -> Result<Egress, crate::connection::routes::Error> {
+    #[cfg(test)]
+    if let Some(error) = EGRESS_FAILURE.with(std::cell::Cell::get) {
+        return Err(error);
+    }
+    Egress::select(profile, canceled, timeout)
+}
 /// Prepared root-side consumer. Not an installer or an elevation entrypoint.
 /// The prepared helper binds uid to its inherited caller and keeps this
 /// controller/lock alive through EOF and every outstanding cleanup. Installed
@@ -136,7 +167,9 @@ impl NativeAttempt<'_> {
             .poll()
             .map_err(|_| at())?;
         if update.start_error.is_some() {
-            return Err(at());
+            // A setup error retained after spawn keeps the step it was born in.
+            let born = self.client.as_ref().and_then(SslDriver::start_step);
+            return Err(Failure::at(born.unwrap_or(step)));
         }
         if let Some(failure) = update.failure {
             return Err(Failure {
@@ -281,24 +314,21 @@ impl Attempt for NativeAttempt<'_> {
         // Preflight failures have no spawned child. After attempting spawn,
         // uncertainty must survive even if setup returns an error.
         check(expires, canceled, Step::Runtime)?;
-        Runtime::installed()
-            .and_then(|_| Runtime::verify_pinentry())
-            .and_then(|_| Runtime::verify_ppp_supervisor())
-            .map_err(|error| Failure {
-                state: if error == RuntimeError::Missing {
-                    ConnectionState::MissingProgram
-                } else {
-                    ConnectionState::Dropped
-                },
-                error: if error == RuntimeError::Missing {
-                    ErrorCode::MissingProgram
-                } else {
-                    ErrorCode::UntrustedConfiguration
-                },
-                step: Step::Runtime,
-            })?;
+        installed_runtime().map_err(|error| Failure {
+            state: if error == RuntimeError::Missing {
+                ConnectionState::MissingProgram
+            } else {
+                ConnectionState::Dropped
+            },
+            error: if error == RuntimeError::Missing {
+                ErrorCode::MissingProgram
+            } else {
+                ErrorCode::UntrustedConfiguration
+            },
+            step: Step::Runtime,
+        })?;
         check(expires, canceled, Step::Egress)?;
-        let egress = Egress::select(
+        let egress = select_egress(
             &self.profile,
             canceled,
             bounded(expires, canceled, Step::Egress)?,

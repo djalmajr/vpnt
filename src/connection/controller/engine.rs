@@ -185,10 +185,10 @@ fn run_with_exit<F: Factory>(
                             cleanup_capable = true;
                             request.id = crate::helper::protocol::CLEANUP_ACK_SNAPSHOT_ID.into();
                         }
-                        if matches!(request.command, Command::Snapshot {})
-                            && request.id == crate::helper::protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID
-                        {
-                            failure_capable = true;
+                        let note_probe = matches!(request.command, Command::Snapshot {})
+                            && request.id
+                                == crate::helper::protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID;
+                        if note_probe {
                             request.id =
                                 crate::helper::protocol::FAILURE_NOTE_ACK_SNAPSHOT_ID.into();
                         }
@@ -208,6 +208,12 @@ fn run_with_exit<F: Factory>(
                                 error,
                             });
                         } else {
+                            // The broker turns the note on only when the ack
+                            // snapshot arrives; a `Failed` keeps it off on
+                            // both sides, so only a successful ack enables it.
+                            if note_probe {
+                                failure_capable = true;
+                            }
                             dispatch(
                                 request,
                                 &factory,

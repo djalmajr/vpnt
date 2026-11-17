@@ -289,6 +289,112 @@ mod recovery {
         drop(broker);
         drop(guard);
     }
+
+    /// The helper answers the note probe with `Failed` when refreshing the
+    /// profiles fails. The broker then keeps the note off, so the helper must
+    /// too: the channel stays usable and the next failure reaches the card
+    /// without a note.
+    #[test]
+    fn rejected_failure_note_capability_leaves_the_broker_usable_without_a_note() {
+        use crate::{bridge::Command as UiCommand, broker::Broker, helper::client::Client};
+        use std::sync::atomic::AtomicUsize;
+        struct RejectingEngine(Arc<AtomicUsize>);
+        struct RoutesAttempt;
+        impl Attempt for RoutesAttempt {
+            fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+                Ok(())
+            }
+            fn ready(&mut self) -> Result<bool, Failure> {
+                Err(Failure::at(Step::Routes))
+            }
+            fn healthy(&mut self) -> Result<(), Failure> {
+                unreachable!()
+            }
+            fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+                unreachable!()
+            }
+            fn cleanup(&mut self) -> bool {
+                true
+            }
+        }
+        impl Factory for RejectingEngine {
+            type Attempt = RoutesAttempt;
+            fn create(
+                &self,
+                _: Profile,
+                _: u32,
+                _: u64,
+                _: Credentials,
+                _: Arc<AtomicBool>,
+            ) -> Self::Attempt {
+                RoutesAttempt
+            }
+            // The broker asks, in order, for the initial snapshot, the
+            // cleanup probe and the note probe: only the third one fails.
+            fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
+                if self.0.fetch_add(1, Ordering::AcqRel) == 2 {
+                    Err(ErrorCode::UntrustedConfiguration)
+                } else {
+                    Ok(None)
+                }
+            }
+            fn idle(&self) -> bool {
+                true
+            }
+        }
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let (input, requests) = mpsc::sync_channel(32);
+        let (output, replies) = mpsc::sync_channel(64);
+        let engine = RejectingEngine(snapshots.clone());
+        let guard = EngineGuard(Some(thread::spawn(move || {
+            run(
+                engine,
+                unsafe { libc::geteuid() },
+                vec![profile("one")],
+                requests,
+                output,
+                Timing::default(),
+            )
+        })));
+        let mut broker = Broker::fixture(Client::fixture_channels(input, replies), FixtureSecrets);
+        let until = Instant::now() + Duration::from_secs(5);
+        while broker.snapshot().vpns.is_empty() || snapshots.load(Ordering::Acquire) < 3 {
+            assert!(
+                Instant::now() < until,
+                "broker never became ready or never sent the note probe"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        broker
+            .dispatch(
+                UiCommand::Connect { id: "one".into() },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        let snapshot = loop {
+            let snapshot = broker.snapshot();
+            if snapshot
+                .vpns
+                .first()
+                .is_some_and(|v| v.state == ConnectionState::Dropped && !v.cleaning)
+            {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < until,
+                "the rejected capability tore down the channel before the failure reached the card"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["vpns"][0].get("failure").is_none(), "{json}");
+        let log = json["vpns"][0]["log"].as_array().unwrap();
+        let dropped: Vec<_> = log.iter().filter(|e| e["state"] == "dropped").collect();
+        assert_eq!(dropped.len(), 1, "{log:?}");
+        assert!(log.iter().all(|e| e.get("failure").is_none()), "{log:?}");
+        drop(broker);
+        drop(guard);
+    }
 }
 
 #[derive(Default)]
