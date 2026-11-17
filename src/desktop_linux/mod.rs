@@ -259,14 +259,19 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     if let Command::Resize { height: requested } = request.command {
                         height = requested;
                         let current = placement::advance(&generation);
-                        if open {
-                            let placement = if !visible {
-                                opening = current;
-                                placement::click_request(current, anchor, height)
-                            } else {
-                                placement::resize_request(current, opening, anchor, height)
-                            };
-                            reposition(&window, &positioner, placement);
+                        if open && !visible {
+                            opening = current;
+                            reposition(
+                                &window,
+                                &positioner,
+                                placement::click_request(current, anchor, height),
+                            );
+                        } else if open {
+                            resize_visible(
+                                &window,
+                                &positioner,
+                                placement::resize_request(current, opening, anchor, height),
+                            );
                         } else {
                             window.set_inner_size(LogicalSize::new(320, height.clamp(180, 720)));
                             fix_bounds(&window, height.clamp(180, 720));
@@ -326,8 +331,11 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                         visible = true;
                         deadline = None;
                     }
-                    let _ =
-                        positioner.send(placement::resize_request(placed, opening, anchor, height));
+                    resize_visible(
+                        &window,
+                        &positioner,
+                        placement::resize_request(placed, opening, anchor, height),
+                    );
                 }
             }
             Event::UserEvent(UserEvent::Placed {
@@ -339,6 +347,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(height) =
                     accept_placement(current, placed, height, &mut anchor, used_anchor)
                 {
+                    window.set_inner_size(LogicalSize::new(320, height));
                     fix_bounds(&window, height);
                 }
             }
@@ -401,9 +410,7 @@ fn reposition(
     request: placement::PlacementRequest,
 ) -> bool {
     let height = request.requested.clamp(180, 720);
-    window.set_min_inner_size(None::<LogicalSize<u32>>);
-    window.set_max_inner_size(None::<LogicalSize<u32>>);
-    window.set_resizable(true);
+    release_bounds(window);
     window.set_inner_size(LogicalSize::new(320, height));
     if !positioner.supported() || positioner.send(request).is_err() {
         fix_bounds(window, height);
@@ -411,6 +418,33 @@ fn reposition(
     } else {
         true
     }
+}
+
+/// Resizes the visible panel through Hyprland, which keeps a floating window's
+/// center when the client changes its own size. A GTK window still fixed at the
+/// old height turns the compositor's resize down and commits the old size back,
+/// so the panel grows around its center and slides under the bar. The bounds are
+/// released and GTK is not resized here; `Placed` fixes them at the applied height.
+fn resize_visible(
+    window: &Window,
+    positioner: &placement::Positioner,
+    request: placement::PlacementRequest,
+) {
+    if positioner.supported() {
+        release_bounds(window);
+        if positioner.send(request).is_ok() {
+            return;
+        }
+    }
+    let height = request.requested.clamp(180, 720);
+    window.set_inner_size(LogicalSize::new(320, height));
+    fix_bounds(window, height);
+}
+
+fn release_bounds(window: &Window) {
+    window.set_min_inner_size(None::<LogicalSize<u32>>);
+    window.set_max_inner_size(None::<LogicalSize<u32>>);
+    window.set_resizable(true);
 }
 
 fn fix_bounds(window: &Window, height: u32) {
