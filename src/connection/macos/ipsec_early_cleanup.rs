@@ -61,24 +61,17 @@ pub(crate) fn orphan_observed(
     }) {
         return Ok(false);
     }
-    if let Some((name, index, vips)) = link {
-        if !vip::retired::observed(name, index, vips, interfaces, table)
+    if let Some((name, index, vips)) = link
+        && (!vip::retired::observed(name, index, vips, interfaces, table)
             || interfaces
                 .entries
                 .values()
-                .any(|entry| vips.iter().any(|vip| entry.addresses.contains(vip)))
-        {
-            return Ok(false);
-        }
-        // Same condition as the retained backend (`networks.is_empty() &&
-        // ipv4 != ipv6` on the selected route networks): a full tunnel (both
-        // defaults, see `config::selection::is_full_tunnel`) with a single VIP
-        // family. That sink is its own UTUN with a private host address, which
-        // the planned destinations do not cover and the claim does not name.
-        let sink_possible = vips.len() == 1 && full_tunnel(networks);
-        if !sink_possible {
-            return Ok(true);
-        }
+                .any(|entry| vips.iter().any(|vip| entry.addresses.contains(vip))))
+    {
+        return Ok(false);
+    }
+    if !needs_fallback(link, networks) {
+        return Ok(true);
     }
     // Legacy/no-link claims and possible sinks have no recorded unit or VIP.
     // A remaining UTUN, unknown route index or unowned LOCAL host route could
@@ -97,6 +90,18 @@ pub(crate) fn orphan_observed(
                 });
             !index_known || orphan_local
         }))
+}
+
+/// Whether the claim's own evidence cannot settle host absence, so the
+/// conservative fallback (no UTUN, no unknown index, no orphan LOCAL route)
+/// decides: a claim without a recorded link, or one whose controller may have
+/// opened a sink. The sink follows the retained backend (`networks.is_empty()
+/// && ipv4 != ipv6` on the selected route networks): a full tunnel (both
+/// defaults, see `config::selection::is_full_tunnel`) with a single VIP
+/// family. It is its own UTUN with a private host address, which the planned
+/// destinations do not cover and the claim does not name.
+pub(crate) fn needs_fallback(link: Option<(&str, u16, &[IpAddr])>, networks: &[String]) -> bool {
+    link.is_none_or(|(_, _, vips)| vips.len() == 1 && full_tunnel(networks))
 }
 
 fn full_tunnel(networks: &[String]) -> bool {

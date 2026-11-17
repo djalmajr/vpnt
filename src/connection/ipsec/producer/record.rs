@@ -81,6 +81,11 @@ pub(super) struct Record {
     pub child: Option<Birth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkClaim>,
+    /// `kern.bootsessionuuid` when the controller created the claim; absent in
+    /// legacy records or when the read failed. Startup recovery compares it
+    /// with the current boot session, with no clock involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_session: Option<String>,
 }
 impl Record {
     pub fn owner(&self) -> Owner {
@@ -118,6 +123,10 @@ impl Record {
                 .link
                 .as_ref()
                 .is_some_and(|link| self.child.is_none() || !link.valid())
+            || self
+                .boot_session
+                .as_deref()
+                .is_some_and(|uuid| !boot_session_valid(uuid))
         {
             return Err(Error::Invalid);
         }
@@ -134,6 +143,15 @@ impl Record {
         b.link = None;
         a == b
     }
+}
+/// Canonical UUID text (`8-4-4-4-12` hex digits, either case), the form the
+/// kernel reports for `kern.bootsessionuuid`.
+pub(super) fn boot_session_valid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, length)| {
+            group.len() == length && group.bytes().all(|b| b.is_ascii_hexdigit())
+        })
 }
 pub(super) fn hex(value: &str, length: usize) -> bool {
     value.len() == length

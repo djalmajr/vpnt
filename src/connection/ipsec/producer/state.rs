@@ -175,6 +175,8 @@ impl Store {
             stage: Stage::Prepared,
             child: None,
             link: None,
+            // Optional: a failed read leaves the legacy clock proof in charge.
+            boot_session: super::recovery::boot_session().ok(),
         };
         record.valid()?;
         budget::check(budget)?;

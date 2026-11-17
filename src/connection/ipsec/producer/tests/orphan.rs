@@ -348,3 +348,58 @@ fn startup_orphan_reads_a_captured_claim_without_vips() {
     assert!(observation.checked_resources);
     assert!(!lease.directory.path.exists());
 }
+
+#[test]
+fn startup_orphan_seal_capture_records_the_admitted_utun_in_the_claim() {
+    use crate::connection::macos::utun_observer::{InterfaceObservation, RetainedInterface};
+    let retained = |name: &str, index: u32| {
+        let fd: std::os::fd::OwnedFd = fs::File::open("/dev/null").unwrap().into();
+        let observation = InterfaceObservation::synthetic_for_test(name, index, 7, 0x55, 0x77);
+        RetainedInterface::synthetic_for_test(fd, observation)
+    };
+    let fixture = Fixture::new();
+
+    // Refused write: the capture fails and the claim keeps no link.
+    let starting = prepare(&fixture, Stage::Starting);
+    let path = starting.directory.path.join("claim.json");
+    let mut producer = child::Producer::new(fixture.context(), starting, None);
+    assert_eq!(
+        producer
+            .seal_capture(retained("utun7", 7), until(), &token())
+            .unwrap_err(),
+        Error::Changed
+    );
+    let durable: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(durable.link, None);
+    drop(producer);
+
+    let fixture = Fixture::new();
+    let lease = prepare(&fixture, Stage::Running);
+    let path = lease.directory.path.join("claim.json");
+    let before: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(before.link, None);
+    // The controller stamps the current boot session when it creates the claim.
+    assert_eq!(before.boot_session, Some(recovery::boot_session().unwrap()));
+    let mut producer = child::Producer::new(fixture.context(), lease, None);
+    let sealed = producer
+        .seal_capture(retained("utun7", 7), until(), &token())
+        .unwrap();
+    assert_eq!((sealed.name(), sealed.index()), ("utun7", 7));
+    let captured = record::LinkClaim {
+        name: "utun7".into(),
+        index: std::num::NonZeroU16::new(7).unwrap(),
+        vips: Vec::new(),
+    };
+    let durable: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(durable.link.as_ref(), Some(&captured));
+    assert_eq!(producer.lease.record.link.as_ref(), Some(&captured));
+    // A second capture for the same attempt is refused.
+    assert_eq!(
+        producer
+            .seal_capture(retained("utun7", 7), until(), &token())
+            .unwrap_err(),
+        Error::Changed
+    );
+    drop(sealed);
+    drop(producer);
+}

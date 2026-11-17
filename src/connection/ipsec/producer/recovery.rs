@@ -1,7 +1,7 @@
 //! Startup observer. It never attaches to or terminates an orphaned daemon.
 use super::{
     Error, NativeContext, Process,
-    record::{Birth, Record},
+    record::{self, Birth, Record},
     state::{ObserveOrphan, Store},
 };
 use crate::{
@@ -27,9 +27,16 @@ struct NativeObserver<'a>(&'a ControllerLock, Instant);
 pub(super) trait OrphanReads {
     fn interfaces(&mut self) -> Result<Interfaces, RouteError>;
     fn routes(&mut self) -> Result<Snapshot, RouteError>;
-    /// `kern.boottime` as `(seconds, microseconds)`, the same clock and layout
-    /// as a recorded [`Birth::start`].
+    /// `kern.boottime` as `(seconds, microseconds)`, the same wall clock and
+    /// layout as a recorded [`Birth::start`]. Unlike a recorded start, the
+    /// kernel shifts it by every step of the wall clock: a forward step after
+    /// the controller started moves it past that start.
     fn boot(&mut self) -> Result<(u64, u64), RouteError>;
+    /// Start of PID 1 (launchd), fixed at its fork like a recorded
+    /// [`Birth::start`]; a later clock step does not move it.
+    fn launchd_start(&mut self) -> Result<(u64, u64), RouteError>;
+    /// Current `kern.bootsessionuuid`.
+    fn boot_session(&mut self) -> Result<String, RouteError>;
     fn pfkey(&mut self, kind: Kind) -> Result<Vec<Entry>, RouteError>;
 }
 
@@ -70,6 +77,16 @@ impl OrphanReads for NativeReads<'_> {
         Ok((seconds, micros))
     }
 
+    fn launchd_start(&mut self) -> Result<(u64, u64), RouteError> {
+        Process::read(1)
+            .map(|process| process.identity.start)
+            .map_err(|_| RouteError::Unavailable)
+    }
+
+    fn boot_session(&mut self) -> Result<String, RouteError> {
+        boot_session()
+    }
+
     fn pfkey(&mut self, kind: Kind) -> Result<Vec<Entry>, RouteError> {
         // IKE and userspace ESP state die with charon. The kernel SAD and SPD
         // survive the process, so a complete read-only dump is required.
@@ -81,6 +98,35 @@ impl OrphanReads for NativeReads<'_> {
     }
 }
 
+/// The current `kern.bootsessionuuid`, read without privileges. Only the
+/// canonical UUID form is accepted.
+pub(super) fn boot_session() -> Result<String, RouteError> {
+    let mut bytes = [0u8; 64];
+    let mut size = bytes.len();
+    // SAFETY: the name is NUL-terminated and the buffer is valid for `size`
+    // bytes; the kernel reports the length it wrote.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size > bytes.len() {
+        return Err(RouteError::Unavailable);
+    }
+    let text = std::ffi::CStr::from_bytes_until_nul(&bytes[..size])
+        .map_err(|_| RouteError::Unavailable)?
+        .to_str()
+        .map_err(|_| RouteError::Unavailable)?;
+    if !record::boot_session_valid(text) {
+        return Err(RouteError::Unavailable);
+    }
+    Ok(text.to_owned())
+}
+
 /// A boot after the recorded controller started destroys every UTUN, VIP and
 /// route the claim could own. Only a strictly later boot counts; a record
 /// without a comparable start (no seconds) never does.
@@ -88,15 +134,37 @@ fn booted_after(controller: &Birth, boot: (u64, u64)) -> bool {
     controller.start.0 > 0 && boot > controller.start
 }
 
+/// Reboot proof. A claim that recorded its boot session is decided by that
+/// UUID alone: a different current session proves a reboot, the same one
+/// denies it, and no clock is read. A legacy claim compares its controller
+/// start with the earlier of `kern.boottime` and launchd's start: a forward
+/// clock step after the controller started moves the boottime but not
+/// launchd's start; a backward step between the two lowers the boottime. When
+/// launchd's start cannot be read the boottime alone decides.
+fn rebooted(record: &Record, reads: &mut impl OrphanReads) -> Result<bool, RouteError> {
+    if let Some(recorded) = &record.boot_session {
+        return Ok(reads.boot_session()? != *recorded);
+    }
+    let boot = reads.boot()?;
+    if !booted_after(&record.controller, boot) {
+        return Ok(false);
+    }
+    Ok(match reads.launchd_start() {
+        Ok(launchd) => booted_after(&record.controller, boot.min(launchd)),
+        Err(_) => true,
+    })
+}
+
 /// UTUN, VIP and route absence. A claim with a recorded link is checked
-/// against it. A claim without one cannot tell its UTUN from the system's, so
-/// only a later boot proves it; otherwise the conservative fallback decides.
+/// against it. When that evidence cannot decide (no link, or a possible sink:
+/// see [`ipsec_early_cleanup::needs_fallback`]), only a reboot proves absence
+/// on a host with system UTUNs; otherwise the conservative fallback decides.
 fn host_absent(record: &Record, reads: &mut impl OrphanReads) -> Result<bool, RouteError> {
     let link = record
         .link
         .as_ref()
         .map(|link| (link.name.as_str(), link.index.get(), link.vips.as_slice()));
-    if link.is_none() && booted_after(&record.controller, reads.boot()?) {
+    if ipsec_early_cleanup::needs_fallback(link, &record.networks) && rebooted(record, reads)? {
         return Ok(true);
     }
     let interfaces = reads.interfaces()?;
@@ -276,7 +344,26 @@ mod tests {
                 start: (1_001, 0),
             }),
             link,
+            boot_session: None,
         };
+        record.valid().unwrap();
+        record
+    }
+
+    const SESSION: &str = "CE2DD70F-0000-4000-8000-000000000001";
+    const OTHER_SESSION: &str = "CE2DD70F-0000-4000-8000-000000000002";
+
+    /// A full tunnel with one VIP family: the controller may have opened a
+    /// sink, so the claim's own link cannot settle absence.
+    fn sink() -> Record {
+        let mut record = linked();
+        record.networks = vec!["0.0.0.0/0".into(), "::/0".into()];
+        record.valid().unwrap();
+        record
+    }
+
+    fn with_session(mut record: Record) -> Record {
+        record.boot_session = Some(SESSION.into());
         record.valid().unwrap();
         record
     }
@@ -296,6 +383,8 @@ mod tests {
         system_utun: bool,
         retained: bool,
         boot: (u64, u64),
+        launchd: Result<(u64, u64), RouteError>,
+        session: &'static str,
         sa: bool,
         policy: bool,
         log: Vec<&'static str>,
@@ -308,6 +397,8 @@ mod tests {
                 system_utun: true,
                 retained: false,
                 boot: (2_000, 0),
+                launchd: Ok((1_999, 0)),
+                session: SESSION,
                 sa: false,
                 policy: false,
                 log: Vec::new(),
@@ -352,6 +443,16 @@ mod tests {
             Ok(self.boot)
         }
 
+        fn launchd_start(&mut self) -> Result<(u64, u64), RouteError> {
+            self.read("launchd")?;
+            self.launchd
+        }
+
+        fn boot_session(&mut self) -> Result<String, RouteError> {
+            self.read("boot_session")?;
+            Ok(self.session.into())
+        }
+
         fn pfkey(&mut self, kind: Kind) -> Result<Vec<Entry>, RouteError> {
             match kind {
                 Kind::Sad => {
@@ -378,7 +479,7 @@ mod tests {
     fn startup_orphan_unlinked_claim_after_a_later_boot_is_absent_on_a_host_with_utuns() {
         let mut later = Fake::default();
         assert_eq!(resources_absent_with(&record(None), &mut later), Ok(true));
-        assert_eq!(later.log, ["boot", "sad", "spd"]);
+        assert_eq!(later.log, ["boot", "launchd", "sad", "spd"]);
         let mut by_micros = Fake {
             boot: (START.0, 1),
             ..Default::default()
@@ -423,7 +524,7 @@ mod tests {
             resources_absent_with(&record(None), &mut with_sa),
             Err(Reason::NamespaceOccupied)
         );
-        assert_eq!(with_sa.log, ["boot", "sad"]);
+        assert_eq!(with_sa.log, ["boot", "launchd", "sad"]);
         let mut with_policy = Fake {
             policy: true,
             ..Default::default()
@@ -432,7 +533,7 @@ mod tests {
             resources_absent_with(&record(None), &mut with_policy),
             Err(Reason::NamespaceOccupied)
         );
-        assert_eq!(with_policy.log, ["boot", "sad", "spd"]);
+        assert_eq!(with_policy.log, ["boot", "launchd", "sad", "spd"]);
     }
 
     #[test]
@@ -464,8 +565,10 @@ mod tests {
             record.controller.start = (3_000, 0);
             record
         };
-        let cases: [(&str, Record); 6] = [
+        let cases: [(&str, Record); 8] = [
             ("boot", record(None)),
+            ("boot", sink()),
+            ("boot_session", with_session(sink())),
             ("interfaces", linked()),
             ("interfaces", unlinked_earlier()),
             ("routes", linked()),
@@ -485,6 +588,130 @@ mod tests {
             );
             assert_eq!(reads.log.last(), Some(&fail));
         }
+    }
+
+    #[test]
+    fn startup_orphan_linked_sink_claim_needs_a_later_boot() {
+        let mut later = Fake::default();
+        assert_eq!(resources_absent_with(&sink(), &mut later), Ok(true));
+        assert_eq!(later.log, ["boot", "launchd", "sad", "spd"]);
+        for boot in [(500, 0), START] {
+            let mut earlier = Fake {
+                boot,
+                ..Default::default()
+            };
+            assert_eq!(
+                resources_absent_with(&sink(), &mut earlier),
+                Ok(false),
+                "{boot:?}"
+            );
+            assert_eq!(earlier.log, ["boot", "interfaces", "routes"]);
+        }
+        // SAD and SPD still decide after the boot proof.
+        let mut with_sa = Fake {
+            sa: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            resources_absent_with(&sink(), &mut with_sa),
+            Err(Reason::NamespaceOccupied)
+        );
+        assert_eq!(with_sa.log, ["boot", "launchd", "sad"]);
+        // Control: two VIP families have no sink, so the boot is not read.
+        let mut dual = sink();
+        dual.link
+            .as_mut()
+            .unwrap()
+            .vips
+            .push("2001:db8::10".parse().unwrap());
+        dual.valid().unwrap();
+        let mut gone = Fake::default();
+        assert_eq!(resources_absent_with(&dual, &mut gone), Ok(true));
+        assert_eq!(gone.log, ["interfaces", "routes", "sad", "spd"]);
+    }
+
+    #[test]
+    fn startup_orphan_recorded_boot_session_alone_decides() {
+        for record in [with_session(record(None)), with_session(sink())] {
+            // A different session proves the reboot even with the clock saying
+            // the boot came before the controller started.
+            let mut rebooted = Fake {
+                session: OTHER_SESSION,
+                boot: (500, 0),
+                ..Default::default()
+            };
+            assert_eq!(resources_absent_with(&record, &mut rebooted), Ok(true));
+            assert_eq!(rebooted.log, ["boot_session", "sad", "spd"]);
+            // The same session denies it even with a later boot on the clock.
+            let mut same = Fake::default();
+            assert_eq!(resources_absent_with(&record, &mut same), Ok(false));
+            assert_eq!(same.log, ["boot_session", "interfaces", "routes"]);
+            let mut failed = Fake {
+                fail: Some("boot_session"),
+                ..Default::default()
+            };
+            assert_eq!(
+                resources_absent_with(&record, &mut failed),
+                Err(Reason::ObservationFailed)
+            );
+            assert_eq!(failed.log, ["boot_session"]);
+        }
+    }
+
+    #[test]
+    fn startup_orphan_legacy_claim_uses_the_earlier_of_boottime_and_launchd() {
+        // A forward clock step after the controller started moved the boottime
+        // past it; launchd's start did not move.
+        let mut stepped = Fake {
+            launchd: Ok((START.0 - 10, 0)),
+            ..Default::default()
+        };
+        assert_eq!(
+            resources_absent_with(&record(None), &mut stepped),
+            Ok(false)
+        );
+        assert_eq!(stepped.log, ["boot", "launchd", "interfaces", "routes"]);
+        let mut equal = Fake {
+            launchd: Ok(START),
+            ..Default::default()
+        };
+        assert_eq!(resources_absent_with(&sink(), &mut equal), Ok(false));
+        // An unreadable launchd start leaves the boottime alone in charge.
+        let mut unreadable = Fake {
+            fail: Some("launchd"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resources_absent_with(&record(None), &mut unreadable),
+            Ok(true)
+        );
+        assert_eq!(unreadable.log, ["boot", "launchd", "sad", "spd"]);
+    }
+
+    #[test]
+    fn startup_orphan_boot_session_is_optional_and_canonical() {
+        let mut bytes = serde_json::to_value(record(None)).unwrap();
+        assert!(bytes.get("boot_session").is_none());
+        bytes.as_object_mut().unwrap().remove("boot_session");
+        let legacy: Record = serde_json::from_value(bytes.clone()).unwrap();
+        assert_eq!(legacy.boot_session, None);
+        bytes["boot_session"] = SESSION.into();
+        let stamped: Record = serde_json::from_value(bytes).unwrap();
+        assert_eq!(stamped.boot_session.as_deref(), Some(SESSION));
+        for bad in [
+            "",
+            "CE2DD70F00004000800000000000000A",
+            "CE2DD70F-0000-4000-8000-00000000000",
+            "CE2DD70F-0000-4000-8000-00000000000G",
+            "CE2DD70F-0000-4000-8000-000000000001-0",
+        ] {
+            let mut record = record(None);
+            record.boot_session = Some(bad.into());
+            assert!(record.valid().is_err(), "{bad}");
+        }
+        // The host's own session reads without privileges and validates.
+        let current = boot_session().unwrap();
+        assert!(record::boot_session_valid(&current), "{current}");
     }
 
     #[test]

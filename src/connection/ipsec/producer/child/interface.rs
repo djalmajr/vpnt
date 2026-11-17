@@ -116,9 +116,18 @@ impl<'a> Producer<'a> {
         let retained = RetainedInterface::admit(descriptor, observation, expires, cancel)
             .map_err(map_observe)?;
         self.current(expires, cancel)?;
-        // Durable before the handoff: a helper that dies between capture and
-        // configure leaves a claim that names this UTUN. A failed write drops
-        // (closes) the retained descriptor and fails the capture.
+        self.seal_capture(retained, expires, cancel)
+    }
+    /// The step after admission. Durable before the handoff: a helper that
+    /// dies between capture and configure leaves a claim that names this UTUN.
+    /// A failed write drops (closes) the retained descriptor and fails the
+    /// capture.
+    pub(in crate::connection::ipsec::producer) fn seal_capture(
+        &mut self,
+        retained: RetainedInterface,
+        expires: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<RetainedInterface, Error> {
         self.lease
             .record_interface(retained.name(), retained.index(), expires, cancel)?;
         Ok(retained)
