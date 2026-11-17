@@ -213,3 +213,30 @@ fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authent
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(removes.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn previous_session_finishing_installer_error_round_trips_and_maps_distinctly() {
+    let reply = crate::install::protocol::Reply::Failed {
+        id: Some("fixture".into()),
+        error: crate::install::Error::PreviousSessionFinishing,
+    };
+    let wire = serde_json::to_vec(&reply).unwrap();
+    let decoded: crate::install::protocol::Reply = serde_json::from_slice(&wire).unwrap();
+    assert!(matches!(
+        decoded,
+        crate::install::protocol::Reply::Failed {
+            error: crate::install::Error::PreviousSessionFinishing,
+            ..
+        }
+    ));
+    assert_eq!(
+        map_error(ComponentError::Rejected(
+            crate::install::Error::PreviousSessionFinishing
+        )),
+        "previous_session_finishing"
+    );
+    assert_eq!(
+        map_error(ComponentError::Rejected(crate::install::Error::Busy)),
+        "component_busy"
+    );
+}

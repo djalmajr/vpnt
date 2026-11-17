@@ -13,6 +13,9 @@ use std::{
 use zeroize::Zeroizing;
 
 pub const VERSION: u32 = 3;
+/// Backwards-compatible capability/version carried by the initial snapshot ID.
+/// A v3 helper treats it as an ordinary opaque request ID and echoes it.
+pub const WAIT_CAPABILITY_SNAPSHOT_ID: &str = "snapshot-wait-v1";
 pub const MAX_REQUEST_BYTES: usize = 65_536;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
@@ -104,6 +107,10 @@ pub struct TunnelStatus {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
     AdminReady {
+        protocol_version: u32,
+        version: String,
+    },
+    PreviousSessionFinishing {
         protocol_version: u32,
         version: String,
     },
@@ -233,6 +240,10 @@ pub fn read_message(reader: &mut impl BufRead) -> Result<Option<Message>, Protoc
     };
     match &message {
         Message::AdminReady {
+            protocol_version,
+            version,
+        }
+        | Message::PreviousSessionFinishing {
             protocol_version,
             version,
         } => {
@@ -434,6 +445,18 @@ fn write_frame(
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    #[test]
+    fn previous_session_finishing_requires_a_compatible_protocol_version() {
+        let frame = format!(
+            "{{\"type\":\"previous_session_finishing\",\"protocol_version\":{VERSION},\"version\":\"0.1.0\"}}\n"
+        );
+        assert!(read_message(&mut frame.as_bytes()).is_ok());
+        let wrong = frame.replace(
+            &format!("\"protocol_version\":{VERSION}"),
+            "\"protocol_version\":999",
+        );
+        assert!(read_message(&mut wrong.as_bytes()).is_err());
+    }
     #[test]
     fn snapshot_build_accepts_legacy_and_valid_hash_but_rejects_malformed_identity() {
         for (field, expected) in [

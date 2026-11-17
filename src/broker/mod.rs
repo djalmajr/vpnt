@@ -47,6 +47,7 @@ pub struct Broker<S: SecretStore> {
     dead: bool,
     next: u64,
     startup: Instant,
+    waiting_previous: bool,
     administration: admin::Flow,
     component: component::Flow,
     diagnostics: diagnostics::Flow,
@@ -98,6 +99,7 @@ impl<S: SecretStore> Broker<S> {
             dead: false,
             next: 1,
             startup: Instant::now() + Duration::from_secs(5),
+            waiting_previous: false,
             administration: admin::Flow::new(),
             component: component::Flow::new(),
             diagnostics: diagnostics::Flow::new(),
@@ -115,7 +117,7 @@ impl<S: SecretStore> Broker<S> {
     fn begin(&mut self) {
         if self.client.as_ref().is_some_and(|c| {
             c.send(Request {
-                id: "snapshot-1".into(),
+                id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
                 command: protocol::Command::Snapshot {},
             })
             .is_err()
@@ -141,6 +143,7 @@ impl<S: SecretStore> Broker<S> {
                 self.client = Some(client);
                 self.dead = false;
                 self.ready = false;
+                self.waiting_previous = false;
                 self.startup = Instant::now() + Duration::from_secs(5);
                 self.begin();
             }
@@ -160,7 +163,14 @@ impl<S: SecretStore> Broker<S> {
         self.automatic.clear();
         self.diagnostics.pending = None;
         self.diagnostics.dirty = false;
-        self.helper = if outdated { "outdated" } else { "missing" };
+        self.helper = if outdated {
+            "outdated"
+        } else if self.waiting_previous {
+            "previous_session_finishing"
+        } else {
+            "missing"
+        };
+        self.waiting_previous = false;
         if let Some(client) = &mut self.client {
             client.close();
         }
@@ -170,7 +180,11 @@ impl<S: SecretStore> Broker<S> {
         }
     }
     pub fn starting(&self) -> bool {
-        !self.component.busy() && !self.dead && !self.ready && self.client.is_some()
+        !self.component.busy()
+            && !self.dead
+            && !self.ready
+            && !self.waiting_previous
+            && self.client.is_some()
     }
     pub fn poll(&mut self) {
         self.diagnostics.tick();
@@ -195,7 +209,12 @@ impl<S: SecretStore> Broker<S> {
                     }
                 }
             }
-            Some(Err(error)) => self.lost(error == Error::Incompatible),
+            Some(Err(error)) => {
+                if !self.ready && error == Error::PreviousSessionFinishing {
+                    self.waiting_previous = true;
+                }
+                self.lost(error == Error::Incompatible);
+            }
             None => {}
         }
         if !self.ready && self.client.is_some() && Instant::now() >= self.startup {
@@ -207,6 +226,25 @@ impl<S: SecretStore> Broker<S> {
     }
     fn receive(&mut self, message: Message) -> Result<(), ()> {
         match message {
+            Message::PreviousSessionFinishing {
+                protocol_version,
+                version,
+            } => {
+                if self.ready || protocol_version != protocol::VERSION {
+                    return Err(());
+                }
+                if version != env!("CARGO_PKG_VERSION") {
+                    self.lost(true);
+                    return Ok(());
+                }
+                if !self.waiting_previous {
+                    // Longer than the helper's bounded lock retry, including
+                    // its bounded protocol write and scheduling margin.
+                    self.startup = Instant::now() + Duration::from_secs(45);
+                }
+                self.waiting_previous = true;
+                self.helper = "previous_session_finishing";
+            }
             Message::Snapshot {
                 id,
                 version,
@@ -281,7 +319,10 @@ impl<S: SecretStore> Broker<S> {
                     self.request_diagnostics();
                 }
             }
-            Message::Fatal { .. } => self.lost(false),
+            Message::Fatal { .. } => {
+                self.waiting_previous = false;
+                self.lost(false);
+            }
             Message::AdminReady { .. } => return Err(()),
         }
         Ok(())

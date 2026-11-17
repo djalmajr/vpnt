@@ -100,29 +100,37 @@ export function App() {
                   }
                   t={t}
                 />
-                {(snapshot.helper !== "installed" ||
-                  installAttempt?.source === "panel") && (
+                {snapshot.helper === "previous_session_finishing" ? (
                   <Notice>
-                    <p>{t(updating ? "helperOutdated" : "helperBanner")}</p>
-                    {installBlocked && (
-                      <small>
-                        {t(
-                          updating
-                            ? "componentUpdateBlocked"
-                            : "componentInstallBlocked",
-                        )}
-                      </small>
-                    )}
-                    <InstallButton
-                      className="primary"
-                      install={() => void installComponent("panel")}
-                      pending={installAttempt?.source === "panel"}
-                      disabled={installBusy || installBlocked}
-                      updating={updating}
-                      failed={installFailure === "panel"}
-                      t={t}
-                    />
+                    <p role="status">
+                      <Icon name="loader" /> {t("helperPreviousSession")}
+                    </p>
                   </Notice>
+                ) : (
+                  (snapshot.helper !== "installed" ||
+                    installAttempt?.source === "panel") && (
+                    <Notice>
+                      <p>{t(updating ? "helperOutdated" : "helperBanner")}</p>
+                      {installBlocked && (
+                        <small>
+                          {t(
+                            updating
+                              ? "componentUpdateBlocked"
+                              : "componentInstallBlocked",
+                          )}
+                        </small>
+                      )}
+                      <InstallButton
+                        className="primary"
+                        install={() => void installComponent("panel")}
+                        pending={installAttempt?.source === "panel"}
+                        disabled={installBusy || installBlocked}
+                        updating={updating}
+                        failed={installFailure === "panel"}
+                        t={t}
+                      />
+                    </Notice>
+                  )
                 )}
                 {snapshot.vpns.length ? (
                   snapshot.vpns.map((vpn) => (

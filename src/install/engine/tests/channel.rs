@@ -58,3 +58,40 @@ fn removal_channel_uses_kernel_identity_and_refuses_an_extra_uid_or_second_docum
         assert_eq!(receipt.users.contains_key(&uid), case != "valid");
     }
 }
+
+#[test]
+fn removal_channel_reports_controller_lock_timeout_distinctly() {
+    let mut f = Fixture::new();
+    let uid = unsafe { libc::getuid() };
+    f.recipient(uid);
+    f.activate().unwrap();
+    let lock = f.executor.tree.bootstrap().unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(4)))
+        .unwrap();
+    std::thread::scope(|scope| {
+        let executor = &mut f.executor;
+        let task = scope.spawn(move || {
+            let caller = Caller::from_fd(server.into()).unwrap();
+            access::channel::serve(caller, executor)
+        });
+        let mut input = BufReader::new(client.try_clone().unwrap());
+        let mut ready = String::new();
+        input.read_line(&mut ready).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["type"],
+            "ready"
+        );
+        client.write_all(b"{\"id\":\"remove-locked\"}\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        input.read_line(&mut reply).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["type"], "failed");
+        assert_eq!(reply["id"], "remove-locked");
+        assert_eq!(reply["error"], "previous_session_finishing");
+        assert!(task.join().unwrap().is_ok());
+    });
+    drop(lock);
+}

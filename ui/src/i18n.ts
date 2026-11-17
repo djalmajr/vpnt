@@ -20,6 +20,10 @@ const en = {
   componentSettling:
     "Waiting for the previous operation to finish. Another installation or removal cannot start yet.",
   componentBusy: "A component change is still pending.",
+  helperPreviousSession:
+    "The previous session is still finishing. VPN Tray will continue when it ends.",
+  previousSessionFinishing:
+    "The previous session is still finishing. Try again in a moment.",
   componentExpired:
     "The operation timed out. It may still be finishing. No new request will be sent automatically.",
   componentUnconfirmed:
@@ -180,7 +184,7 @@ const en = {
     "The tunnel appears connected, but traffic is not getting through.",
   droppedHint: "The server closed the connection.",
   credentialsHint: "The server rejected your username or password.",
-  timeoutHint: "The gateway did not respond within 30 seconds.",
+  timeoutHint: "The gateway did not respond within 60 seconds.",
   secretHint: "The password for this VPN is not in the keychain.",
   programHint: "Install the VPN client and try again.",
   checked: "Tunnel checked",
@@ -222,6 +226,10 @@ const pt: Record<MessageKey, string> = {
   componentSettling:
     "Aguardando o encerramento da operação anterior. Ainda não é possível iniciar outra instalação ou remoção.",
   componentBusy: "Uma alteração do componente ainda está pendente.",
+  helperPreviousSession:
+    "A sessão anterior ainda está terminando. O VPN Tray continua quando ela acabar.",
+  previousSessionFinishing:
+    "A sessão anterior ainda está terminando. Tente de novo em instantes.",
   componentExpired:
     "O prazo da operação venceu. Ela ainda pode estar terminando. Nenhum novo pedido será enviado automaticamente.",
   componentUnconfirmed:
@@ -383,7 +391,7 @@ const pt: Record<MessageKey, string> = {
   staleHint: "O túnel parece ligado, mas nada passa por ele.",
   droppedHint: "O servidor encerrou a conexão.",
   credentialsHint: "O servidor recusou o usuário ou a senha.",
-  timeoutHint: "O gateway não respondeu em 30 segundos.",
+  timeoutHint: "O gateway não respondeu em 60 segundos.",
   secretHint: "A senha desta VPN não está no chaveiro.",
   programHint: "Instale o cliente de VPN e tente de novo.",
   checked: "Túnel testado",

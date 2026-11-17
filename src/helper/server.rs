@@ -11,7 +11,7 @@ use crate::storage::{ProfileStore, StoreError};
 use caller::Caller;
 use std::{
     os::{
-        fd::{FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
     sync::{
@@ -20,8 +20,14 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+// Reserve 30 seconds for the planned cleanup budget plus scheduling margin.
+// The existing controller is still unbounded; this wait never signals it or
+// implies that cleanup succeeded.
+const PREVIOUS_SESSION_WAIT: Duration = Duration::from_secs(35);
+const LOCK_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -53,6 +59,96 @@ fn mode_lock(
     })
 }
 
+// Inspect only the first complete request without consuming it: a legacy v3
+// helper accepts and echoes this opaque ID, while an old client never sends it.
+// This is capability negotiation, not authentication or authority.
+fn supports_wait_notice(stream: &UnixStream, deadline: Instant) -> bool {
+    let mut bytes = zeroize::Zeroizing::new(vec![0u8; protocol::MAX_REQUEST_BYTES + 1]);
+    loop {
+        if interrupted() || Instant::now() >= deadline {
+            return false;
+        }
+        // SAFETY: bytes is writable for its length and the borrowed socket is live.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return false;
+        }
+        if count < 0 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                return false;
+            }
+        } else {
+            let seen = &bytes[..count as usize];
+            if let Some(end) = seen.iter().position(|byte| *byte == b'\n') {
+                return protocol::parse_request(&seen[..=end]).is_ok_and(|request| {
+                    request.id == protocol::WAIT_CAPABILITY_SNAPSHOT_ID
+                        && matches!(request.command, protocol::Command::Snapshot {})
+                });
+            }
+            if seen.len() == bytes.len() {
+                return false;
+            }
+        }
+        thread::sleep(LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn wait_for_mode_lock(
+    mode: Mode,
+    stream: &mut UnixStream,
+    budget: Duration,
+    announced: &mut bool,
+    mut acquire: impl FnMut() -> Result<ControllerLock, super::controller_lock::LockError>,
+) -> Result<Option<ControllerLock>, ErrorCode> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if interrupted() {
+            return Err(ErrorCode::Unavailable);
+        }
+        match mode_lock(mode, &mut acquire) {
+            Ok(lock) => return Ok(lock),
+            Err(ErrorCode::ProfileBusy) if mode == Mode::Runtime => {
+                if !*announced {
+                    if !supports_wait_notice(stream, deadline.min(Instant::now() + io::DEADLINE)) {
+                        return Err(ErrorCode::ProfileBusy);
+                    }
+                    send(
+                        stream,
+                        &Message::PreviousSessionFinishing {
+                            protocol_version: protocol::VERSION,
+                            version: env!("CARGO_PKG_VERSION").into(),
+                        },
+                    )?;
+                    *announced = true;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ErrorCode::ProfileBusy);
+                }
+                thread::sleep(LOCK_POLL.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn send_admission_error(stream: &mut UnixStream, announced: bool, error: ErrorCode) {
+    if !(announced && error == ErrorCode::ProfileBusy) {
+        let _ = send(stream, &Message::Fatal { error });
+    }
+}
+
 /// Only for the standalone helper process, before it starts any threads.
 /// No path, target UID or ownership override is accepted.
 ///
@@ -69,13 +165,20 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     if unsafe { libc::fcntl(0, libc::F_GETFD) } < 0 {
         return Err(ErrorCode::PermissionDenied);
     }
-    let caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
+    let mut caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
         .map_err(|_| ErrorCode::PermissionDenied)?;
     let _signals = signals::Guard::install().map_err(|_| ErrorCode::Unavailable)?;
+    let mut announced = false;
     let admitted = (|| {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
-        let lock = mode_lock(mode, ControllerLock::acquire)?;
+        let lock = wait_for_mode_lock(
+            mode,
+            &mut caller.stream,
+            PREVIOUS_SESSION_WAIT,
+            &mut announced,
+            ControllerLock::acquire,
+        )?;
         let (build, _) = crate::install::engine::admit_uid(caller.uid)
             .map_err(|_| ErrorCode::UntrustedConfiguration)?;
         Ok((store, lock, build))
@@ -83,8 +186,7 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     let (store, lock, build) = match admitted {
         Ok(value) => value,
         Err(error) => {
-            let mut stream = caller.stream;
-            let _ = send(&mut stream, &Message::Fatal { error });
+            send_admission_error(&mut caller.stream, announced, error);
             return Err(error);
         }
     };
@@ -336,4 +438,4 @@ pub(crate) fn runtime_fixture(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -9,9 +9,8 @@ import { profileOriginRoute, type Route } from "./navigation";
 const scope = globalThis as unknown as { window?: unknown };
 const previousWindow = scope.window;
 scope.window = {};
-const { reconcileRoute, reconcileComponentError } = await import(
-  "./useAppState"
-);
+const { reconcileRoute, reconcileComponentError, componentBlocked } =
+  await import("./useAppState");
 if (previousWindow === undefined) delete scope.window;
 else scope.window = previousWindow;
 
@@ -93,4 +92,16 @@ test("demo e helper ausente/desatualizado não redirecionam", () => {
   expect(reconcileRoute(onboarding, snapshot({ helper: "outdated" }))).toBe(
     onboarding,
   );
+});
+
+test("sessão anterior não é ausência nem permite operação de componente", () => {
+  const finishing = snapshot({ helper: "previous_session_finishing" });
+  expect(reconcileRoute({ page: "onboarding" }, finishing)).toEqual({
+    page: "panel",
+  });
+  expect(reconcileRoute({ page: "preferences" }, finishing)).toEqual({
+    page: "preferences",
+  });
+  expect(componentBlocked(finishing)).toBe(true);
+  expect(componentBlocked(snapshot({ helper: "missing" }))).toBe(false);
 });

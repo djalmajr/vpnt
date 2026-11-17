@@ -223,12 +223,17 @@ function destination(locale: Locale, origin: "home" | "preferences") {
 const actions = () =>
   commands.filter((command) => command.type !== "get_snapshot");
 
-async function mountComponentScenario(initial: Snapshot, harness = false) {
+async function mountComponentScenario(
+  initial: Snapshot,
+  harness = false,
+  locale: Locale = "en-US",
+  componentError?: string,
+) {
   commands = [];
   snapshot = initial;
   localStorage.setItem(
     "vpnt.preferences.v1",
-    JSON.stringify({ locale: "en-US", theme: "light" }),
+    JSON.stringify({ locale, theme: "light" }),
   );
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const request = JSON.parse(String(init?.body)) as {
@@ -237,6 +242,11 @@ async function mountComponentScenario(initial: Snapshot, harness = false) {
     };
     commands.push(request.command);
     if (request.command.type === "install_helper") {
+      if (componentError)
+        return new Response(
+          JSON.stringify({ id: request.id, error: componentError }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
       return await new Promise<Response>((resolve) => {
         const settle = (success: boolean) => {
           pendingInstalls.delete(settle);
@@ -950,3 +960,90 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     expect(actions()).toEqual([]);
   });
 }
+
+for (const locale of ["en-US", "pt-BR"] as const) {
+  test(`${locale}: sessão anterior no primeiro snapshot avisa sem instalar`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("previous_session_finishing", []),
+      false,
+      locale,
+    );
+    expect(heading()).toBe(t(locale, "vpns"));
+    const notice = [...document.querySelectorAll('[role="status"]')].find(
+      (element) =>
+        element.textContent?.trim() === t(locale, "helperPreviousSession"),
+    );
+    expect(notice?.querySelector("svg.spin")).not.toBeNull();
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>("button")];
+    expect(
+      buttons.some((button) =>
+        [t(locale, "install"), t(locale, "update")].includes(
+          button.textContent?.trim() ?? "",
+        ),
+      ),
+    ).toBe(false);
+    expect(actions()).toEqual([]);
+    await click(byLabel(t(locale, "preferences")));
+    expect(heading()).toBe(t(locale, "preferences"));
+    expect(document.body.textContent).toContain(
+      t(locale, "helperPreviousSession"),
+    );
+    const controls = [
+      ...document.querySelectorAll<HTMLButtonElement>("button"),
+    ];
+    expect(
+      controls.some((button) =>
+        [t(locale, "install"), t(locale, "update")].includes(
+          button.textContent?.trim() ?? "",
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      document.querySelector(`button[aria-label="${t(locale, "remove")}"]`),
+    ).toBeNull();
+    expect(actions()).toEqual([]);
+  });
+
+  test(`${locale}: erro de sessão anterior tem mensagem própria`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("missing"),
+      false,
+      locale,
+      "previous_session_finishing",
+    );
+    await click(byText(t(locale, "install")));
+    expect(document.querySelector('[role="alert"]')?.textContent).toBe(
+      t(locale, "previousSessionFinishing"),
+    );
+    expect(actions()).toEqual([{ type: "install_helper" }]);
+  });
+}
+
+test("sessão anterior fecha confirmação de remoção aberta sem enviar remoção", async () => {
+  await mountComponentScenario(componentSnapshot("installed"));
+  await click(byLabel(t("en-US", "preferences")));
+  await click(byLabel(t("en-US", "remove")));
+  expect(dialog("en-US", "componentRemoveTitle")).not.toBeNull();
+  snapshot = { ...snapshot, helper: "previous_session_finishing" };
+  await click(byLabel(t("en-US", "startAtLogin")));
+  expect(dialog("en-US", "componentRemoveTitle")).toBeNull();
+  expect(actions().some((command) => command.type === "remove_helper")).toBe(
+    false,
+  );
+});
+
+test("sessão anterior reconcilia onboarding durante instalação pendente", async () => {
+  await mountComponentScenario(componentSnapshot("missing", []), true);
+  expect(appState?.route).toEqual({ page: "onboarding" });
+  await act(async () => {
+    void appState?.installComponent("onboarding");
+  });
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  snapshot = { ...snapshot, helper: "previous_session_finishing" };
+  await act(async () => {
+    await appState?.run({ type: "get_snapshot" });
+  });
+  expect(appState?.route).toEqual({ page: "panel" });
+  expect(actions()).toEqual([{ type: "install_helper" }]);
+  await act(async () => pendingInstall?.(false));
+});

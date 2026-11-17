@@ -11,7 +11,7 @@ impl<S: SecretStore> Broker<S> {
     ) -> Result<(), ()> {
         let initial = !self.ready;
         let observed = if initial {
-            if id != "snapshot-1" {
+            if id != protocol::WAIT_CAPABILITY_SNAPSHOT_ID {
                 return Err(());
             }
             None
@@ -122,6 +122,7 @@ impl<S: SecretStore> Broker<S> {
         }
         self.connections = current;
         self.refresh_actions();
+        self.waiting_previous = false;
         self.ready = true;
         self.helper = match (self.expected_build.as_deref(), build.as_deref()) {
             (Some(expected), Some(installed)) if expected == installed => "installed",
