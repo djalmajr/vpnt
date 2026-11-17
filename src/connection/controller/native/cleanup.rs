@@ -559,6 +559,91 @@ mod abandon_tests {
         assert!(factory.idle());
     }
     #[test]
+    fn native_abandon_persists_dns_key_for_recovery() {
+        use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+        use crate::connection::macos::{
+            fence_recovery::tests::assert_attempt_dns_recovery, store::DnsLease,
+        };
+        use crate::helper::{controller_lock::ControllerLock, ppp_supervisor::ServiceId};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = Root(
+            std::env::current_dir()
+                .unwrap()
+                .join("output/fixtures")
+                .join(format!(
+                    "native-abandon-dns-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                )),
+        );
+        fs::create_dir_all(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let lock_dir = root.0.join("controller");
+        fs::create_dir(&lock_dir).unwrap();
+        fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(lock_dir.join(".controller.lock"))
+            .unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let controller = ControllerLock::fixture(&lock_dir, uid).unwrap();
+        let profile: Profile = serde_json::from_value(serde_json::json!({"id":"example","name":"example","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
+        let store = ProfileStore::open(&root.0, uid).unwrap();
+        store.save(profile.clone()).unwrap();
+        let profiles = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+        let routes = Arc::new(Mutex::new(
+            Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+        ));
+        let factory = NativeFactory::new(routes, profiles.clone(), None, uid)
+            .fixture_fence_root(root.0.clone(), uid);
+        let fixture = crate::connection::ssl::tests::Fixture::new();
+        let mut attempt = match factory.create(
+            profile.clone(),
+            uid,
+            1,
+            Credentials {
+                password: "fictional".into(),
+                psk: "".into(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        ) {
+            AttemptKind::Ssl(attempt) => attempt,
+            _ => panic!("SSL factory expected"),
+        };
+        attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
+        let driver = fixture.start("ready.fixture.invalid");
+        let (service, _) = driver.recorded_processes().unwrap();
+        let service = ServiceId::parse(&service).unwrap();
+        let expected = format!("State:/Network/Service/{}/DNS", service.as_str());
+        let (lease, state) = DnsLease::fixture(service);
+        lease
+            .publish(&["172.20.0.4".parse().unwrap()], &["cit.example".into()])
+            .unwrap();
+        assert_eq!(state.lock().unwrap().as_deref(), Some(expected.as_str()));
+        attempt.client = Some(driver);
+        attempt.dns = Some(lease);
+        assert_eq!(attempt.abandon_ssl(Reason::RouteOwner), Ok(()));
+        let record = fence::read(&root.0, uid, uid, &profile.id, 1)
+            .unwrap()
+            .expect("fence persisted");
+        assert_eq!(
+            record.service_id.as_deref(),
+            Some(service_id_from_key(&expected))
+        );
+        assert_eq!(record.dns_key.as_deref(), Some(expected.as_str()));
+        assert_attempt_dns_recovery(&root.0, uid, &profile, &expected, &state);
+    }
+
+    fn service_id_from_key(key: &str) -> &str {
+        key.strip_prefix("State:/Network/Service/")
+            .unwrap()
+            .strip_suffix("/DNS")
+            .unwrap()
+    }
+    #[test]
     fn durable_transaction_retains_everything_on_failure_and_releases_after_success() {
         let root = Root(
             std::env::current_dir()

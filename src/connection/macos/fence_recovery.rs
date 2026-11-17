@@ -365,6 +365,36 @@ pub(crate) mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         (Root(path), unsafe { libc::geteuid() })
     }
+    pub(crate) fn assert_attempt_dns_recovery(
+        root: &Path,
+        uid: u32,
+        profile: &Profile,
+        expected_key: &str,
+        state: &std::sync::Mutex<Option<String>>,
+    ) {
+        let mut recovery = Recovery {
+            root: root.into(),
+            owner: uid,
+            uid,
+            global: false,
+            blocked: BTreeSet::new(),
+        };
+        assert_eq!(state.lock().unwrap().as_deref(), Some(expected_key));
+        let mut observer = fake();
+        observer.dns_present = state.lock().unwrap().is_some();
+        recovery.reconcile(None, &mut observer);
+        assert!(recovery.blocked(profile));
+        assert!(observer.calls.borrow().contains(&"dns"));
+        *state.lock().unwrap() = None;
+        observer.dns_present = state.lock().unwrap().is_some();
+        recovery.reconcile(Some(&profile.id), &mut observer);
+        assert!(!recovery.blocked(profile));
+        assert!(
+            fence::read(root, uid, uid, &profile.id, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
     #[test]
     fn persisted_dns_key_blocks_recovery_until_absent() {
         let (root, uid) = root();

@@ -55,6 +55,31 @@ pub(crate) struct DnsLease {
     service: crate::helper::ppp_supervisor::ServiceId,
 }
 impl DnsLease {
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        service: crate::helper::ppp_supervisor::ServiceId,
+    ) -> (Self, std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        use std::sync::{Arc, Mutex, mpsc};
+        let state = Arc::new(Mutex::new(None));
+        let worker_state = state.clone();
+        let key = dns_key(&service);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok(DnsCommand::Publish(_, _, reply)) = receiver.recv() {
+                *worker_state.lock().unwrap() = Some(key.clone());
+                let _ = reply.send(Ok(()));
+            }
+            // Model a foreign update retaining the key after the lease closes.
+        });
+        (
+            Self {
+                sender: Some(sender),
+                worker: Some(worker),
+                service,
+            },
+            state,
+        )
+    }
     pub fn key(&self) -> String {
         dns_key(&self.service)
     }
