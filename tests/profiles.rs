@@ -83,7 +83,6 @@ fn dns_domains_round_trip_validation_and_ipsec_rejection() {
             "c".repeat(63),
             "d".repeat(63)
         )],
-        vec!["a.b".into(); 9],
         vec!["a.b".into(), "a.b".into()],
     ] {
         bad.dns_domains = domains;
@@ -94,6 +93,10 @@ fn dns_domains_round_trip_validation_and_ipsec_rejection() {
             bad.dns_domains
         );
     }
+    bad.dns_domains = (0..8).map(|i| format!("host{i}.example.net")).collect();
+    assert_eq!(bad.validate(), Ok(()));
+    bad.dns_domains.push("host8.example.net".into());
+    assert_eq!(bad.validate(), Err("invalid_profile"));
     let mut ipsec = old;
     ipsec["kind"] = serde_json::json!("ipsec");
     ipsec["dnsDomains"] = serde_json::json!(["a.b"]);

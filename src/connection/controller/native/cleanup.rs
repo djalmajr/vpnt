@@ -366,6 +366,117 @@ mod abandon_tests {
         }
     }
     #[test]
+    fn ready_delivers_profile_dns_and_logs_missing_gateway_servers() {
+        use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
+        use crate::helper::controller_lock::ControllerLock;
+        use std::os::unix::fs::OpenOptionsExt;
+        struct Capture;
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                READY_DNS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let uid = unsafe { libc::geteuid() };
+        assert_ne!(uid, 0, "fixture must run without root");
+        for has_server in [true, false] {
+            let root = Root(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("output/fixtures")
+                    .join(format!(
+                        "ready-dns-{}-{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed)
+                    )),
+            );
+            fs::create_dir_all(&root.0).unwrap();
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+            let lock_dir = root.0.join("controller");
+            fs::create_dir(&lock_dir).unwrap();
+            fs::set_permissions(&lock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(lock_dir.join(".controller.lock"))
+                .unwrap();
+            let controller = ControllerLock::fixture(&lock_dir, uid).unwrap();
+            let profile: Profile = serde_json::from_value(serde_json::json!({"id":"example","name":"example","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":["192.0.2.0/24"],"dnsDomains":["corp.example.com"],"port":443,"certificate":"","probeHost":"192.0.2.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
+            let store = ProfileStore::open(&root.0, uid).unwrap();
+            store.save(profile.clone()).unwrap();
+            let profiles = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+            let routes = Arc::new(Mutex::new(
+                Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+            ));
+            let factory = NativeFactory::new(routes, profiles.clone(), None, uid)
+                .fixture_fence_root(root.0.clone(), uid);
+            let fixture = crate::connection::ssl::tests::Fixture::new();
+            let mut attempt = match factory.create(
+                profile.clone(),
+                uid,
+                1,
+                Credentials {
+                    password: "fictional".into(),
+                    psk: "".into(),
+                },
+                Arc::new(AtomicBool::new(false)),
+            ) {
+                AttemptKind::Ssl(attempt) => attempt,
+                _ => panic!("SSL factory expected"),
+            };
+            attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
+            let mut driver = fixture.start("ready.fixture.invalid");
+            let batch: &[u8] = if has_server {
+                b"INFO:   vpnt: dns-server 172.16.0.4\nINFO:   vpnt: dns 1 0\n"
+            } else {
+                b"INFO:   vpnt: dns 0 0\n"
+            };
+            driver.fixture_output(batch).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let seen = driver.split_observation();
+                if seen.dns_count == Some((usize::from(has_server), 0)) {
+                    assert!(!seen.dns_invalid);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "DNS batch not observed; server={has_server}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let link = OwnedPpp::fixture_with_child(driver.fixture_child_id()).unwrap();
+            attempt.client = Some(driver);
+            attempt.link = Some(Arc::new(link));
+            READY_DNS.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+            let _capture = Capture;
+            assert!(
+                attempt.ready().is_ok_and(|ready| ready),
+                "ready fixture server={has_server}"
+            );
+            let calls = READY_DNS.with(|slot| slot.borrow().clone().unwrap());
+            if has_server {
+                assert_eq!(
+                    calls,
+                    vec![(
+                        vec!["172.16.0.4".parse().unwrap()],
+                        vec!["corp.example.com".to_owned()]
+                    )]
+                );
+            } else {
+                assert!(calls.is_empty(), "must not publish without a server");
+            }
+            attempt.client.as_mut().unwrap().stop().unwrap();
+            let log = fs::read_to_string(fixture.diagnostic_log()).unwrap();
+            let note = "domínios internos configurados, mas o gateway não publicou servidores DNS";
+            assert_eq!(
+                log.contains(note),
+                !has_server,
+                "server={has_server}, log={log}"
+            );
+        }
+    }
+    #[test]
     fn native_abandon_persists_before_releasing_claim_and_reservation() {
         use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};
         use crate::helper::controller_lock::ControllerLock;

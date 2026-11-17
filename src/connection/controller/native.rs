@@ -35,8 +35,12 @@ use std::sync::{
 type Routes<'a> = Arc<Mutex<Coordinator<NativeBackend<'a>>>>;
 
 #[cfg(test)]
+type DnsPublication = (Vec<std::net::Ipv4Addr>, Vec<String>);
+
+#[cfg(test)]
 thread_local! {
     static READY_NETWORKS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static READY_DNS: std::cell::RefCell<Option<Vec<DnsPublication>>> = const { std::cell::RefCell::new(None) };
 }
 
 // Forward the exact call to the real backend while observing its input in a
@@ -324,24 +328,45 @@ impl Attempt for NativeAttempt<'_> {
                     client.note_invalid_split();
                     Failure::unavailable()
                 })?;
+            macro_rules! setup_routes {
+                () => {{
+                    #[cfg(test)]
+                    let mut backend = ObservedBackend(routes.backend_mut());
+                    #[cfg(not(test))]
+                    let backend = routes.backend_mut();
+                    let (token, plan) = backend
+                        .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
+                        .map_err(|_| Failure::unavailable())?;
+                    self.token = Some(token); // retain before any fallible ADD/lease
+                    self.lease = Some(
+                        routes
+                            .acquire(self.owner.clone(), &plan)
+                            .map_err(|_| Failure::unavailable())?,
+                    );
+                }};
+            }
             #[cfg(test)]
-            let mut backend = ObservedBackend(routes.backend_mut());
+            if !READY_DNS.with(|slot| slot.borrow().is_some()) {
+                setup_routes!();
+            }
             #[cfg(not(test))]
-            let backend = routes.backend_mut();
-            let (token, plan) = backend
-                .register_ppp(link, self.owner.clone(), &networks, &self.canceled)
-                .map_err(|_| Failure::unavailable())?;
-            self.token = Some(token); // retain before any fallible ADD/lease
-            self.lease = Some(
-                routes
-                    .acquire(self.owner.clone(), &plan)
-                    .map_err(|_| Failure::unavailable())?,
-            );
+            setup_routes!();
             let observation = client.split_observation();
             apply_dns(
                 &self.profile.dns_domains,
                 &observation,
                 |servers, domains| {
+                    #[cfg(test)]
+                    if READY_DNS.with(|slot| {
+                        if let Some(calls) = slot.borrow_mut().as_mut() {
+                            calls.push((servers.to_vec(), domains.to_vec()));
+                            true
+                        } else {
+                            false
+                        }
+                    }) {
+                        return Ok(());
+                    }
                     let proof = client.supervised_ppp().ok_or(())?;
                     self.dns =
                         Some(DnsLease::new(proof.child().service().clone()).map_err(|_| ())?);
@@ -358,6 +383,10 @@ impl Attempt for NativeAttempt<'_> {
             } else if self.profile.dns_domains.is_empty() && observation.dns_domains.is_empty() {
                 client.note_no_dns_domain();
             }
+        }
+        #[cfg(test)]
+        if READY_DNS.with(|slot| slot.borrow().is_some()) {
+            return Ok(true);
         }
         routes
             .validate(self.lease.as_ref().ok_or_else(Failure::unavailable)?)

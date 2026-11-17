@@ -95,6 +95,10 @@ impl Fixture {
             runtime,
         }
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn diagnostic_log(&self) -> std::path::PathBuf {
+        paths::openfortivpn_log(&self.state)
+    }
     fn profile(gateway: &str) -> Profile {
         serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","kind":"ssl","gateway":gateway,"username":"fixture-user","port":443,"networks":[],"certificate":"","probeHost":"127.0.0.1","probePort":8443,"probeMethod":"tcp"})).unwrap()
     }
