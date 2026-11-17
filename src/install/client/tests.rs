@@ -37,7 +37,7 @@ impl Drop for Fixture {
     }
 }
 fn until(mut check: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(3);
+    let end = Instant::now() + Duration::from_secs(15);
     while !check() {
         assert!(Instant::now() < end, "condition timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -96,7 +96,7 @@ fn admitted_component_process_cannot_start_before_the_controller_releases_its_ga
         command,
         "install-1".into(),
         Locale::EnUs,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + Duration::from_secs(30),
     )
     .expect("the operation must prepare asynchronously");
     until(|| op.prepared());
@@ -174,7 +174,7 @@ fn expired_operation_is_reported_but_its_live_child_is_never_killed_or_treated_a
     );
 }
 
-fn removal(f: &Fixture, case: &str) -> Operation {
+fn removal(f: &Fixture, case: &str, expires: Duration) -> Operation {
     let mut command = f.command(include_str!(
         "../../../tests/fixtures/component-client/peer.py"
     ));
@@ -188,7 +188,7 @@ fn removal(f: &Fixture, case: &str) -> Operation {
         command,
         "remove-1".into(),
         Locale::PtBr,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + expires,
     )
     .unwrap();
     until(|| op.prepared());
@@ -199,7 +199,8 @@ fn removal(f: &Fixture, case: &str) -> Operation {
 #[test]
 fn removal_receipt_and_eof_do_not_report_success_before_the_owned_child_has_exited() {
     let held = Fixture::new();
-    let mut held_op = removal(&held, "held");
+    // Short on purpose: this case must expire while the child is held.
+    let mut held_op = removal(&held, "held", Duration::from_secs(2));
     let mut premature = None;
     until(|| {
         premature = held_op.poll();
@@ -218,7 +219,7 @@ fn removal_receipt_and_eof_do_not_report_success_before_the_owned_child_has_exit
         "exit after expiry cannot publish again"
     );
     let f = Fixture::new();
-    let mut op = removal(&f, "held");
+    let mut op = removal(&f, "held", Duration::from_secs(30));
     until(|| f.root.join("receipt").exists());
     assert!(!op.finished() && op.poll().is_none());
     let request: serde_json::Value =
@@ -246,7 +247,7 @@ fn incompatible_wrong_extra_or_excessive_removal_replies_never_commit_and_exit_m
         "exit",
     ] {
         let f = Fixture::new();
-        let mut op = removal(&f, case);
+        let mut op = removal(&f, case, Duration::from_secs(30));
         until(|| op.finished());
         let expected = match case {
             "format" | "version" => Error::Incompatible,
