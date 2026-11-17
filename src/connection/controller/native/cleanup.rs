@@ -271,7 +271,7 @@ mod abandon_tests {
             "fixture requires an ordinary user; never create routes or a sink"
         );
         for (own_networks, expected) in [
-            (vec![], vec!["10.0.0.0/8", "172.20.0.0/16"]),
+            (vec![], vec!["10.0.0.0/8", "172.16.0.0/16"]),
             (vec!["192.168.64.0/20"], vec!["192.168.64.0/20"]),
         ] {
             let root = Root(
@@ -323,7 +323,7 @@ mod abandon_tests {
             };
             attempt.profile_use = Some(profiles.begin(&profile, 1).unwrap());
             let mut driver = fixture.start("ready.fixture.invalid");
-            driver.fixture_output(b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0\nINFO:   vpnt: split-route 172.20.0.0/255.255.0.0\nINFO:   vpnt: split-routes 2\n").unwrap();
+            driver.fixture_output(b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0\nINFO:   vpnt: split-route 172.16.0.0/255.255.0.0\nINFO:   vpnt: split-routes 2\n").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let observation = driver.split_observation();
@@ -620,7 +620,7 @@ mod abandon_tests {
         let expected = format!("State:/Network/Service/{}/DNS", service.as_str());
         let (lease, state) = DnsLease::fixture(service);
         lease
-            .publish(&["172.20.0.4".parse().unwrap()], &["cit.example".into()])
+            .publish(&["172.16.0.4".parse().unwrap()], &["corp.example".into()])
             .unwrap();
         assert_eq!(state.lock().unwrap().as_deref(), Some(expected.as_str()));
         attempt.client = Some(driver);

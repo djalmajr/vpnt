@@ -417,8 +417,8 @@ mod tests {
             worker: Some(worker),
             service: service.clone(),
         };
-        let servers = ["172.20.0.4".parse().unwrap(), "172.20.0.3".parse().unwrap()];
-        let domains = vec!["cit.example".to_owned()];
+        let servers = ["172.16.0.4".parse().unwrap(), "172.16.0.3".parse().unwrap()];
+        let domains = vec!["corp.example".to_owned()];
         assert!(lease.publish(&servers, &[]).is_err());
         assert!(state.lock().unwrap().is_none());
         lease.publish(&servers, &domains).unwrap();
@@ -429,9 +429,9 @@ mod tests {
         let dictionary = dns_dictionary(&servers, &domains).as_CFType();
         let dictionary = dictionary.downcast::<CFDictionary>().unwrap();
         let expected_servers =
-            CFArray::from_CFTypes(&[CFString::new("172.20.0.4"), CFString::new("172.20.0.3")])
+            CFArray::from_CFTypes(&[CFString::new("172.16.0.4"), CFString::new("172.16.0.3")])
                 .as_CFType();
-        let expected_domains = CFArray::from_CFTypes(&[CFString::new("cit.example")]).as_CFType();
+        let expected_domains = CFArray::from_CFTypes(&[CFString::new("corp.example")]).as_CFType();
         assert_eq!(
             field(&dictionary, "ServerAddresses"),
             Some(expected_servers)

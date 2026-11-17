@@ -688,15 +688,15 @@ mod tests {
     fn dns_output_requires_strict_values_and_complete_counts() {
         let mut seen = Observation::default();
         for line in [
-            "INFO:   vpnt: dns-server 172.20.0.4",
-            "INFO:   vpnt: dns-server 172.20.0.3",
-            "INFO:   vpnt: dns-domain CIT.Example",
+            "INFO:   vpnt: dns-server 172.16.0.4",
+            "INFO:   vpnt: dns-server 172.16.0.3",
+            "INFO:   vpnt: dns-domain Corp.Example",
             "INFO:   vpnt: dns 2 1",
         ] {
             parse(line.as_bytes(), &mut seen);
         }
         assert!(!seen.dns_invalid);
-        assert_eq!(seen.dns_domains, ["cit.example"]);
+        assert_eq!(seen.dns_domains, ["corp.example"]);
         assert_eq!(seen.dns_count, Some((2, 1)));
         for line in [
             "INFO:   vpnt: dns-domain bad_name",
@@ -721,7 +721,7 @@ mod tests {
             "INFO:   Authenticated.",
             "INFO:   Remote gateway has allocated a VPN.",
             "INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
-            "INFO:   vpnt: split-route 172.20.0.0/255.255.0.0",
+            "INFO:   vpnt: split-route 172.16.0.0/255.255.0.0",
             "INFO:   vpnt: split-route 192.168.1.0/255.255.255.0",
             "INFO:   vpnt: split-routes 3",
             "INFO:   Interface ppp0 is UP.",
@@ -735,7 +735,7 @@ mod tests {
             observation.split,
             vec![
                 ("10.0.0.0".parse().unwrap(), 8),
-                ("172.20.0.0".parse().unwrap(), 16),
+                ("172.16.0.0".parse().unwrap(), 16),
                 ("192.168.1.0".parse().unwrap(), 24)
             ]
         );

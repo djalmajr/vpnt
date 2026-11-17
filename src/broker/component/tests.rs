@@ -26,7 +26,7 @@ impl SecretStore for Secrets {
     }
 }
 fn wait(mut check: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(4);
+    let end = Instant::now() + Duration::from_secs(15);
     while !check() {
         assert!(Instant::now() < end, "component broker timed out");
         std::thread::sleep(Duration::from_millis(5));

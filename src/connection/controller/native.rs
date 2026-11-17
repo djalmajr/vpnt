@@ -416,8 +416,8 @@ mod split_tests {
     #[test]
     fn dns_requires_both_a_domain_and_a_server() {
         let mut value = Observation {
-            dns_servers: vec!["172.20.0.4".parse().unwrap()],
-            dns_domains: vec!["cit.example".into()],
+            dns_servers: vec!["172.16.0.4".parse().unwrap()],
+            dns_domains: vec!["corp.example".into()],
             dns_count: Some((1, 1)),
             ..Observation::default()
         };
@@ -447,7 +447,7 @@ mod split_tests {
     #[test]
     fn configured_domains_override_gateway_and_require_servers() {
         let mut value = Observation {
-            dns_servers: vec!["172.20.0.4".parse().unwrap()],
+            dns_servers: vec!["172.16.0.4".parse().unwrap()],
             dns_domains: vec!["gateway.example".into()],
             dns_count: Some((1, 1)),
             ..Observation::default()
@@ -492,11 +492,11 @@ mod split_tests {
     #[test]
     fn selection_honors_profile_and_complete_gateway_routes() {
         let split = observation(
-            &[("10.0.0.0", 8), ("172.20.0.0", 16), ("192.168.1.0", 24)],
+            &[("10.0.0.0", 8), ("172.16.0.0", 16), ("192.168.1.0", 24)],
             Some(3),
         );
         let chosen = ssl_networks(&[], &split).unwrap();
-        assert_eq!(chosen, ["10.0.0.0/8", "172.20.0.0/16", "192.168.1.0/24"]);
+        assert_eq!(chosen, ["10.0.0.0/8", "172.16.0.0/16", "192.168.1.0/24"]);
         let plan = crate::connection::routes::ppp_networks(&chosen, 9, true, false, None).unwrap();
         assert_eq!(plan.len(), 3);
         assert!(plan.iter().all(|route| route.interface == 9
