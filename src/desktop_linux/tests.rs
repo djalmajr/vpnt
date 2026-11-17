@@ -938,3 +938,62 @@ fn hidden_panel_is_sized_before_its_placement_is_queued() {
         [SizeOp::Release, SizeOp::SetHeight(480), SizeOp::Fix(480)]
     );
 }
+
+#[test]
+fn opening_rule_turns_off_omarchy_titlebars_only_while_the_plugin_is_loaded() {
+    // Omarchy's floating workspace mode draws a 30 px hyprbars titlebar above the
+    // popover; behind the bar it showed as a band in the gap below it.
+    let monitors = monitors(
+        r#"[{"name":"HDMI-A-1","x":1600,"y":0,"width":1920,"height":1080,"scale":1,"reserved":[0,26,0,0]}]"#,
+    );
+    let frame = placement::Frame {
+        x: 3107,
+        y: 33,
+        height: 480,
+    };
+    let [titlebar_free, plain, still] = placement::lua_opening_rules(&monitors[0], &frame);
+    let table = r#"{ name = "vpnt-tray", match = { class = "^(vpnt)$", title = "^(VPN Tray)$" }, float = true, pin = true, monitor = "HDMI-A-1", size = { 320, 480 }, move = { 1507, 33 }, animation = "popin 100%" }"#;
+    assert_eq!(
+        titlebar_free,
+        format!(
+            r#"local rule = {table}; if hl.plugin and hl.plugin.hyprbars then rule["hyprbars:no_bar"] = true end; hl.window_rule(rule)"#
+        )
+    );
+    assert_eq!(plain, placement::lua_opening_rule(&monitors[0], &frame));
+    assert_eq!(plain, format!("hl.window_rule({table})"));
+    assert_eq!(
+        still,
+        format!(
+            "hl.window_rule({})",
+            table.replace(r#", animation = "popin 100%""#, "")
+        )
+    );
+}
+
+#[test]
+fn opening_rules_stop_at_the_first_one_hyprland_accepts() {
+    let rules = ["first".to_owned(), "second".to_owned(), "third".to_owned()];
+    let mut tried = Vec::new();
+    assert_eq!(
+        placement::first_accepted(&rules, |rule| {
+            tried.push(rule.to_owned());
+            if rule == "second" {
+                Ok(())
+            } else {
+                Err(format!("refused {rule}"))
+            }
+        }),
+        Ok(())
+    );
+    assert_eq!(tried, ["first", "second"]);
+    let mut tried = Vec::new();
+    assert_eq!(
+        placement::first_accepted(&rules, |rule| {
+            tried.push(rule.to_owned());
+            Err(format!("refused {rule}"))
+        }),
+        Err("refused third".to_owned())
+    );
+    assert_eq!(tried, ["first", "second", "third"]);
+    assert!(placement::first_accepted(&[], |_| Ok(())).is_err());
+}

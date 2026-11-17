@@ -362,6 +362,45 @@ pub(super) fn lua_opening_rule(monitor: &Monitor, frame: &Frame) -> String {
     )
 }
 
+/// The opening rule, then the same rule with less in it, tried in this order.
+///
+/// Omarchy's floating workspace mode loads its hyprbars plugin and gives every
+/// window on that workspace a 30 px titlebar drawn above the window. Above the
+/// popover it sits behind the bar and shows below it as a band. The plugin's
+/// `hyprbars:no_bar` effect turns it off, but Hyprland refuses an unknown field,
+/// so the first rule asks for it only while the plugin is loaded, and the others
+/// leave it out, then drop the animation, in case the field is refused anyway.
+pub(super) fn lua_opening_rules(monitor: &Monitor, frame: &Frame) -> [String; 3] {
+    let rule = lua_opening_rule(monitor, frame);
+    let table = rule
+        .strip_prefix("hl.window_rule(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_default();
+    [
+        format!(
+            r#"local rule = {table}; if hl.plugin and hl.plugin.hyprbars then rule["hyprbars:no_bar"] = true end; hl.window_rule(rule)"#
+        ),
+        rule.clone(),
+        rule.replace(", animation = \"popin 100%\"", ""),
+    ]
+}
+
+/// Evaluates each rule until one is accepted; the error is the last one.
+pub(super) fn first_accepted(
+    rules: &[String],
+    mut eval: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut last = Err("No popover rule".to_owned());
+    for rule in rules {
+        last = eval(rule);
+        match &last {
+            Ok(()) => break,
+            Err(error) => eprintln!("Could not register popover rule: {error}"),
+        }
+    }
+    last
+}
+
 pub(super) fn lua_for_frame(address: &str, frame: &Frame) -> Option<String> {
     let hex = address.strip_prefix("0x")?;
     if hex.is_empty()
@@ -500,14 +539,9 @@ fn apply(
         frame_with_gap(anchor, &monitors, request.requested, gap).ok_or("No valid monitor")?;
     if request.is_opening {
         let monitor = monitor_for_anchor(anchor, &monitors).ok_or("No valid monitor")?;
-        let rule = lua_opening_rule(monitor, &frame);
+        let rules = lua_opening_rules(monitor, &frame);
         dispatch_if_current(generation, request.generation, || {
-            if let Err(error) = eval(&rule) {
-                eprintln!("Could not register popover animation rule: {error}");
-                let fallback = rule.replace(", animation = \"popin 100%\"", "");
-                eval(&fallback)?;
-            }
-            Ok(())
+            first_accepted(&rules, eval)
         })?;
         return Ok(Some(frame.height));
     }
