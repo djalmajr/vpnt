@@ -116,7 +116,9 @@ fn component_install_rechecks_activity_after_admission_before_runtime_handoff() 
         .begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(3),
+            // Generous: this test is about the activity recheck, and a loaded
+            // host can take seconds to prepare, which used to expire first.
+            Instant::now() + Duration::from_secs(30),
         )
         .unwrap();
     wait(|| broker.component.current.as_ref().unwrap().client.prepared());
