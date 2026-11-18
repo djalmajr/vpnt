@@ -14,6 +14,7 @@ pub enum ErrorCode {
     Limit,
     InvalidAddress,
     InvalidRoute,
+    RouteConflict,
     InvalidDns,
     Backend,
 }

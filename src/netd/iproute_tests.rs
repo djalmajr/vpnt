@@ -24,8 +24,24 @@ fn exact_argv_and_dns_branches() {
             "tuntap", "add", "dev", "vpnt0", "mode", "tun", "user", "1234"
         ]
     );
+    assert_eq!(
+        alias_args(&name),
+        ["link", "set", "dev", "vpnt0", "alias", "vpnt-helper"]
+    );
+    assert_eq!(
+        exact_route_args("10.0.0.0/8"),
+        [
+            "-j",
+            "route",
+            "show",
+            "exact",
+            "10.0.0.0/8",
+            "table",
+            "main"
+        ]
+    );
     assert_eq!(delete_args(&name), ["link", "del", "dev", "vpnt0"]);
-    assert_eq!(existing_args(), ["-j", "link", "show"]);
+    assert_eq!(existing_args(), ["-j", "-d", "link", "show"]);
     let c = config(r#"["10.200.0.1","1.1.1.1"]"#, r#"["serpro","example.org"]"#);
     let commands = configure_commands(&c);
     let actual: Vec<_> = commands
@@ -42,14 +58,8 @@ fn exact_argv_and_dns_branches() {
                 vec!["link", "set", "dev", "vpnt0", "mtu", "1400", "up"]
             ),
             (false, vec!["addr", "add", "10.9.0.2/24", "dev", "vpnt0"]),
-            (
-                false,
-                vec!["route", "replace", "10.0.0.0/8", "dev", "vpnt0"]
-            ),
-            (
-                false,
-                vec!["route", "replace", "172.16.0.0/12", "dev", "vpnt0"]
-            ),
+            (false, vec!["route", "add", "10.0.0.0/8", "dev", "vpnt0"]),
+            (false, vec!["route", "add", "172.16.0.0/12", "dev", "vpnt0"]),
             (true, vec!["revert", "vpnt0"]),
             (true, vec!["dns", "vpnt0", "10.200.0.1", "1.1.1.1"]),
             (true, vec!["domain", "vpnt0", "~serpro", "~example.org"]),
@@ -81,7 +91,10 @@ fn exact_argv_and_dns_branches() {
 fn existing_filters_names_and_rejects_malformed_output() {
     let names=parse_existing(r#"[{"ifname":"vpnt0"},{"ifname":"eth0"},{"ifname":"vpnt99"},{"ifname":"vpnt00"},{"ifname":"vpnt123"},{"ifname":"vpnt١"}]"#.as_bytes()).unwrap();
     assert_eq!(
-        names.iter().map(TunName::as_str).collect::<Vec<_>>(),
+        names
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
         ["vpnt0", "vpnt99"]
     );
     for bytes in [
@@ -152,7 +165,7 @@ fn runner_clears_environment_captures_output_and_does_not_echo_stderr() {
     let f = Fixture::new();
     let ip=f.script("ip", "[ \"$LC_ALL\" = C ] || exit 2\n[ -z \"${HOME+x}\" ] || exit 3\n[ -z \"${XDG_CONFIG_HOME+x}\" ] || exit 4\n[ -z \"${TMPDIR+x}\" ] || exit 5\n[ -z \"${USERPROFILE+x}\" ] || exit 6\nprintf '[{\"ifname\":\"vpnt0\"}]'");
     let backend = IpRoute::with_paths(ip, f.0.join("unused"), Duration::from_secs(1));
-    assert_eq!(backend.existing().unwrap()[0].as_str(), "vpnt0");
+    assert_eq!(backend.existing().unwrap()[0].name.as_str(), "vpnt0");
     let bad = f.script("bad", "printf 'private-client-input' >&2\nexit 7");
     let backend = IpRoute::with_paths(bad, f.0.join("unused"), Duration::from_secs(1));
     let message = backend.existing().unwrap_err().to_string();
@@ -188,5 +201,81 @@ fn backend_revalidates_public_config_before_any_effect() {
     assert_eq!(
         backend.configure(&c).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn create_marks_tun_and_rolls_back_if_alias_fails() {
+    let f = Fixture::new();
+    let log = f.0.join("argv");
+    let name = TunName::parse("vpnt0").unwrap();
+    let ip = f.script(
+        "ip",
+        &format!(
+            "printf '%s\n' \"$*\" >> '{}'\n[ \"$2\" != set ]",
+            log.display()
+        ),
+    );
+    let backend = IpRoute::with_paths(ip, f.0.join("unused"), Duration::from_secs(1));
+    assert!(backend.create_tun(&name, 1000).is_err());
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "tuntap add dev vpnt0 mode tun user 1000\nlink set dev vpnt0 alias vpnt-helper\nlink del dev vpnt0\n"
+    );
+}
+
+#[test]
+fn exact_route_lookup_controls_add_and_preserves_foreign_routes() {
+    let f = Fixture::new();
+    let log = f.0.join("argv");
+    let answers = f.0.join("routes");
+    let ip = f.script(
+        "ip",
+        &format!(
+            "printf '%s\n' \"$*\" >> '{}'\nif [ \"$1\" = -j ]; then /usr/bin/cat '{}'; fi",
+            log.display(),
+            answers.display()
+        ),
+    );
+    let dns = f.script("dns", "exit 0");
+    let backend = IpRoute::with_paths(ip, dns, Duration::from_secs(1));
+    let mut config = config("[]", "[]");
+    config.routes.truncate(1);
+    for (response, conflict, add) in [
+        ("[]", false, true),
+        (r#"[{"dev":"vpnt0"}]"#, false, false),
+        (r#"[{"dev":"vpnt0"},{"dev":"lo"}]"#, true, false),
+        (r#"[{"type":"blackhole"}]"#, true, false),
+    ] {
+        fs::write(&answers, response).unwrap();
+        fs::write(&log, "").unwrap();
+        let result = backend.configure(&config);
+        if conflict {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        } else {
+            result.unwrap();
+        }
+        let commands = fs::read_to_string(&log).unwrap();
+        let expected = "addr flush dev vpnt0\nroute flush dev vpnt0\nlink set dev vpnt0 mtu 1400 up\naddr add 10.9.0.2/24 dev vpnt0\n-j route show exact 10.0.0.0/8 table main\n";
+        assert_eq!(
+            commands,
+            if add {
+                format!("{expected}route add 10.0.0.0/8 dev vpnt0\n")
+            } else {
+                expected.to_string()
+            }
+        );
+    }
+}
+
+#[test]
+fn only_tun_with_exact_alias_is_owned() {
+    let entries = parse_existing(br#"[{"ifname":"vpnt0","ifalias":"vpnt-helper","linkinfo":{"info_kind":"tun"}},{"ifname":"vpnt1","linkinfo":{"info_kind":"tun"}},{"ifname":"vpnt2","ifalias":"vpnt-helper","linkinfo":{"info_kind":"dummy"}},{"ifname":"vpnt3","ifalias":"vpnt-helper-extra","linkinfo":{"info_kind":"tun"}}]"#).unwrap();
+    assert_eq!(
+        entries
+            .into_iter()
+            .map(|entry| entry.owned)
+            .collect::<Vec<_>>(),
+        [true, false, false, false]
     );
 }

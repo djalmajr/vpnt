@@ -55,6 +55,7 @@ fn responses_exact_wire() {
         (ErrorCode::Limit, "limit"),
         (ErrorCode::InvalidAddress, "invalid_address"),
         (ErrorCode::InvalidRoute, "invalid_route"),
+        (ErrorCode::RouteConflict, "route_conflict"),
         (ErrorCode::InvalidDns, "invalid_dns"),
         (ErrorCode::Backend, "backend"),
     ] {
@@ -242,6 +243,7 @@ fn transport_encoders_round_trip_and_reject_inconsistent_responses() {
         Response::Version(1),
         Response::Opened(TunName::parse("vpnt0").unwrap()),
         Response::Error(ErrorCode::NotOwned),
+        Response::Error(ErrorCode::RouteConflict),
     ] {
         let bytes = encode_response(&response);
         assert_eq!(encode_response(&decode_response(&bytes).unwrap()), bytes);

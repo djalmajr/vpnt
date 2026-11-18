@@ -4,6 +4,7 @@ use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, tim
 use vpnt::netd::{
     iproute::{Backend, IpRoute},
     protocol::{Config, Request, TunName, parse_request},
+    server::cleanup_startup,
 };
 
 struct Fixture {
@@ -132,9 +133,23 @@ fn isolated_network_replacement_and_cleanup() {
     let addresses = addresses[0]["addr_info"].as_array().unwrap();
     assert!(addresses.iter().any(|a| a["local"] == "10.10.0.2"));
     assert!(!addresses.iter().any(|a| a["local"] == "10.9.0.2"));
-    assert!(fixture.backend.existing().unwrap().contains(&fixture.name));
+    assert!(
+        fixture
+            .backend
+            .existing()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == fixture.name)
+    );
     fixture.backend.delete_tun(&fixture.name).unwrap();
-    assert!(!fixture.backend.existing().unwrap().contains(&fixture.name));
+    assert!(
+        !fixture
+            .backend
+            .existing()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.name == fixture.name)
+    );
     assert!(
         !ip(&["-j", "link", "show"])
             .as_array()
@@ -153,4 +168,78 @@ fn isolated_network_replacement_and_cleanup() {
         fs::read_to_string(&log).unwrap(),
         "revert vpnt0\ndns vpnt0 10.200.0.1\ndomain vpnt0 ~serpro\ndefault-route vpnt0 false\nrevert vpnt0\ndns vpnt0 10.200.0.1\ndefault-route vpnt0 true\nrevert vpnt0\n"
     );
+
+    for args in [
+        ["route", "add", "198.51.100.0/24", "dev", "lo"].as_slice(),
+        ["link", "add", "vpnt7", "type", "dummy"].as_slice(),
+    ] {
+        assert!(
+            Command::new("/usr/bin/ip")
+                .args(args)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let exact = [
+        "-j",
+        "route",
+        "show",
+        "exact",
+        "198.51.100.0/24",
+        "table",
+        "main",
+    ];
+    let original = ip(&exact);
+    assert_eq!(original[0]["dev"], "lo");
+    fixture.backend.create_tun(&fixture.name, 0).unwrap();
+    let conflict = config(
+        "10.9.0.2",
+        serde_json::json!([{"network":"198.51.100.0","prefix":24}]),
+        serde_json::json!([]),
+    );
+    assert_eq!(
+        fixture.backend.configure(&conflict).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(ip(&exact), original);
+
+    let connected = config(
+        "10.9.0.2",
+        serde_json::json!([{"network":"10.9.0.0","prefix":24}]),
+        serde_json::json!([]),
+    );
+    fixture.backend.configure(&connected).unwrap();
+    let routes = ip(&[
+        "-j",
+        "route",
+        "show",
+        "exact",
+        "10.9.0.0/24",
+        "table",
+        "main",
+    ]);
+    assert_eq!(routes.as_array().unwrap().len(), 1);
+    assert_eq!(routes[0]["dev"], "vpnt0");
+    assert_eq!(routes[0]["protocol"], "kernel");
+
+    let entries = fixture.backend.existing().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == fixture.name && entry.owned)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name.as_str() == "vpnt7" && !entry.owned)
+    );
+    assert!(cleanup_startup(&fixture.backend).unwrap().is_empty());
+    assert_eq!(ip(&exact), original);
+    let entries = fixture.backend.existing().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name.as_str(), "vpnt7");
+    assert!(!entries[0].owned);
 }
