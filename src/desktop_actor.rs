@@ -43,6 +43,9 @@ fn list_certificates(id: String, module: String) -> Reply {
             ),
             ..Reply::default()
         },
+        Err(crate::connection::ovpn::pkcs11::TokenError::UntrustedModule) => {
+            Reply::error(id, "untrusted_module")
+        }
         Err(_) => Reply::error(id, "token_unavailable"),
     }
 }

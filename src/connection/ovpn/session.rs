@@ -289,6 +289,7 @@ impl Session {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         add_extra_options(&mut command, &launch.extra, version);
+        command.args(["--remote-cert-tls", "server"]);
         match launch.signatures {
             Signatures::Any => {
                 command.args(["--management-external-key", "pkcs1", "pss"]);

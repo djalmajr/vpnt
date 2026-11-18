@@ -271,3 +271,19 @@ fn blocked_certificate_listing_does_not_block_actor() {
     assert!(after > before, "poll must continue during listing");
     assert_eq!(listing.unwrap().id, "listing");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_listing_reports_an_untrusted_module_distinctly() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vpnt-actor-module-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let module = dir.join("token.so");
+    std::fs::write(&module, b"not a library").unwrap();
+    std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let reply = super::list_certificates("one".into(), module.to_string_lossy().into_owned());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(reply.id, "one");
+    assert_eq!(reply.error.as_deref(), Some("untrusted_module"));
+    assert!(reply.certificates.is_none());
+}

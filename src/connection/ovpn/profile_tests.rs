@@ -7,6 +7,18 @@ fn append(line: &str) -> String {
 }
 
 #[test]
+fn remote_cert_tls_requires_exact_server_role() {
+    for value in ["client", "", "server extra", "SERVER"] {
+        assert_eq!(
+            inspect(append(&format!("remote-cert-tls {value}")).as_bytes()).unwrap_err(),
+            ImportError::Forbidden("remote-cert-tls".into())
+        );
+    }
+    assert!(inspect(append("remote-cert-tls server").as_bytes()).is_ok());
+    assert!(inspect(MINIMAL.as_bytes()).is_ok());
+}
+
+#[test]
 fn serpro_shape_normalizes_and_extracts_metadata() {
     let input = concat!(
         "  # Name: Rede de teste \r\n",

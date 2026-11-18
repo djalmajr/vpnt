@@ -376,7 +376,7 @@ fn oversized_network_stops_and_reports() {
 fn launch_passes_device_and_management_up_down() {
     let directory = PrivateDir::create(&std::env::temp_dir()).unwrap();
     let executable = directory.path.join("openvpn");
-    fs::write(&executable, "#!/usr/bin/env python3\nimport socket,sys,time\na=sys.argv\nif '--version' in a: print('OpenVPN 2.6.19'); sys.exit(0)\ni=a.index('--dev')\nassert a[i:i+5] == ['--dev','vpnt0','--dev-type','tun','--disable-dco']\nassert '--management-up-down' in a\ns=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\ntime.sleep(.2)\n").unwrap();
+    fs::write(&executable, "#!/usr/bin/env python3\nimport socket,sys,time\na=sys.argv\nif '--version' in a: print('OpenVPN 2.6.19'); sys.exit(0)\ni=a.index('--dev')\nassert a[i:i+5] == ['--dev','vpnt0','--dev-type','tun','--disable-dco']\nassert '--management-up-down' in a\nc=a.index('--config')\nr=a.index('--remote-cert-tls')\nassert r > c+1 and a[r+1] == 'server'\ns=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\ntime.sleep(.2)\n").unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
     let mut settings = launch(&executable);
     settings.dev = Some("vpnt0".into());

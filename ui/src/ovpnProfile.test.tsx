@@ -304,6 +304,19 @@ test("OVPN certificate listing reports empty and error states and allows retry",
   expect(document.querySelector('[role="alert"]')).toBeNull();
 });
 
+test("untrusted module displays a distinct localized error", async () => {
+  await createProfile();
+  replyFor = () => ({ error: "untrusted_module" });
+  await click(button("List certificates"));
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain(
+    "The PKCS#11 module or its folders are not trusted.",
+  );
+  const { catalogs } = await import("./i18n");
+  expect(catalogs["pt-BR"].ovpnUntrustedModule).toBe(
+    "O módulo PKCS#11 ou suas pastas não são confiáveis.",
+  );
+});
+
 test("Editing OVPN without importing omits the config and never prompts for secrets", async () => {
   await mount([existing]);
   await click(button("Example OVPN: Disconnected"));

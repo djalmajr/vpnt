@@ -123,7 +123,9 @@ export function Profile({
       setCertificateError(
         error instanceof Error && error.message === "invalid_module"
           ? "ovpnInvalidModule"
-          : "ovpnTokenUnavailable",
+          : error instanceof Error && error.message === "untrusted_module"
+            ? "ovpnUntrustedModule"
+            : "ovpnTokenUnavailable",
       );
     } finally {
       setListing(false);

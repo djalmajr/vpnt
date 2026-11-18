@@ -110,6 +110,7 @@ fn certificates_reply_with(
             ),
             ..Reply::default()
         },
+        Ok(Err(TokenError::UntrustedModule)) => Reply::error(id.into(), "untrusted_module"),
         _ => Reply::error(id.into(), "token_unavailable"),
     }
 }
@@ -167,6 +168,19 @@ pub(crate) fn validate_config(content: &str) -> Result<(), &'static str> {
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_module_has_a_distinct_bridge_error() {
+        static LISTING_TEST: AtomicBool = AtomicBool::new(false);
+        let result = certificates_reply_with(
+            "fixture",
+            "/fixture.so",
+            Duration::from_secs(1),
+            &LISTING_TEST,
+            |_| Err(TokenError::UntrustedModule),
+        );
+        assert_eq!(result.error.as_deref(), Some("untrusted_module"));
+    }
 
     #[test]
     fn certificate_listing_deadline_returns_before_provider_finishes() {

@@ -151,6 +151,9 @@ pub fn inspect(content: &[u8]) -> Result<Inspected, ImportError> {
         match directive {
             "remote" => remotes.push(parse_remote(&args)?),
             "setenv" => check_setenv(&args)?,
+            "remote-cert-tls" if args.as_slice() != ["server"] => {
+                return Err(ImportError::Forbidden("remote-cert-tls".into()));
+            }
             _ => {}
         }
     }

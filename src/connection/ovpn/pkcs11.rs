@@ -26,6 +26,8 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenError {
+    /// The module or its directory chain is not trusted.
+    UntrustedModule,
     /// The module could not be loaded or initialized.
     Module,
     /// No token holds a certificate and private key with this id.
@@ -35,6 +37,38 @@ pub enum TokenError {
     /// The token wants a PIN; only protected authentication paths are handled.
     PinRequired,
     Failed(RvError),
+}
+
+fn admit_module(path: &str) -> Result<PathBuf, TokenError> {
+    admit_module_with(path, &[0, unsafe { libc::geteuid() }], Path::new("/"))
+}
+
+fn admit_module_with(path: &str, owners: &[u32], stop_at: &Path) -> Result<PathBuf, TokenError> {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::model::valid_module_path(path) {
+        return Err(TokenError::UntrustedModule);
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|_| TokenError::Module)?;
+    let stop = std::fs::canonicalize(stop_at).map_err(|_| TokenError::UntrustedModule)?;
+    if !resolved.starts_with(&stop) || resolved == stop {
+        return Err(TokenError::UntrustedModule);
+    }
+    let metadata = std::fs::metadata(&resolved).map_err(|_| TokenError::UntrustedModule)?;
+    if !metadata.is_file() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+        return Err(TokenError::UntrustedModule);
+    }
+    let mut directory = resolved.parent().ok_or(TokenError::UntrustedModule)?;
+    loop {
+        let metadata = std::fs::metadata(directory).map_err(|_| TokenError::UntrustedModule)?;
+        if !metadata.is_dir() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+            return Err(TokenError::UntrustedModule);
+        }
+        if directory == stop {
+            break;
+        }
+        directory = directory.parent().ok_or(TokenError::UntrustedModule)?;
+    }
+    Ok(resolved)
 }
 
 impl From<Error> for TokenError {
@@ -240,19 +274,30 @@ impl TokenKey {
 /// never finalizes on drop, and unloading a module that runs its own threads
 /// (cloud tokens do) can crash; initializing it again would fail instead.
 fn context(module: &Path) -> Result<Arc<Pkcs11>, TokenError> {
-    static CONTEXTS: Mutex<Vec<(PathBuf, Arc<Pkcs11>)>> = Mutex::new(Vec::new());
-    let mut contexts = CONTEXTS.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some((_, pkcs11)) = contexts.iter().find(|(path, _)| path == module) {
-        return Ok(Arc::clone(pkcs11));
-    }
-    let pkcs11 = Pkcs11::new(module).map_err(|_| TokenError::Module)?;
-    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-        Ok(()) | Err(Error::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
-        Err(_) => return Err(TokenError::Module),
-    }
-    let pkcs11 = Arc::new(pkcs11);
-    contexts.push((module.to_path_buf(), Arc::clone(&pkcs11)));
-    Ok(pkcs11)
+    with_admitted_module(module, admit_module, |module| {
+        static CONTEXTS: Mutex<Vec<(PathBuf, Arc<Pkcs11>)>> = Mutex::new(Vec::new());
+        let mut contexts = CONTEXTS.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, pkcs11)) = contexts.iter().find(|(path, _)| path == module) {
+            return Ok(Arc::clone(pkcs11));
+        }
+        let pkcs11 = Pkcs11::new(module).map_err(|_| TokenError::Module)?;
+        match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+            Ok(()) | Err(Error::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
+            Err(_) => return Err(TokenError::Module),
+        }
+        let pkcs11 = Arc::new(pkcs11);
+        contexts.push((module.to_path_buf(), Arc::clone(&pkcs11)));
+        Ok(pkcs11)
+    })
+}
+
+fn with_admitted_module<T>(
+    module: &Path,
+    admit: impl FnOnce(&str) -> Result<PathBuf, TokenError>,
+    load: impl FnOnce(&Path) -> Result<T, TokenError>,
+) -> Result<T, TokenError> {
+    let canonical = admit(module.to_str().ok_or(TokenError::UntrustedModule)?)?;
+    load(&canonical)
 }
 
 fn session<'a>(
