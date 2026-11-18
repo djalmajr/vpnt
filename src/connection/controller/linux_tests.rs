@@ -174,3 +174,103 @@ fn linux_controller_loads_profiles_refuses_connection_and_stops() {
         thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn worker_publishes_changed_phase_and_default_phase_stays_silent() {
+    use crate::connection::controller::{ConnectionState, ProbeClock, worker};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct AttemptWithPhase {
+        calls: Arc<AtomicUsize>,
+        publish: bool,
+    }
+    impl Attempt for AttemptWithPhase {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+        fn phase(&self) -> Option<ConnectionState> {
+            self.publish.then_some(ConnectionState::Reconnecting)
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            Ok(())
+        }
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            Ok(true)
+        }
+        fn cleanup(&mut self) -> bool {
+            true
+        }
+    }
+    struct WorkerGuard {
+        cancel: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<worker::Finished>>,
+    }
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.cancel.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+    assert_eq!(UnsupportedAttempt.phase(), None);
+    for publish in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(None));
+        let signals = worker::Signals {
+            canceled: cancel.clone(),
+            probe: Arc::new(AtomicBool::new(false)),
+            state: state.clone(),
+            exit: Arc::new(worker::ExitRequested::new(Duration::from_secs(1))),
+        };
+        let timing = Timing {
+            connect: Duration::from_secs(3),
+            probe: Duration::from_secs(1),
+            interval: Duration::from_secs(1),
+            health: Duration::from_secs(1),
+            poll: Duration::from_millis(5),
+        };
+        let attempt = AttemptWithPhase {
+            calls: calls.clone(),
+            publish,
+        };
+        let _guard = WorkerGuard {
+            cancel: cancel.clone(),
+            thread: Some(thread::spawn(move || {
+                worker::run(
+                    attempt,
+                    signals,
+                    timing,
+                    ProbeClock::new(Duration::from_secs(1)),
+                )
+            })),
+        };
+        let until = Instant::now() + Duration::from_secs(2);
+        while calls.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "ready was not called");
+            thread::sleep(Duration::from_millis(5));
+        }
+        if publish {
+            while state.lock().unwrap().is_none() {
+                assert!(Instant::now() < until, "phase was not published");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                state.lock().unwrap().as_ref().unwrap().state,
+                ConnectionState::Reconnecting
+            );
+        } else {
+            assert!(
+                state.lock().unwrap().is_none(),
+                "None must not publish a phase"
+            );
+        }
+    }
+}

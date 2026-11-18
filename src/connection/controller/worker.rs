@@ -122,6 +122,7 @@ pub(super) fn run(
             return Err(timeout(start.as_ref().err()));
         }
         start?;
+        let mut previous_phase = None;
         loop {
             if canceled() {
                 return Ok(());
@@ -139,6 +140,13 @@ pub(super) fn run(
             if ready? {
                 break;
             }
+            let phase = attempt.phase();
+            if phase != previous_phase
+                && let Some(state) = phase
+            {
+                send(state, 0, false, None);
+            }
+            previous_phase = phase;
             thread::sleep(timing.poll);
         }
         if canceled() {

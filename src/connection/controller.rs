@@ -56,6 +56,9 @@ trait Attempt {
     fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure>;
     /// true only after owned interface discovery and complete route leases.
     fn ready(&mut self) -> Result<bool, Failure>;
+    fn phase(&self) -> Option<ConnectionState> {
+        None
+    }
     fn healthy(&mut self) -> Result<(), Failure>;
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure>;
     /// Stop only owned children; return true only after observed cleanup.
