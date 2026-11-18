@@ -84,13 +84,17 @@ impl Observer for NativeObserver {
             .any(|entry| entry.name == name && entry.index == index))
     }
     fn route_absent(&mut self, route: Route) -> Result<bool, ()> {
-        let table = Snapshot::read().map_err(|_| ())?;
-        match table.exact(route.key).map_err(|_| ())? {
-            None => Ok(true),
-            Some(record) => Ok(record.route().map_err(|_| ())? != route),
-        }
+        route_absent_in(&Snapshot::read().map_err(|_| ())?, route)
     }
 }
+fn route_absent_in(table: &Snapshot, route: Route) -> Result<bool, ()> {
+    match table.exact(route.key).map_err(|_| ())? {
+        None => Ok(true),
+        Some(_) if super::routing::TransportDefault::try_from(route).is_ok() => Ok(false),
+        Some(record) => Ok(record.route().map_err(|_| ())? != route),
+    }
+}
+
 fn interface_absent(observer: &mut impl Observer, interface: &Interface) -> Result<bool, ()> {
     if interface.name.is_empty() || interface.index == 0 {
         return Err(());
@@ -175,18 +179,23 @@ impl Recovery {
             global: true,
             blocked: BTreeSet::new(),
         };
-        result.reconcile(None, &mut NativeObserver);
+        result.reconcile(None, &BTreeSet::new(), &mut NativeObserver);
         result
     }
     pub fn blocked(&self, profile: &Profile) -> bool {
         (self.global && profile.kind == VpnKind::Ssl) || self.blocked.contains(&profile.id)
     }
-    pub fn verify(&mut self, profile: &Profile) -> bool {
-        self.reconcile(Some(&profile.id), &mut NativeObserver);
+    pub fn verify(&mut self, profile: &Profile, live: &BTreeSet<(String, u64)>) -> bool {
+        self.reconcile(Some(&profile.id), live, &mut NativeObserver);
         !self.blocked(profile)
     }
-    fn reconcile(&mut self, target: Option<&str>, observer: &mut impl Observer) {
-        let records = match fence::scan(&self.root, self.owner, self.uid) {
+    fn reconcile(
+        &mut self,
+        target: Option<&str>,
+        live: &BTreeSet<(String, u64)>,
+        observer: &mut impl Observer,
+    ) {
+        let records = match fence::scan(&self.root, self.owner, self.uid, live) {
             Ok(records) => records,
             Err(_) => {
                 self.global = true;
@@ -273,10 +282,7 @@ pub(crate) mod tests {
             if self.fail {
                 Err(())
             } else if let Some(snapshot) = &self.snapshot {
-                match snapshot.exact(route.key).map_err(|_| ())? {
-                    None => Ok(true),
-                    Some(record) => Ok(record.route().map_err(|_| ())? != route),
-                }
+                route_absent_in(snapshot, route)
             } else {
                 Ok(!self.route_present)
             }
@@ -382,12 +388,12 @@ pub(crate) mod tests {
         assert_eq!(state.lock().unwrap().as_deref(), Some(expected_key));
         let mut observer = fake();
         observer.dns_present = state.lock().unwrap().is_some();
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(profile));
         assert!(observer.calls.borrow().contains(&"dns"));
         *state.lock().unwrap() = None;
         observer.dns_present = state.lock().unwrap().is_some();
-        recovery.reconcile(Some(&profile.id), &mut observer);
+        recovery.reconcile(Some(&profile.id), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(profile));
         assert!(
             fence::read(root, uid, uid, &profile.id, 1)
@@ -413,11 +419,11 @@ pub(crate) mod tests {
         };
         let mut observer = fake();
         observer.dns_present = true;
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(observer.calls.borrow().contains(&"dns"));
         observer.dns_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(&profile("one")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
         item.dns_key =
@@ -465,7 +471,7 @@ pub(crate) mod tests {
                 global: true,
                 blocked: BTreeSet::new(),
             };
-            recovery.reconcile(None, &mut observer);
+            recovery.reconcile(None, &BTreeSet::new(), &mut observer);
             assert!(observer.destructive.borrow().is_empty());
             Self {
                 root,
@@ -492,7 +498,7 @@ pub(crate) mod tests {
             self.verifies.fetch_add(1, Ordering::SeqCst);
             let mut state = self.state.lock().unwrap();
             let (recovery, observer) = &mut *state;
-            recovery.reconcile(Some(&profile.id), observer);
+            recovery.reconcile(Some(&profile.id), &BTreeSet::new(), observer);
             assert!(observer.destructive.borrow().is_empty());
             !recovery.blocked(profile)
         }
@@ -523,6 +529,49 @@ pub(crate) mod tests {
         assert!(!observer.calls.borrow().contains(&"delete"));
     }
     #[test]
+    fn transport_default_fence_blocks_on_occupied_exact_key_until_absent() {
+        use super::super::routing::{Gateway, Record, TransportDefault};
+        use crate::connection::routes::Address;
+
+        let (root, uid) = root();
+        let hop = |ip: &str| Address::unscoped(ip.parse().unwrap());
+        let route = TransportDefault::from_egress(7, NextHop::Gateway(hop("192.0.2.1")))
+            .unwrap()
+            .route();
+        let mut item = record(uid, "one");
+        item.routes = vec![AbandonedRoute {
+            route,
+            created: true,
+        }];
+        fence::write(&root.0, uid, &item).unwrap();
+        let mut recovery = Recovery {
+            root: root.0.clone(),
+            owner: uid,
+            uid,
+            global: false,
+            blocked: BTreeSet::new(),
+        };
+        let mut observer = fake();
+        observer.snapshot = Some(Snapshot {
+            records: vec![Record {
+                key: route.key,
+                interface: route.interface,
+                flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_IFSCOPE,
+                gateway: Some(Gateway::Address(hop("192.0.2.2"))),
+                source: None,
+            }],
+        });
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
+        assert!(recovery.blocked(&profile("one")));
+        assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
+        observer.snapshot.as_mut().unwrap().records[0].key.scope = 0;
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
+        assert!(!recovery.blocked(&profile("one")));
+        assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
+        assert!(observer.destructive.borrow().is_empty());
+    }
+
+    #[test]
     fn reconciliation_removes_only_after_absence_and_blocks_invalid_by_profile() {
         let (root, uid) = root();
         let mut observer = fake();
@@ -537,18 +586,18 @@ pub(crate) mod tests {
             blocked: BTreeSet::new(),
         };
         observer.route_present = true;
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(recovery.blocked(&profile("two")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
         observer.fail = true;
         observer.route_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("one")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
         observer.fail = false;
         observer.route_present = false;
-        recovery.reconcile(Some("one"), &mut observer);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut observer);
         assert!(!recovery.blocked(&profile("one")));
         assert!(recovery.blocked(&profile("two")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
@@ -560,7 +609,7 @@ pub(crate) mod tests {
             .join(uid.to_string())
             .join("bad-1.json");
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).unwrap();
-        recovery.reconcile(None, &mut observer);
+        recovery.reconcile(None, &BTreeSet::new(), &mut observer);
         assert!(recovery.blocked(&profile("bad")));
         assert!(!recovery.blocked(&profile("two")));
         assert!(bad.exists());
@@ -585,12 +634,39 @@ pub(crate) mod tests {
             global: false,
             blocked: BTreeSet::new(),
         };
-        recovery.reconcile(None, &mut fake());
+        recovery.reconcile(None, &BTreeSet::new(), &mut fake());
         assert!(recovery.blocked(&profile("one")));
         assert!(path.exists());
         recovery.owner = uid.wrapping_add(1);
-        recovery.reconcile(None, &mut fake());
+        recovery.reconcile(None, &BTreeSet::new(), &mut fake());
         assert!(recovery.blocked(&profile("one")));
+        assert!(path.exists());
+    }
+    #[test]
+    fn verification_skips_live_fence_and_keeps_other_generations() {
+        let (root, uid) = root();
+        let mut recovery = Recovery::new(&root.0, uid, uid);
+        let active = record(uid, "live");
+        fence::write(&root.0, uid, &active).unwrap();
+        let path = root
+            .0
+            .join("fences")
+            .join(uid.to_string())
+            .join("live-1.json");
+        // If the active file is opened and validated, this mode is untrusted.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let live = BTreeSet::from([("live".to_string(), 1)]);
+        assert!(recovery.verify(&profile("other"), &live));
+        assert!(!recovery.blocked(&profile("live")));
+        assert!(path.exists());
+        assert!(recovery.verify(
+            &profile("other"),
+            &BTreeSet::from([("live".to_string(), 2)])
+        ));
+        assert!(
+            recovery.blocked(&profile("live")),
+            "a different generation must not exempt this fence"
+        );
         assert!(path.exists());
     }
 }

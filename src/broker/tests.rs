@@ -12,6 +12,7 @@ mod automatic_interval;
 mod automatic_notifications;
 mod automatic_reconnect;
 mod automatic_support;
+mod failure_note;
 mod ipsec_dispatch;
 mod manual_intent;
 mod recovery;

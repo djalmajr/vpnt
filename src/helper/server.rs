@@ -190,6 +190,11 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
             return Err(error);
         }
     };
+    if mode == Mode::Runtime
+        && let Some(controller) = lock.as_ref()
+    {
+        crate::connection::ipsec::NativeContext::recover_orphans(controller, caller.uid);
+    }
     match mode {
         Mode::Runtime => runtime_with_build(caller, Some(build), |uid, requests, output| {
             crate::connection::controller::run_ssl(

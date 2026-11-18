@@ -419,6 +419,12 @@ fn names(dir: &File) -> io::Result<Vec<CString>> {
         }
     }
     let stream = Directory(stream);
+    // The duplicate shares the open file description, and with it the read
+    // offset, with `dir`. A previous enumeration left that offset at the end,
+    // and fdopendir does not rewind on every system (btrfs then misses
+    // entries created since), so start from the first entry explicitly.
+    // SAFETY: the stream is valid until Directory drops it.
+    unsafe { libc::rewinddir(stream.0) };
     let mut result = Vec::new();
     loop {
         // SAFETY: errno belongs to this thread; readdir's returned entry lives until the next call.
@@ -465,7 +471,12 @@ pub fn read_all(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<Fence>, E
 /// Preserve the path identity even when an individual record is rejected.
 /// A directory or filename that cannot be trusted fails the entire scan.
 type ScannedFence = (String, u64, Result<Fence, Error>);
-pub(crate) fn scan(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<ScannedFence>, Error> {
+pub(crate) fn scan(
+    state_root: &Path,
+    owner: u32,
+    uid: u32,
+    live: &std::collections::BTreeSet<(String, u64)>,
+) -> Result<Vec<ScannedFence>, Error> {
     let Some(dir) = directory(state_root, owner, uid, false).map_err(map_storage)? else {
         return Ok(Vec::new());
     };
@@ -492,6 +503,10 @@ pub(crate) fn scan(state_root: &Path, owner: u32, uid: u32) -> Result<Vec<Scanne
                 continue;
             }
         };
+        // Do not open or interpret an active generation's journal.
+        if live.contains(&(profile.clone(), generation)) {
+            continue;
+        }
         let fence = read_from(&dir, owner, uid, &profile, generation)
             .and_then(|item| item.ok_or(Error::Untrusted));
         result.push((profile, generation, fence));
@@ -692,6 +707,17 @@ mod tests {
         );
         assert_eq!(f.read().unwrap(), Some(f.fence()));
         assert_eq!(fs::read_dir(f.dir()).unwrap().count(), 1);
+    }
+    #[test]
+    fn a_second_enumeration_of_the_same_directory_sees_every_entry() {
+        let f = Fixture::new();
+        f.write();
+        let dir = directory(&f.root, f.owner, f.uid, false).unwrap().unwrap();
+        assert_eq!(names(&dir).unwrap().len(), 1);
+        fs::write(f.dir().join("late-entry"), b"").unwrap();
+        // The first pass left the shared offset at the end of the directory.
+        let again = names(&dir).unwrap();
+        assert_eq!(again.len(), 2, "{again:?}");
     }
     #[test]
     fn failed_write_removes_unreadable_temp() {

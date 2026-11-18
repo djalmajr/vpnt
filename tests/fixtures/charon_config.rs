@@ -21,10 +21,10 @@ mod producer {
         ));
     }
     pub fn render(path: &std::path::Path) -> String {
-        config::render(path).unwrap()
+        config::render(path, &path.join("charon.log")).unwrap()
     }
     pub fn render_bound(path: &std::path::Path, index: NonZeroU16) -> String {
-        config::render_bound(path, index).unwrap()
+        config::render_bound(path, &path.join("charon.log"), index).unwrap()
     }
 }
 fn main() {

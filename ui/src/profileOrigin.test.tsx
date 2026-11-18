@@ -973,13 +973,14 @@ test("Log segmentado troca a aba e mantém navegação por teclado", async () =>
   const second: VpnView = {
     ...vpn,
     profile: { ...vpn.profile, id: "other", name: "Other VPN" },
+    log: [{ timestamp: 1, state: "gateway_timeout" }],
   };
   const data: Snapshot = {
     version: "0.1.0",
     demo: false,
     helper: "installed",
     preferences: defaultPreferences,
-    vpns: [vpn, second],
+    vpns: [{ ...vpn, log: [{ timestamp: 1, state: "connected" }] }, second],
   };
   container = document.createElement("div");
   document.body.append(container);
@@ -988,6 +989,7 @@ test("Log segmentado troca a aba e mantém navegação por teclado", async () =>
     root?.render(
       createElement(Log, {
         snapshot: data,
+        id: "other",
         navigate: () => {},
         run: async () => true,
         t: (key, values) => translate("en-US", key, values),
@@ -999,10 +1001,23 @@ test("Log segmentado troca a aba e mantém navegação por teclado", async () =>
     ...document.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
   ];
   expect(tabs).toHaveLength(2);
-  expect(tabs[0]?.getAttribute("aria-selected")).toBe("true");
-  expect(tabs[1]?.getAttribute("aria-selected")).toBe("false");
+  expect(tabs[0]?.getAttribute("aria-selected")).toBe("false");
+  expect(tabs[1]?.getAttribute("aria-selected")).toBe("true");
+  expect(document.querySelector('[role="tabpanel"]')?.textContent).toContain(
+    translate("en-US", "state.gateway_timeout"),
+  );
+  expect(
+    document.querySelector('[role="tabpanel"]')?.textContent,
+  ).not.toContain(translate("en-US", "state.connected"));
   expect(tabs[0]?.classList.contains("primary")).toBe(false);
   if (!tabs[0] || !tabs[1]) throw new Error("missing log tabs");
+  await click(tabs[0]);
+  expect(document.querySelector('[role="tabpanel"]')?.textContent).toContain(
+    translate("en-US", "state.connected"),
+  );
+  expect(
+    document.querySelector('[role="tabpanel"]')?.textContent,
+  ).not.toContain(translate("en-US", "state.gateway_timeout"));
   await click(tabs[1]);
   expect(tabs[1].getAttribute("aria-selected")).toBe("true");
   expect(

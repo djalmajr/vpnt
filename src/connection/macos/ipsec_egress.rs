@@ -7,6 +7,7 @@
 use super::{
     interfaces::{Interface, Interfaces},
     routing::Record,
+    routing::TransportDefault,
 };
 use crate::{
     connection::routes::{Address, Error, Route},
@@ -61,6 +62,10 @@ impl IpsecEgress {
 
     pub fn interface_name(&self) -> &str {
         &self.interface.name
+    }
+
+    pub(crate) fn transport_default(&self) -> Result<Option<TransportDefault>, Error> {
+        ipsec_transport_default(self.gateway_route())
     }
 
     pub fn gateway_route(&self) -> Route {
@@ -277,6 +282,17 @@ pub(super) fn resolve_error(error: super::tcp::Error) -> Error {
         super::tcp::Error::Invalid => Error::Invalid,
         _ => Error::Unavailable,
     }
+}
+
+pub(crate) fn ipsec_transport_default(
+    gateway_pin: Route,
+) -> Result<Option<TransportDefault>, Error> {
+    if !gateway_pin.key.network.address().is_ipv4() {
+        return Ok(None);
+    }
+    // The gateway pin contains a synthesized host key, so the observed prefix
+    // is unknown here.
+    TransportDefault::for_plan(gateway_pin.interface, gateway_pin.next_hop, None)
 }
 
 mod native;

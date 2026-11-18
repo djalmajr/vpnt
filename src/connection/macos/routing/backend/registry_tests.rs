@@ -1,6 +1,6 @@
 use super::*;
 use crate::connection::routes::{Coordinator, ppp_networks};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicBool};
 
 #[derive(Default)]
 struct Kernel {
@@ -14,22 +14,75 @@ struct Kernel {
     read_error: Option<Error>,
     auto_purge: bool,
     implicit_pending: bool,
+    default_get: Option<Record>,
+    route_actions: Vec<(&'static str, Key)>,
+    reads: Vec<Key>,
+    replace_on_read: Option<(usize, Route)>,
+    replace_during_delete: bool,
 }
 type Shared = Rc<RefCell<Kernel>>;
 struct FixtureTable(Shared);
 impl Table for FixtureTable {
     fn exact(&mut self, key: Key) -> Result<Option<Route>, Error> {
-        let kernel = self.0.borrow_mut();
+        let mut kernel = self.0.borrow_mut();
         if let Some(error) = kernel.read_error {
             return Err(error);
         }
+        kernel.reads.push(key);
+        if let Some((read, replacement)) = kernel.replace_on_read
+            && kernel.reads.iter().filter(|&&seen| seen == key).count() == read
+            && replacement.key == key
+        {
+            kernel.routes.insert(key, replacement);
+        }
         Ok(kernel.routes.get(&key).copied())
+    }
+    fn add_default(&mut self, route: TransportDefault, _: &AtomicBool) -> Result<Attempt, Error> {
+        let route = route.route();
+        let mut kernel = self.0.borrow_mut();
+        kernel.route_actions.push(("add", route.key));
+        if let std::collections::btree_map::Entry::Vacant(entry) = kernel.routes.entry(route.key) {
+            entry.insert(route);
+            Ok(Attempt {
+                confirmation: Ok(()),
+            })
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+    fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error> {
+        let key = route.route().key;
+        let mut kernel = self.0.borrow_mut();
+        kernel.route_actions.push(("get", key));
+        Ok(kernel
+            .default_get
+            .clone()
+            .or_else(|| kernel.routes.get(&key).map(|route| default_record(*route))))
+    }
+    fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error> {
+        let key = route.route().key;
+        let mut kernel = self.0.borrow_mut();
+        kernel.route_actions.push(("delete", key));
+        if let Some(old) = kernel.routes.remove(&key)
+            && kernel.replace_during_delete
+        {
+            kernel.replace_during_delete = false;
+            kernel.routes.insert(key, old);
+            return Ok(Attempt {
+                confirmation: Err(Error::TimedOut),
+            });
+        }
+        Ok(Attempt {
+            confirmation: Ok(()),
+        })
     }
 }
 struct FixtureScope {
     kernel: Shared,
     primary: u16,
     targets: BTreeSet<u16>,
+    default: Option<TransportDefault>,
+    canceled: AtomicBool,
 }
 impl Scope for FixtureScope {
     fn index(&self) -> u16 {
@@ -37,6 +90,9 @@ impl Scope for FixtureScope {
     }
     fn owns(&self, index: u16) -> bool {
         self.targets.contains(&index)
+    }
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        self.default.map(|default| (default, &self.canceled))
     }
     fn active(&self) -> Result<(), Error> {
         if self.kernel.borrow_mut().live[&self.primary] {
@@ -49,6 +105,7 @@ impl Scope for FixtureScope {
         assert!(self.owns(route.interface));
         let mut kernel = self.kernel.borrow_mut();
         kernel.writes += 1;
+        kernel.route_actions.push(("add", route.key));
         if kernel.routes.contains_key(&route.key) {
             return Ok(Attempt {
                 confirmation: Err(Error::Conflict),
@@ -119,6 +176,7 @@ fn register(
 ) -> InterfaceToken {
     let targets = plan
         .iter()
+        .filter(|route| TransportDefault::try_from(**route).is_err())
         .map(|route| route.interface)
         .chain([index])
         .collect();
@@ -129,6 +187,10 @@ fn register(
                 kernel: kernel.clone(),
                 primary: index,
                 targets,
+                default: plan
+                    .iter()
+                    .find_map(|route| TransportDefault::try_from(*route).ok()),
+                canceled: AtomicBool::new(false),
             },
             owner(profile, 1),
             plan,
@@ -394,6 +456,8 @@ fn only_registered_networks_and_owned_targets_can_reach_the_writer() {
         kernel: kernel.clone(),
         primary: 4,
         targets: BTreeSet::from([4]),
+        default: None,
+        canceled: AtomicBool::new(false),
     };
     assert!(matches!(
         registry.register(candidate(), owner("one", 2), vec![route("10.30.0.0/16", 4)]),
@@ -409,6 +473,8 @@ fn only_registered_networks_and_owned_targets_can_reach_the_writer() {
         kernel: kernel.clone(),
         primary: 5,
         targets: BTreeSet::from([4]),
+        default: None,
+        canceled: AtomicBool::new(false),
     };
     assert!(matches!(
         separate.register(unowned, owner("three", 1), vec![route("10.40.0.0/16", 4)]),
@@ -458,4 +524,223 @@ fn a_route_moved_to_another_owned_target_is_not_treated_as_foreign_cleanup() {
     kernel.borrow_mut().routes.clear();
     registry.finish_cleanup(&token).unwrap();
     assert_eq!(registry.receipt_state(&receipt).unwrap(), Presence::Absent);
+}
+
+fn scoped_route(gateway: &str) -> Route {
+    Route {
+        key: Key {
+            network: "0.0.0.0/0".parse().unwrap(),
+            scope: 7,
+        },
+        interface: 7,
+        next_hop: NextHop::Gateway(crate::connection::routes::Address::unscoped(
+            gateway.parse().unwrap(),
+        )),
+    }
+}
+
+fn default_record(route: Route) -> Record {
+    let default = TransportDefault::try_from(route).unwrap();
+    Record {
+        key: route.key,
+        interface: route.interface,
+        flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_STATIC | libc::RTF_IFSCOPE,
+        gateway: Some(crate::connection::macos::routing::Gateway::Address(
+            default.gateway(),
+        )),
+        source: None,
+    }
+}
+
+fn transport_plan(networks: &[String]) -> (Vec<Route>, Route) {
+    let expected = scoped_route("192.0.2.1");
+    let default = TransportDefault::try_from(expected).unwrap();
+    let mut plan = ppp_networks(networks, 3, true, true, None).unwrap();
+    TransportDefault::add_to_plan(&mut plan, || Ok(Some(default))).unwrap();
+    (plan, expected)
+}
+
+fn stop_and_release(
+    coordinator: &mut Coordinator<TestRegistry>,
+    kernel: &Shared,
+    token: &InterfaceToken,
+    lease: crate::connection::routes::Lease,
+) -> crate::connection::routes::Cleanup {
+    kernel.borrow_mut().live.insert(3, false);
+    kernel.borrow_mut().auto_purge = true;
+    assert!(coordinator.backend_mut().begin_cleanup(token).unwrap());
+    let cleanup = coordinator.release(lease).unwrap();
+    coordinator.backend_mut().finish_cleanup(token).unwrap();
+    assert!(!coordinator.has_resources());
+    cleanup
+}
+
+#[test]
+fn transport_default_full_adds_on_egress_before_halves_and_deletes_after_get() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&[]);
+    let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    assert_eq!(kernel.borrow().routes[&expected.key], expected);
+    assert_eq!(kernel.borrow().route_actions[0], ("add", expected.key));
+    let cleanup = stop_and_release(&mut coordinator, &kernel, &token, lease);
+    assert_eq!(cleanup.removed, 1);
+    assert_eq!(cleanup.absent, 4);
+    let kernel = kernel.borrow();
+    assert_eq!(
+        kernel.route_actions[5..],
+        [("get", expected.key), ("delete", expected.key)]
+    );
+    assert!(kernel.routes.is_empty());
+}
+
+#[test]
+fn transport_default_split_never_reads_or_writes_scoped_key() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&["10.0.0.0/8".into()]);
+    let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    stop_and_release(&mut coordinator, &kernel, &token, lease);
+    assert_eq!(kernel.borrow().route_actions, [("add", plan[0].key)]);
+    assert!(!kernel.borrow().routes.contains_key(&expected.key));
+    assert!(!kernel.borrow().reads.contains(&expected.key));
+}
+
+#[test]
+fn transport_default_existing_equal_is_borrowed() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&["0.0.0.0/0".into()]);
+    kernel.borrow_mut().routes.insert(expected.key, expected);
+    let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    let cleanup = stop_and_release(&mut coordinator, &kernel, &token, lease);
+    assert_eq!(cleanup.borrowed, 1);
+    assert_eq!(cleanup.removed, 0);
+    assert_eq!(kernel.borrow().routes[&expected.key], expected);
+    assert_eq!(kernel.borrow().route_actions.len(), 2);
+}
+
+#[test]
+fn transport_default_existing_different_refuses_before_any_write() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&[]);
+    let different = scoped_route("192.0.2.2");
+    kernel.borrow_mut().routes.insert(different.key, different);
+    register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let err = coordinator.acquire(owner("one", 1), &plan).unwrap_err();
+    assert_eq!(err.reason, Error::Conflict);
+    assert_eq!(kernel.borrow().routes[&expected.key], different);
+    assert!(kernel.borrow().route_actions.is_empty());
+}
+
+#[test]
+fn transport_default_divergent_exact_get_never_deletes() {
+    for record in [
+        default_record(scoped_route("192.0.2.2")),
+        Record {
+            flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_IFSCOPE,
+            ..default_record(scoped_route("192.0.2.1"))
+        },
+        Record {
+            key: Key {
+                scope: 0,
+                ..scoped_route("192.0.2.1").key
+            },
+            flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_STATIC,
+            ..default_record(scoped_route("192.0.2.1"))
+        },
+    ] {
+        let (mut registry, kernel) = backend();
+        let (plan, expected) = transport_plan(&[]);
+        let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+        let mut coordinator = Coordinator::new(registry).unwrap();
+        let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+        kernel.borrow_mut().default_get = Some(record);
+        let cleanup = stop_and_release(&mut coordinator, &kernel, &token, lease);
+        assert_eq!(cleanup.changed, 1);
+        assert_eq!(kernel.borrow().route_actions[5..], [("get", expected.key)]);
+        assert_eq!(kernel.borrow().routes[&expected.key], expected);
+    }
+}
+
+#[test]
+fn transport_default_abandonment_records_route_without_deleting_it() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&[]);
+    register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let _lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    let inventory = coordinator
+        .try_abandon(&owner("one", 1), |items| {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.route == expected && item.created)
+            );
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert_eq!(inventory.len(), plan.len());
+    assert_eq!(kernel.borrow().routes[&expected.key], expected);
+    assert!(
+        kernel
+            .borrow()
+            .route_actions
+            .iter()
+            .all(|(action, _)| *action == "add")
+    );
+}
+
+#[test]
+fn transport_default_preflight_race_refuses_a_foreign_gateway_before_any_write() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&[]);
+    let different = scoped_route("192.0.2.2");
+    kernel.borrow_mut().replace_on_read = Some((2, different));
+    register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let error = coordinator.acquire(owner("one", 1), &plan).unwrap_err();
+    assert_eq!(error.reason, Error::Conflict);
+    let kernel = kernel.borrow();
+    assert_eq!(
+        kernel
+            .reads
+            .iter()
+            .filter(|&&key| key == expected.key)
+            .count(),
+        2
+    );
+    assert_eq!(kernel.routes[&expected.key], different);
+    assert!(kernel.route_actions.is_empty());
+}
+
+#[test]
+fn transport_default_ambiguous_delete_does_not_retry_against_an_identical_replacement() {
+    let (mut registry, kernel) = backend();
+    let (plan, expected) = transport_plan(&[]);
+    let token = register(&mut registry, &kernel, "one", 3, plan.clone());
+    let mut coordinator = Coordinator::new(registry).unwrap();
+    let lease = coordinator.acquire(owner("one", 1), &plan).unwrap();
+    {
+        let mut state = kernel.borrow_mut();
+        state.live.insert(3, false);
+        state.auto_purge = true;
+        state.replace_during_delete = true;
+    }
+    assert!(coordinator.backend_mut().begin_cleanup(&token).unwrap());
+    assert_eq!(coordinator.release(lease).unwrap().pending, 1);
+    assert_eq!(coordinator.retry_cleanup().pending, 1);
+    assert_eq!(
+        kernel.borrow().route_actions[5..],
+        [("get", expected.key), ("delete", expected.key)]
+    );
+    assert_eq!(kernel.borrow().routes[&expected.key], expected);
+    kernel.borrow_mut().routes.remove(&expected.key);
+    assert_eq!(coordinator.retry_cleanup().absent, 1);
+    coordinator.backend_mut().finish_cleanup(&token).unwrap();
+    assert!(!coordinator.has_resources());
 }

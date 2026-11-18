@@ -191,3 +191,51 @@ fn cleanup_log_actual_recorder_emits_changes_and_thirty_second_heartbeats_only()
     }
     assert!(lines[2].ends_with("reason=producer_not_stopped"));
 }
+#[test]
+fn journal_failure_gets_its_own_line_and_never_replaces_the_refusal() {
+    let f = Fixture::new();
+    let now = Instant::now();
+    DIAGNOSTIC.with(|d| *d.borrow_mut() = Diagnostic::default());
+    for (seconds, failed, refusal) in [
+        (0, true, Some(Reason::RouteLock)),
+        (1, true, None),
+        (2, false, None),
+        (31, true, None),
+    ] {
+        begin();
+        assert!(!journal_failure());
+        if failed {
+            journal_failed();
+        }
+        if let Some(reason) = refusal {
+            mark(reason);
+        }
+        assert_eq!(current_reason(), refusal);
+        finish_at(
+            &f.0,
+            uid(),
+            &f.owner(),
+            refusal.is_none(),
+            now + Duration::from_secs(seconds),
+        );
+    }
+    let text = fs::read_to_string(paths::cleanup_log(&f.0)).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(lines[0].ends_with("profile=fixture-id attempt=1 reason=route_lock_failed"));
+    assert!(lines[1].ends_with("profile=fixture-id attempt=1 journal=failed"));
+    assert!(lines[2].ends_with("profile=fixture-id attempt=4 journal=failed"));
+}
+#[test]
+fn deadline_line_says_whether_a_live_attempt_had_no_journal() {
+    let f = Fixture::new();
+    deadline_at(&f.0, uid(), true).unwrap();
+    deadline_at(&f.0, uid(), false).unwrap();
+    let text = fs::read_to_string(paths::cleanup_log(&f.0)).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].ends_with(" exit=deadline unjournaled=yes"));
+    assert!(lines[1].ends_with(" exit=deadline unjournaled=no"));
+    // The same private-file checks as every append: a foreign owner is refused.
+    assert!(deadline_at(&f.0, uid().wrapping_add(1), true).is_err());
+}

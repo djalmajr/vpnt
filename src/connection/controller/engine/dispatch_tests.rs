@@ -52,6 +52,7 @@ fn slot(id: &str, interval: u64) -> Slot<'static> {
         state: ConnectionState::Off,
         failures: 0,
         cleaning: false,
+        failure: None,
         interval: ProbeClock::new(Duration::from_secs(interval)),
         worker: None,
         pending: None,
@@ -87,6 +88,7 @@ fn set_probe_interval_replaces_the_default_and_every_slot_clock_and_accepts() {
         &mut slots,
         &mut outgoing,
         &default,
+        false,
         false,
     );
     assert_eq!(default.get(), Duration::from_secs(60));
@@ -133,6 +135,7 @@ fn connect_carries_its_generation_interval_and_resets_a_failure_streak() {
         &mut slots,
         &mut outgoing,
         &default,
+        false,
         false,
     );
     assert_eq!(slots["one"].generation, 1);
@@ -213,6 +216,7 @@ fn cleanup_verification_refuses_a_profile_with_queued_connection() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(slots["one"].pending.is_some());
     out.clear();
@@ -229,6 +233,7 @@ fn cleanup_verification_refuses_a_profile_with_queued_connection() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(matches!(
         out.pop_front(),
@@ -254,6 +259,7 @@ fn cleanup_verification_refuses_a_profile_with_queued_connection() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(matches!(out.pop_front(), Some(Message::Snapshot { .. })));
     assert!(!factory.0.load(Ordering::SeqCst));
@@ -282,6 +288,7 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
             &mut out,
             &interval,
             capable,
+            false,
         );
         let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
             panic!("snapshot expected")
@@ -307,6 +314,7 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(matches!(
         out.pop_front(),
@@ -323,6 +331,7 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
     out.clear();
@@ -332,7 +341,15 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
             profile: "one".into(),
         },
     };
-    dispatch(verify(), &factory, &mut slots, &mut out, &interval, false);
+    dispatch(
+        verify(),
+        &factory,
+        &mut slots,
+        &mut out,
+        &interval,
+        false,
+        false,
+    );
     assert!(matches!(
         out.pop_front(),
         Some(Message::Failed {
@@ -341,7 +358,15 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
         })
     ));
     assert!(factory.0.load(Ordering::SeqCst));
-    dispatch(verify(), &factory, &mut slots, &mut out, &interval, true);
+    dispatch(
+        verify(),
+        &factory,
+        &mut slots,
+        &mut out,
+        &interval,
+        true,
+        false,
+    );
     let Some(Message::Snapshot { connections, .. }) = out.pop_front() else {
         panic!("snapshot expected")
     };
@@ -356,6 +381,7 @@ fn cleanup_capability_preserves_legacy_snapshot_and_guards_connect() {
         &mut out,
         &interval,
         true,
+        false,
     );
     assert!(matches!(out.pop_front(), Some(Message::Accepted { .. })));
 }
@@ -410,6 +436,7 @@ mod recovery {
                 out,
                 &clock,
                 true,
+                false,
             )
         };
         send("snap", Command::Snapshot {}, &mut slots, &mut out);

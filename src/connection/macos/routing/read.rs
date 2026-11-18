@@ -1,14 +1,13 @@
-use super::{Address, Error, Record, codec};
+use super::{Address, Error, Record, codec, next_sequence};
 use crate::connection::macos::tcp;
 use std::{
     io,
     mem::{offset_of, size_of},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr,
-    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-static NEXT_QUERY: AtomicI32 = AtomicI32::new(1);
 const MAX_TABLE: usize = 8 * 1024 * 1024;
 #[derive(Debug)]
 pub struct Snapshot {
@@ -135,19 +134,7 @@ impl Reader {
         if timeout.is_zero() || timeout > Duration::from_secs(2) {
             return Err(Error::Invalid);
         }
-        let mut sequence = NEXT_QUERY.load(Ordering::Relaxed);
-        loop {
-            let next = sequence.checked_add(1).ok_or(Error::Limit)?;
-            match NEXT_QUERY.compare_exchange_weak(
-                sequence,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => sequence = current,
-            }
-        }
+        let sequence = next_sequence()?;
         let pid = i32::try_from(std::process::id()).map_err(|_| Error::Invalid)?;
         let packet = codec::query(address, scope, pid, sequence)?;
         let deadline = Instant::now() + timeout;

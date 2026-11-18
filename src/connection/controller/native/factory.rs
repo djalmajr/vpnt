@@ -10,14 +10,25 @@ pub(super) struct NativeFactory<'a> {
     fence_root: std::path::PathBuf,
     fence_owner: u32,
     recovery: Mutex<crate::connection::macos::fence_recovery::Recovery>,
+    /// `journaled` of each SSL attempt still alive, for the exit watchdog.
+    journals: Mutex<Vec<std::sync::Weak<AtomicBool>>>,
 }
 
 impl<'a> NativeFactory<'a> {
     #[cfg(test)]
     pub(super) fn fixture_fence_root(mut self, root: std::path::PathBuf, owner: u32) -> Self {
+        self.recovery = Mutex::new(crate::connection::macos::fence_recovery::Recovery::new(
+            &root, owner, owner,
+        ));
         self.fence_root = root;
         self.fence_owner = owner;
         self
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_hold_journals(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Vec<std::sync::Weak<AtomicBool>>> {
+        self.journals.lock().unwrap()
     }
     pub(super) fn new(
         routes: Routes<'a>,
@@ -36,6 +47,7 @@ impl<'a> NativeFactory<'a> {
                 0,
                 uid,
             )),
+            journals: Mutex::new(Vec::new()),
         }
     }
 }
@@ -95,20 +107,22 @@ impl Attempt for AttemptKind<'_> {
 /// operation, but never pretends readiness or success.
 pub(super) struct DeniedAttempt;
 impl Attempt for DeniedAttempt {
+    /// Without a domain the host has no usable IPsec component.
     fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
         Err(Failure {
             state: ConnectionState::MissingProgram,
             error: ErrorCode::MissingProgram,
+            step: Step::Runtime,
         })
     }
     fn ready(&mut self) -> Result<bool, Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Tunnel))
     }
     fn healthy(&mut self) -> Result<(), Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Health))
     }
     fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
-        Err(Failure::unavailable())
+        Err(Failure::at(Step::Health))
     }
     fn cleanup(&mut self) -> bool {
         true
@@ -132,9 +146,11 @@ impl<'a> Factory for NativeFactory<'a> {
             .map_or(true, |recovery| recovery.blocked(profile))
     }
     fn verify_cleanup(&self, profile: &Profile) -> bool {
-        self.recovery
-            .lock()
-            .is_ok_and(|mut recovery| recovery.verify(profile))
+        self.recovery.lock().is_ok_and(|mut recovery| {
+            self.profiles
+                .with_live(|live| recovery.verify(profile, live))
+                .unwrap_or(false)
+        })
     }
     fn create(
         &self,
@@ -165,6 +181,14 @@ impl<'a> Factory for NativeFactory<'a> {
                 None => AttemptKind::Denied(DeniedAttempt),
             };
         }
+        let journaled = Arc::new(AtomicBool::new(false));
+        let mut journals = self
+            .journals
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        journals.retain(|flag| flag.strong_count() > 0);
+        journals.push(Arc::downgrade(&journaled));
+        drop(journals);
         AttemptKind::Ssl(NativeAttempt {
             owner: Owner {
                 uid,
@@ -180,8 +204,10 @@ impl<'a> Factory for NativeFactory<'a> {
             before: None,
             before_routes: None,
             client: None,
+            egress: None,
             link: None,
             token: None,
+            requires_transport_default: false,
             lease: None,
             dns: None,
             spawn_attempted: false,
@@ -189,6 +215,16 @@ impl<'a> Factory for NativeFactory<'a> {
             uncertain_cleanup: false,
             fence_root: self.fence_root.clone(),
             fence_owner: self.fence_owner,
+            journaled,
+        })
+    }
+    /// A registry held by a concurrent `create` counts as an unjournaled attempt.
+    fn unjournaled(&self) -> bool {
+        self.journals.try_lock().map_or(true, |journals| {
+            journals
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|flag| !flag.load(Ordering::Acquire))
         })
     }
     fn idle(&self) -> bool {
@@ -221,6 +257,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.state, ConnectionState::MissingProgram);
         assert_eq!(failure.error, ErrorCode::MissingProgram);
+        assert_eq!(failure.step, Step::Runtime);
         assert!(denied.ready().is_err());
         assert!(denied.healthy().is_err());
         assert!(

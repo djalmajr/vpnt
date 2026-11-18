@@ -44,3 +44,33 @@ pub(super) fn clear(tree: &Tree, guard: &ControllerLock) -> Result<(), Error> {
     }
     unchanged()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_orphan_with_dead_producer_and_absent_resources_removes_claim() {
+        let mut calls = 0;
+        crate::connection::ipsec::NativeContext::assert_installer_after_orphan(
+            |state, controller| {
+                // SAFETY: UID/GID queries have no memory preconditions.
+                let (owner, group) = unsafe { (libc::geteuid(), libc::getegid()) };
+                let tree = Tree {
+                    state: state.into(),
+                    tools: state.join("tools"),
+                    policies: state.join("policies"),
+                    owner,
+                    group,
+                };
+                let result = clear(&tree, controller);
+                calls += 1;
+                if calls == 1 {
+                    assert!(matches!(result, Err(Error::Busy)));
+                }
+                result.is_ok()
+            },
+        );
+        assert_eq!(calls, 2);
+    }
+}

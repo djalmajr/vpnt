@@ -34,6 +34,7 @@ fn view(id: &str, kind: VpnKind, state: ConnectionState) -> VpnView {
         cleanup_verifying: false,
         profile: profile(id, kind),
         state,
+        failure: None,
         has_password: true,
         has_psk: kind == VpnKind::Ipsec,
         log: Vec::new(),

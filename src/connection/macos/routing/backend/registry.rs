@@ -1,9 +1,11 @@
-use super::{Error, Key, Route};
+use super::{Error, Key, Route, TransportDefault};
+use crate::connection::macos::routing::Record;
 use crate::{
     connection::routes::{Backend, NextHop, Owner, Presence},
     model::valid_profile_id,
 };
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -11,6 +13,13 @@ static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
 
 pub(super) trait Table {
     fn exact(&mut self, key: Key) -> Result<Option<Route>, Error>;
+    fn add_default(
+        &mut self,
+        route: TransportDefault,
+        canceled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Attempt, Error>;
+    fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error>;
+    fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error>;
 }
 pub(super) struct Attempt {
     pub confirmation: Result<(), Error>,
@@ -19,6 +28,9 @@ pub(super) trait Scope {
     fn index(&self) -> u16;
     fn owns(&self, index: u16) -> bool {
         self.index() == index
+    }
+    fn transport_default(&self) -> Option<(TransportDefault, &std::sync::atomic::AtomicBool)> {
+        None
     }
     fn active(&self) -> Result<(), Error>;
     fn add(&mut self, route: Route) -> Result<Attempt, Error>;
@@ -33,13 +45,15 @@ pub struct InterfaceToken {
     index: u16,
 }
 /// Evidence is a retained interface and confirmed ADD, not a kernel route ID.
-/// These receipts never authorize a per-key delete or an attribute-based CAS.
+/// Only a confirmed transport-default ADD can authorize a guarded DELETE.
 pub struct NativeReceipt {
     backend: u64,
     scope: u64,
     primary: u16,
     route: Route,
     confirmation: Result<(), Error>,
+    confirmed_add: bool,
+    delete_uncertain: Cell<bool>,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Phase {
@@ -54,6 +68,18 @@ struct Entry<S> {
     plan: Vec<Route>,
     phase: Phase,
 }
+impl<S: Scope> Entry<S> {
+    fn accepts_target(&self, route: Route) -> bool {
+        if let Ok(default) = TransportDefault::try_from(route) {
+            self.scope
+                .transport_default()
+                .is_some_and(|(allowed, _)| allowed == default)
+        } else {
+            self.scope.owns(route.interface)
+        }
+    }
+}
+
 pub(super) struct Registry<S, K> {
     id: u64,
     next: u64,
@@ -116,10 +142,29 @@ impl<S: Scope, K: Table> Registry<S, K> {
         let mut keys = BTreeSet::new();
         for route in &plan {
             route.validate()?;
+            if !keys.insert(route.key) {
+                return Err(Error::Invalid);
+            }
+            if let Ok(default) = TransportDefault::try_from(*route) {
+                if !scope
+                    .transport_default()
+                    .is_some_and(|(allowed, _)| allowed == default)
+                    || scope.owns(route.interface)
+                {
+                    return Err(Error::Invalid);
+                }
+                if self
+                    .entries
+                    .values()
+                    .any(|old| old.plan.iter().any(|other| other.key == route.key))
+                {
+                    return Err(Error::Busy);
+                }
+                continue;
+            }
             if !scope.owns(route.interface)
                 || route.key.scope != 0
                 || matches!(route.next_hop, NextHop::Gateway(_))
-                || !keys.insert(route.key)
             {
                 return Err(Error::Invalid);
             }
@@ -178,6 +223,11 @@ impl<S: Scope, K: Table> Registry<S, K> {
         }
         let plan = entry.plan.clone();
         for route in plan {
+            // Scoped defaults were accounted for by lease cleanup. The same
+            // key may still belong to an external provider (borrow/replace).
+            if TransportDefault::try_from(route).is_ok() {
+                continue;
+            }
             // Same numeric index after close is still uncertain, including
             // possible reuse; do not declare it foreign based on attributes.
             if let Some(now) = self.observed(route.key)?
@@ -222,6 +272,16 @@ impl<S: Scope, K: Table> Registry<S, K> {
         // instead retain receipts even if the platform adapter used that code.
         self.table.exact(key).map_err(|_| Error::Unavailable)
     }
+
+    fn transport_entry(&self, receipt: &NativeReceipt) -> Result<&Entry<S>, Error> {
+        if receipt.backend != self.id {
+            return Err(Error::Invalid);
+        }
+        self.entries
+            .get(&receipt.primary)
+            .filter(|entry| entry.serial == receipt.scope && entry.accepts_target(receipt.route))
+            .ok_or(Error::Unavailable)
+    }
 }
 impl<S: Scope, K: Table> Backend for Registry<S, K> {
     type Receipt = NativeReceipt;
@@ -229,7 +289,7 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
         let entry = self
             .entries
             .values()
-            .find(|entry| entry.scope.owns(route.interface))
+            .find(|entry| entry.accepts_target(route))
             .ok_or(Error::Invalid)?;
         if entry.owner != *owner || !entry.plan.contains(&route) {
             return Err(Error::Invalid);
@@ -246,7 +306,7 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
         let (&primary, entry) = self
             .entries
             .iter_mut()
-            .find(|(_, entry)| entry.scope.owns(route.interface))
+            .find(|(_, entry)| entry.accepts_target(route))
             .ok_or(Error::Invalid)?;
         if entry.phase != Phase::Active {
             return Err(Error::Busy);
@@ -255,7 +315,13 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
             return Err(Error::Invalid);
         }
         entry.scope.active()?;
-        let mut attempt = entry.scope.add(route)?;
+        let mut attempt = match entry.scope.transport_default() {
+            Some((default, canceled)) if default.route() == route => {
+                self.table.add_default(default, canceled)?
+            }
+            _ => entry.scope.add(route)?,
+        };
+        let confirmed_add = attempt.confirmation.is_ok();
         let scope = entry.serial;
         // Once dispatch was attempted, postflight errors belong in a receipt.
         // Returning Err here would let the coordinator forget a possible ADD.
@@ -276,6 +342,8 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
             primary,
             route,
             confirmation: attempt.confirmation,
+            confirmed_add,
+            delete_uncertain: Cell::new(false),
         })
     }
     fn receipt_state(&mut self, receipt: &Self::Receipt) -> Result<Presence, Error> {
@@ -285,6 +353,24 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
         let Some(now) = self.observed(receipt.route.key)? else {
             return Ok(Presence::Absent);
         };
+        if TransportDefault::try_from(receipt.route).is_ok() {
+            if now != receipt.route {
+                note_default_changed();
+                return Ok(Presence::Replaced);
+            }
+            let entry = self.transport_entry(receipt)?;
+            if !receipt.confirmed_add || receipt.delete_uncertain.get() {
+                return Err(Error::Busy);
+            }
+            if entry.phase == Phase::Active && receipt.confirmation.is_ok() {
+                entry.scope.active().map_err(|_| Error::Unavailable)?;
+            } else if entry.phase == Phase::Active {
+                // Rollback can still remove a confirmed ADD even if later
+                // postflight failed. Validation must not promote the receipt.
+                return Err(Error::Busy);
+            }
+            return Ok(Presence::Owned);
+        }
         if now.interface != receipt.route.interface {
             let still_ours = self
                 .entries
@@ -315,11 +401,47 @@ impl<S: Scope, K: Table> Backend for Registry<S, K> {
         Ok(Presence::Owned)
     }
     fn remove(&mut self, receipt: &Self::Receipt) -> Result<(), Error> {
+        if let Ok(default) = TransportDefault::try_from(receipt.route) {
+            self.transport_entry(receipt)?;
+            if !receipt.confirmed_add || receipt.delete_uncertain.get() {
+                return Err(Error::Busy);
+            }
+            if !self
+                .table
+                .get_default(default)?
+                .is_some_and(|record| default.matches_static(&record))
+            {
+                note_default_changed();
+                return Err(Error::Changed);
+            }
+            // Darwin does not offer an attribute CAS. The kernel can replace
+            // this exact key after GET and before DELETE.
+            let attempt = self.table.delete_default(default)?;
+            if attempt
+                .confirmation
+                .is_err_and(|error| error != Error::Changed)
+            {
+                // A lost acknowledgement can hide a successful DELETE. A
+                // later identical row could belong to a different owner.
+                receipt.delete_uncertain.set(true);
+            }
+            return attempt.confirmation;
+        }
         match self.receipt_state(receipt)? {
             Presence::Absent | Presence::Replaced => Ok(()),
             Presence::Owned => Err(Error::Busy),
         }
     }
+}
+
+fn note_default_changed() {
+    // SAFETY: static, NUL-terminated format string with no placeholders.
+    unsafe {
+        libc::syslog(
+            libc::LOG_NOTICE,
+            c"vpnt: scoped transport default changed before cleanup; leaving it in place".as_ptr(),
+        )
+    };
 }
 
 #[cfg(test)]

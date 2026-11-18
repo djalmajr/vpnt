@@ -105,7 +105,9 @@ export function VpnCard({
       : state === "unresponsive"
         ? "staleHint"
         : state === "dropped"
-          ? "droppedHint"
+          ? vpn.failure && vpn.failure.step !== "health"
+            ? "failedAtHint"
+            : "droppedHint"
           : state === "credentials_rejected"
             ? "credentialsHint"
             : state === "gateway_timeout"
@@ -189,7 +191,12 @@ export function VpnCard({
           {state === "cleanup_unconfirmed" && (
             <strong>{t("state.cleanup_unconfirmed")}</strong>
           )}
-          <p>{t(hint)}</p>
+          <p>
+            {t(
+              hint,
+              vpn.failure ? { step: t(`step.${vpn.failure.step}`) } : {},
+            )}
+          </p>
           {cleaning && (
             <p id={cleanupId} role="status">
               {t("cleanupHint")}

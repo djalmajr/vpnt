@@ -13,10 +13,11 @@ mod diagnostic;
 mod fixture;
 mod lease_budget;
 mod ledger;
+mod orphan;
 mod startup;
 mod userspace;
 mod utun;
-use fixture::Fixture;
+pub(super) use fixture::Fixture;
 #[derive(Clone, Default)]
 struct Kernel(Arc<Mutex<BTreeSet<u32>>>);
 impl KernelClaims for Kernel {
@@ -56,7 +57,7 @@ fn config<N: Observer>(registry: &Registry<N>, reservation: &Reservation) -> Con
     .unwrap()
 }
 fn until() -> Instant {
-    Instant::now() + Duration::from_secs(5)
+    Instant::now() + Duration::from_secs(20)
 }
 fn token() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))

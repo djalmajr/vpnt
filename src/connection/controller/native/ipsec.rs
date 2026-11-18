@@ -12,7 +12,7 @@ use crate::connection::{
         Admission, Candidate, Control, NativeContext, NativeLedger, Registry, Reservation,
         UserspaceObserver,
     },
-    macos::{routing::InterfaceToken, vip::ConfiguredUtun},
+    macos::{ipsec_egress::IpsecEgress, routing::InterfaceToken, vip::ConfiguredUtun},
     routes::Owner,
 };
 pub(super) use domain::NativeDomain;
@@ -38,6 +38,7 @@ pub(super) struct NativeIpsecAttempt<'a> {
     pub(super) reservation: Option<Reservation>,
     pub(super) admission: Option<Admission<'a>>,
     pub(super) control: Option<IpsecControl<'a>>,
+    pub(super) egress: Option<Arc<IpsecEgress>>,
     pub(super) configured: Option<Arc<ConfiguredUtun<'a>>>,
     pub(super) token: Option<InterfaceToken>,
     pub(super) lease: Option<OwnedLease>,
@@ -68,6 +69,7 @@ impl<'a> NativeIpsecAttempt<'a> {
             reservation: None,
             admission: None,
             control: None,
+            egress: None,
             configured: None,
             token: None,
             lease: None,
@@ -103,41 +105,42 @@ impl Attempt for NativeIpsecAttempt<'_> {
     }
 }
 
-fn unavailable() -> Failure {
-    Failure::unavailable()
-}
-
-fn check(expires: Instant, canceled: &AtomicBool) -> Result<(), Failure> {
+/// `step`: the step the guarded operation belongs to.
+fn check(expires: Instant, canceled: &AtomicBool, step: Step) -> Result<(), Failure> {
     if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
-        return Err(unavailable());
+        return Err(Failure::at(step));
     }
     Ok(())
 }
 
-fn bounded(expires: Instant, canceled: &AtomicBool) -> Result<Duration, Failure> {
-    check(expires, canceled)?;
+fn bounded(expires: Instant, canceled: &AtomicBool, step: Step) -> Result<Duration, Failure> {
+    check(expires, canceled, step)?;
     let remaining = expires
         .saturating_duration_since(Instant::now())
         .min(Duration::from_secs(3));
     if remaining.is_zero() {
-        return Err(unavailable());
+        return Err(Failure::at(step));
     }
     Ok(remaining)
 }
 
+/// `Err` when canceled, expired or poisoned. Attempt callers name the step;
+/// cleanup only refuses.
 fn lock_until<'a, T>(
     mutex: &'a Mutex<T>,
     expires: Instant,
     canceled: &AtomicBool,
-) -> Result<MutexGuard<'a, T>, Failure> {
+) -> Result<MutexGuard<'a, T>, ()> {
+    let live = || !canceled.load(Ordering::Acquire) && Instant::now() < expires;
     loop {
-        check(expires, canceled)?;
+        if !live() {
+            return Err(());
+        }
         match mutex.try_lock() {
             Ok(guard) => {
-                check(expires, canceled)?;
-                return Ok(guard);
+                return if live() { Ok(guard) } else { Err(()) };
             }
-            Err(TryLockError::Poisoned(_)) => return Err(unavailable()),
+            Err(TryLockError::Poisoned(_)) => return Err(()),
             Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(2)),
         }
     }
@@ -151,13 +154,16 @@ fn profile_failure(error: StoreError) -> Failure {
             StoreError::NotFound => ErrorCode::ProfileNotFound,
             _ => ErrorCode::UntrustedConfiguration,
         },
+        step: Step::Profile,
     }
 }
 
+/// The attempt was created for a profile of another kind.
 fn missing_program() -> Failure {
     Failure {
         state: ConnectionState::MissingProgram,
         error: ErrorCode::MissingProgram,
+        step: Step::Profile,
     }
 }
 

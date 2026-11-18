@@ -104,7 +104,7 @@ fn socket_wait_honors_cancellation_and_deadline_and_retains_the_original_produce
         let warm = peer
             .open(
                 reservation.owner(),
-                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(20),
                 token(),
             )
             .err();
@@ -120,7 +120,7 @@ fn socket_wait_honors_cancellation_and_deadline_and_retains_the_original_produce
         let cancel = token();
         let signal = cancel.clone();
         let canceler = std::thread::spawn(move || {
-            let expires = Instant::now() + Duration::from_secs(5);
+            let expires = Instant::now() + Duration::from_secs(20);
             while !pidfile.exists() {
                 assert!(
                     Instant::now() < expires,

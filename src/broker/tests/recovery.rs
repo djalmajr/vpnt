@@ -22,6 +22,7 @@ fn newly_discovered_blocked_profile_requires_negotiated_capability() {
                 state: State::CleanupUnconfirmed,
                 failures: 0,
                 cleaning: false,
+                failure: None,
             }],
         });
         assert_eq!(result.is_ok(), expected);
@@ -372,6 +373,7 @@ fn cleanup_verification_snapshot_tracks_correlation_failure_and_channel_loss() {
                 },
                 failures: 0,
                 cleaning: false,
+                failure: None,
             })
             .collect(),
     };
@@ -379,10 +381,16 @@ fn cleanup_verification_snapshot_tracks_correlation_failure_and_channel_loss() {
     broker.poll();
     let capability = requests.recv().unwrap();
     assert_eq!(capability.id, protocol::CLEANUP_PROBE_SNAPSHOT_ID);
+    // The failure-note probe follows; this helper predates it and echoes it.
+    let notes = requests.recv().unwrap();
+    assert_eq!(notes.id, protocol::FAILURE_NOTE_PROBE_SNAPSHOT_ID);
     send_reply
         .send(response(protocol::CLEANUP_ACK_SNAPSHOT_ID.into(), true))
         .unwrap();
+    send_reply.send(response(notes.id, true)).unwrap();
     broker.poll();
+    assert!(broker.cleanup_capable);
+    assert!(!broker.failure_capable);
     let started = broker
         .dispatch(
             Command::Probe { id: "one".into() },

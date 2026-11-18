@@ -2,11 +2,12 @@
 //! adapter. No configured UTUN is fabricated and no RTM_ADD is attempted.
 use super::*;
 use crate::connection::{
+    macos::ipsec_egress::ipsec_transport_default,
     macos::routing::backend::{
         registry::{Registry, Scope, Table},
         utun_retirement::{Guard, Lifecycle, Pin, Retire, Sink},
     },
-    routes::{Backend, Key, Network},
+    routes::{Backend, Key, Network, ppp_networks},
 };
 use std::sync::{
     Weak,
@@ -29,6 +30,24 @@ fn route(index: u16) -> Route {
         interface: index,
         next_hop: NextHop::Interface,
     }
+}
+
+#[test]
+fn ipsec_full_plan_refuses_an_on_link_ipv4_pin_without_prefix_proof() {
+    let gateway_pin = route(7);
+    let full = ppp_networks(&[], 3, true, true, None).unwrap();
+    let mut plan = full.clone();
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut plan, || ipsec_transport_default(gateway_pin)),
+        Err(Error::Conflict)
+    );
+    assert_eq!(plan, full);
+
+    let mut split = ppp_networks(&["10.0.0.0/8".into()], 3, true, true, None).unwrap();
+    assert_eq!(
+        TransportDefault::add_to_plan(&mut split, || ipsec_transport_default(gateway_pin)),
+        Ok(None)
+    );
 }
 
 #[derive(Clone)]
@@ -128,6 +147,25 @@ struct TestTable(Option<Route>);
 impl Table for TestTable {
     fn exact(&mut self, _key: Key) -> Result<Option<Route>, Error> {
         Ok(self.0)
+    }
+    fn add_default(
+        &mut self,
+        _: TransportDefault,
+        _: &AtomicBool,
+    ) -> Result<crate::connection::macos::routing::backend::Attempt, Error> {
+        panic!("fixture has no transport default")
+    }
+    fn get_default(
+        &mut self,
+        _: TransportDefault,
+    ) -> Result<Option<crate::connection::macos::routing::Record>, Error> {
+        panic!("fixture has no transport default")
+    }
+    fn delete_default(
+        &mut self,
+        _: TransportDefault,
+    ) -> Result<crate::connection::macos::routing::backend::Attempt, Error> {
+        panic!("fixture has no transport default")
     }
 }
 

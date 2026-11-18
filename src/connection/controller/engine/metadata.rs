@@ -39,6 +39,7 @@ pub(super) fn refresh(
                 // A new generation never inherits the previous failure streak.
                 slot.failures = 0;
                 slot.cleaning = false;
+                slot.failure = None;
             }
         } else {
             slots.insert(
@@ -49,6 +50,7 @@ pub(super) fn refresh(
                     state: ConnectionState::Off,
                     failures: 0,
                     cleaning: false,
+                    failure: None,
                     interval: ProbeClock::new(default.get()),
                     worker: None,
                     pending: None,
@@ -74,6 +76,7 @@ mod tests {
             },
             failures: 0,
             cleaning: false,
+            failure: None,
             interval: ProbeClock::new(std::time::Duration::from_secs(60)),
             worker: None,
             pending: pending.then(|| Pending {

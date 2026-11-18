@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-struct Fixture {
+pub(crate) struct Fixture {
     fd: RefCell<Option<OwnedFd>>,
     peer: RefCell<UnixStream>,
     interfaces: RefCell<Interfaces>,
@@ -27,7 +27,7 @@ struct Fixture {
     randoms: Cell<usize>,
 }
 impl Fixture {
-    fn new(failure: &'static str) -> Self {
+    pub(crate) fn new(failure: &'static str) -> Self {
         let (fd, peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         Self {
@@ -45,6 +45,23 @@ impl Fixture {
             randoms: Cell::new(0),
         }
     }
+    pub(crate) fn with_sink<T>(&self, ipv4: bool, use_sink: impl FnOnce(u16) -> T) -> T {
+        let sink = create_using(ipv4, self, || Ok(())).ok().unwrap();
+        let result = use_sink(sink.identity.index);
+        drop(sink);
+        self.closed();
+        result
+    }
+
+    pub(crate) fn connections_and_aliases(&self) -> (usize, usize) {
+        let calls = self.calls.borrow();
+        let count = |name| calls.iter().filter(|&&call| call == name).count();
+        (
+            count("connect-new-unit"),
+            count("assign-only-own-interface"),
+        )
+    }
+
     fn closed(&self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -212,6 +229,92 @@ fn sink_fixture_enforces_kernel_flag_phase() {
     drop(fd);
     fixture.closed();
 }
+#[test]
+fn transport_refusal_precedes_sink_creation_and_alias_assignment() {
+    use crate::connection::{
+        macos::{
+            ipsec_egress::ipsec_transport_default,
+            routing::{TransportDefault, TunnelPlan},
+        },
+        routes::{NextHop, Route},
+    };
+
+    for ipv4 in [true, false] {
+        let on_link = Route {
+            key: Key {
+                network: "0.0.0.0/0".parse().unwrap(),
+                scope: 0,
+            },
+            interface: 7,
+            next_hop: NextHop::Interface,
+        };
+        for ipsec in [false, true] {
+            let decide = || {
+                if ipsec {
+                    ipsec_transport_default(Route {
+                        key: Key {
+                            network: Network::host("192.0.2.9".parse().unwrap()),
+                            scope: 0,
+                        },
+                        ..on_link
+                    })
+                } else {
+                    TransportDefault::for_plan(
+                        on_link.interface,
+                        on_link.next_hop,
+                        Some(on_link.key),
+                    )
+                }
+            };
+            let fixture = Fixture::new("");
+            let result = TunnelPlan::prepare(&[], (ipv4, !ipv4), decide, |plan| {
+                let sink = create_using(plan.sink_ipv4().unwrap(), &fixture, || Ok(()))
+                    .map_err(|failure| failure.error)?;
+                plan.bind(3, Some(sink.identity.index))
+            });
+            assert_eq!(result, Err(Error::Conflict));
+            assert_eq!(fixture.connections_and_aliases(), (0, 0));
+            assert!(fixture.calls.borrow().is_empty());
+        }
+
+        let fixture = Fixture::new("");
+        let scoped = TransportDefault::from_egress(
+            7,
+            NextHop::Gateway(crate::connection::routes::Address::unscoped(
+                "192.0.2.1".parse().unwrap(),
+            )),
+        )
+        .unwrap();
+        let (routes, default) = TunnelPlan::prepare(
+            &[],
+            (ipv4, !ipv4),
+            || Ok(Some(scoped)),
+            |plan| {
+                let sink = create_using(plan.sink_ipv4().unwrap(), &fixture, || Ok(()))
+                    .map_err(|failure| failure.error)?;
+                plan.bind(3, Some(sink.identity.index))
+            },
+        )
+        .unwrap();
+        assert_eq!(default, Some(scoped));
+        assert_eq!(routes[0], scoped.route());
+        assert_eq!(
+            routes.iter().filter(|route| route.interface == 234).count(),
+            2
+        );
+        assert_eq!(
+            fixture
+                .calls
+                .borrow()
+                .iter()
+                .filter(|&&call| call == "assign-only-own-interface")
+                .count(),
+            1,
+        );
+        fixture.closed();
+    }
+}
+
 #[test]
 fn sink_disables_packets_before_alias_and_retains_only_its_control_descriptor() {
     for ipv4 in [true, false] {

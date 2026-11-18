@@ -30,14 +30,26 @@ export type Profile = {
   probePort: number;
   probeMethod: "ping_tcp" | "tcp";
 };
+export type FailureStep =
+  | "profile"
+  | "runtime"
+  | "egress"
+  | "spawn"
+  | "tunnel"
+  | "routes"
+  | "dns"
+  | "verify"
+  | "health";
+export type FailureView = { code: string; step: FailureStep };
 export type VpnView = {
   cleaning: boolean;
   cleanupVerifying: boolean;
   profile: Profile;
   state: ConnectionState;
+  failure?: FailureView;
   hasPassword: boolean;
   hasPsk: boolean;
-  log: { timestamp: number; state: ConnectionState }[];
+  log: { timestamp: number; state: ConnectionState; failure?: FailureView }[];
 };
 export type NativePreferences = {
   interval: 10 | 30 | 60;

@@ -8,7 +8,7 @@ mod native;
 mod profiles;
 mod worker;
 use crate::{
-    helper::protocol::ErrorCode,
+    helper::protocol::{ErrorCode, Step},
     helper::runtime::cleanup::Reason,
     model::{Profile, VpnKind},
     secrets::Credentials,
@@ -20,6 +20,9 @@ use crate::{
 enum AbandonError {
     Unsupported,
     Persist,
+    /// A lock taken with `try_lock` was held elsewhere; the same call can
+    /// succeed later. Only the journal (i) retries on it.
+    Busy,
 }
 #[cfg(target_os = "macos")]
 pub use native::run_ssl;
@@ -28,15 +31,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// `step` names where the failure was born; it never changes `state`/`error`.
+#[derive(Debug)]
 struct Failure {
     state: ConnectionState,
     error: ErrorCode,
+    step: Step,
 }
 impl Failure {
-    fn unavailable() -> Self {
+    /// A local failure at `step`: the attempt drops with a backend failure.
+    fn at(step: Step) -> Self {
         Self {
             state: ConnectionState::Dropped,
             error: ErrorCode::BackendFailure,
+            step,
         }
     }
 }
@@ -82,6 +90,11 @@ trait Factory: Sync {
     ) -> Self::Attempt;
     /// Includes failed admissions with no public lease/token.
     fn idle(&self) -> bool;
+    /// Whether a live attempt has no journal on disk, for the exit watchdog's
+    /// last diagnostic line. Never blocks.
+    fn unjournaled(&self) -> bool {
+        false
+    }
 }
 #[derive(Clone, Copy)]
 struct Timing {

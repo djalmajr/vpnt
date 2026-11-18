@@ -2,14 +2,14 @@
 //! typed registration entry point. Nothing here fabricates a configured link.
 use super::super::resource_fence::RouteWork;
 use super::utun_retirement::{Guard, Lifecycle, Pin, Retire, UtunPin};
-use super::{AddWriter, Error, NativeBackend, Route, retirement};
+use super::{AddWriter, Error, NativeBackend, Route, TransportDefault, TunnelPlan, retirement};
 use crate::connection::{
     ipsec::{self, NativeContext, NativePeer, Peer},
     macos::{
         sink::{OwnedSink, RetiredSink},
-        vip::{ConfiguredUtun, Family},
+        vip::ConfiguredUtun,
     },
-    routes::{NextHop, Owner, ppp_networks},
+    routes::{NextHop, Owner},
 };
 use std::{
     sync::{
@@ -38,6 +38,7 @@ pub(super) struct UtunScope<'a> {
     writer: AddWriter<'a>,
     canceled: Arc<AtomicBool>,
     sink: Option<OwnedSink<'a>>,
+    transport_default: Option<TransportDefault>,
     // Last: descriptors above close before pending metadata enters the queue.
     retirement: Guard<UtunPin<'a>, Arc<Mutex<NativePeer<'a>>>, RetiredSink>,
 }
@@ -48,6 +49,10 @@ impl super::registry::Scope for UtunScope<'_> {
     }
     fn owns(&self, index: u16) -> bool {
         self.index == index || self.sink.as_ref().is_some_and(|sink| sink.index() == index)
+    }
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        self.transport_default
+            .map(|route| (route, self.canceled.as_ref()))
     }
     fn active(&self) -> Result<(), Error> {
         // Total budget is fixed before any check and shared by every call.
@@ -127,12 +132,12 @@ impl<'a> NativeBackend<'a> {
     /// are the same ones used by the existing registry; the opaque link is the
     /// only source of index/VIP. The caller keeps its `Arc` on error and drops
     /// it during begin_cleanup after the original stop and before absence.
-    pub fn register_utun(
+    pub(crate) fn register_utun(
         &mut self,
         link: &Arc<ConfiguredUtun<'a>>,
         producer: (Arc<NativeContext<'a>>, Arc<Mutex<NativePeer<'a>>>),
         owner: Owner,
-        networks: &[String],
+        route_plan: TunnelPlan,
         canceled: &Arc<AtomicBool>,
         work: RouteWork,
     ) -> Result<(super::InterfaceToken, Vec<Route>), Error> {
@@ -156,15 +161,6 @@ impl<'a> NativeBackend<'a> {
             return Err(Error::Busy);
         }
         link.validate().map_err(map_ipsec)?;
-        let ipv4 = link.vip(Family::V4).is_some();
-        let ipv6 = link.vip(Family::V6).is_some();
-        let needs_sink = networks.is_empty() && ipv4 != ipv6;
-        // Explicit unsupported split networks fail before allocation.
-        let plan = if needs_sink {
-            None
-        } else {
-            Some(ppp_networks(networks, index, ipv4, ipv6, None)?)
-        };
         self.reap_retired()?;
         retirement::admit(&self.retired)?;
         if self.registry.len() >= 64 {
@@ -191,8 +187,8 @@ impl<'a> NativeBackend<'a> {
                 .open_guard(conflict, owner.clone(), pin.clone(), peer.clone())?;
         retirement.attach_work(work)?;
         let writer = AddWriter::open(self.controller)?;
-        let sink = if needs_sink {
-            match OwnedSink::create(!ipv4, self.controller) {
+        let sink = if let Some(sink_ipv4) = route_plan.sink_ipv4() {
+            match OwnedSink::create(sink_ipv4, self.controller) {
                 Ok(sink) => {
                     retirement.set_sink(Some(sink.identity()));
                     Some(sink)
@@ -205,16 +201,8 @@ impl<'a> NativeBackend<'a> {
         } else {
             None
         };
-        let plan = match plan {
-            Some(plan) => plan,
-            None => ppp_networks(
-                networks,
-                index,
-                ipv4,
-                ipv6,
-                sink.as_ref().map(|sink| sink.index()),
-            )?,
-        };
+        let (plan, transport_default) =
+            route_plan.bind(index, sink.as_ref().map(|sink| sink.index()))?;
         let scope = UtunScope {
             pin,
             peer,
@@ -224,6 +212,7 @@ impl<'a> NativeBackend<'a> {
             writer,
             canceled: canceled.clone(),
             sink,
+            transport_default,
             retirement,
         };
         let token =

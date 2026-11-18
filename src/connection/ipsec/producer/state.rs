@@ -19,6 +19,8 @@ pub(super) const CONFIG: &str = "strongswan.conf";
 const CLAIM: &str = "claim.json";
 const MAX: u64 = 8192;
 mod lease;
+mod orphan;
+pub(super) use orphan::ObserveOrphan;
 
 pub(super) fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -47,13 +49,16 @@ impl Store {
             Ok(_) => Directory::open(path, owner)?,
             Err(_) => return Err(Error::Unavailable),
         };
-        Ok(Arc::new(Self {
+        Ok(Self::from_root(parent, root))
+    }
+    fn from_root(parent: &std::path::Path, root: Directory) -> Arc<Self> {
+        Arc::new(Self {
             root,
             log: crate::helper::paths::charon_log(parent),
             io: Mutex::new(()),
             #[cfg(test)]
             before_create: Mutex::new(None),
-        }))
+        })
     }
     #[cfg(test)]
     pub(super) fn cancel_before_create(&self, cancel: Arc<AtomicBool>) {
@@ -78,24 +83,18 @@ impl Store {
             .inventory()?
             .into_iter()
             .map(|name| {
-                if !record::hex(&name, 32) {
-                    return Err(Error::Changed);
-                }
-                let dir = Directory::open(self.root.path.join(&name), self.root.owner)?;
-                let (bytes, _) = dir.read(CLAIM, MAX)?;
-                let record: Record = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-                record.valid()?;
-                if record.session != name {
-                    return Err(Error::Changed);
-                }
-                let (conf, _) = dir.read(CONFIG, MAX)?;
-                if digest(&conf) != record.configuration_hash {
-                    return Err(Error::Changed);
-                }
-                inventory(&dir)?;
+                let dir = self.session(&name)?;
+                let (record, _, _) = read_admission(&dir, &name)?;
                 Ok(record)
             })
             .collect()
+    }
+    fn session(&self, name: &str) -> Result<Directory, Error> {
+        if !record::hex(name, 32) {
+            return Err(Error::Changed);
+        }
+        self.root.validate()?;
+        Directory::open(self.root.path.join(name), self.root.owner)
     }
     pub fn prepare(
         self: &Arc<Self>,
@@ -175,6 +174,9 @@ impl Store {
             transport_interface,
             stage: Stage::Prepared,
             child: None,
+            link: None,
+            // Optional: a failed read leaves the legacy clock proof in charge.
+            boot_session: super::recovery::boot_session().ok(),
         };
         record.valid()?;
         budget::check(budget)?;
@@ -197,6 +199,20 @@ impl Store {
             removed: false,
         })
     }
+}
+fn read_admission(dir: &Directory, name: &str) -> Result<(Record, Stamp, Stamp), Error> {
+    let (bytes, record_stamp) = dir.read(CLAIM, MAX)?;
+    let record: Record = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+    record.valid()?;
+    if record.session != name {
+        return Err(Error::Changed);
+    }
+    let (conf, config_stamp) = dir.read(CONFIG, MAX)?;
+    if digest(&conf) != record.configuration_hash {
+        return Err(Error::Changed);
+    }
+    inventory(dir)?;
+    Ok((record, record_stamp, config_stamp))
 }
 pub(super) struct Lease {
     pub store: Arc<Store>,

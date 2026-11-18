@@ -2,12 +2,20 @@
 //! The connection deadline governs only start/ready; maintenance uses a fresh
 //! short budget and the existing probe keeps its own timeout.
 use super::*;
-use crate::connection::macos::probe::{self, Outcome};
+use crate::connection::macos::{
+    probe::{self, Outcome},
+    routing::TunnelPlan,
+};
+use std::net::IpAddr;
 
 impl NativeIpsecAttempt<'_> {
+    /// IKE selection and the owned utun are `Tunnel`; route registration and
+    /// the lease are `Routes`.
     pub(super) fn ready_driver(&mut self) -> Result<bool, Failure> {
+        let unavailable = || Failure::at(Step::Tunnel);
+        let routing = || Failure::at(Step::Routes);
         let expires = self.expires.ok_or_else(unavailable)?;
-        check(expires, &self.canceled)?;
+        check(expires, &self.canceled, Step::Tunnel)?;
         self.profile_use
             .as_ref()
             .ok_or_else(unavailable)?
@@ -25,11 +33,35 @@ impl NativeIpsecAttempt<'_> {
             let Some((candidate, networks)) = selected else {
                 return Ok(false);
             };
-            check(expires, &self.canceled)?;
+            check(expires, &self.canceled, Step::Tunnel)?;
             let admission = self.admission.as_mut().ok_or_else(unavailable)?;
-            let link = admission
-                .configure(&candidate, expires, self.canceled.clone())
-                .map_err(|_| unavailable())?;
+            let egress = self.egress.as_deref().ok_or_else(unavailable)?;
+            let families = (
+                candidate.vips.iter().any(IpAddr::is_ipv4),
+                candidate.vips.iter().any(IpAddr::is_ipv6),
+            );
+            // The plan and the transport decision are `Routes`, as they were
+            // inside `register_utun`; configuring the owned utun is `Tunnel`.
+            let mut configuring = false;
+            let (route_plan, link) = TunnelPlan::prepare(
+                &networks,
+                families,
+                || egress.transport_default(),
+                |plan| {
+                    configuring = true;
+                    let link = admission
+                        .configure(&candidate, expires, self.canceled.clone())
+                        .map_err(|_| crate::connection::routes::Error::Unavailable)?;
+                    Ok((plan, link))
+                },
+            )
+            .map_err(|_| {
+                if configuring {
+                    unavailable()
+                } else {
+                    routing()
+                }
+            })?;
             self.selected_vips = candidate.vips.clone();
             self.selected_networks = networks.clone();
             self.configured = Some(link.clone());
@@ -38,27 +70,29 @@ impl NativeIpsecAttempt<'_> {
                 .map_err(|_| unavailable())?;
             let work = admission
                 .begin_routes(expires, self.canceled.clone())
-                .map_err(|_| unavailable())?;
+                .map_err(|_| routing())?;
             let owner = self.owner.clone();
             let context = self.domain.context().clone();
             let canceled = self.canceled.clone();
             let (token, plan) = {
-                let mut routes = lock_until(&self.routes, expires, &canceled)?;
+                let mut routes =
+                    lock_until(&self.routes, expires, &canceled).map_err(|()| routing())?;
                 routes
                     .backend_mut()
                     .register_utun(
                         &link,
                         (context, peer),
                         owner.clone(),
-                        &networks,
+                        route_plan,
                         &canceled,
                         work,
                     )
-                    .map_err(|_| unavailable())?
+                    .map_err(|_| routing())?
             };
             self.token = Some(token);
             let lease = {
-                let mut routes = lock_until(&self.routes, expires, &canceled)?;
+                let mut routes =
+                    lock_until(&self.routes, expires, &canceled).map_err(|()| routing())?;
                 routes
                     .acquire_guarded(owner.clone(), &plan, || {
                         if canceled.load(Ordering::Acquire) {
@@ -69,27 +103,29 @@ impl NativeIpsecAttempt<'_> {
                             Ok(())
                         }
                     })
-                    .map_err(|_| unavailable())?
+                    .map_err(route_acquire_failure)?
             };
             self.lease = Some(OwnedLease::new(lease, owner));
-            check(expires, &self.canceled)?;
+            check(expires, &self.canceled, Step::Routes)?;
             return Ok(true);
         }
-        self.revalidate(expires)
+        self.revalidate(expires, Step::Tunnel)
     }
 
     pub(super) fn healthy_driver(&mut self) -> Result<(), Failure> {
         // Maintenance is outside the 60 s connection deadline. Use a fresh
         // short budget and the same real cancellation flag.
         let expires = Instant::now() + Duration::from_secs(2);
-        check(expires, &self.canceled)?;
-        if !self.revalidate(expires)? {
-            return Err(unavailable());
+        check(expires, &self.canceled, Step::Health)?;
+        if !self.revalidate(expires, Step::Health)? {
+            return Err(Failure::at(Step::Health));
         }
         Ok(())
     }
 
-    fn revalidate(&mut self, expires: Instant) -> Result<bool, Failure> {
+    /// `step`: `Health` for maintenance; `Tunnel` if a ready poll repeats.
+    fn revalidate(&mut self, expires: Instant, step: Step) -> Result<bool, Failure> {
+        let unavailable = || Failure::at(step);
         self.profile_use
             .as_ref()
             .ok_or_else(unavailable)?
@@ -120,16 +156,20 @@ impl NativeIpsecAttempt<'_> {
             return Err(unavailable());
         }
         let lease = self.lease.as_ref().ok_or_else(unavailable)?;
-        let mut routes = lock_until(&self.routes, expires, &self.canceled)?;
+        let mut routes =
+            lock_until(&self.routes, expires, &self.canceled).map_err(|()| unavailable())?;
         lease.validate(&mut routes).map_err(|_| unavailable())?;
         Ok(true)
     }
 
+    /// A periodic probe failure is `Health`; the worker marks the initial
+    /// probe, which verifies the new tunnel, as `Verify`.
     pub(super) fn probe_driver(
         &mut self,
         canceled: &AtomicBool,
         timeout: Duration,
     ) -> Result<bool, Failure> {
+        let unavailable = || Failure::at(Step::Health);
         if canceled.load(Ordering::Acquire) {
             return Ok(false);
         }

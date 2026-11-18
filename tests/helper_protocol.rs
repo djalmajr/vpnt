@@ -343,3 +343,150 @@ fn a_genuine_protocol_two_snapshot_is_classified_by_version_not_by_its_old_shape
         );
     }
 }
+
+#[test]
+fn a_failure_note_round_trips_and_an_older_helper_without_it_is_accepted() {
+    use protocol::{ErrorCode, FailureNote, Step, TunnelStatus};
+    use vpnt::session::ConnectionState;
+    let note = FailureNote {
+        code: ErrorCode::BackendFailure,
+        step: Step::Routes,
+    };
+    let wire = |message: &Message| {
+        let mut bytes = vec![];
+        protocol::write_message(&mut bytes, message).unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    let snapshot = |failure| Message::Snapshot {
+        id: "snapshot-1".into(),
+        protocol_version: protocol::VERSION,
+        version: "0.1.0".into(),
+        build: None,
+        profiles: vec![serde_json::from_value(profile("one")).unwrap()],
+        connections: vec![TunnelStatus {
+            id: "one".into(),
+            generation: 1,
+            state: ConnectionState::Dropped,
+            failures: 0,
+            cleaning: false,
+            failure,
+        }],
+    };
+    let changed = |failure| Message::Changed {
+        profile_id: "one".into(),
+        generation: 1,
+        state: ConnectionState::Dropped,
+        failures: 0,
+        cleaning: true,
+        failure,
+    };
+    for failure in [Some(note), None] {
+        let frame = wire(&snapshot(failure));
+        // Without a note the field is absent, so an older app never sees it.
+        assert_eq!(frame.contains("\"failure\""), failure.is_some(), "{frame}");
+        let Some(Message::Snapshot { connections, .. }) = read_wire(&frame).unwrap() else {
+            panic!("snapshot expected");
+        };
+        assert_eq!(connections[0].failure, failure);
+        let frame = wire(&changed(failure));
+        assert_eq!(frame.contains("\"failure\""), failure.is_some(), "{frame}");
+        let Some(Message::Changed { failure: read, .. }) = read_wire(&frame).unwrap() else {
+            panic!("changed expected");
+        };
+        assert_eq!(read, failure);
+    }
+    assert!(
+        wire(&changed(Some(note)))
+            .contains(r#""failure":{"code":"backend_failure","step":"routes"}"#)
+    );
+    // A helper that predates the note omits the field: accepted, no note.
+    let Some(Message::Snapshot { connections, .. }) = read_wire(
+        &(serde_json::json!({
+            "type": "snapshot",
+            "id": "snapshot-1",
+            "protocol_version": protocol::VERSION,
+            "version": "0.1.0",
+            "profiles": [profile("one")],
+            "connections": [{"id": "one", "generation": 1, "state": "dropped", "failures": 0, "cleaning": false}],
+        })
+        .to_string()
+            + "\n"),
+    )
+    .unwrap() else {
+        panic!("older snapshot expected");
+    };
+    assert_eq!(connections[0].failure, None);
+    let Some(Message::Changed { failure, .. }) = read_wire(
+        "{\"type\":\"changed\",\"profile_id\":\"one\",\"generation\":1,\"state\":\"dropped\",\"failures\":0}\n",
+    )
+    .unwrap() else {
+        panic!("older change expected");
+    };
+    assert_eq!(failure, None);
+}
+
+#[test]
+fn a_failure_note_outside_a_failed_state_or_off_contract_is_rejected() {
+    let changed = |state: &str, failure: serde_json::Value| {
+        serde_json::json!({"type":"changed","profile_id":"one","generation":1,"state":state,"failures":0,"failure":failure}).to_string() + "\n"
+    };
+    let note = serde_json::json!({"code":"backend_failure","step":"dns"});
+    for state in [
+        "dropped",
+        "credentials_rejected",
+        "gateway_timeout",
+        "missing_program",
+    ] {
+        assert!(read_wire(&changed(state, note.clone())).is_ok(), "{state}");
+    }
+    // A note claims a failed attempt; an active or idle state cannot carry it.
+    for state in [
+        "off",
+        "connecting",
+        "verifying",
+        "connected",
+        "disconnecting",
+    ] {
+        assert!(
+            matches!(
+                read_wire(&changed(state, note.clone())),
+                Err(ProtocolError::InvalidRequest)
+            ),
+            "{state}"
+        );
+    }
+    for hostile in [
+        serde_json::json!({"code":"backend_failure","step":"kernel"}),
+        serde_json::json!({"code":"backend_failure","step":"DNS"}),
+        serde_json::json!({"code":"backend_failure"}),
+        serde_json::json!({"step":"dns"}),
+        serde_json::json!({"code":"unknown","step":"dns"}),
+        serde_json::json!({"code":"backend_failure","step":"dns","detail":"/etc/resolv.conf"}),
+        serde_json::json!("dns"),
+    ] {
+        assert!(
+            matches!(
+                read_wire(&changed("dropped", hostile.clone())),
+                Err(ProtocolError::InvalidRequest)
+            ),
+            "{hostile}"
+        );
+    }
+    let snapshot = |state: &str| {
+        serde_json::json!({
+            "type": "snapshot",
+            "id": "snapshot-1",
+            "protocol_version": protocol::VERSION,
+            "version": "0.1.0",
+            "profiles": [profile("one")],
+            "connections": [{"id": "one", "generation": 1, "state": state, "failures": 0, "failure": {"code":"backend_failure","step":"health"}}],
+        })
+        .to_string()
+            + "\n"
+    };
+    assert!(read_wire(&snapshot("dropped")).unwrap().is_some());
+    assert!(matches!(
+        read_wire(&snapshot("connected")),
+        Err(ProtocolError::InvalidRequest)
+    ));
+}
