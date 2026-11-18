@@ -400,14 +400,22 @@ fn drive(
             continue;
         }
         if let Some(Some(pairs)) = block.take() {
-            match network::from_env(&pairs) {
-                Ok(config) => {
-                    let _ = progress.send(Progress::Up(config));
+            // openvpn ends every UP block with >UPDOWN:ENV,END. Any other line
+            // before it means the block is incomplete or forged: never publish
+            // the pairs read so far. The line itself is then handled normally.
+            if event == Event::EnvEnd {
+                match network::from_env(&pairs) {
+                    Ok(config) => {
+                        let _ = progress.send(Progress::Up(config));
+                    }
+                    Err(error) => {
+                        let _ = progress.send(Progress::BadNetwork(error));
+                        let _ = send(control, management::TERMINATE);
+                    }
                 }
-                Err(error) => {
-                    let _ = progress.send(Progress::BadNetwork(error));
-                    let _ = send(control, management::TERMINATE);
-                }
+            } else {
+                let _ = progress.send(Progress::BadNetwork(NetworkError::Malformed));
+                let _ = send(control, management::TERMINATE);
             }
         }
         let reply = match event {

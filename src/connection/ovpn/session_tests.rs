@@ -385,12 +385,33 @@ fn launch_passes_device_and_management_up_down() {
 }
 
 #[test]
-fn up_block_closes_on_next_non_environment_line() {
-    let mut vpn = Openvpn::connect(FakeToken::default());
-    vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n>HOLD:waiting\n");
-    assert_eq!(vpn.hear(), management::HOLD_RELEASE);
-    let (_, progress) = vpn.hang_up();
-    assert!(matches!(&progress[..], [Progress::Up(c)] if c.prefix == 24));
+fn up_block_without_end_is_rejected_and_the_line_still_handled() {
+    // Every line other than ENV records and END inside an open UP block
+    // rejects it, even well-formed ones; the line is then processed as usual.
+    for (line, reply) in [
+        (">HOLD:waiting\n", Some(management::HOLD_RELEASE)),
+        (">STATE:1,CONNECTED,SUCCESS,10.81.0.2,,,,\n", None),
+        (">PK_SIGN:%%%,RSA_PKCS1_PADDING\n", Some(management::TERMINATE)),
+        (">UPDOWN:UP\n", None),
+        (">UPDOWN:DOWN\n", None),
+    ] {
+        let mut vpn = Openvpn::connect(FakeToken::default());
+        vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n");
+        vpn.say(line);
+        assert_eq!(vpn.hear(), management::TERMINATE, "{line}");
+        if let Some(reply) = reply {
+            assert_eq!(vpn.hear(), reply, "{line}");
+        }
+        let (_, progress) = vpn.hang_up();
+        assert!(
+            !progress.iter().any(|p| matches!(p, Progress::Up(_))),
+            "{line}: {progress:?}"
+        );
+        assert!(
+            progress.contains(&Progress::BadNetwork(NetworkError::Malformed)),
+            "{line}: {progress:?}"
+        );
+    }
 }
 
 #[test]
