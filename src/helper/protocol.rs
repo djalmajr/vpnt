@@ -79,6 +79,9 @@ pub struct AdminRequest {
     pub command: AdminCommand,
 }
 
+// One command is decoded per admin request; boxing the profile would only
+// move the allocation and touch every constructor.
+#[allow(clippy::large_enum_variant)]
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {

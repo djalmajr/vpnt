@@ -907,6 +907,7 @@ impl Drop for Harness {
 }
 fn profile(id: &str) -> Profile {
     Profile {
+        ovpn: None,
         dns_domains: Vec::new(),
         id: id.into(),
         name: id.into(),

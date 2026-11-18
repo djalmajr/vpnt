@@ -46,3 +46,23 @@ fn a_missing_module_is_a_module_error() {
         Some(TokenError::Module)
     );
 }
+
+#[test]
+fn listing_a_missing_module_is_a_module_error() {
+    assert_eq!(
+        list_certificates(Path::new("/nonexistent/vpnt-pkcs11.so")),
+        Err(TokenError::Module)
+    );
+}
+
+#[test]
+fn certificate_debug_renders_id_as_lowercase_hex() {
+    let info = CertificateInfo {
+        id: vec![0, 0xa7, 0xff],
+        subject: Some("Synthetic".into()),
+        issuer: None,
+        not_before: None,
+        not_after: None,
+    };
+    assert!(format!("{info:?}").contains("id: \"00a7ff\""));
+}

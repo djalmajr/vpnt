@@ -57,7 +57,9 @@ export function VpnCard({
   navigate: Navigate;
   secrets: () => void;
 }) {
-  const { state, profile, cleaning } = vpn;
+  const { profile, cleaning } = vpn;
+  const isOvpn = profile.kind === "ovpn";
+  const state = isOvpn && vpn.state === "missing_secret" ? "off" : vpn.state;
   const cleanupId = `cleanup-${profile.id}`;
   // While cleaning, the Notice action stays focusable (aria-disabled, inert
   // click) so the keyboard reaches it and hears why it is unavailable.
@@ -66,6 +68,7 @@ export function VpnCard({
     : {};
   const busy = [
     "connecting",
+    "awaiting_approval",
     "reconnecting",
     "disconnecting",
     "verifying",
@@ -79,7 +82,10 @@ export function VpnCard({
       "disconnecting",
       "cleanup_unconfirmed",
     ].includes(state);
-  const cancelable = state === "connecting" || state === "reconnecting";
+  const cancelable =
+    state === "connecting" ||
+    state === "awaiting_approval" ||
+    state === "reconnecting";
   const missingSecret = state === "missing_secret";
   const on = active(state);
   const warning = [
@@ -96,7 +102,9 @@ export function VpnCard({
       ? "warning-text"
       : state === "connected" || state === "verifying"
         ? "success-text"
-        : state === "connecting" || state === "reconnecting"
+        : state === "connecting" ||
+            state === "awaiting_approval" ||
+            state === "reconnecting"
           ? "primary-text"
           : "muted";
   const hint =
@@ -109,7 +117,9 @@ export function VpnCard({
             ? "failedAtHint"
             : "droppedHint"
           : state === "credentials_rejected"
-            ? "credentialsHint"
+            ? isOvpn
+              ? "ovpnRejected"
+              : "credentialsHint"
             : state === "gateway_timeout"
               ? "timeoutHint"
               : state === "missing_program"
@@ -137,7 +147,7 @@ export function VpnCard({
               {t(profile.kind)} ·{" "}
               {profile.networks.length
                 ? profile.networks.join(", ")
-                : t(profile.kind === "ssl" ? "gatewayRoutes" : "fullTunnel")}
+                : t(profile.kind === "ipsec" ? "fullTunnel" : "gatewayRoutes")}
             </small>
           </span>
           <span className="card-controls">
@@ -184,6 +194,9 @@ export function VpnCard({
               </button>
             )}
           </span>
+        )}
+        {state === "awaiting_approval" && (
+          <small>{t("ovpnApprovalHint")}</small>
         )}
       </div>
       {hint && (
@@ -248,7 +261,7 @@ export function VpnCard({
                   >
                     {t("disconnect")}
                   </button>
-                ) : state === "credentials_rejected" ? (
+                ) : state === "credentials_rejected" && !isOvpn ? (
                   <button type="button" onClick={secrets}>
                     {t("changePassword")}
                   </button>

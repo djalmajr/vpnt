@@ -53,6 +53,13 @@ impl Credentials {
     }
 
     pub fn validate(&self, kind: VpnKind) -> Result<(), SecretError> {
+        if kind == VpnKind::Ovpn {
+            return if self.password.expose().is_empty() && self.psk.expose().is_empty() {
+                Ok(())
+            } else {
+                Err(SecretError::InvalidData)
+            };
+        }
         self.validate_shape()?;
         // openfortivpn 1.24.1 stores at most PASSWORD_SIZE=256 bytes. Reject
         // excess before sending to pinentry instead of silently truncating.
@@ -79,4 +86,25 @@ pub trait SecretStore: Send {
     fn load(&self, id: &str, kind: VpnKind) -> Result<Credentials, SecretError>;
     fn save(&self, id: &str, kind: VpnKind, credentials: &Credentials) -> Result<(), SecretError>;
     fn remove(&self, id: &str, kind: VpnKind) -> Result<(), SecretError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ovpn_credentials_must_both_be_empty() {
+        for (password, psk, expected) in [
+            ("", "", Ok(())),
+            ("placeholder", "", Err(SecretError::InvalidData)),
+            ("", "placeholder", Err(SecretError::InvalidData)),
+            ("placeholder", "placeholder", Err(SecretError::InvalidData)),
+        ] {
+            let credentials = Credentials {
+                password: password.into(),
+                psk: psk.into(),
+            };
+            assert_eq!(credentials.validate(VpnKind::Ovpn), expected);
+        }
+    }
 }

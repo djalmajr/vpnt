@@ -20,6 +20,7 @@ export function SecretsDialog({
   const [password, setPassword] = useState("");
   const [psk, setPsk] = useState("");
   const [saving, setSaving] = useState(false);
+  if (vpn.profile.kind === "ovpn") return null;
   const ipsec = vpn.profile.kind === "ipsec";
   return (
     <Dialog

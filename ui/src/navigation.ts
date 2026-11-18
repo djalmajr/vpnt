@@ -1,4 +1,4 @@
-import type { Command } from "./model";
+import type { Command, VpnKind } from "./model";
 export type ProfileOrigin = "home" | "preferences";
 export type Route =
   | { page: "panel" | "preferences" | "about" | "onboarding" }
@@ -6,7 +6,7 @@ export type Route =
   | {
       page: "profile";
       id?: string;
-      kind?: "ipsec" | "ssl";
+      kind?: VpnKind;
       origin?: ProfileOrigin;
     }
   | { page: "log"; id?: string };

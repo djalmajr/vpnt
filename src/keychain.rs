@@ -43,6 +43,7 @@ impl MacKeychain {
             match kind {
                 VpnKind::Ipsec => "ipsec",
                 VpnKind::Ssl => "ssl",
+                VpnKind::Ovpn => "ovpn",
             }
         ))
     }
