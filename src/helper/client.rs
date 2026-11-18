@@ -182,8 +182,49 @@ pub(super) fn linux_command(path: &std::path::Path, mode: &str) -> Result<Comman
     Ok(command)
 }
 
+/// Prepares a Linux runtime or admin child: passes the user's session
+/// variables, and lets only stdin (the channel), stdout and stderr cross exec.
 #[cfg(target_os = "linux")]
 pub(super) fn linux_inherit_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Descriptors the app inherited without CLOEXEC would otherwise stay open in
+    // the child for its whole session. Marking them close-on-exec (instead of
+    // closing) keeps std's own exec-error pipe working.
+    let limit = {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit only writes the struct it is given.
+        let known = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+        if known {
+            limit.rlim_cur.min(1 << 16) as libc::c_int
+        } else {
+            1024
+        }
+    };
+    // SAFETY: the closure runs between fork and exec and only makes raw
+    // syscalls (close_range, fcntl), which are async-signal-safe and allocate
+    // nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let first: libc::c_uint = 3;
+            if libc::syscall(
+                libc::SYS_close_range,
+                first,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == 0
+            {
+                return Ok(());
+            }
+            // Kernels before 5.11 lack CLOSE_RANGE_CLOEXEC.
+            for fd in 3..limit {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
     for key in [
         "HOME",
         "USER",
@@ -223,5 +264,7 @@ pub fn linux_build_identity() -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod tests;
