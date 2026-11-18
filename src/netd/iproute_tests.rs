@@ -89,7 +89,7 @@ fn exact_argv_and_dns_branches() {
 }
 #[test]
 fn existing_filters_names_and_rejects_malformed_output() {
-    let names=parse_existing(r#"[{"ifname":"vpnt0"},{"ifname":"eth0"},{"ifname":"vpnt99"},{"ifname":"vpnt00"},{"ifname":"vpnt123"},{"ifname":"vpnt١"}]"#.as_bytes()).unwrap();
+    let names=parse_existing(r#"[{"ifindex":42,"ifname":"vpnt0"},{"ifindex":42,"ifname":"eth0"},{"ifindex":42,"ifname":"vpnt99"},{"ifindex":42,"ifname":"vpnt00"},{"ifindex":42,"ifname":"vpnt123"},{"ifindex":42,"ifname":"vpnt١"}]"#.as_bytes()).unwrap();
     assert_eq!(
         names
             .iter()
@@ -101,6 +101,8 @@ fn existing_filters_names_and_rejects_malformed_output() {
         b"{}".as_slice(),
         b"garbage",
         b"[{}]",
+        br#"[{"ifname":"vpnt0"}]"#,
+        br#"[{"ifindex":0,"ifname":"vpnt0"}]"#,
         b"[{\"ifname\":3}]",
         b"[{\"ifname\":\"vpnt0\"},{}]",
     ] {
@@ -163,7 +165,7 @@ fn execution_stops_on_failure_and_delete_ignores_dns_failure() {
 #[test]
 fn runner_clears_environment_captures_output_and_does_not_echo_stderr() {
     let f = Fixture::new();
-    let ip=f.script("ip", "[ \"$LC_ALL\" = C ] || exit 2\n[ -z \"${HOME+x}\" ] || exit 3\n[ -z \"${XDG_CONFIG_HOME+x}\" ] || exit 4\n[ -z \"${TMPDIR+x}\" ] || exit 5\n[ -z \"${USERPROFILE+x}\" ] || exit 6\nprintf '[{\"ifname\":\"vpnt0\"}]'");
+    let ip=f.script("ip", "[ \"$LC_ALL\" = C ] || exit 2\n[ -z \"${HOME+x}\" ] || exit 3\n[ -z \"${XDG_CONFIG_HOME+x}\" ] || exit 4\n[ -z \"${TMPDIR+x}\" ] || exit 5\n[ -z \"${USERPROFILE+x}\" ] || exit 6\nprintf '[{\"ifindex\":42,\"ifname\":\"vpnt0\"}]'");
     let backend = IpRoute::with_paths(ip, f.0.join("unused"), Duration::from_secs(1));
     assert_eq!(backend.existing().unwrap()[0].name.as_str(), "vpnt0");
     let bad = f.script("bad", "printf 'private-client-input' >&2\nexit 7");
@@ -206,24 +208,42 @@ fn backend_revalidates_public_config_before_any_effect() {
 
 #[test]
 fn create_marks_tun_and_rolls_back_if_alias_fails() {
-    let f = Fixture::new();
-    let log = f.0.join("argv");
-    let name = TunName::parse("vpnt0").unwrap();
-    let ip = f.script(
-        "ip",
-        &format!(
-            "printf '%s\n' \"$*\" >> '{}'\n[ \"$2\" != set ]",
-            log.display()
-        ),
-    );
-    let backend = IpRoute::with_paths(ip, f.0.join("unused"), Duration::from_secs(1));
-    assert!(backend.create_tun(&name, 1000).is_err());
-    assert_eq!(
-        fs::read_to_string(log).unwrap(),
-        "tuntap add dev vpnt0 mode tun user 1000\nlink set dev vpnt0 alias vpnt-helper\nlink del dev vpnt0\n"
-    );
+    for fail_rollback in [false, true] {
+        let f = Fixture::new();
+        let log = f.0.join("argv");
+        let name = TunName::parse("vpnt0").unwrap();
+        let ip = f.script(
+            "ip",
+            &format!(
+                r#"printf '%s\n' "$*" >> '{}'
+case "$1 $2" in
+    "-j -d") printf '%s' '[{{"ifindex":67,"ifname":"vpnt0","linkinfo":{{"info_kind":"tun"}}}}]' ;;
+    "link set") exit 3 ;;
+    "link del") exit {} ;;
+esac"#,
+                log.display(),
+                u8::from(fail_rollback)
+            ),
+        );
+        let backend = IpRoute::with_paths(ip, f.0.join("unused"), Duration::from_secs(1));
+        let err = backend.create_tun(&name, 1000).unwrap_err();
+        let partial = err
+            .get_ref()
+            .and_then(|err| err.downcast_ref::<PartialCreate>());
+        if fail_rollback {
+            let partial = partial.expect("create and rollback failed");
+            assert_eq!(partial.ifindex.get(), 67);
+            assert!(partial.alias.to_string().contains("status: 3"));
+            assert!(partial.rollback.to_string().contains("status: 1"));
+        } else {
+            assert!(partial.is_none());
+        }
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "tuntap add dev vpnt0 mode tun user 1000\n-j -d link show dev vpnt0\nlink set dev vpnt0 alias vpnt-helper\nlink del dev vpnt0\n"
+        );
+    }
 }
-
 #[test]
 fn exact_route_lookup_controls_add_and_preserves_foreign_routes() {
     let f = Fixture::new();
@@ -270,7 +290,7 @@ fn exact_route_lookup_controls_add_and_preserves_foreign_routes() {
 
 #[test]
 fn only_tun_with_exact_alias_is_owned() {
-    let entries = parse_existing(br#"[{"ifname":"vpnt0","ifalias":"vpnt-helper","linkinfo":{"info_kind":"tun"}},{"ifname":"vpnt1","linkinfo":{"info_kind":"tun"}},{"ifname":"vpnt2","ifalias":"vpnt-helper","linkinfo":{"info_kind":"dummy"}},{"ifname":"vpnt3","ifalias":"vpnt-helper-extra","linkinfo":{"info_kind":"tun"}}]"#).unwrap();
+    let entries = parse_existing(br#"[{"ifindex":42,"ifname":"vpnt0","ifalias":"vpnt-helper","linkinfo":{"info_kind":"tun"}},{"ifindex":42,"ifname":"vpnt1","linkinfo":{"info_kind":"tun"}},{"ifindex":42,"ifname":"vpnt2","ifalias":"vpnt-helper","linkinfo":{"info_kind":"dummy"}},{"ifindex":42,"ifname":"vpnt3","ifalias":"vpnt-helper-extra","linkinfo":{"info_kind":"tun"}}]"#).unwrap();
     assert_eq!(
         entries
             .into_iter()

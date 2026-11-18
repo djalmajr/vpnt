@@ -10,6 +10,8 @@ pub(in crate::netd) struct Fake {
     pub(in crate::netd) events: Mutex<Vec<String>>,
     names: Mutex<HashSet<TunName>>,
     foreign: Mutex<HashSet<TunName>>,
+    unmarked: Mutex<HashMap<TunName, (NonZeroU32, bool)>>,
+    partial_create: Mutex<Option<NonZeroU32>>,
     fail_delete: AtomicBool,
     conflict: AtomicBool,
     fail_create: AtomicBool,
@@ -26,6 +28,17 @@ impl Backend for Arc<Fake> {
             .push(format!("create {name} {owner}"));
         if self.fail_create.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("private input"));
+        }
+        if let Some(ifindex) = self.partial_create.lock().unwrap().take() {
+            self.unmarked
+                .lock()
+                .unwrap()
+                .insert(name.clone(), (ifindex, true));
+            return Err(io::Error::other(PartialCreate {
+                ifindex,
+                alias: io::Error::other("alias failed"),
+                rollback: io::Error::other("rollback failed"),
+            }));
         }
         let pause = self.pause_create.lock().unwrap().take();
         if let Some((started, resume)) = pause {
@@ -62,6 +75,7 @@ impl Backend for Arc<Fake> {
         }
         self.names.lock().unwrap().remove(name);
         self.foreign.lock().unwrap().remove(name);
+        self.unmarked.lock().unwrap().remove(name);
         Ok(())
     }
     fn existing(&self) -> io::Result<Vec<Existing>> {
@@ -69,11 +83,29 @@ impl Backend for Arc<Fake> {
         let foreign = self.foreign.lock().unwrap().clone();
         Ok(owned
             .into_iter()
-            .map(|name| Existing { name, owned: true })
+            .map(|name| Existing {
+                name,
+                owned: true,
+                ifindex: NonZeroU32::MIN,
+                is_tun: true,
+            })
+            .chain(foreign.into_iter().map(|name| Existing {
+                name,
+                owned: false,
+                ifindex: NonZeroU32::MIN,
+                is_tun: false,
+            }))
             .chain(
-                foreign
-                    .into_iter()
-                    .map(|name| Existing { name, owned: false }),
+                self.unmarked
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, (ifindex, is_tun))| Existing {
+                        name: name.clone(),
+                        owned: false,
+                        ifindex: *ifindex,
+                        is_tun: *is_tun,
+                    }),
             )
             .collect())
     }
@@ -470,7 +502,7 @@ fn disconnect_failure_retries_on_accept_and_releases_name() {
     f.fake.fail_delete.store(true, Ordering::SeqCst);
     drop(wire);
     worker.unwrap().join().unwrap();
-    assert!(f.server.pending.lock().unwrap().contains(&name));
+    assert!(f.server.pending.lock().unwrap().contains_key(&name));
     assert!(f.server.reserved.lock().unwrap().contains(&name));
 
     let (mut next, worker) = f.connection(1001);
@@ -523,7 +555,10 @@ fn open_retries_pending_and_never_deletes_missing_or_unmarked_interface() {
                 .count(),
             1
         );
-        assert_eq!(f.server.pending.lock().unwrap().contains(&name), foreign);
+        assert_eq!(
+            f.server.pending.lock().unwrap().contains_key(&name),
+            foreign
+        );
         assert_eq!(f.fake.foreign.lock().unwrap().contains(&name), foreign);
         drop(wire);
         worker.unwrap().join().unwrap();
@@ -563,4 +598,75 @@ fn slow_pending_delete_does_not_hold_open_past_retry_budget() {
     drop(wire);
     worker.unwrap().join().unwrap();
     assert!(f.fake.existing().unwrap().is_empty());
+}
+
+fn failed_alias_and_rollback(f: &Fixture, ifindex: NonZeroU32) -> TunName {
+    *f.fake.partial_create.lock().unwrap() = Some(ifindex);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    assert!(matches!(
+        exchange(&mut wire, OPEN),
+        Response::Error(ErrorCode::Backend)
+    ));
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    let name = TunName::parse("vpnt0").unwrap();
+    assert!(f.server.reserved.lock().unwrap().contains(&name));
+    assert!(
+        matches!(f.server.pending.lock().unwrap().get(&name), Some(CleanupProof::Created { ifindex: actual }) if *actual == ifindex)
+    );
+    name
+}
+
+#[test]
+fn partially_created_tun_retries_on_next_accept_and_releases_name() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let name = failed_alias_and_rollback(&f, NonZeroU32::new(42).unwrap());
+    assert!(!f.fake.existing().unwrap()[0].owned);
+
+    let (mut next, worker) = f.connection(1001);
+    hello(&mut next);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while f.server.reserved.lock().unwrap().contains(&name) {
+        assert!(
+            Instant::now() < deadline,
+            "accept did not clean up the partial create"
+        );
+        thread::yield_now();
+    }
+    assert!(f.fake.existing().unwrap().is_empty());
+    assert_eq!(
+        *f.fake.events.lock().unwrap(),
+        ["create vpnt0 1000", "delete vpnt0"]
+    );
+    open(&mut next, "vpnt0");
+    drop(next);
+    worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn partial_create_does_not_delete_a_replacement_link() {
+    let original = NonZeroU32::new(42).unwrap();
+    for replacement in [(NonZeroU32::new(43).unwrap(), true), (original, false)] {
+        let f = Fixture::new(HELLO_TIMEOUT);
+        let name = failed_alias_and_rollback(&f, original);
+        f.fake
+            .unmarked
+            .lock()
+            .unwrap()
+            .insert(name.clone(), replacement);
+
+        let (mut next, worker) = f.connection(1001);
+        hello(&mut next);
+        open(&mut next, "vpnt1");
+        assert_eq!(
+            *f.fake.events.lock().unwrap(),
+            ["create vpnt0 1000", "create vpnt1 1001"]
+        );
+        assert!(f.server.reserved.lock().unwrap().contains(&name));
+        assert!(f.server.pending.lock().unwrap().contains_key(&name));
+        assert_eq!(f.fake.unmarked.lock().unwrap()[&name], replacement);
+        drop(next);
+        worker.unwrap().join().unwrap();
+    }
 }

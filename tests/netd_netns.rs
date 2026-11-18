@@ -236,6 +236,16 @@ fn isolated_network_replacement_and_cleanup() {
             .iter()
             .any(|entry| entry.name.as_str() == "vpnt7" && !entry.owned)
     );
+    let tun = entries
+        .iter()
+        .find(|entry| entry.name == fixture.name)
+        .unwrap();
+    let kernel = ip(&["-j", "-d", "link", "show", "dev", fixture.name.as_str()]);
+    assert!(tun.is_tun);
+    assert_eq!(
+        kernel[0]["ifindex"].as_u64(),
+        Some(u64::from(tun.ifindex.get()))
+    );
     assert!(cleanup_startup(&fixture.backend).unwrap().is_empty());
     assert_eq!(ip(&exact), original);
     let entries = fixture.backend.existing().unwrap();

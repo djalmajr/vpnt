@@ -1,6 +1,6 @@
 //! Linux netd socket admission, interface reservations, and session cleanup.
 use super::{
-    iproute::{Backend, IpRoute},
+    iproute::{Backend, Existing, IpRoute, PartialCreate},
     protocol::{
         ErrorCode, Request, Response, TunName, VERSION, encode_response, parse_request, read_line,
     },
@@ -11,6 +11,7 @@ use std::{
     ffi::{CString, OsString},
     fs::{self, DirBuilder},
     io::{self, BufReader, Read, Write},
+    num::NonZeroU32,
     os::{
         fd::FromRawFd,
         unix::{
@@ -60,11 +61,27 @@ struct RetryPass {
     finished: Condvar,
 }
 
+#[derive(Clone, Copy)]
+enum CleanupProof {
+    Marked,
+    // Process-local evidence. After restart an unmarked link is reported
+    // as a name conflict and will not be deleted.
+    Created { ifindex: NonZeroU32 },
+}
+impl CleanupProof {
+    fn matches(self, entry: &Existing) -> bool {
+        match self {
+            Self::Marked => entry.owned,
+            Self::Created { ifindex } => entry.is_tun && entry.ifindex == ifindex,
+        }
+    }
+}
+
 pub(super) struct Server<B> {
     backend: B,
     reserved: Mutex<HashSet<TunName>>,
     active: Mutex<HashMap<u32, usize>>,
-    pending: Mutex<HashSet<TunName>>,
+    pending: Mutex<HashMap<TunName, CleanupProof>>,
     retry: Mutex<Option<Arc<RetryPass>>>,
     hello_timeout: Duration,
     idle_timeout: Duration,
@@ -76,7 +93,7 @@ impl<B: Backend + 'static> Server<B> {
             backend,
             reserved: Mutex::new(HashSet::new()),
             active: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             retry: Mutex::new(None),
             hello_timeout,
             idle_timeout: IDLE_TIMEOUT,
@@ -89,7 +106,10 @@ impl<B: Backend + 'static> Server<B> {
             .lock()
             .expect("reservation mutex")
             .extend(pending.iter().cloned());
-        self.pending.lock().expect("pending mutex").extend(pending);
+        self.pending
+            .lock()
+            .expect("pending mutex")
+            .extend(pending.into_iter().map(|name| (name, CleanupProof::Marked)));
         Ok(())
     }
     fn retry_pending(self: &Arc<Self>, wait: bool) {
@@ -130,14 +150,14 @@ impl<B: Backend + 'static> Server<B> {
     }
     fn retry_pass(&self) {
         let names = self.pending.lock().expect("pending mutex").clone();
-        for name in names {
+        for (name, proof) in names {
             // Refresh for each deletion. A pass can outlast one backend deadline.
             let Ok(existing) = self.backend.existing() else {
                 log_tun("cleanup_inventory_failed", 0, &name);
                 continue;
             };
             match existing.iter().find(|entry| entry.name == name) {
-                Some(entry) if !entry.owned => {
+                Some(entry) if !proof.matches(entry) => {
                     log_tun("cleanup_name_conflict", 0, &name);
                     continue;
                 }
@@ -241,13 +261,32 @@ impl<B: Backend + 'static> Server<B> {
             .ok_or(ErrorCode::Limit)?;
         reserved.insert(name.clone());
         drop(reserved);
-        if self.backend.create_tun(&name, uid).is_err() {
-            self.release(&name);
-            log_tun("create_failed", uid, &name);
+        if let Err(error) = self.backend.create_tun(&name, uid) {
+            if let Some(partial) = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<PartialCreate>())
+            {
+                self.defer(
+                    &name,
+                    CleanupProof::Created {
+                        ifindex: partial.ifindex,
+                    },
+                );
+                log_tun("create_cleanup_pending", uid, &name);
+            } else {
+                self.release(&name);
+                log_tun("create_failed", uid, &name);
+            }
             return Err(ErrorCode::Backend);
         }
         log_tun("created", uid, &name);
         Ok(name)
+    }
+    fn defer(&self, name: &TunName, proof: CleanupProof) {
+        self.pending
+            .lock()
+            .expect("pending mutex")
+            .insert(name.clone(), proof);
     }
     fn release(&self, name: &TunName) {
         self.reserved
@@ -384,11 +423,7 @@ impl<B: Backend + 'static> Session<'_, B> {
     }
     fn delete(&self, name: &TunName) -> Result<(), ErrorCode> {
         self.server.backend.delete_tun(name).map_err(|_| {
-            self.server
-                .pending
-                .lock()
-                .expect("pending mutex")
-                .insert(name.clone());
+            self.server.defer(name, CleanupProof::Marked);
             log_tun("delete_failed", self.uid, name);
             ErrorCode::Backend
         })?;

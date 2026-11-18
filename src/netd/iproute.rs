@@ -5,6 +5,7 @@ use std::{
     error::Error,
     fmt,
     io::{self, Read},
+    num::NonZeroU32,
     os::fd::AsRawFd,
     path::PathBuf,
     process::{Command, Stdio},
@@ -25,6 +26,30 @@ pub trait Backend: Send + Sync {
 pub struct Existing {
     pub name: TunName,
     pub owned: bool,
+    pub ifindex: NonZeroU32,
+    pub is_tun: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct PartialCreate {
+    pub(super) ifindex: NonZeroU32,
+    pub(super) alias: io::Error,
+    pub(super) rollback: io::Error,
+}
+impl fmt::Display for PartialCreate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ip: tun alias and rollback failed ({}, {})",
+            self.alias.kind(),
+            self.rollback.kind()
+        )
+    }
+}
+impl Error for PartialCreate {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.alias)
+    }
 }
 
 pub struct IpRoute {
@@ -307,6 +332,7 @@ fn parse_existing(bytes: &[u8]) -> io::Result<Vec<Existing>> {
     #[derive(Deserialize)]
     struct Link {
         ifname: String,
+        ifindex: NonZeroU32,
         ifalias: Option<String>,
         linkinfo: Option<LinkInfo>,
     }
@@ -320,25 +346,44 @@ fn parse_existing(bytes: &[u8]) -> io::Result<Vec<Existing>> {
         .into_iter()
         .filter_map(|link| {
             let name = TunName::parse(&link.ifname).ok()?;
-            let owned = link.ifalias.as_deref() == Some("vpnt-helper")
-                && link.linkinfo.and_then(|info| info.info_kind).as_deref() == Some("tun");
-            Some(Existing { name, owned })
+            let is_tun = link.linkinfo.and_then(|info| info.info_kind).as_deref() == Some("tun");
+            let owned = is_tun && link.ifalias.as_deref() == Some("vpnt-helper");
+            Some(Existing {
+                name,
+                owned,
+                ifindex: link.ifindex,
+                is_tun,
+            })
         })
         .collect())
 }
 impl Backend for IpRoute {
     fn create_tun(&self, name: &TunName, owner: u32) -> io::Result<()> {
         self.run(false, &create_args(name, owner))?;
-        if let Err(alias_error) = self.run(false, &alias_args(name)) {
-            if self.run(false, &delete_args(name)).is_err() {
-                // Surface the failed rollback without disclosing command output.
-                return Err(command_error(
-                    "ip",
-                    alias_error.kind(),
-                    "alias and rollback failed",
-                ));
+        let ifindex = match self.created_ifindex(name) {
+            Ok(ifindex) => ifindex,
+            Err(error) => {
+                // No identity was established. Compensate the successful create,
+                // but never grant an unmarked link retry authority without a proof.
+                if self.run(false, &delete_args(name)).is_err() {
+                    return Err(command_error(
+                        "ip",
+                        error.kind(),
+                        "tun identity lookup and rollback failed",
+                    ));
+                }
+                return Err(error);
             }
-            return Err(alias_error);
+        };
+        if let Err(alias) = self.run(false, &alias_args(name)) {
+            return match self.run(false, &delete_args(name)) {
+                Ok(_) => Err(alias),
+                Err(rollback) => Err(io::Error::other(PartialCreate {
+                    ifindex,
+                    alias,
+                    rollback,
+                })),
+            };
         }
         Ok(())
     }
@@ -379,6 +424,20 @@ impl Backend for IpRoute {
     }
 }
 impl IpRoute {
+    fn created_ifindex(&self, name: &TunName) -> io::Result<NonZeroU32> {
+        let bytes = self.run(
+            false,
+            &strings(&["-j", "-d", "link", "show", "dev", name.as_str()]),
+        )?;
+        let entries = parse_existing(&bytes)?;
+        match entries.as_slice() {
+            [entry] if &entry.name == name && entry.is_tun => Ok(entry.ifindex),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ip: unexpected created link",
+            )),
+        }
+    }
     fn route_exists_on(&self, prefix: &str, name: &TunName) -> io::Result<bool> {
         #[derive(Deserialize)]
         struct RouteDevice {
