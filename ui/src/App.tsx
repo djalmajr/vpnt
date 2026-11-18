@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ComponentDialog,
   ComponentStatus,
@@ -43,6 +43,24 @@ export function App() {
     installFailure,
     installComponent,
   } = useAppState();
+  const panelRef = useRef<HTMLElement>(null);
+  const [dismissedNotices, setDismissedNotices] = useState<
+    Record<string, { state: string; identity: string }>
+  >({});
+  useEffect(() => {
+    if (!snapshot) return;
+    setDismissedNotices((previous) => {
+      const current = new Map(
+        snapshot.vpns.map((vpn) => [vpn.profile.id, vpn.state]),
+      );
+      const entries = Object.entries(previous).filter(
+        ([id, notice]) => current.get(id) === notice.state,
+      );
+      return entries.length === Object.keys(previous).length
+        ? previous
+        : Object.fromEntries(entries);
+    });
+  }, [snapshot]);
   const installBusy = !!installAttempt || !!snapshot?.componentOperation;
   const installBlocked = snapshot ? componentBlocked(snapshot) : false;
   const updating = installAttempt?.updating ?? snapshot?.helper === "outdated";
@@ -57,7 +75,7 @@ export function App() {
     [commitNavigation, navigationGuard],
   );
   return (
-    <main id="panel" className="panel">
+    <main id="panel" className="panel" ref={panelRef} tabIndex={-1}>
       <div className="panel-content">
         {snapshot?.demo && (
           <aside className="demo-label" title={t("demoHint")}>
@@ -65,11 +83,18 @@ export function App() {
           </aside>
         )}
         {error && (
-          <Notice tone="error">
+          <Notice
+            tone="error"
+            t={t}
+            onDismiss={() => {
+              setError(undefined);
+              const firstControl = panelRef.current?.querySelector<HTMLElement>(
+                "button:not(:disabled):not(.notice-dismiss), select:not(:disabled), input:not(:disabled), a[href]",
+              );
+              (firstControl ?? panelRef.current)?.focus();
+            }}
+          >
             <p role="alert">{t(error)}</p>
-            <button type="button" onClick={() => setError(undefined)}>
-              {t("close")}
-            </button>
           </Notice>
         )}
         {!snapshot ? (
@@ -137,6 +162,27 @@ export function App() {
                     <VpnCard
                       key={vpn.profile.id}
                       vpn={vpn}
+                      dismissed={
+                        dismissedNotices[vpn.profile.id]?.identity ===
+                        JSON.stringify([
+                          vpn.state,
+                          vpn.log.at(-1)?.timestamp ?? null,
+                          vpn.log.length,
+                        ])
+                      }
+                      dismiss={() =>
+                        setDismissedNotices((previous) => ({
+                          ...previous,
+                          [vpn.profile.id]: {
+                            state: vpn.state,
+                            identity: JSON.stringify([
+                              vpn.state,
+                              vpn.log.at(-1)?.timestamp ?? null,
+                              vpn.log.length,
+                            ]),
+                          },
+                        }))
+                      }
                       t={t}
                       run={run}
                       navigate={navigate}
