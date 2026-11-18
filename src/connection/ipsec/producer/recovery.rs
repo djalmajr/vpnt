@@ -150,6 +150,8 @@ fn rebooted(record: &Record, reads: &mut impl OrphanReads) -> Result<bool, Route
         return Ok(false);
     }
     Ok(match reads.launchd_start() {
+        // `min` keeps `boot` only when it precedes launchd (a backward step), which the guard
+        // above already accepted: the mutant `launchd` is equivalent and no oracle can kill it.
         Ok(launchd) => booted_after(&record.controller, boot.min(launchd)),
         Err(_) => true,
     })

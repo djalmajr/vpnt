@@ -73,6 +73,7 @@ jobs:
         run: |
           cargo +1.99.0 fmt --check
           cargo +1.99.0 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.99.0 clippy --locked --all-targets --no-default-features -- -D warnings
           cargo +1.99.0 test --locked --all-targets --all-features
           cargo +1.99.0 build --locked
       - name: Package unsigned development app
@@ -221,6 +222,14 @@ jobs:
         run: python3 scripts/macos/check-utun-handoff.py
       - name: Verify permanent original-TU protected UDP fixture
         run: python3 scripts/macos/check-protected-udp.py
+      - name: Install Rust toolchain for the charon configuration oracle
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Fetch locked Rust dependencies for the offline charon oracle
+        run: cargo +1.99.0 fetch --locked
+      - name: Verify rendered charon configuration with the original strongSwan parser
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: python3 scripts/macos/check-charon-config.py
 
   core:
     runs-on: ubuntu-24.04
