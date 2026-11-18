@@ -47,7 +47,10 @@ pub struct ProfileStore {
 
 enum ConfigChange {
     None,
+    // Only the Linux admin path stores .ovpn files.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Remove,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Replace(Option<Vec<u8>>),
 }
 
@@ -171,6 +174,7 @@ impl ProfileStore {
         self.ovpn_file(&dir, &name).map(|file| file.is_some())
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn read_ovpn_config(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let name = ovpn_name(id)?;
         let Some(dir) = self.ovpn_directory(false)? else {

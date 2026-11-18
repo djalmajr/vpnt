@@ -160,7 +160,7 @@ fn runtime_busy_wait_is_bounded_and_does_not_send_fatal() {
         &mut server,
         Duration::from_millis(100),
         &mut announced,
-        || Err(super::super::controller_lock::LockError::Busy),
+        || Err::<(), _>(super::super::controller_lock::LockError::Busy),
     );
     assert!(matches!(result, Err(ErrorCode::ProfileBusy)));
     assert!(announced);
@@ -550,7 +550,7 @@ pub(crate) fn busy_wire(id: &str) -> Vec<u8> {
         &mut server,
         Duration::from_millis(50),
         &mut announced,
-        || Err(super::super::controller_lock::LockError::Busy),
+        || Err::<(), _>(super::super::controller_lock::LockError::Busy),
     );
     assert!(matches!(result, Err(ErrorCode::ProfileBusy)));
     send_admission_error(&mut server, announced, ErrorCode::ProfileBusy);
