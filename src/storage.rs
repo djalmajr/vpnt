@@ -83,8 +83,23 @@ impl ProfileStore {
                 share
             }
         };
+        match fs::symlink_metadata(&base) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let parent = base.parent().ok_or(StoreError::UntrustedPath)?;
+                check_ancestors(parent, uid)?;
+                create_private_dir_if_missing(&base, uid, true)?;
+            }
+            Err(_) => return Err(StoreError::UntrustedPath),
+        }
         check_ancestors(&base, uid)?;
-        let dir = base.join("vpnt");
+        let app_dir = base.join("vpnt");
+        create_private_dir_if_missing(&app_dir, uid, false)?;
+        let metadata = fs::symlink_metadata(&app_dir).map_err(|_| StoreError::UntrustedPath)?;
+        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return Err(StoreError::UntrustedPath);
+        }
+        let dir = app_dir.join("profiles");
         create_private_dir_if_missing(&dir, uid, true)?;
         Self::open(dir, uid)
     }
@@ -416,11 +431,25 @@ mod linux_tests {
         let base = f.path.join("xdg");
         fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
         let store = f.make(Some(base.clone().into_os_string()), None).unwrap();
-        assert_eq!(store.directory, base.join("vpnt"));
+        assert_eq!(store.directory, base.join("vpnt/profiles"));
         assert_eq!(mode(&store.directory), 0o700);
         let expected = profile();
         store.save(expected.clone()).unwrap();
         assert_eq!(store.load().unwrap(), vec![expected]);
+    }
+    #[test]
+    fn missing_xdg_base_is_created_private_without_creating_its_parent() {
+        let f = Fixture::new();
+        let base = f.path.join("new-base");
+        let store = f.make(Some(base.clone().into_os_string()), None).unwrap();
+        assert_eq!(mode(&base), 0o700);
+        assert_eq!(store.directory, base.join("vpnt/profiles"));
+        let nested = f.path.join("missing-parent/base");
+        assert!(matches!(
+            f.make(Some(nested.into_os_string()), None),
+            Err(StoreError::UntrustedPath)
+        ));
+        assert!(!f.path.join("missing-parent").exists());
     }
     #[test]
     fn relative_or_empty_xdg_uses_home_and_creates_only_share() {
@@ -432,7 +461,7 @@ mod linux_tests {
             let f = Fixture::new();
             let home = f.home();
             let store = f.make(xdg, Some(home.clone().into_os_string())).unwrap();
-            assert_eq!(store.directory, home.join(".local/share/vpnt"));
+            assert_eq!(store.directory, home.join(".local/share/vpnt/profiles"));
             assert_eq!(mode(&home.join(".local/share")), 0o700);
             assert_eq!(mode(&store.directory), 0o700);
         }
@@ -460,32 +489,93 @@ mod linux_tests {
         ));
     }
     #[test]
-    fn existing_wrong_mode_and_symlink_are_refused_without_changes() {
+    fn app_directory_shared_with_webkit_is_accepted_without_changing_contents() {
         let f = Fixture::new();
-        let dir = f.path.join("vpnt");
-        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let app = f.path.join("vpnt");
+        fs::DirBuilder::new().mode(0o700).create(&app).unwrap();
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(app.join("hsts-storage.sqlite"), b"fixture").unwrap();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        assert_eq!(store.directory, app.join("profiles"));
+        assert_eq!(mode(&app), 0o755);
+        assert_eq!(mode(&store.directory), 0o700);
+        assert_eq!(
+            fs::read(app.join("hsts-storage.sqlite")).unwrap(),
+            b"fixture"
+        );
+        let expected = profile();
+        store.save(expected.clone()).unwrap();
+        assert_eq!(store.load().unwrap(), [expected]);
+    }
+    #[test]
+    fn group_writable_app_directory_is_refused_before_creating_profiles() {
+        let f = Fixture::new();
+        let app = f.path.join("vpnt");
+        fs::DirBuilder::new().mode(0o700).create(&app).unwrap();
+        fs::set_permissions(&app, fs::Permissions::from_mode(0o775)).unwrap();
         assert!(matches!(
             f.make(Some(f.path.clone().into_os_string()), None),
             Err(StoreError::UntrustedPath)
         ));
-        assert_eq!(mode(&dir), 0o755);
-        fs::remove_dir(&dir).unwrap();
-        let target = f.path.join("target");
-        fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
-        symlink(&target, &dir).unwrap();
+        assert_eq!(mode(&app), 0o775);
+        assert!(!app.join("profiles").exists());
+    }
+    #[test]
+    fn profiles_with_wrong_mode_are_refused_without_changes() {
+        let f = Fixture::new();
+        let app = f.path.join("vpnt");
+        fs::DirBuilder::new().mode(0o700).create(&app).unwrap();
+        let profiles = app.join("profiles");
+        fs::DirBuilder::new().mode(0o700).create(&profiles).unwrap();
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
             f.make(Some(f.path.clone().into_os_string()), None),
             Err(StoreError::UntrustedPath)
         ));
-        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
-        assert_eq!(mode(&target), 0o700);
+        assert_eq!(mode(&profiles), 0o755);
+        assert!(matches!(
+            create_private_dir_if_missing(&profiles, f.uid, true),
+            Err(StoreError::UntrustedPath)
+        ));
+        assert!(matches!(
+            ProfileStore::open(&profiles, f.uid),
+            Err(StoreError::UntrustedPath)
+        ));
+        assert_eq!(mode(&profiles), 0o755);
+    }
+    #[test]
+    fn symlinks_in_app_or_profiles_are_refused() {
+        for link_app in [true, false] {
+            let f = Fixture::new();
+            let app = f.path.join("vpnt");
+            let target = f.path.join("target");
+            fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+            let link = if link_app {
+                app
+            } else {
+                fs::DirBuilder::new().mode(0o700).create(&app).unwrap();
+                app.join("profiles")
+            };
+            symlink(&target, &link).unwrap();
+            assert!(matches!(
+                f.make(Some(f.path.clone().into_os_string()), None),
+                Err(StoreError::UntrustedPath)
+            ));
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(mode(&target), 0o700);
+        }
     }
     #[test]
     fn ovpn_directory_is_private_and_never_follows_symlinks() {
         let f = Fixture::new();
         let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
         let dir = store.ovpn_dir().unwrap();
+        assert_eq!(dir, f.path.join("vpnt/profiles/ovpn"));
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(store.ovpn_dir().unwrap(), dir);
         fs::remove_dir(&dir).unwrap();
