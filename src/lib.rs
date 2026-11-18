@@ -28,6 +28,8 @@ pub mod notifications;
 pub mod preferences;
 #[cfg(feature = "desktop")]
 pub mod preview;
+#[cfg(target_os = "linux")]
+pub mod secret_service;
 pub mod secrets;
 pub mod session;
 #[cfg(unix)]

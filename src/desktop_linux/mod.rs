@@ -9,6 +9,9 @@ mod backend;
 mod icon;
 mod omarchy;
 mod placement;
+// Wired into the desktop backend in the subsequent integration slice.
+#[allow(dead_code)]
+mod preferences;
 #[cfg(test)]
 mod tests;
 
