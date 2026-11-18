@@ -4,9 +4,32 @@
 use super::*;
 use crate::connection::macos::{
     probe::{self, Outcome},
-    routing::TunnelPlan,
+    routing::{TransportDefault, TunnelPlan},
 };
 use std::net::IpAddr;
+
+/// The plan and the transport decision are `Routes`, as they were inside
+/// `register_utun`; configuring the owned utun is `Tunnel`.
+fn prepare_owned_utun<T>(
+    networks: &[String],
+    families: (bool, bool),
+    transport_default: impl FnOnce()
+        -> Result<Option<TransportDefault>, crate::connection::routes::Error>,
+    configure: impl FnOnce() -> Result<T, crate::connection::routes::Error>,
+) -> Result<(TunnelPlan, T), Failure> {
+    let mut configuring = false;
+    TunnelPlan::prepare(networks, families, transport_default, |plan| {
+        configuring = true;
+        Ok((plan, configure()?))
+    })
+    .map_err(|_| {
+        if configuring {
+            Failure::at(Step::Tunnel)
+        } else {
+            Failure::at(Step::Routes)
+        }
+    })
+}
 
 impl NativeIpsecAttempt<'_> {
     /// IKE selection and the owned utun are `Tunnel`; route registration and
@@ -40,28 +63,16 @@ impl NativeIpsecAttempt<'_> {
                 candidate.vips.iter().any(IpAddr::is_ipv4),
                 candidate.vips.iter().any(IpAddr::is_ipv6),
             );
-            // The plan and the transport decision are `Routes`, as they were
-            // inside `register_utun`; configuring the owned utun is `Tunnel`.
-            let mut configuring = false;
-            let (route_plan, link) = TunnelPlan::prepare(
+            let (route_plan, link) = prepare_owned_utun(
                 &networks,
                 families,
                 || egress.transport_default(),
-                |plan| {
-                    configuring = true;
-                    let link = admission
+                || {
+                    admission
                         .configure(&candidate, expires, self.canceled.clone())
-                        .map_err(|_| crate::connection::routes::Error::Unavailable)?;
-                    Ok((plan, link))
+                        .map_err(|_| crate::connection::routes::Error::Unavailable)
                 },
-            )
-            .map_err(|_| {
-                if configuring {
-                    unavailable()
-                } else {
-                    routing()
-                }
-            })?;
+            )?;
             self.selected_vips = candidate.vips.clone();
             self.selected_networks = networks.clone();
             self.configured = Some(link.clone());
@@ -188,6 +199,114 @@ impl NativeIpsecAttempt<'_> {
             Outcome::Responsive(_) => Ok(true),
             Outcome::Unresponsive | Outcome::Canceled => Ok(false),
             Outcome::InvalidLink | Outcome::InvalidTarget => Err(unavailable()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `ready_driver` needs a root-built `NativeDomain`, so these drive the
+    //! step split it delegates to, with the real `TunnelPlan::prepare`.
+    use super::*;
+    use crate::connection::routes::{Address, Error, NextHop};
+    use std::cell::Cell;
+
+    fn transport_default() -> TransportDefault {
+        TransportDefault::from_egress(
+            7,
+            NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap())),
+        )
+        .unwrap()
+    }
+
+    /// Calls `prepare_owned_utun`, counting how often each callback ran.
+    fn prepare(
+        networks: &[&str],
+        families: (bool, bool),
+        decision: Result<Option<TransportDefault>, Error>,
+        configured: Result<u16, Error>,
+    ) -> (Result<u16, Failure>, usize, usize) {
+        let networks: Vec<String> = networks.iter().map(|text| (*text).to_owned()).collect();
+        let (decided, configures) = (Cell::new(0), Cell::new(0));
+        let result = prepare_owned_utun(
+            &networks,
+            families,
+            || {
+                decided.set(decided.get() + 1);
+                decision
+            },
+            || {
+                configures.set(configures.get() + 1);
+                configured
+            },
+        )
+        .map(|(_, link)| link);
+        (result, decided.get(), configures.get())
+    }
+
+    /// Before the owned utun is configured, a refused plan or a failed
+    /// transport decision is `Routes`, and nothing is configured.
+    #[test]
+    fn plan_and_transport_failures_before_configuring_are_routes() {
+        for (case, networks, families, decision, decided) in [
+            (
+                "unparsable network",
+                &["10.20.0.0/33"][..],
+                (true, false),
+                Ok(None),
+                0,
+            ),
+            (
+                "no address family",
+                &["10.20.0.0/24"][..],
+                (false, false),
+                Ok(None),
+                0,
+            ),
+            (
+                "unsupported family",
+                &["2001:db8::/32"][..],
+                (true, false),
+                Ok(None),
+                0,
+            ),
+            (
+                "transport decision",
+                &[][..],
+                (true, false),
+                Err(Error::Changed),
+                1,
+            ),
+        ] {
+            let (result, decisions, configures) = prepare(networks, families, decision, Ok(9));
+            let failure = result.expect_err(case);
+            assert_eq!(failure.step, Step::Routes, "{case}");
+            assert_eq!(failure.state, ConnectionState::Dropped, "{case}");
+            assert_eq!(failure.error, ErrorCode::BackendFailure, "{case}");
+            assert_eq!((decisions, configures), (decided, 0), "{case}");
+        }
+    }
+
+    /// Once the plan and the transport decision passed, a failed utun
+    /// configuration is `Tunnel`; the same inputs that configure succeed.
+    #[test]
+    fn utun_configuration_failure_is_tunnel() {
+        for (case, networks, decision, decided) in [
+            ("split tunnel", &["10.20.0.0/24"][..], Ok(None), 0),
+            ("full tunnel", &[][..], Ok(Some(transport_default())), 1),
+        ] {
+            let (result, decisions, configures) =
+                prepare(networks, (true, false), decision, Err(Error::Unavailable));
+            let failure = result.expect_err(case);
+            assert_eq!(failure.step, Step::Tunnel, "{case}");
+            assert_eq!(failure.state, ConnectionState::Dropped, "{case}");
+            assert_eq!(failure.error, ErrorCode::BackendFailure, "{case}");
+            assert_eq!((decisions, configures), (decided, 1), "{case}");
+
+            // Control: the configured link comes back through the same path.
+            let (result, decisions, configures) = prepare(networks, (true, false), decision, Ok(9));
+            assert_eq!(result.ok(), Some(9), "{case}");
+            assert_eq!((decisions, configures), (decided, 1), "{case}");
         }
     }
 }

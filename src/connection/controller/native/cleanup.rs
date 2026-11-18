@@ -585,6 +585,75 @@ mod abandon_tests {
             assert!(attempt.client.is_none() && !attempt.spawn_attempted);
         });
     }
+
+    /// The outgoing network moved after `register_ppp` returned a plan that
+    /// routes through the transport default: `ready` fails at `egress`, after
+    /// it retained the token and before it acquires a route. The test seam
+    /// registers a fixture scope in place of the root-only writer; the egress
+    /// interface no longer exists, so the real `is_current` answers `false`.
+    #[test]
+    fn ready_maps_a_moved_transport_egress_to_egress() {
+        use crate::connection::routes::{Address, NextHop, ppp_networks};
+        struct Injected;
+        impl Drop for Injected {
+            fn drop(&mut self) {
+                READY_PLAN.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let transport_default = Route {
+            key: Key {
+                network: "0.0.0.0/0".parse().unwrap(),
+                scope: 7,
+            },
+            interface: 7,
+            next_hop: NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap())),
+        };
+        let split = ppp_networks(&["203.0.113.0/24".into()], 42, true, false, None).unwrap();
+        let mut full = split.clone();
+        full.insert(0, transport_default);
+        // Control: a plan that does not use the transport default skips the
+        // egress check and fails later, when the fixture scope refuses the ADD.
+        for (case, plan, depends, step) in [
+            ("transport default", full, true, Step::Egress),
+            ("split control", split, false, Step::Routes),
+        ] {
+            // The fixture must outlive the driver, including during unwind.
+            let fixture = crate::connection::ssl::tests::Fixture::new();
+            with_ssl_attempt("ready-egress", |attempt, profiles, profile| {
+                attempt.profile_use = Some(profiles.begin(profile, 1).unwrap());
+                let mut driver = fixture.start("ready.fixture.invalid");
+                driver
+                    .fixture_output(b"INFO:   vpnt: split-route 203.0.113.0/255.255.255.0\nINFO:   vpnt: split-routes 1\n")
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while driver.split_observation().split_count != Some(1) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{case}: split batch not observed"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let link = OwnedPpp::fixture_with_child(driver.fixture_child_id()).unwrap();
+                attempt.client = Some(driver);
+                attempt.link = Some(Arc::new(link));
+                attempt.spawn_attempted = true;
+                let egress = Egress::fixture_departed(profile);
+                assert!(!egress.is_current(profile).unwrap(), "{case}");
+                attempt.egress = Some(Box::new(egress));
+                READY_PLAN.with(|slot| *slot.borrow_mut() = Some(plan));
+                let _injected = Injected;
+                let failure = attempt.ready().expect_err(case);
+                assert_eq!(failure.step, step, "{case}");
+                assert_eq!(failure.state, ConnectionState::Dropped, "{case}");
+                assert_eq!(failure.error, ErrorCode::BackendFailure, "{case}");
+                // The seam ran: registration consumed the plan.
+                assert!(READY_PLAN.with(|slot| slot.borrow().is_none()), "{case}");
+                assert_eq!(attempt.requires_transport_default, depends, "{case}");
+                assert!(attempt.token.is_some(), "{case}: token retained first");
+                assert!(attempt.lease.is_none(), "{case}: no route acquired");
+            });
+        }
+    }
     #[test]
     fn ready_delivers_profile_dns_and_logs_missing_gateway_servers() {
         use crate::connection::controller::native::factory::{AttemptKind, NativeFactory};

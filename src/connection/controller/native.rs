@@ -41,6 +41,9 @@ type DnsPublication = (Vec<std::net::Ipv4Addr>, Vec<String>);
 thread_local! {
     static READY_NETWORKS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static READY_DNS: std::cell::RefCell<Option<Vec<DnsPublication>>> = const { std::cell::RefCell::new(None) };
+    // A plan `register_ppp` returns, with a token for a fixture scope on the
+    // plan's first link route, instead of calling the root-only writer.
+    static READY_PLAN: std::cell::RefCell<Option<Vec<crate::connection::routes::Route>>> = const { std::cell::RefCell::new(None) };
 }
 
 // Forward the exact call to the real backend while observing its input in a
@@ -65,6 +68,14 @@ impl ObservedBackend<'_, '_> {
                 *observed = networks.to_vec();
             }
         });
+        if let Some(plan) = READY_PLAN.with(|slot| slot.borrow_mut().take()) {
+            let link_route = plan
+                .iter()
+                .find(|route| TransportDefault::try_from(**route).is_err())
+                .copied()
+                .ok_or(crate::connection::routes::Error::Invalid)?;
+            return Ok((self.0.fixture_scope(owner, link_route), plan));
+        }
         self.0.register_ppp(link, owner, networks, canceled, egress)
     }
 }
