@@ -130,8 +130,10 @@ fn text(value: Tlv<'_>) -> Option<String> {
         0x13 | 0x16 if value.value.is_ascii() => std::str::from_utf8(value.value).ok()?.to_owned(),
         0x1e if value.value.len().is_multiple_of(2) => value
             .value
-            .chunks_exact(2)
-            .map(|bytes| char::from_u32(u32::from(u16::from_be_bytes([bytes[0], bytes[1]]))))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| char::from_u32(u32::from(u16::from_be_bytes(*bytes))))
             .collect::<Option<String>>()?,
         _ => return None,
     };
