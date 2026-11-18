@@ -1,26 +1,26 @@
 //! Deferred host work runs only while the desktop actor has no user request.
 use super::*;
-use crate::{
-    localization::Locale,
-    notifications::{Notice, Notifier},
-    preferences::ProbeInterval,
-};
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+#[cfg(any(test, feature = "desktop"))]
+use crate::{localization::Locale, notifications::Notice};
+use crate::{notifications::Notifier, preferences::ProbeInterval};
+use std::collections::VecDeque;
+#[cfg(any(test, feature = "desktop"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 pub(super) enum Action {
     Notify {
         id: String,
+        #[cfg(any(test, feature = "desktop"))]
         generation: u64,
+        #[cfg(any(test, feature = "desktop"))]
         current: Arc<AtomicBool>,
     },
     Reconnect {
         id: String,
+        #[cfg(any(test, feature = "desktop"))]
         generation: u64,
     },
 }
@@ -37,6 +37,7 @@ impl<S: SecretStore> Broker<S> {
         self.notifier = notifier;
         self
     }
+    #[cfg(any(test, feature = "desktop"))]
     pub(crate) fn set_locale(&mut self, locale: Locale) {
         self.locale = locale;
     }
@@ -80,13 +81,20 @@ impl<S: SecretStore> Broker<S> {
             if let Some(current) = effects.notice {
                 pending.push(Action::Notify {
                     id: id.clone(),
+                    #[cfg(any(test, feature = "desktop"))]
                     generation: c.generation,
+                    #[cfg(any(test, feature = "desktop"))]
                     current,
                 });
+                // Only `perform_automatic` reads the token; without it the
+                // queued key alone keeps refresh and interruption unchanged.
+                #[cfg(not(any(test, feature = "desktop")))]
+                drop(current);
             }
             if effects.reconnect {
                 pending.push(Action::Reconnect {
                     id: id.clone(),
+                    #[cfg(any(test, feature = "desktop"))]
                     generation: c.generation,
                 });
             }
@@ -131,6 +139,7 @@ impl<S: SecretStore> Broker<S> {
         self.next = next;
         self.sent_interval = Some(self.preferences.interval);
     }
+    #[cfg(any(test, feature = "desktop"))]
     pub(crate) fn perform_automatic(&mut self, current: impl Fn() -> bool) {
         self.poll();
         if !current() || !self.ready || self.component.busy() {
