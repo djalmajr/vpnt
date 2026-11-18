@@ -38,7 +38,9 @@ python3 scripts/macos/check-charon-config.py
 
 O clippy sem a feature `desktop` roda só no job macOS: no Linux, os módulos
 do helper e do broker são exclusivos do macOS e ainda deixam código morto.
-O oráculo do charon roda no job `runtime-handoff`, depois de `build-runtime.py`.
+O oráculo do charon lê o runtime preparado: rode antes
+`python3 scripts/macos/build-runtime.py` (seção do runtime, mais abaixo). No CI
+ele roda no job `runtime-handoff`, depois desse build.
 
 O gate de tokens compara as 94 entradas mapeadas em `DESIGN.md` com o CSS.
 O gate de classes ainda não tem classes proibidas configuradas; sua execução
