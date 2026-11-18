@@ -767,7 +767,24 @@ fn real_backend_saves_profile_through_bridge() {
                 .unwrap();
             recv.recv_timeout(Duration::from_secs(15)).unwrap()
         };
-        let initial = send_request("initial", serde_json::json!({"type":"get_snapshot"}));
+        // Like the UI, ask again while the runtime child is still starting
+        // (a debug executable is hashed first, slowly on a busy runner).
+        let ready_by = Instant::now() + Duration::from_secs(30);
+        let mut attempt = 0;
+        let initial = loop {
+            attempt += 1;
+            let reply = send_request(
+                &format!("initial-{attempt}"),
+                serde_json::json!({"type":"get_snapshot"}),
+            );
+            if reply.snapshot.is_some()
+                || reply.error.as_deref() != Some("backend_unavailable")
+                || Instant::now() >= ready_by
+            {
+                break reply;
+            }
+            thread::sleep(Duration::from_millis(250));
+        };
         assert!(
             initial.snapshot.is_some(),
             "initial snapshot: {:?}",
