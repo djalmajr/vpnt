@@ -271,7 +271,9 @@ impl Session {
         let stream = accept(&listener, &mut openvpn.0)?;
         drop(listener);
         let _ = fs::remove_file(&socket);
-        let control = Arc::new(Mutex::new(stream.try_clone()?));
+        let control_stream = stream.try_clone()?;
+        control_stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let control = Arc::new(Mutex::new(control_stream));
         let reason = Arc::default();
         let (sender, progress) = mpsc::channel();
         let (writer, last_reason) = (Arc::clone(&control), Arc::clone(&reason));
@@ -306,7 +308,10 @@ impl Session {
             )
         };
         if result == 0 && unsafe { info.si_pid() } != 0 {
-            Some(*lock(&self.reason))
+            match self.finished.recv_timeout(DRAIN_TIMEOUT) {
+                Err(RecvTimeoutError::Disconnected) => Some(*lock(&self.reason)),
+                _ => None,
+            }
         } else {
             None
         }
@@ -318,7 +323,31 @@ impl Session {
 
     /// Asks openvpn to leave, notifying the server.
     pub fn stop(&self) -> io::Result<()> {
-        send(&self.control, management::TERMINATE)
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut control = match self.control.try_lock() {
+                Ok(control) => control,
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    };
+                    if remaining.is_zero() {
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                    continue;
+                }
+            };
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(io::ErrorKind::TimedOut.into());
+            };
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            control.set_write_timeout(Some(remaining))?;
+            return control.write_all(management::TERMINATE.as_bytes());
+        }
     }
 
     /// Returns once openvpn has exited and its last lines were read, so a

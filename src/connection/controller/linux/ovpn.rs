@@ -23,6 +23,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::Path,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -147,7 +148,24 @@ pub(super) struct OvpnAttempt<N, T> {
     phase: Option<ConnectionState>,
     down: bool,
     stopped: bool,
+    probe_job: Arc<dyn Fn(String, u16, Instant) -> bool + Send + Sync>,
+    probe_inflight: Option<(mpsc::Receiver<bool>, thread::JoinHandle<()>)>,
     start_real: fn(&mut Self) -> Result<(), Failure>,
+}
+fn probe_connection(host: String, port: u16, deadline: Instant) -> bool {
+    let addresses = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addresses) => addresses,
+        Err(_) => return false,
+    };
+    for address in addresses {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if !remaining.is_zero() && TcpStream::connect_timeout(&address, remaining).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 impl OvpnAttempt<RealNetwork, RealTunnel> {
     pub(super) fn new(profile: Profile, uid: u32) -> Self {
@@ -160,6 +178,8 @@ impl OvpnAttempt<RealNetwork, RealTunnel> {
             phase: None,
             down: false,
             stopped: false,
+            probe_job: Arc::new(probe_connection),
+            probe_inflight: None,
             start_real: Self::open,
         }
     }
@@ -323,6 +343,8 @@ impl<N: Network, T: Tunnel> OvpnAttempt<N, T> {
             phase: None,
             down: false,
             stopped: false,
+            probe_job: Arc::new(probe_connection),
+            probe_inflight: None,
             start_real: |_| Ok(()),
         }
     }
@@ -344,24 +366,49 @@ impl<N: Network, T: Tunnel> Attempt for OvpnAttempt<N, T> {
         self.process(false).map(|_| ())
     }
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
+        if canceled.load(Ordering::Acquire) || timeout.is_zero() {
+            return Ok(false);
+        }
+        if let Some((_, worker)) = self.probe_inflight.as_ref() {
+            if !worker.is_finished() {
+                return Ok(false);
+            }
+            let (_, worker) = self.probe_inflight.take().unwrap();
+            let _ = worker.join();
+        }
         let deadline = Instant::now() + timeout;
-        let addresses =
-            match (self.profile.probe_host.as_str(), self.profile.probe_port).to_socket_addrs() {
-                Ok(a) => a,
-                Err(_) => return Ok(false),
-            };
-        for address in addresses {
+        let job = self.probe_job.clone();
+        let host = self.profile.probe_host.clone();
+        let port = self.profile.probe_port;
+        let (send, recv) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("vpnt-ovpn-probe".into())
+            .spawn(move || {
+                let _ = send.send(job(host, port, deadline));
+            })
+            .map_err(|_| Failure::at(Step::Verify))?;
+        self.probe_inflight = Some((recv, worker));
+        let (recv, _) = self.probe_inflight.as_ref().unwrap();
+        loop {
             if canceled.load(Ordering::Acquire) {
                 return Ok(false);
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
+                return Ok(false);
             };
-            if !remaining.is_zero() && TcpStream::connect_timeout(&address, remaining).is_ok() {
-                return Ok(true);
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            match recv.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(result) => {
+                    return Ok(result
+                        && !canceled.load(Ordering::Acquire)
+                        && Instant::now() < deadline);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
             }
         }
-        Ok(false)
     }
     fn cleanup(&mut self) -> bool {
         if let Some(tunnel) = self.tunnel.as_mut() {

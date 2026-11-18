@@ -522,3 +522,71 @@ fn malformed_environment_outside_up_and_in_down_is_ignored() {
     let (_, progress) = vpn.hang_up();
     assert_eq!(progress, [Progress::Down]);
 }
+
+#[test]
+fn stop_times_out_when_management_does_not_read() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scratch.path.join("openvpn");
+    fs::write(&executable, "#!/usr/bin/python3\nimport socket,sys,time\nif '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[sys.argv.index('--management')+1])\nb=b''\nwhile b.count(b'\\n') < 2: b+=s.recv(1024)\ns.sendall(b'>STATE:1,CONNECTING,,,,,,,\\n')\ntime.sleep(20)\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let session = start_scripted(&executable, FakeToken::default());
+    assert!(matches!(
+        session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Progress::State(_)
+    ));
+    assert_eq!(
+        session.control.lock().unwrap().write_timeout().unwrap(),
+        Some(Duration::from_secs(2))
+    );
+    let mut fill = session.control.lock().unwrap().try_clone().unwrap();
+    fill.set_nonblocking(true).unwrap();
+    loop {
+        match fill.write(&[0u8; 8192]) {
+            Ok(0) => panic!("management socket closed while filling"),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling management socket: {e}"),
+        }
+    }
+    fill.set_nonblocking(false).unwrap();
+    let control = Arc::clone(&session.control);
+    let held = control.lock().unwrap();
+    let (send, recv) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let start = Instant::now();
+        let result = session.stop();
+        let _ = send.send((result, start.elapsed()));
+    });
+    thread::sleep(Duration::from_millis(1300));
+    drop(held);
+    let outcome = recv.recv_timeout(Duration::from_millis(1600));
+    let _ = fill.shutdown(Shutdown::Both);
+    worker.join().unwrap();
+    let (result, elapsed) = outcome.expect("stop blocked for more than 3 seconds");
+    assert!(result.is_err(), "full socket should time out");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[test]
+fn stop_times_out_waiting_for_control_lock() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 20.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let control = Arc::clone(&session.control);
+    let held = control.lock().unwrap();
+    let (send, recv) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let started = Instant::now();
+        let result = session.stop();
+        let _ = send.send((result, started.elapsed()));
+    });
+    let observed = recv.recv_timeout(Duration::from_secs(3));
+    drop(held);
+    worker.join().unwrap();
+    let (result, elapsed) = observed.expect("stop waited over 3 seconds for control lock");
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}

@@ -177,3 +177,154 @@ fn profile_mode_and_probe() {
             .unwrap()
     );
 }
+
+#[test]
+fn real_session_exit_waits_for_auth_failure_on_fifty_attempts() {
+    use crate::connection::ovpn::{session::Signer, signing::Padding};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    struct DelayedSigner;
+    impl Signer for DelayedSigner {
+        fn certificate(&mut self) -> Result<Vec<u8>, SignError> {
+            Ok(vec![1])
+        }
+        fn sign(&mut self, _: Padding, _: &[u8]) -> Result<Vec<u8>, SignError> {
+            thread::sleep(Duration::from_millis(40));
+            Ok(vec![1])
+        }
+    }
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("vpnt-ovpn-auth-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let _fixture = Fixture(dir.clone());
+    let program = dir.join("fake-openvpn");
+    let lines = format!(
+        ">PK_SIGN:{},RSA_PKCS1_PSS_PADDING,hashalg=SHA256,saltlen=digest\n>STATE:2,EXITING,auth-failure,,,,,\n",
+        STANDARD.encode([5u8; 32])
+    );
+    let script = format!(
+        "#!/usr/bin/python3\nimport socket,sys\nif '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[sys.argv.index('--management')+1])\ns.sendall({lines:?}.encode())\n"
+    );
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    for round in 0..50 {
+        let launch = Launch {
+            openvpn: program.clone(),
+            config: "/dev/null".into(),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        };
+        let session = Session::start(launch, DelayedSigner).unwrap();
+        let state = Arc::new(Mutex::new(Observed::default()));
+        let mut attempt = OvpnAttempt::fixture(
+            profile(),
+            FakeNetwork(state),
+            RealTunnel {
+                session: Some(session),
+                waiting: None,
+                wait_failed: false,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let failure = loop {
+            match attempt.ready() {
+                Err(e) => break Some(e),
+                Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+                _ => break None,
+            }
+        };
+        let cleaned = attempt.cleanup();
+        assert!(cleaned, "cleanup failed in round {round}");
+        assert_eq!(
+            failure.expect("no exit").state,
+            ConnectionState::CredentialsRejected,
+            "round {round}"
+        );
+    }
+}
+
+#[test]
+fn probe_deadline_cancellation_and_single_inflight_job() {
+    use std::sync::{Condvar, atomic::AtomicUsize};
+    struct Guard {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cv.notify_all();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+    for cancel_while_waiting in [false, true] {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (mut attempt, _) = attempt(profile(), vec![], None);
+        let inner_gate = gate.clone();
+        let inner_calls = calls.clone();
+        attempt.probe_job = Arc::new(move |_, _, _| {
+            inner_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = started_tx.send(());
+            let (lock, cv) = &*inner_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            let _ = finished_tx.send(());
+            true
+        });
+        let canceled = Arc::new(AtomicBool::new(false));
+        let worker_canceled = canceled.clone();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let deadline = if cancel_while_waiting {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(100)
+            };
+            let first = attempt.probe(&worker_canceled, deadline).unwrap();
+            worker_canceled.store(false, Ordering::Release);
+            let second = attempt
+                .probe(&worker_canceled, Duration::from_millis(100))
+                .unwrap();
+            let _ = answer_tx.send((first, second));
+        });
+        let mut guard = Guard {
+            gate: gate.clone(),
+            worker: Some(worker),
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        if cancel_while_waiting {
+            canceled.store(true, Ordering::Release);
+        }
+        let answer = answer_rx.recv_timeout(Duration::from_millis(600));
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        guard.worker.take().unwrap().join().unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            answer.expect("probe failed to respect deadline or cancellation"),
+            (false, false)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only one job may be in flight"
+        );
+    }
+}
