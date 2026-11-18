@@ -23,6 +23,7 @@ pub struct Route {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkError {
+    Malformed,
     MissingAddress,
     UnsupportedTopology,
     InvalidAddress,
@@ -35,6 +36,7 @@ pub enum NetworkError {
 impl fmt::Display for NetworkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Malformed => "malformed environment",
             Self::MissingAddress => "missing address",
             Self::UnsupportedTopology => "unsupported topology",
             Self::InvalidAddress => "invalid address",
@@ -78,6 +80,16 @@ fn domain(s: &str) -> Option<String> {
         Some(s)
     }
 }
+fn index(s: &str) -> Result<Option<usize>, NetworkError> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let n = s.parse::<usize>().map_err(|_| NetworkError::TooLarge)?;
+    if n > 256 {
+        return Err(NetworkError::TooLarge);
+    }
+    Ok(Some(n))
+}
 pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkError> {
     use NetworkError::*;
     if pairs.len() > 1024 {
@@ -114,10 +126,7 @@ pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkErro
             .strip_prefix("route_network_")
             .or_else(|| key.strip_prefix("route_netmask_"))
         {
-            let Ok(n) = n.parse::<usize>() else { continue };
-            if n > 256 {
-                return Err(TooLarge);
-            }
+            let Some(n) = index(n)? else { continue };
             if n == 0 {
                 continue;
             }
@@ -154,14 +163,14 @@ pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkErro
     }
     let mut dns_servers = Vec::new();
     let mut dns_domains = Vec::new();
-    let mut foreign: Vec<_> = vars
-        .iter()
-        .filter_map(|(key, value)| {
-            key.strip_prefix("foreign_option_")
-                .and_then(|s| s.parse::<usize>().ok())
-                .map(|n| (n, *value))
-        })
-        .collect();
+    let mut foreign = Vec::new();
+    for (&key, &value) in &vars {
+        if let Some(suffix) = key.strip_prefix("foreign_option_") {
+            if let Some(n) = index(suffix)? {
+                foreign.push((n, value));
+            }
+        }
+    }
     foreign.sort_by_key(|entry| entry.0);
     for (_, value) in foreign {
         let mut fields = value.split_whitespace();

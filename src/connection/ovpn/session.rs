@@ -389,6 +389,14 @@ fn drive(
             }
             continue;
         }
+        if event == Event::MalformedEnv {
+            if matches!(block, Some(Some(_))) {
+                let _ = progress.send(Progress::BadNetwork(NetworkError::Malformed));
+                let _ = send(control, management::TERMINATE);
+                block = Some(None);
+            }
+            continue;
+        }
         if let Some(Some(pairs)) = block.take() {
             match network::from_env(&pairs) {
                 Ok(config) => {
@@ -411,7 +419,7 @@ fn drive(
                 None
             }
             Event::EnvEnd => None,
-            Event::Env { .. } => unreachable!(),
+            Event::Env { .. } | Event::MalformedEnv => unreachable!(),
             Event::Hold => Some(management::HOLD_RELEASE.to_owned()),
             Event::NeedCertificate => Some(match signer.certificate() {
                 Ok(der) => management::certificate(&der),

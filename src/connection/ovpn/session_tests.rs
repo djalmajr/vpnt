@@ -463,3 +463,35 @@ fn version_detection_caches_and_times_out() {
     );
     assert!(start.elapsed() < Duration::from_secs(7));
 }
+
+#[test]
+fn malformed_up_environment_rejects_block_and_terminates() {
+    for invalid in [
+        ">UPDOWN:ENV,broken\n",
+        ">UPDOWN:ENV,=value\n",
+        ">UPDOWN:ENV,key=\u{fffd}\n",
+    ] {
+        let mut vpn = Openvpn::connect(FakeToken::default());
+        vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n");
+        if invalid.contains('\u{fffd}') {
+            vpn.writer.write_all(b">UPDOWN:ENV,key=\xff\n").unwrap();
+        } else {
+            vpn.say(invalid);
+        }
+        vpn.say(">UPDOWN:ENV,END\n");
+        assert_eq!(vpn.hear(), management::TERMINATE);
+        let (_, progress) = vpn.hang_up();
+        assert_eq!(progress, [Progress::BadNetwork(NetworkError::Malformed)]);
+    }
+}
+
+#[test]
+fn malformed_environment_outside_up_and_in_down_is_ignored() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(
+        ">UPDOWN:ENV,broken\n>UPDOWN:DOWN\n>UPDOWN:ENV,=invalid\n>UPDOWN:ENV,END\n>HOLD:waiting\n",
+    );
+    assert_eq!(vpn.hear(), management::HOLD_RELEASE);
+    let (_, progress) = vpn.hang_up();
+    assert_eq!(progress, [Progress::Down]);
+}

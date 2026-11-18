@@ -3,6 +3,7 @@
 //! hard length bound and their text is never retained.
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
+    fmt,
     io::{self, BufRead, Read},
     net::Ipv4Addr,
 };
@@ -16,7 +17,7 @@ pub const STATE_ON: &str = "state on\n";
 pub const HOLD_RELEASE: &str = "hold release\n";
 pub const TERMINATE: &str = "signal SIGTERM\n";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum Event {
     Up,
     Down,
@@ -25,6 +26,7 @@ pub enum Event {
         value: String,
     },
     EnvEnd,
+    MalformedEnv,
     Hold,
     State(State),
     NeedCertificate,
@@ -37,6 +39,34 @@ pub enum Event {
     Fatal,
     Ignored,
     Malformed,
+}
+
+impl fmt::Debug for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Env { key, .. } => f
+                .debug_struct("Env")
+                .field("key", key)
+                .field("value", &"<redacted>")
+                .finish(),
+            Self::State(state) => f.debug_tuple("State").field(state).finish(),
+            Self::Sign { data, algorithm } => f
+                .debug_struct("Sign")
+                .field("data", data)
+                .field("algorithm", algorithm)
+                .finish(),
+            Self::Up => f.write_str("Up"),
+            Self::Down => f.write_str("Down"),
+            Self::EnvEnd => f.write_str("EnvEnd"),
+            Self::MalformedEnv => f.write_str("MalformedEnv"),
+            Self::Hold => f.write_str("Hold"),
+            Self::NeedCertificate => f.write_str("NeedCertificate"),
+            Self::UnreadableSign => f.write_str("UnreadableSign"),
+            Self::Fatal => f.write_str("Fatal"),
+            Self::Ignored => f.write_str("Ignored"),
+            Self::Malformed => f.write_str("Malformed"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,7 +106,11 @@ pub fn parse(line: &[u8]) -> Event {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let Ok(line) = std::str::from_utf8(line) else {
-        return Event::Malformed;
+        return if line.starts_with(b">UPDOWN:ENV,") {
+            Event::MalformedEnv
+        } else {
+            Event::Malformed
+        };
     };
     let Some((kind, payload)) = line.strip_prefix('>').and_then(|rest| rest.split_once(':')) else {
         return Event::Ignored;
@@ -91,6 +125,7 @@ pub fn parse(line: &[u8]) -> Event {
                     key: key.into(),
                     value: value.into(),
                 },
+                _ if payload.starts_with("ENV,") => Event::MalformedEnv,
                 _ => Event::Malformed,
             },
         },

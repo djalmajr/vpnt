@@ -106,3 +106,27 @@ fn route_and_environment_bounds() {
     let many = vec![("unknown".to_string(), "value".to_string()); 1025];
     assert_eq!(from_env(&many), Err(NetworkError::TooLarge));
 }
+
+#[test]
+fn oversized_numeric_indices_are_rejected_and_unknown_keys_ignored() {
+    for stem in ["route_network_", "route_netmask_", "foreign_option_"] {
+        for suffix in ["9".repeat(80), "257".to_string()] {
+            let mut env = pairs(&[]);
+            env.push((format!("{stem}{suffix}"), "ignored".into()));
+            assert_eq!(
+                from_env(&env),
+                Err(NetworkError::TooLarge),
+                "{stem}{suffix}"
+            );
+        }
+        let mut env = pairs(&[]);
+        env.push((format!("{stem}1x"), "ignored".into()));
+        assert!(from_env(&env).is_ok(), "{stem}1x");
+    }
+    let mut env = pairs(&[]);
+    env.push((
+        "foreign_option_256".into(),
+        "dhcp-option DNS 10.0.0.1".into(),
+    ));
+    assert_eq!(from_env(&env).unwrap().dns_servers.len(), 1);
+}

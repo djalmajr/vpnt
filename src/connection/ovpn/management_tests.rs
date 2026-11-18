@@ -167,6 +167,16 @@ fn updown_events() {
         }
     );
     assert_eq!(parse(b">UPDOWN:ENV,END\n"), Event::EnvEnd);
-    assert_eq!(parse(b">UPDOWN:ENV,=x\n"), Event::Malformed);
-    assert_eq!(parse(b">UPDOWN:ENV,broken\n"), Event::Malformed);
+    assert_eq!(parse(b">UPDOWN:ENV,=x\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:ENV,broken\n"), Event::MalformedEnv);
+}
+
+#[test]
+fn environment_debug_redacts_value() {
+    let event = parse(b">UPDOWN:ENV,probe_key=synthetic_private_value\n");
+    let debug = format!("{event:?}");
+    assert!(debug.contains("probe_key"));
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("synthetic_private_value"));
+    assert_eq!(parse(b">UPDOWN:ENV,foo=\xff\n"), Event::MalformedEnv);
 }
