@@ -140,7 +140,21 @@ impl Fixture {
             ])
             .args([
                 "--push",
-                "route 10.81.0.0 255.255.255.0",
+                "topology subnet",
+                "--push",
+                "ifconfig 10.81.0.2 255.255.255.0",
+                "--push",
+                "route-gateway 10.81.0.1",
+                "--push",
+                "route 10.82.0.0 255.255.0.0",
+                "--push",
+                "route 10.83.0.0 255.255.0.0",
+                "--push",
+                "dhcp-option DNS 10.81.0.1",
+                "--push",
+                "dhcp-option DNS 10.81.0.3",
+                "--push",
+                "dhcp-option DOMAIN example.test",
                 "--ifconfig-noexec",
                 "--route-noexec",
             ])

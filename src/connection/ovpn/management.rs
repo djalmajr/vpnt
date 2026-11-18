@@ -18,6 +18,13 @@ pub const TERMINATE: &str = "signal SIGTERM\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
+    Up,
+    Down,
+    Env {
+        key: String,
+        value: String,
+    },
+    EnvEnd,
     Hold,
     State(State),
     NeedCertificate,
@@ -75,6 +82,18 @@ pub fn parse(line: &[u8]) -> Event {
         return Event::Ignored;
     };
     match kind {
+        "UPDOWN" => match payload {
+            "UP" => Event::Up,
+            "DOWN" => Event::Down,
+            "ENV,END" => Event::EnvEnd,
+            _ => match payload.strip_prefix("ENV,").and_then(|s| s.split_once('=')) {
+                Some((key, value)) if !key.is_empty() => Event::Env {
+                    key: key.into(),
+                    value: value.into(),
+                },
+                _ => Event::Malformed,
+            },
+        },
         "HOLD" => Event::Hold,
         "STATE" => state(payload).map_or(Event::Malformed, Event::State),
         "NEED-CERTIFICATE" => Event::NeedCertificate,

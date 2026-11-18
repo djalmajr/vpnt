@@ -154,3 +154,19 @@ fn certificate_is_a_pem_block_inside_the_certificate_command() {
         "certificate\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\nEND\n"
     );
 }
+
+#[test]
+fn updown_events() {
+    assert_eq!(parse(b">UPDOWN:UP\n"), Event::Up);
+    assert_eq!(parse(b">UPDOWN:DOWN\n"), Event::Down);
+    assert_eq!(
+        parse(b">UPDOWN:ENV,dev=vpnt0\n"),
+        Event::Env {
+            key: "dev".into(),
+            value: "vpnt0".into()
+        }
+    );
+    assert_eq!(parse(b">UPDOWN:ENV,END\n"), Event::EnvEnd);
+    assert_eq!(parse(b">UPDOWN:ENV,=x\n"), Event::Malformed);
+    assert_eq!(parse(b">UPDOWN:ENV,broken\n"), Event::Malformed);
+}

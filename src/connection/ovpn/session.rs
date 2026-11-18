@@ -8,24 +8,122 @@
 //! the vpnt helper, so a `Connected` state alone does not mean traffic flows.
 use super::{
     management::{self, Event, Reason, State},
+    network::{self, NetworkConfig, NetworkError},
     private_dir::PrivateDir,
     signing::Padding,
 };
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         mpsc::{self, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+type Version = Option<(u64, u64)>;
+static VERSIONS: OnceLock<Mutex<HashMap<PathBuf, Version>>> = OnceLock::new();
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn parse_version(output: &[u8]) -> Version {
+    let line = std::str::from_utf8(output).ok()?.lines().next()?;
+    let mut words = line.split_whitespace();
+    if words.next()? != "OpenVPN" {
+        return None;
+    }
+    let mut numbers = words.next()?.split('.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn version_for(path: &Path) -> io::Result<Version> {
+    let mut cache = lock(VERSIONS.get_or_init(|| Mutex::new(HashMap::new())));
+    if let Some(version) = cache.get(path) {
+        return Ok(*version);
+    }
+    let mut child = Openvpn(
+        Command::new(path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let mut output = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("version output unavailable"))?;
+    use std::os::fd::AsRawFd;
+    let fd = output.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let deadline = Instant::now() + VERSION_TIMEOUT;
+    let mut captured = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        for _ in 0..4 {
+            match output.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let remaining = 4096usize.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..n.min(remaining)]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(status) = child.0.try_wait()? {
+            if !status.success() {
+                return Err(io::Error::other("openvpn version check failed"));
+            }
+            while captured.len() < 4096 {
+                match output.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remaining = 4096 - captured.len();
+                        captured.extend_from_slice(&buffer[..n.min(remaining)]);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            let version = parse_version(&captured);
+            if version.is_none() {
+                eprintln!("warning: could not read OpenVPN version");
+            }
+            cache.insert(path.to_owned(), version);
+            return Ok(version);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "openvpn version check timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn add_extra_options(command: &mut Command, extra: &[OsString], version: Version) {
+    command.args(extra);
+    if version.is_some_and(|version| version >= (2, 7)) {
+        command.args(["--dns-updown", "disable"]);
+    }
+}
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `wait` lets the management thread read openvpn's last lines.
@@ -51,6 +149,7 @@ pub enum SignError {
 pub struct Launch {
     pub openvpn: PathBuf,
     pub config: PathBuf,
+    pub dev: Option<String>,
     pub signatures: Signatures,
     pub extra: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
@@ -79,6 +178,9 @@ const PKCS1_ONLY: &str = "openssl_conf = vpnt\n[vpnt]\nssl_conf = vpnt_ssl\n\
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Progress {
+    Up(NetworkConfig),
+    Down,
+    BadNetwork(NetworkError),
     AwaitingApproval,
     State(State),
     Refused(SignError),
@@ -103,25 +205,34 @@ pub struct Session {
 }
 
 impl Session {
+    /// On Linux the child receives SIGTERM when the thread calling this method
+    /// dies; that thread must outlive the session.
     pub fn start(launch: Launch, signer: impl Signer) -> io::Result<Self> {
+        let version = version_for(&launch.openvpn)?;
         let directory = PrivateDir::create(Path::new("/tmp"))?;
         let socket = directory.path.join("management");
         let listener = UnixListener::bind(&socket)?;
         let mut command = Command::new(&launch.openvpn);
+        command.arg("--config").arg(&launch.config);
+        if let Some(dev) = &launch.dev {
+            command.args(["--dev", dev, "--dev-type", "tun", "--disable-dco"]);
+        }
         command
-            .arg("--config")
-            .arg(&launch.config)
             .arg("--management")
             .arg(&socket)
             .arg("unix")
-            .args(["--management-client", "--management-hold"])
+            .args([
+                "--management-client",
+                "--management-hold",
+                "--management-up-down",
+            ])
             .args(["--management-external-cert", "vpnt"])
             .args(["--route-noexec", "--ifconfig-noexec"])
-            .args(&launch.extra)
             .envs(launch.env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        add_extra_options(&mut command, &launch.extra, version);
         match launch.signatures {
             Signatures::Any => {
                 command.args(["--management-external-key", "pkcs1", "pss"]);
@@ -135,6 +246,25 @@ impl Session {
                     .args(["--management-external-key", "pkcs1"])
                     .args(["--tls-version-max", "1.2"])
                     .env("OPENSSL_CONF", config);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = unsafe { libc::getpid() };
+            // With pre_exec, spawn waits for fork/exec via its CLOEXEC pipe,
+            // keeping this calling thread alive through prctl. getppid checks
+            // process death between fork and prctl.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        return Err(io::Error::other("parent exited"));
+                    }
+                    Ok(())
+                });
             }
         }
         let mut openvpn = Openvpn(command.spawn()?);
@@ -244,8 +374,44 @@ fn drive(
     // A failed write means openvpn is gone; its last lines are still worth
     // reading, so writes never end the loop, only the end of the stream does.
     let _ = send(control, management::VERSION).and_then(|()| send(control, management::STATE_ON));
+    let mut block: Option<Option<Vec<(String, String)>>> = None;
     while let Ok(true) = management::read_line(&mut reader, &mut line) {
-        let reply = match management::parse(&line) {
+        let event = management::parse(&line);
+        if let Event::Env { key, value } = event {
+            if let Some(Some(pairs)) = &mut block {
+                if pairs.len() == 1024 {
+                    let _ = progress.send(Progress::BadNetwork(NetworkError::TooLarge));
+                    let _ = send(control, management::TERMINATE);
+                    block = Some(None);
+                } else {
+                    pairs.push((key, value));
+                }
+            }
+            continue;
+        }
+        if let Some(Some(pairs)) = block.take() {
+            match network::from_env(&pairs) {
+                Ok(config) => {
+                    let _ = progress.send(Progress::Up(config));
+                }
+                Err(error) => {
+                    let _ = progress.send(Progress::BadNetwork(error));
+                    let _ = send(control, management::TERMINATE);
+                }
+            }
+        }
+        let reply = match event {
+            Event::Up => {
+                block = Some(Some(Vec::new()));
+                None
+            }
+            Event::Down => {
+                let _ = progress.send(Progress::Down);
+                block = Some(None);
+                None
+            }
+            Event::EnvEnd => None,
+            Event::Env { .. } => unreachable!(),
             Event::Hold => Some(management::HOLD_RELEASE.to_owned()),
             Event::NeedCertificate => Some(match signer.certificate() {
                 Ok(der) => management::certificate(&der),
