@@ -83,7 +83,7 @@ def main():
         ('reservation-inherited-through-exec',reservation,leak_fd,['--test','profile_reservations',independent],independent),
         ('cached-metadata-used-after-edit',profiles,lambda s:replace(s,'if current != *profile {','if false {'),['--lib',cached],cached),
         ('worker-unwind-releases-reservation',profiles,lambda s:replace(s,'            reservation.live = false;\n','            all.remove(&self.key);\n'),['--lib',retained],retained),
-        ('cleanup-releases-invalid-reservation',profiles,lambda s:replace(s,'        all.get(&self.key)\n            .ok_or(StoreError::InvalidData)?\n            .validate()?;\n',''),['--lib',cached],cached),
+        ('cleanup-releases-invalid-reservation',profiles,lambda s:replace(s,'        all.get(&self.key)\n            .ok_or(StoreError::InvalidData)?\n            .profile\n            .validate()?;\n',''),['--lib',cached],cached),
         ('snapshot-does-not-refresh-catalog','src/connection/controller/engine.rs',lambda s:replace(s,'metadata::refresh(&mut slots, profiles, &interval)?;','let _ = profiles;'),['--lib',refresh],refresh),
         ('changed-metadata-keeps-generation',metadata,lambda s:replace(s,'                slot.generation += 1;\n',''),['--lib',refresh],refresh),
         ('removed-profile-remains-visible',metadata,lambda s:replace(s,'    slots.retain(|id, _| next.contains_key(id));\n',''),['--lib',refresh],refresh),
