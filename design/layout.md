@@ -55,7 +55,9 @@ Por correção do Djalma em 2026-11-13, o popover abre na tela do clique, como n
 Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
 (`panel-min-height`, 480 px) e a conserva entre telas, para não haver
 deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
-com a mesma medida. Conteúdo mais alto cresce até `panel-max-height`; tela mais
+com a mesma medida. Enquanto o viewport estiver vazio, como no WebKitGTK antes
+da primeira exibição, a interface não mede: o texto quebraria numa coluna sem
+largura e o pedido iria ao teto. Conteúdo mais alto cresce até `panel-max-height`; tela mais
 baixa limita a janela e o painel rola.
 O pedido ao host soma a estrutura fixa ao `scrollHeight` de panel-content,
 independentemente do viewport atual; mudanças internas também são observadas.

@@ -9,6 +9,9 @@ pub mod cli;
 pub mod connection;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub mod desktop;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+#[path = "desktop_linux/mod.rs"]
+pub mod desktop;
 #[cfg(unix)]
 mod fs_permissions;
 pub mod helper;

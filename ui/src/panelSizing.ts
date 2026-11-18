@@ -106,6 +106,11 @@ export function observePanelHeight(
   const root = document.documentElement;
   let previous = 0;
   const report = () => {
+    // A window that was never shown can have an empty viewport (WebKitGTK on
+    // Linux). The text then wraps in a zero-width column and the panel would ask
+    // for its limit, so the window would open at it. Measure once the window
+    // has a size: the panel resizes then and the observer reports again.
+    if (!(window.innerWidth > 0 && window.innerHeight > 0)) return;
     const panel = document.getElementById("panel");
     const content = panel?.querySelector<HTMLElement>(".panel-content");
     const panelHeight = panel?.getBoundingClientRect().height ?? 360;

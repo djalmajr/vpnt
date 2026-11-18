@@ -82,8 +82,11 @@ test("a altura predefinida é o piso do pedido e respeita o teto", () => {
   expect(requestedHeight({ natural: 300, reserve: 600, min: 480 })).toBe(600);
 });
 
-test("conteúdo limitado pelo viewport cresce até o teto e é observado por dentro", () => {
+/** Installs the globals observePanelHeight reads, with a panel whose content
+ * scroll height the test controls, and returns the controls. */
+function mockPanelDom(viewport = { innerWidth: 320, innerHeight: 480 }) {
   const keys = [
+    "window",
     "document",
     "getComputedStyle",
     "ResizeObserver",
@@ -115,6 +118,7 @@ test("conteúdo limitado pelo viewport cresce até o teto e é observado por den
   let mutate = () => {};
   let disconnected = 0;
   const mocks = [
+    viewport,
     {
       documentElement: root,
       getElementById: (id: string) => (id === "panel" ? panel : target),
@@ -147,36 +151,60 @@ test("conteúdo limitado pelo viewport cresce até o teto e é observado por den
       }
     },
   ];
-  try {
-    keys.forEach((key, index) => {
-      Object.defineProperty(globalThis, key, {
-        configurable: true,
-        value: mocks[index],
-      });
+  keys.forEach((key, index) => {
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      value: mocks[index],
     });
+  });
+  return {
+    child,
+    content,
+    observed,
+    viewport,
+    setContentHeight: (height: number) => {
+      contentHeight = height;
+    },
+    resize: () => resize(),
+    mutate: () => mutate(),
+    disconnected: () => disconnected,
+    restore: () => {
+      keys.forEach((key, index) => {
+        const original = originals[index];
+        if (original) Object.defineProperty(globalThis, key, original);
+        else Reflect.deleteProperty(globalThis, key);
+      });
+    },
+  };
+}
+
+test("conteúdo limitado pelo viewport cresce até o teto e é observado por dentro", () => {
+  const dom = mockPanelDom();
+  const { content, observed } = dom;
+  try {
     const requests: number[] = [];
     const reserve = createReserve();
     const stop = observePanelHeight((height) => requests.push(height), reserve);
     expect(requests).toEqual([648]);
     expect(observed.has(content)).toBe(true);
-    expect(observed.has(child)).toBe(true);
-    contentHeight = 650;
-    resize();
+    expect(observed.has(dom.child)).toBe(true);
+    dom.setContentHeight(650);
+    dom.resize();
     expect(requests).toEqual([648, 698]);
-    contentHeight = 900;
-    resize();
+    dom.setContentHeight(900);
+    dom.resize();
     expect(requests.at(-1)).toBe(720);
     expect(content.scrollHeight).toBeGreaterThan(content.clientHeight);
-    resize();
+    dom.resize();
     expect(requests).toEqual([648, 698, 720]);
     const added = {};
     content.children.push(added);
-    contentHeight = 432;
-    mutate();
+    dom.setContentHeight(432);
+    dom.mutate();
     expect(observed.has(added)).toBe(true);
     expect(requests.at(-1)).toBe(480);
     content.children.pop();
-    mutate();
+    dom.mutate();
     expect(observed.has(added)).toBe(false);
     const owner = Symbol();
     reserve.hold(owner, 700);
@@ -185,12 +213,35 @@ test("conteúdo limitado pelo viewport cresce até o teto e é observado por den
     expect(requests.at(-1)).toBe(480);
     stop();
     expect(observed.size).toBe(0);
-    expect(disconnected).toBe(1);
+    expect(dom.disconnected()).toBe(1);
   } finally {
-    keys.forEach((key, index) => {
-      const original = originals[index];
-      if (original) Object.defineProperty(globalThis, key, original);
-      else Reflect.deleteProperty(globalThis, key);
-    });
+    dom.restore();
+  }
+});
+
+// Measured on Omarchy: before its first show the WebKitGTK viewport is 0×0, the
+// text wraps in a 16 px column, panel-content scrolls to 1240 px and the panel
+// asked for 720, so the window opened at 720 and then shrank to 480.
+test("viewport vazio não é medido: a primeira medida espera a janela ter tamanho", () => {
+  const dom = mockPanelDom({ innerWidth: 0, innerHeight: 0 });
+  try {
+    const requests: number[] = [];
+    const reserve = createReserve();
+    dom.setContentHeight(1240);
+    const stop = observePanelHeight((height) => requests.push(height), reserve);
+    dom.resize();
+    dom.mutate();
+    const owner = Symbol();
+    reserve.hold(owner, 700);
+    reserve.release(owner);
+    expect(requests).toEqual([]);
+    dom.viewport.innerWidth = 320;
+    dom.viewport.innerHeight = 480;
+    dom.setContentHeight(432);
+    dom.resize();
+    expect(requests).toEqual([480]);
+    stop();
+  } finally {
+    dom.restore();
   }
 });
