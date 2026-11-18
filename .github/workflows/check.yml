@@ -231,5 +231,9 @@ jobs:
           persist-credentials: false
       - name: Install Rust toolchain
         run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Install openvpn for the OVPN session test
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openvpn
       - name: Validate portable core
+        env:
+          VPNT_TEST_OPENVPN: /usr/sbin/openvpn
         run: cargo +1.99.0 test --locked --no-default-features

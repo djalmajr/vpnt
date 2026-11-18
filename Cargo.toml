@@ -34,6 +34,9 @@ zeroize = { version = "1", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# OVPN: management-channel signatures and PKCS#11 tokens (no pkcs11-helper).
+base64 = "0.23"
+cryptoki = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tao = { version = "0.37", optional = true }
