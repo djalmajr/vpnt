@@ -391,7 +391,10 @@ fn up_block_without_end_is_rejected_and_the_line_still_handled() {
     for (line, reply) in [
         (">HOLD:waiting\n", Some(management::HOLD_RELEASE)),
         (">STATE:1,CONNECTED,SUCCESS,10.81.0.2,,,,\n", None),
-        (">PK_SIGN:%%%,RSA_PKCS1_PADDING\n", Some(management::TERMINATE)),
+        (
+            ">PK_SIGN:%%%,RSA_PKCS1_PADDING\n",
+            Some(management::TERMINATE),
+        ),
         (">UPDOWN:UP\n", None),
         (">UPDOWN:DOWN\n", None),
     ] {
