@@ -36,7 +36,7 @@ impl OvpnSettings {
     fn is_valid(&self) -> bool {
         let path = Path::new(&self.module);
         (2..=128).contains(&self.certificate_id.len())
-            && self.certificate_id.len() % 2 == 0
+            && self.certificate_id.len().is_multiple_of(2)
             && self
                 .certificate_id
                 .bytes()
