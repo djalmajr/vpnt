@@ -590,3 +590,50 @@ fn stop_times_out_waiting_for_control_lock() {
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_exit_has_a_total_management_drain_budget() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, &pss_request(32), 0.0);
+    let (release, gate) = mpsc::channel();
+    let session = start_scripted(
+        &executable,
+        FakeToken {
+            gate: Some(Arc::new(Mutex::new(gate))),
+            ..FakeToken::default()
+        },
+    );
+    assert_eq!(
+        session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Progress::AwaitingApproval
+    );
+    let start = Instant::now();
+    let mut observed = None;
+    while start.elapsed() < Duration::from_millis(1500) {
+        observed = session.exited();
+        if observed.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = start.elapsed();
+    let again_at = Instant::now();
+    let again = session.exited();
+    let again_elapsed = again_at.elapsed();
+    let _ = release.send(());
+    session.wait().unwrap();
+    assert!(
+        observed.is_some(),
+        "dead child remained running after {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert!(again.is_some());
+    assert!(
+        again_elapsed < Duration::from_millis(100),
+        "drain budget restarted: {again_elapsed:?}"
+    );
+}

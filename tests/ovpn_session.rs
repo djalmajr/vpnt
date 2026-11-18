@@ -327,3 +327,34 @@ fn pdeathsig_stops_peer_that_ignores_management_disconnect() {
         "independent management peer pid {pid} survived for two seconds"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sealed_config_connects_through_dev_fd_three() {
+    use vpnt::connection::ovpn::session::ConfigSource;
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(fixture) = Fixture::new("sealed") else {
+        return;
+    };
+    let ports = free_udp_ports();
+    let _server = fixture.server(ports);
+    let path = fixture.client_config(ports, "");
+    let config = ConfigSource::sealed(&fs::read(&path).unwrap()).unwrap();
+    fs::rename(&path, fixture.path("original.ovpn")).unwrap();
+    fs::write(&path, b"not the sealed config").unwrap();
+    let session = Session::start(
+        Launch {
+            openvpn: fixture.openvpn.clone(),
+            config,
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        },
+        fixture.signer(),
+    )
+    .unwrap();
+    wait_for_connected(&session, Duration::from_secs(30));
+    session.stop().unwrap();
+    assert!(session.wait().unwrap().status.success());
+}

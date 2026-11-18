@@ -6,10 +6,10 @@ use crate::{
         management::Reason,
         network::NetworkConfig,
         pkcs11::TokenKey,
-        session::{Launch, Progress, Session, SignError, Signatures},
+        session::{ConfigSource, Launch, Progress, Session, SignError, Signatures},
     },
     helper::protocol::{ErrorCode, Step},
-    model::{OvpnTls, Profile, VpnKind},
+    model::{OvpnSettings, OvpnTls, Profile, VpnKind},
     netd::{
         client::{Client, ClientError, SOCKET_PATH},
         protocol::{Config, Dns, ErrorCode as NetCode, Route, TunName},
@@ -18,12 +18,14 @@ use crate::{
     storage::ProfileStore,
 };
 use std::{
+    collections::BTreeSet,
     fs,
+    io::Read,
     net::{TcpStream, ToSocketAddrs},
-    os::unix::fs::MetadataExt,
-    path::Path,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -123,11 +125,117 @@ impl Tunnel for RealTunnel {
         }
     }
 }
-fn profile_file_ok(path: &Path, uid: u32) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|m| {
-        m.file_type().is_file() && m.uid() == uid && m.mode() & 0o7777 == 0o600 && m.nlink() == 1
-    })
+fn read_profile(path: &Path, uid: u32) -> Result<ConfigSource, Failure> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| Failure::at(Step::Profile))?;
+    let metadata = file.metadata().map_err(|_| Failure::at(Step::Profile))?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(Failure::at(Step::Profile));
+    }
+    const LIMIT: u64 = 256 * 1024;
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Failure::at(Step::Profile))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(Failure::at(Step::Profile));
+    }
+    let inspected = crate::connection::ovpn::profile::inspect(&bytes)
+        .map_err(|_| Failure::at(Step::Profile))?;
+    ConfigSource::sealed(inspected.normalized.as_bytes()).map_err(|_| Failure::at(Step::Profile))
 }
+
+trait Starter<N, T> {
+    type Key;
+    fn connect(&mut self) -> Result<N, Failure>;
+    fn token(&mut self, settings: &OvpnSettings, id: &[u8]) -> Result<Self::Key, Failure>;
+    fn session(
+        &mut self,
+        config: ConfigSource,
+        settings: &OvpnSettings,
+        name: String,
+        key: Self::Key,
+    ) -> Result<T, Failure>;
+}
+pub(super) struct RealStart;
+impl Starter<RealNetwork, RealTunnel> for RealStart {
+    type Key = TokenKey;
+    fn connect(&mut self) -> Result<RealNetwork, Failure> {
+        Client::connect(Path::new(SOCKET_PATH))
+            .map(RealNetwork)
+            .map_err(|_| {
+                state_failure(
+                    ConnectionState::HelperMissing,
+                    ErrorCode::Unavailable,
+                    Step::Runtime,
+                )
+            })
+    }
+    fn token(&mut self, settings: &OvpnSettings, id: &[u8]) -> Result<TokenKey, Failure> {
+        TokenKey::open(Path::new(&settings.module), id).map_err(|_| Failure::at(Step::Profile))
+    }
+    fn session(
+        &mut self,
+        config: ConfigSource,
+        settings: &OvpnSettings,
+        name: String,
+        key: TokenKey,
+    ) -> Result<RealTunnel, Failure> {
+        let program = Path::new("/usr/bin/openvpn");
+        if !program.is_file() {
+            return Err(state_failure(
+                ConnectionState::MissingProgram,
+                ErrorCode::MissingProgram,
+                Step::Spawn,
+            ));
+        }
+        let session = Session::start(
+            Launch {
+                openvpn: program.into(),
+                config,
+                signatures: match settings.tls {
+                    OvpnTls::Any => Signatures::Any,
+                    OvpnTls::Pkcs1Only => Signatures::Pkcs1Only,
+                },
+                dev: Some(name),
+                extra: vec![],
+                env: vec![],
+            },
+            key,
+        )
+        .map_err(|_| Failure::at(Step::Spawn))?;
+        Ok(RealTunnel {
+            session: Some(session),
+            waiting: None,
+            wait_failed: false,
+        })
+    }
+}
+
+static PROBES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+struct ProbeSlot(String);
+impl ProbeSlot {
+    fn acquire(id: &str) -> Option<Self> {
+        let mut slots = PROBES.lock().unwrap_or_else(|e| e.into_inner());
+        slots.insert(id.to_owned()).then(|| Self(id.to_owned()))
+    }
+}
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        PROBES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 fn rejected(step: Step) -> Failure {
     Failure {
         state: ConnectionState::CredentialsRejected,
@@ -139,7 +247,7 @@ fn state_failure(state: ConnectionState, error: ErrorCode, step: Step) -> Failur
     Failure { state, error, step }
 }
 
-pub(super) struct OvpnAttempt<N, T> {
+pub(super) struct OvpnAttempt<N, T, S = RealStart> {
     profile: Profile,
     uid: u32,
     network: Option<N>,
@@ -150,7 +258,8 @@ pub(super) struct OvpnAttempt<N, T> {
     stopped: bool,
     probe_job: Arc<dyn Fn(String, u16, Instant) -> bool + Send + Sync>,
     probe_inflight: Option<(mpsc::Receiver<bool>, thread::JoinHandle<()>)>,
-    start_real: fn(&mut Self) -> Result<(), Failure>,
+    starter: S,
+    config_path: Option<PathBuf>,
 }
 fn probe_connection(host: String, port: u16, deadline: Instant) -> bool {
     let addresses = match (host.as_str(), port).to_socket_addrs() {
@@ -167,8 +276,8 @@ fn probe_connection(host: String, port: u16, deadline: Instant) -> bool {
     }
     false
 }
-impl OvpnAttempt<RealNetwork, RealTunnel> {
-    pub(super) fn new(profile: Profile, uid: u32) -> Self {
+impl<N, T, S> OvpnAttempt<N, T, S> {
+    fn with_start(profile: Profile, uid: u32, config_path: Option<PathBuf>, starter: S) -> Self {
         Self {
             profile,
             uid,
@@ -180,9 +289,18 @@ impl OvpnAttempt<RealNetwork, RealTunnel> {
             stopped: false,
             probe_job: Arc::new(probe_connection),
             probe_inflight: None,
-            start_real: Self::open,
+            starter,
+            config_path,
         }
     }
+}
+impl OvpnAttempt<RealNetwork, RealTunnel> {
+    pub(super) fn new(profile: Profile, uid: u32) -> Self {
+        Self::with_start(profile, uid, None, RealStart)
+    }
+}
+#[allow(private_bounds)]
+impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
     fn open(&mut self) -> Result<(), Failure> {
         if self.profile.kind != VpnKind::Ovpn || self.profile.validate().is_err() {
             return Err(Failure::at(Step::Profile));
@@ -192,21 +310,15 @@ impl OvpnAttempt<RealNetwork, RealTunnel> {
             .ovpn
             .as_ref()
             .ok_or_else(|| Failure::at(Step::Profile))?;
-        let path = ProfileStore::for_current_user()
-            .and_then(|s| s.ovpn_dir())
-            .map_err(|_| Failure::at(Step::Profile))?
-            .join(format!("{}.ovpn", self.profile.id));
-        if !profile_file_ok(&path, self.uid) {
-            return Err(Failure::at(Step::Profile));
-        }
-        let client = Client::connect(Path::new(SOCKET_PATH)).map_err(|_| {
-            state_failure(
-                ConnectionState::HelperMissing,
-                ErrorCode::Unavailable,
-                Step::Runtime,
-            )
-        })?;
-        self.network = Some(RealNetwork(client));
+        let path = match &self.config_path {
+            Some(path) => path.clone(),
+            None => ProfileStore::for_current_user()
+                .and_then(|s| s.ovpn_dir())
+                .map_err(|_| Failure::at(Step::Profile))?
+                .join(format!("{}.ovpn", self.profile.id)),
+        };
+        let config = read_profile(&path, self.uid)?;
+        self.network = Some(self.starter.connect()?);
         let name = self
             .network
             .as_mut()
@@ -223,41 +335,10 @@ impl OvpnAttempt<RealNetwork, RealTunnel> {
             .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap_or(""), 16))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| Failure::at(Step::Profile))?;
-        let token = TokenKey::open(Path::new(&settings.module), &bytes)
-            .map_err(|_| Failure::at(Step::Profile))?;
-        let program = Path::new("/usr/bin/openvpn");
-        if !program.is_file() {
-            return Err(state_failure(
-                ConnectionState::MissingProgram,
-                ErrorCode::MissingProgram,
-                Step::Spawn,
-            ));
-        }
-        let session = Session::start(
-            Launch {
-                openvpn: program.into(),
-                config: path,
-                signatures: match settings.tls {
-                    OvpnTls::Any => Signatures::Any,
-                    OvpnTls::Pkcs1Only => Signatures::Pkcs1Only,
-                },
-                dev: Some(name),
-                extra: vec![],
-                env: vec![],
-            },
-            token,
-        )
-        .map_err(|_| Failure::at(Step::Spawn))?;
-        self.tunnel = Some(RealTunnel {
-            session: Some(session),
-            waiting: None,
-            wait_failed: false,
-        });
+        let key = self.starter.token(settings, &bytes)?;
+        self.tunnel = Some(self.starter.session(config, settings, name, key)?);
         Ok(())
     }
-}
-#[allow(private_bounds)] // The injectable interfaces stay private to this module.
-impl<N: Network, T: Tunnel> OvpnAttempt<N, T> {
     fn configure(&mut self, net: NetworkConfig) -> Result<(), Failure> {
         let name = TunName::parse(
             self.name
@@ -333,28 +414,20 @@ impl<N: Network, T: Tunnel> OvpnAttempt<N, T> {
         Ok(false)
     }
     #[cfg(test)]
-    fn fixture(profile: Profile, network: N, tunnel: T) -> Self {
-        Self {
-            profile,
-            uid: 0,
-            network: Some(network),
-            tunnel: Some(tunnel),
-            name: Some("vpnt0".into()),
-            phase: None,
-            down: false,
-            stopped: false,
-            probe_job: Arc::new(probe_connection),
-            probe_inflight: None,
-            start_real: |_| Ok(()),
-        }
+    fn fixture(profile: Profile, network: N, tunnel: T, starter: S) -> Self {
+        let mut result = Self::with_start(profile, 0, None, starter);
+        result.network = Some(network);
+        result.tunnel = Some(tunnel);
+        result.name = Some("vpnt0".into());
+        result
     }
 }
-impl<N: Network, T: Tunnel> Attempt for OvpnAttempt<N, T> {
+impl<N: Network, T: Tunnel, S: Starter<N, T>> Attempt for OvpnAttempt<N, T, S> {
     fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure> {
         if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
             return Err(Failure::at(Step::Tunnel));
         }
-        (self.start_real)(self)
+        self.open()
     }
     fn ready(&mut self) -> Result<bool, Failure> {
         self.process(true)
@@ -376,6 +449,9 @@ impl<N: Network, T: Tunnel> Attempt for OvpnAttempt<N, T> {
             let (_, worker) = self.probe_inflight.take().unwrap();
             let _ = worker.join();
         }
+        let Some(slot) = ProbeSlot::acquire(&self.profile.id) else {
+            return Ok(false);
+        };
         let deadline = Instant::now() + timeout;
         let job = self.probe_job.clone();
         let host = self.profile.probe_host.clone();
@@ -384,6 +460,7 @@ impl<N: Network, T: Tunnel> Attempt for OvpnAttempt<N, T> {
         let worker = thread::Builder::new()
             .name("vpnt-ovpn-probe".into())
             .spawn(move || {
+                let _slot = slot;
                 let _ = send.send(job(host, port, deadline));
             })
             .map_err(|_| Failure::at(Step::Verify))?;

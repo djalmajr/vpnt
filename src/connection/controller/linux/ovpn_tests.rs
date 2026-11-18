@@ -1,3 +1,25 @@
+struct NoStart;
+impl<N, T> super::Starter<N, T> for NoStart {
+    type Key = ();
+    fn connect(&mut self) -> Result<N, super::Failure> {
+        Err(super::Failure::at(super::Step::Runtime))
+    }
+    fn token(&mut self, _: &crate::model::OvpnSettings, _: &[u8]) -> Result<(), super::Failure> {
+        Ok(())
+    }
+    fn session(
+        &mut self,
+        _: super::ConfigSource,
+        _: &crate::model::OvpnSettings,
+        _: String,
+        _: (),
+    ) -> Result<T, super::Failure> {
+        Err(super::Failure::at(super::Step::Spawn))
+    }
+}
+fn valid_profile() -> &'static str {
+    "client\nremote vpn.example.test 1194\n<ca>\nfixture\n</ca>\n"
+}
 use super::*;
 use std::{
     collections::VecDeque,
@@ -10,6 +32,9 @@ use std::{
 #[derive(Default)]
 struct Observed {
     configs: Vec<Config>,
+    opened: std::collections::BTreeSet<String>,
+    events: Vec<&'static str>,
+    open_error: Option<NetFailure>,
     closes: usize,
     stops: usize,
     close_error: Option<NetFailure>,
@@ -18,6 +43,12 @@ struct Observed {
 struct FakeNetwork(Arc<Mutex<Observed>>);
 impl Network for FakeNetwork {
     fn open_tun(&mut self) -> Result<String, NetFailure> {
+        let mut s = self.0.lock().unwrap();
+        s.events.push("open");
+        if let Some(error) = s.open_error.take() {
+            return Err(error);
+        }
+        assert!(s.opened.insert("vpnt0".into()));
         Ok("vpnt0".into())
     }
     fn configure(&mut self, c: &Config) -> Result<(), NetFailure> {
@@ -28,7 +59,12 @@ impl Network for FakeNetwork {
     fn close_tun(&mut self, _: &str) -> Result<(), NetFailure> {
         let mut s = self.0.lock().unwrap();
         s.closes += 1;
-        s.close_error.take().map_or(Ok(()), Err)
+        s.events.push("close");
+        if let Some(error) = s.close_error.take() {
+            return Err(error);
+        }
+        s.opened.remove("vpnt0");
+        Ok(())
     }
 }
 struct FakeTunnel {
@@ -51,7 +87,9 @@ impl Tunnel for FakeTunnel {
     }
 }
 fn profile() -> Profile {
-    serde_json::from_value(serde_json::json!({"id":"fixture", "name":"fixture", "kind":"ovpn", "gateway":"vpn.example.test", "username":"", "networks":[], "port":443, "certificate":"", "probeHost":"127.0.0.1", "probePort":1234, "probeMethod":"tcp", "ovpn":{"certificateId":"01", "module":"/fixture.so"}})).unwrap()
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = format!("fixture-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    serde_json::from_value(serde_json::json!({"id":id, "name":"fixture", "kind":"ovpn", "gateway":"vpn.example.test", "username":"", "networks":[], "port":443, "certificate":"", "probeHost":"127.0.0.1", "probePort":1234, "probeMethod":"tcp", "ovpn":{"certificateId":"01", "module":"/fixture.so"}})).unwrap()
 }
 fn network() -> NetworkConfig {
     NetworkConfig {
@@ -68,8 +106,12 @@ fn attempt(
     p: Profile,
     events: Vec<Progress>,
     exit: Option<Option<Reason>>,
-) -> (OvpnAttempt<FakeNetwork, FakeTunnel>, Arc<Mutex<Observed>>) {
+) -> (
+    OvpnAttempt<FakeNetwork, FakeTunnel, NoStart>,
+    Arc<Mutex<Observed>>,
+) {
     let state = Arc::new(Mutex::new(Observed::default()));
+    state.lock().unwrap().opened.insert("vpnt0".into());
     let a = OvpnAttempt::fixture(
         p,
         FakeNetwork(state.clone()),
@@ -78,6 +120,7 @@ fn attempt(
             events: events.into(),
             exit,
         },
+        NoStart,
     );
     (a, state)
 }
@@ -163,11 +206,11 @@ fn profile_mode_and_probe() {
     fs::create_dir(&directory).unwrap();
     let _guard = Fixture(directory.clone());
     let path = directory.join("profile.ovpn");
-    fs::write(&path, b"fixture").unwrap();
+    fs::write(&path, valid_profile()).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(!profile_file_ok(&path, unsafe { libc::geteuid() }));
+    assert!(read_profile(&path, unsafe { libc::geteuid() }).is_err());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(profile_file_ok(&path, unsafe { libc::geteuid() }));
+    assert!(read_profile(&path, unsafe { libc::geteuid() }).is_ok());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut p = profile();
     p.probe_port = listener.local_addr().unwrap().port();
@@ -214,7 +257,7 @@ fn real_session_exit_waits_for_auth_failure_on_fifty_attempts() {
     for round in 0..50 {
         let launch = Launch {
             openvpn: program.clone(),
-            config: "/dev/null".into(),
+            config: ConfigSource::from("/dev/null"),
             dev: None,
             signatures: Signatures::Any,
             extra: vec![],
@@ -230,6 +273,7 @@ fn real_session_exit_waits_for_auth_failure_on_fifty_attempts() {
                 waiting: None,
                 wait_failed: false,
             },
+            NoStart,
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         let failure = loop {
@@ -327,4 +371,368 @@ fn probe_deadline_cancellation_and_single_inflight_job() {
             "only one job may be in flight"
         );
     }
+}
+
+#[test]
+fn probe_slot_survives_three_retired_generations() {
+    use std::sync::{Condvar, atomic::AtomicUsize};
+    struct Guard {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        workers: Vec<thread::JoinHandle<()>>,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cv.notify_all();
+            for worker in self.workers.drain(..) {
+                worker.join().unwrap();
+            }
+        }
+    }
+    let p = profile();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut guard = Guard {
+        gate: gate.clone(),
+        workers: vec![],
+    };
+    for _ in 0..3 {
+        let (mut a, _) = attempt(p.clone(), vec![], None);
+        let gate = gate.clone();
+        let calls = calls.clone();
+        a.probe_job = Arc::new(move |_, _, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let (lock, cv) = &*gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            true
+        });
+        assert!(
+            !a.probe(&AtomicBool::new(false), Duration::from_millis(50))
+                .unwrap()
+        );
+        assert!(a.cleanup());
+        if let Some((_, worker)) = a.probe_inflight.take() {
+            guard.workers.push(worker);
+        }
+        drop(a);
+    }
+    let observed = calls.load(Ordering::SeqCst);
+    drop(guard);
+    assert_eq!(
+        observed, 1,
+        "retired attempts must not release a live probe slot"
+    );
+    let (mut next, _) = attempt(p, vec![], None);
+    next.probe_job = Arc::new(|_, _, _| true);
+    assert!(
+        next.probe(&AtomicBool::new(false), Duration::from_secs(1))
+            .unwrap()
+    );
+    if let Some((_, worker)) = next.probe_inflight.take() {
+        worker.join().unwrap();
+    }
+}
+
+struct Scratch(std::path::PathBuf);
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vpnt-start-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
+    fn profile(&self, text: &[u8]) -> std::path::PathBuf {
+        let path = self.0.join("profile.ovpn");
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+#[derive(Clone, Copy)]
+enum FailStart {
+    Connect,
+    Open,
+    Token,
+    Session,
+}
+struct FakeStart {
+    state: Arc<Mutex<Observed>>,
+    fail: FailStart,
+}
+impl Starter<FakeNetwork, FakeTunnel> for FakeStart {
+    type Key = ();
+    fn connect(&mut self) -> Result<FakeNetwork, Failure> {
+        let mut s = self.state.lock().unwrap();
+        s.events.push("connect");
+        if matches!(self.fail, FailStart::Connect) {
+            return Err(state_failure(
+                ConnectionState::HelperMissing,
+                ErrorCode::Unavailable,
+                Step::Runtime,
+            ));
+        }
+        if matches!(self.fail, FailStart::Open) {
+            s.open_error = Some(NetFailure::Backend);
+        }
+        Ok(FakeNetwork(self.state.clone()))
+    }
+    fn token(&mut self, _: &OvpnSettings, _: &[u8]) -> Result<(), Failure> {
+        self.state.lock().unwrap().events.push("token");
+        if matches!(self.fail, FailStart::Token) {
+            return Err(Failure::at(Step::Profile));
+        }
+        Ok(())
+    }
+    fn session(
+        &mut self,
+        _: ConfigSource,
+        _: &OvpnSettings,
+        _: String,
+        _: (),
+    ) -> Result<FakeTunnel, Failure> {
+        self.state.lock().unwrap().events.push("session");
+        Err(Failure::at(Step::Spawn))
+    }
+}
+#[test]
+fn partial_start_failure_releases_every_acquired_tun() {
+    let scratch = Scratch::new();
+    let path = scratch.profile(valid_profile().as_bytes());
+    for fail in [
+        FailStart::Connect,
+        FailStart::Open,
+        FailStart::Token,
+        FailStart::Session,
+    ] {
+        let state = Arc::new(Mutex::new(Observed::default()));
+        let mut a = OvpnAttempt::with_start(
+            profile(),
+            unsafe { libc::geteuid() },
+            Some(path.clone()),
+            FakeStart {
+                state: state.clone(),
+                fail,
+            },
+        );
+        let failure = a
+            .start(
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+        let (step, expected) = match fail {
+            FailStart::Connect => {
+                assert_eq!(failure.state, ConnectionState::HelperMissing);
+                (Step::Runtime, vec!["connect"])
+            }
+            FailStart::Open => (Step::Tunnel, vec!["connect", "open"]),
+            FailStart::Token => (Step::Profile, vec!["connect", "open", "token", "close"]),
+            FailStart::Session => (
+                Step::Spawn,
+                vec!["connect", "open", "token", "session", "close"],
+            ),
+        };
+        assert_eq!(failure.step, step);
+        assert!(a.cleanup());
+        assert!(a.cleanup());
+        let state = state.lock().unwrap();
+        assert!(state.opened.is_empty());
+        assert_eq!(state.stops, 0);
+        assert_eq!(state.events, expected);
+    }
+}
+#[test]
+fn start_revalidates_the_profile_before_any_external_effect() {
+    let scratch = Scratch::new();
+    for text in [
+        b"script-security 2\nup /bad\n".to_vec(),
+        vec![b'x'; 256 * 1024 + 1],
+        b"remote vpn.example.test\0\n".to_vec(),
+    ] {
+        let path = scratch.profile(&text);
+        let state = Arc::new(Mutex::new(Observed::default()));
+        let mut a = OvpnAttempt::with_start(
+            profile(),
+            unsafe { libc::geteuid() },
+            Some(path),
+            FakeStart {
+                state: state.clone(),
+                fail: FailStart::Connect,
+            },
+        );
+        assert_eq!(
+            a.start(
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .step,
+            Step::Profile
+        );
+        assert!(a.cleanup());
+        assert!(state.lock().unwrap().events.is_empty());
+    }
+    let path = scratch.profile(valid_profile().as_bytes());
+    assert!(read_profile(&path, unsafe { libc::geteuid() } + 1).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_profile(&path, unsafe { libc::geteuid() }).is_err());
+    let link = scratch.0.join("link");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(read_profile(&link, unsafe { libc::geteuid() }).is_err());
+    assert!(read_profile(&scratch.0, unsafe { libc::geteuid() }).is_err());
+    let fifo = scratch.0.join("fifo");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    assert!(read_profile(&fifo, unsafe { libc::geteuid() }).is_err());
+}
+#[test]
+fn sealed_profile_survives_rename_and_link_after_session_start() {
+    use crate::connection::ovpn::session::Signer;
+    use crate::connection::ovpn::signing::Padding;
+    struct NoSigner;
+    impl Signer for NoSigner {
+        fn certificate(&mut self) -> Result<Vec<u8>, SignError> {
+            Err(SignError::Unavailable)
+        }
+        fn sign(&mut self, _: Padding, _: &[u8]) -> Result<Vec<u8>, SignError> {
+            Err(SignError::Unavailable)
+        }
+    }
+    let scratch = Scratch::new();
+    let original = valid_profile().replace('\n', "\r\n");
+    let path = scratch.profile(original.as_bytes());
+    let config = read_profile(&path, unsafe { libc::geteuid() }).unwrap();
+    let program = scratch.0.join("openvpn");
+    let release = scratch.0.join("release");
+    let observed = scratch.0.join("observed");
+    let script = format!(
+        "#!/usr/bin/python3\nimport socket,sys,time,pathlib\nif '--version' in sys.argv: print('OpenVPN 2.6.19');sys.exit(0)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[sys.argv.index('--management')+1])\nend=time.monotonic()+5\nwhile not pathlib.Path({release:?}).exists() and time.monotonic()<end: time.sleep(.005)\nc=sys.argv[sys.argv.index('--config')+1]\npathlib.Path({observed:?}).write_text(c+'\\n'+pathlib.Path(c).read_text())\n"
+    );
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let session = Session::start(
+        Launch {
+            openvpn: program,
+            config,
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        },
+        NoSigner,
+    )
+    .unwrap();
+    fs::rename(&path, scratch.0.join("original")).unwrap();
+    let alternate = scratch.0.join("alternate");
+    fs::write(&alternate, b"replacement").unwrap();
+    std::os::unix::fs::symlink(&alternate, &path).unwrap();
+    fs::write(release, b"go").unwrap();
+    session.wait().unwrap();
+    assert_eq!(
+        fs::read_to_string(observed).unwrap(),
+        format!("/dev/fd/3\n{}", valid_profile())
+    );
+}
+
+#[test]
+fn dead_session_is_not_healthy_while_the_signer_is_blocked() {
+    use crate::connection::ovpn::{session::Signer, signing::Padding};
+    struct Blocking {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Signer for Blocking {
+        fn certificate(&mut self) -> Result<Vec<u8>, SignError> {
+            Ok(vec![1])
+        }
+        fn sign(&mut self, _: Padding, _: &[u8]) -> Result<Vec<u8>, SignError> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(5));
+            Ok(vec![1])
+        }
+    }
+    let scratch = Scratch::new();
+    let program = scratch.0.join("openvpn");
+    fs::write(&program,"#!/usr/bin/python3\nimport socket,sys\nif '--version' in sys.argv: print('OpenVPN 2.6.19');sys.exit(0)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[sys.argv.index('--management')+1])\ns.sendall(b'>PK_SIGN:BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=,RSA_PKCS1_PSS_PADDING,hashalg=SHA256,saltlen=digest\\n')\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let (entered, started) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let session = Session::start(
+        Launch {
+            openvpn: program,
+            config: ConfigSource::from("/dev/null"),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        },
+        Blocking {
+            entered,
+            release: gate,
+        },
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(Observed::default()));
+    let mut a = OvpnAttempt::fixture(
+        profile(),
+        FakeNetwork(state),
+        RealTunnel {
+            session: Some(session),
+            waiting: None,
+            wait_failed: false,
+        },
+        NoStart,
+    );
+    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    let began = Instant::now();
+    let mut result = Ok(false);
+    while began.elapsed() < Duration::from_millis(1500) {
+        result = a.ready();
+        if result.is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = began.elapsed();
+    let health_began = Instant::now();
+    let health = a.healthy();
+    let health_elapsed = health_began.elapsed();
+    let _ = release.send(());
+    assert!(a.cleanup());
+    assert_eq!(result.unwrap_err().step, Step::Tunnel);
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert_eq!(health.unwrap_err().step, Step::Health);
+    assert!(
+        health_elapsed < Duration::from_millis(100),
+        "{health_elapsed:?}"
+    );
+}
+
+#[test]
+fn sealed_profile_rejects_writes_and_resizing() {
+    let scratch = Scratch::new();
+    let path = scratch.profile(valid_profile().as_bytes());
+    let config = read_profile(&path, unsafe { libc::geteuid() }).unwrap();
+    let ConfigSource::Sealed(fd) = &config else {
+        panic!("profile is not sealed");
+    };
+    use std::io::Write;
+    let mut attempt_write = std::fs::File::from(fd.try_clone().unwrap());
+    assert!(attempt_write.write_all(b"change").is_err());
+    assert!(attempt_write.set_len(1).is_err());
+    assert!(attempt_write.set_len(1024 * 1024).is_err());
 }

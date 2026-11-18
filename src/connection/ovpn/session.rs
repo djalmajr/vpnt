@@ -146,9 +146,50 @@ pub enum SignError {
     Unavailable,
 }
 
-pub struct Launch {
+#[derive(Debug)]
+pub enum ConfigSource {
+    Path(PathBuf),
+    #[cfg(target_os = "linux")]
+    Sealed(std::os::fd::OwnedFd),
+}
+impl From<PathBuf> for ConfigSource {
+    fn from(path: PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
+impl From<&str> for ConfigSource {
+    fn from(path: &str) -> Self {
+        Self::Path(path.into())
+    }
+}
+impl ConfigSource {
+    /// Immutable bytes retained until the child inherits its config descriptor.
+    #[cfg(target_os = "linux")]
+    pub fn sealed(text: &[u8]) -> io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe {
+            libc::memfd_create(
+                c"vpnt-ovpn".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        file.write_all(text)?;
+        let seals =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self::Sealed(OwnedFd::from(file)))
+    }
+}
+
+pub struct Launch<C = PathBuf> {
     pub openvpn: PathBuf,
-    pub config: PathBuf,
+    pub config: C,
     pub dev: Option<String>,
     pub signatures: Signatures,
     pub extra: Vec<OsString>,
@@ -202,18 +243,33 @@ pub struct Session {
     finished: mpsc::Receiver<()>,
     progress: mpsc::Receiver<Progress>,
     _directory: PrivateDir,
+    #[cfg(target_os = "linux")]
+    exit_observed: Mutex<Option<Instant>>,
 }
 
 impl Session {
     /// On Linux the child receives SIGTERM when the thread calling this method
     /// dies; that thread must outlive the session.
-    pub fn start(launch: Launch, signer: impl Signer) -> io::Result<Self> {
+    pub fn start<C: Into<ConfigSource>>(
+        launch: Launch<C>,
+        signer: impl Signer,
+    ) -> io::Result<Self> {
+        let config = launch.config.into();
         let version = version_for(&launch.openvpn)?;
         let directory = PrivateDir::create(Path::new("/tmp"))?;
         let socket = directory.path.join("management");
         let listener = UnixListener::bind(&socket)?;
         let mut command = Command::new(&launch.openvpn);
-        command.arg("--config").arg(&launch.config);
+        command.arg("--config");
+        match &config {
+            ConfigSource::Path(path) => {
+                command.arg(path);
+            }
+            #[cfg(target_os = "linux")]
+            ConfigSource::Sealed(_) => {
+                command.arg("/dev/fd/3");
+            }
+        }
         if let Some(dev) = &launch.dev {
             command.args(["--dev", dev, "--dev-type", "tun", "--disable-dco"]);
         }
@@ -250,13 +306,33 @@ impl Session {
         }
         #[cfg(target_os = "linux")]
         {
+            use std::os::fd::AsRawFd;
             use std::os::unix::process::CommandExt;
+            let config_fd = match &config {
+                ConfigSource::Path(_) => None,
+                ConfigSource::Sealed(fd) => {
+                    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+                    let required = libc::F_SEAL_WRITE
+                        | libc::F_SEAL_GROW
+                        | libc::F_SEAL_SHRINK
+                        | libc::F_SEAL_SEAL;
+                    if seals < 0 || seals & required != required {
+                        return Err(io::ErrorKind::InvalidInput.into());
+                    }
+                    Some(fd.as_raw_fd())
+                }
+            };
             let parent = unsafe { libc::getpid() };
             // With pre_exec, spawn waits for fork/exec via its CLOEXEC pipe,
             // keeping this calling thread alive through prctl. getppid checks
             // process death between fork and prctl.
             unsafe {
                 command.pre_exec(move || {
+                    if let Some(fd) = config_fd
+                        && (libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0)
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -292,6 +368,8 @@ impl Session {
             finished,
             progress,
             _directory: directory,
+            #[cfg(target_os = "linux")]
+            exit_observed: Mutex::new(None),
         })
     }
 
@@ -308,10 +386,10 @@ impl Session {
             )
         };
         if result == 0 && unsafe { info.si_pid() } != 0 {
-            match self.finished.recv_timeout(DRAIN_TIMEOUT) {
-                Err(RecvTimeoutError::Disconnected) => Some(*lock(&self.reason)),
-                _ => None,
-            }
+            let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
+            let remaining = (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now());
+            let _ = self.finished.recv_timeout(remaining);
+            Some(*lock(&self.reason))
         } else {
             None
         }
