@@ -23,6 +23,12 @@ impl Fixture {
         let path = PathBuf::from(std::env::var_os("HOME").unwrap())
             .join(".cache")
             .join(format!("vpnt-linux-controller-test-{}", std::process::id()));
+        // A fresh CI runner may have no ~/.cache yet.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap())
+            .unwrap();
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Self(path)
     }
