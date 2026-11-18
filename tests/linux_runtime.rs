@@ -768,29 +768,30 @@ fn real_backend_saves_profile_through_bridge() {
             recv.recv_timeout(Duration::from_secs(15)).unwrap()
         };
         // Like the UI, ask again while the runtime child is still starting
-        // (a debug executable is hashed first, slowly on a busy runner).
+        // (a debug executable is hashed first, slowly on a busy runner). The
+        // broker refuses with backend_unavailable before doing anything until
+        // it is ready, so repeating is safe.
         let ready_by = Instant::now() + Duration::from_secs(30);
-        let mut attempt = 0;
-        let initial = loop {
-            attempt += 1;
-            let reply = send_request(
-                &format!("initial-{attempt}"),
-                serde_json::json!({"type":"get_snapshot"}),
-            );
-            if reply.snapshot.is_some()
-                || reply.error.as_deref() != Some("backend_unavailable")
-                || Instant::now() >= ready_by
-            {
-                break reply;
+        let until_available = |name: &str, command: serde_json::Value| {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let reply = send_request(&format!("{name}-{attempt}"), command.clone());
+                if reply.error.as_deref() != Some("backend_unavailable")
+                    || Instant::now() >= ready_by
+                {
+                    break reply;
+                }
+                thread::sleep(Duration::from_millis(250));
             }
-            thread::sleep(Duration::from_millis(250));
         };
+        let initial = until_available("initial", serde_json::json!({"type":"get_snapshot"}));
         assert!(
             initial.snapshot.is_some(),
             "initial snapshot: {:?}",
             initial.error
         );
-        let saved = send_request(
+        let saved = until_available(
             "save",
             serde_json::json!({"type":"save_profile", "profile":profile()}),
         );
