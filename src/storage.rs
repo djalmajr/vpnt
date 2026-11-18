@@ -3,15 +3,16 @@
 mod reservation;
 pub use reservation::ProfileReservation;
 
-use crate::model::{Profile, valid_profile_id};
+use crate::model::{Profile, VpnKind, valid_profile_id};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    fs::{self, File, Metadata, OpenOptions},
-    io::{ErrorKind, Read, Write},
+    ffi::{CStr, CString},
+    fs::{self, File, Metadata, OpenOptions, Permissions},
+    io::{self, ErrorKind, Read, Write},
     os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -19,6 +20,7 @@ use std::{
 
 const MAX_BYTES: u64 = 1_048_576;
 const MAX_PROFILES: usize = 64;
+const MAX_OVPN_BYTES: usize = 256 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +124,107 @@ impl ProfileStore {
         Ok(dir)
     }
 
+    pub fn save_ovpn_config(&self, id: &str, text: &str) -> Result<(), StoreError> {
+        let name = ovpn_name(id)?;
+        if text.len() > MAX_OVPN_BYTES {
+            return Err(StoreError::Limit);
+        }
+        let dir = self.ovpn_directory(true)?.ok_or(StoreError::Io)?;
+        self.ovpn_file(&dir, &name)?;
+        let (mut temp, mut file) = OvpnTemporary::create(&dir)?;
+        file.write_all(text.as_bytes())
+            .map_err(|_| StoreError::Io)?;
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(|_| StoreError::Io)?;
+        file.sync_all().map_err(|_| StoreError::Io)?;
+        self.ovpn_file(&dir, &name)?;
+        // SAFETY: both names are single components in the same open directory.
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                temp.name.as_ptr(),
+                dir.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(StoreError::Io);
+        }
+        temp.committed = true;
+        dir.sync_all().map_err(|_| StoreError::Io)
+    }
+
+    pub fn ovpn_config_exists(&self, id: &str) -> Result<bool, StoreError> {
+        let name = ovpn_name(id)?;
+        let Some(dir) = self.ovpn_directory(false)? else {
+            return Ok(false);
+        };
+        self.ovpn_file(&dir, &name).map(|file| file.is_some())
+    }
+
+    pub fn remove_ovpn_config(&self, id: &str) -> Result<(), StoreError> {
+        let name = ovpn_name(id)?;
+        let Some(dir) = self.ovpn_directory(false)? else {
+            return Ok(());
+        };
+        if self.ovpn_file(&dir, &name)?.is_none() {
+            return Ok(());
+        }
+        match unlink_at(&dir, &name) {
+            Ok(()) => dir.sync_all().map_err(|_| StoreError::Io),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(StoreError::Io),
+        }
+    }
+
+    fn ovpn_directory(&self, create: bool) -> Result<Option<File>, StoreError> {
+        const FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        self.check_directory()?;
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(FLAGS)
+            .open(&self.directory)
+            .map_err(|_| StoreError::UntrustedPath)?;
+        let dir = match open_at(&root, c"ovpn", FLAGS, 0) {
+            Ok(dir) => dir,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if !create {
+                    return Ok(None);
+                }
+                // SAFETY: root is live and the fixed component is NUL-terminated.
+                if unsafe { libc::mkdirat(root.as_raw_fd(), c"ovpn".as_ptr(), 0o700) } == 0 {
+                    root.sync_all().map_err(|_| StoreError::Io)?;
+                } else if io::Error::last_os_error().kind() != ErrorKind::AlreadyExists {
+                    return Err(StoreError::Io);
+                }
+                open_at(&root, c"ovpn", FLAGS, 0).map_err(|_| StoreError::UntrustedPath)?
+            }
+            Err(_) => return Err(StoreError::UntrustedPath),
+        };
+        let metadata = dir.metadata().map_err(|_| StoreError::Io)?;
+        if metadata.uid() != self.owner || metadata.mode() & 0o7777 != 0o700 {
+            return Err(StoreError::UntrustedPath);
+        }
+        crate::fs_permissions::check_file(&dir, true).map_err(|_| StoreError::UntrustedPath)?;
+        Ok(Some(dir))
+    }
+
+    fn ovpn_file(&self, dir: &File, name: &CStr) -> Result<Option<File>, StoreError> {
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let file = match open_at(dir, name, flags, 0) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(StoreError::UntrustedPath),
+        };
+        let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+        self.check_file(&metadata)?;
+        if metadata.mode() & 0o7777 != 0o600 {
+            return Err(StoreError::UntrustedPath);
+        }
+        crate::fs_permissions::check_file(&file, true).map_err(|_| StoreError::UntrustedPath)?;
+        Ok(Some(file))
+    }
+
     /// Fixed production location. No path or ownership policy comes from IPC.
     pub fn for_user(uid: u32) -> Result<Self, StoreError> {
         if uid == 0 {
@@ -180,26 +283,78 @@ impl ProfileStore {
     }
 
     pub fn save(&self, profile: Profile) -> Result<(), StoreError> {
+        self.save_profile_with(profile, |_| Ok(false))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn save_admin_profile(
+        &self,
+        profile: Profile,
+        config: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let id = profile.id.clone();
+        let kind = profile.kind;
+        self.save_profile_with(profile, |previous| {
+            if kind != VpnKind::Ovpn {
+                // Refuse an untrusted cleanup target before replacing the profile.
+                if previous == Some(VpnKind::Ovpn) {
+                    return self.ovpn_config_exists(&id);
+                }
+                return Ok(false);
+            }
+            if let Some(config) = config {
+                self.save_ovpn_config(&id, config)
+                    .map_err(|_| StoreError::Io)?;
+            } else if !self.ovpn_config_exists(&id)? {
+                return Err(StoreError::InvalidData);
+            }
+            Ok(false)
+        })
+    }
+
+    fn save_profile_with(
+        &self,
+        profile: Profile,
+        prepare_config: impl FnOnce(Option<VpnKind>) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
         profile.validate().map_err(|_| StoreError::InvalidData)?;
-        let reservation = self.reserve(&profile.id)?;
+        let id = profile.id.clone();
+        let reservation = self.reserve(&id)?;
         let _lock = self.lock()?;
         let mut profiles = self.load()?;
-        if let Some(existing) = profiles
-            .iter_mut()
-            .find(|existing| existing.id == profile.id)
-        {
-            *existing = profile;
-        } else {
-            if profiles.len() >= MAX_PROFILES {
-                return Err(StoreError::Limit);
-            }
-            profiles.push(profile);
-        }
+        let previous =
+            if let Some(existing) = profiles.iter_mut().find(|existing| existing.id == id) {
+                let kind = existing.kind;
+                *existing = profile;
+                Some(kind)
+            } else {
+                if profiles.len() >= MAX_PROFILES {
+                    return Err(StoreError::Limit);
+                }
+                profiles.push(profile);
+                None
+            };
+        let data = encode_profiles(profiles)?;
         reservation.validate()?;
-        self.write(profiles)
+        let remove_config = prepare_config(previous)?;
+        reservation.validate()?;
+        self.write(&data)?;
+        if remove_config {
+            self.remove_ovpn_config(&id)?;
+        }
+        Ok(())
     }
 
     pub fn remove(&self, id: &str) -> Result<(), StoreError> {
+        self.remove_profile(id, false)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_admin_profile(&self, id: &str) -> Result<(), StoreError> {
+        self.remove_profile(id, true)
+    }
+
+    fn remove_profile(&self, id: &str, remove_config: bool) -> Result<(), StoreError> {
         if !valid_profile_id(id) {
             return Err(StoreError::InvalidData);
         }
@@ -208,11 +363,22 @@ impl ProfileStore {
         let mut profiles = self.load()?;
         let count = profiles.len();
         profiles.retain(|profile| profile.id != id);
-        if count == profiles.len() {
+        let found = count != profiles.len();
+        if !found && !remove_config {
             return Err(StoreError::NotFound);
         }
         reservation.validate()?;
-        self.write(profiles)
+        if found {
+            self.write(&encode_profiles(profiles)?)?;
+        }
+        if remove_config {
+            self.remove_ovpn_config(id)?;
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound)
+        }
     }
 
     fn check_directory(&self) -> Result<(), StoreError> {
@@ -272,20 +438,12 @@ impl ProfileStore {
         Ok(file)
     }
 
-    fn write(&self, profiles: Vec<Profile>) -> Result<(), StoreError> {
+    fn write(&self, data: &[u8]) -> Result<(), StoreError> {
         let destination = self.directory.join("profiles.json");
         match fs::symlink_metadata(&destination) {
             Ok(metadata) => self.check_file(&metadata)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(StoreError::Io),
-        }
-        let data = serde_json::to_vec(&Document {
-            version: 1,
-            profiles,
-        })
-        .map_err(|_| StoreError::InvalidData)?;
-        if data.len() as u64 > MAX_BYTES {
-            return Err(StoreError::Limit);
         }
         let mut created = None;
         for _ in 0..16 {
@@ -310,12 +468,97 @@ impl ProfileStore {
             }
         }
         let (temporary, mut file) = created.ok_or(StoreError::Io)?;
-        file.write_all(&data).map_err(|_| StoreError::Io)?;
+        file.write_all(data).map_err(|_| StoreError::Io)?;
         file.sync_all().map_err(|_| StoreError::Io)?;
         fs::rename(&temporary.0, destination).map_err(|_| StoreError::Io)?;
         File::open(&self.directory)
             .and_then(|directory| directory.sync_all())
             .map_err(|_| StoreError::Io)
+    }
+}
+
+fn encode_profiles(profiles: Vec<Profile>) -> Result<Vec<u8>, StoreError> {
+    let data = serde_json::to_vec(&Document {
+        version: 1,
+        profiles,
+    })
+    .map_err(|_| StoreError::InvalidData)?;
+    if data.len() as u64 > MAX_BYTES {
+        return Err(StoreError::Limit);
+    }
+    Ok(data)
+}
+
+fn ovpn_name(id: &str) -> Result<CString, StoreError> {
+    if !valid_profile_id(id) {
+        return Err(StoreError::InvalidData);
+    }
+    CString::new(format!("{id}.ovpn")).map_err(|_| StoreError::InvalidData)
+}
+
+fn open_at(dir: &File, name: &CStr, flags: i32, mode: u32) -> io::Result<File> {
+    // SAFETY: dir owns a live descriptor and name is NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful openat returned a descriptor owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn unlink_at(dir: &File, name: &CStr) -> io::Result<()> {
+    // SAFETY: the live directory and name are borrowed only for the syscall.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+struct OvpnTemporary<'a> {
+    dir: &'a File,
+    name: CString,
+    committed: bool,
+}
+impl<'a> OvpnTemporary<'a> {
+    fn create(dir: &'a File) -> Result<(Self, File), StoreError> {
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+        for _ in 0..16 {
+            let name = CString::new(format!(
+                ".ovpn-{}-{}.tmp",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ))
+            .map_err(|_| StoreError::Io)?;
+            match open_at(dir, &name, flags, 0o600) {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            dir,
+                            name,
+                            committed: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(StoreError::Io),
+            }
+        }
+        Err(StoreError::Io)
+    }
+}
+impl Drop for OvpnTemporary<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = unlink_at(self.dir, &self.name);
+        }
     }
 }
 
@@ -599,5 +842,145 @@ mod linux_tests {
         symlink(&target, &dir).unwrap();
         assert!(matches!(store.ovpn_dir(), Err(StoreError::UntrustedPath)));
         assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn ovpn_config_is_atomic_private_and_bounded() {
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        assert_eq!(store.ovpn_config_exists("test"), Ok(false));
+        assert_eq!(store.remove_ovpn_config("test"), Ok(()));
+        let dir = store.directory.join("ovpn");
+        assert!(!dir.exists());
+        for id in ["", "../outside", "separ/ator"] {
+            assert_eq!(
+                store.save_ovpn_config(id, "fixture"),
+                Err(StoreError::InvalidData)
+            );
+        }
+        let data = "X".repeat(MAX_OVPN_BYTES);
+        let over = format!("{data}X");
+        assert_eq!(
+            store.save_ovpn_config("test", &over),
+            Err(StoreError::Limit)
+        );
+        assert!(!dir.exists());
+        store.save_ovpn_config("test", &data).unwrap();
+        let path = dir.join("test.ovpn");
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let old = File::open(&path).unwrap();
+        store.save_ovpn_config("test", "replacement").unwrap();
+        assert_eq!(store.ovpn_config_exists("test"), Ok(true));
+        assert_ne!(
+            old.metadata().unwrap().ino(),
+            fs::metadata(&path).unwrap().ino()
+        );
+        let mut original = String::new();
+        (&old).read_to_string(&mut original).unwrap();
+        assert!(original == data);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        store.remove_ovpn_config("test").unwrap();
+        assert_eq!(store.ovpn_config_exists("test"), Ok(false));
+        assert_eq!(store.remove_ovpn_config("test"), Ok(()));
+    }
+
+    #[test]
+    fn ovpn_save_holds_the_profile_reservation_between_the_two_writes() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        let expected = profile();
+        let (reservation, document_before) = thread::scope(|scope| {
+            let (file_saved, await_file) = mpsc::channel();
+            let (resume, await_resume) = mpsc::channel();
+            let writer_store = &store;
+            let writer = scope.spawn(move || {
+                writer_store.save_profile_with(expected.clone(), move |_| {
+                    writer_store.save_ovpn_config(&expected.id, "synthetic")?;
+                    file_saved.send(()).unwrap();
+                    await_resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(false)
+                })
+            });
+            await_file.recv_timeout(Duration::from_secs(5)).unwrap();
+            let reservation = store.reserve(&profile().id);
+            let document_before = store.load().unwrap();
+            resume.send(()).unwrap();
+            writer.join().unwrap().unwrap();
+            (reservation, document_before)
+        });
+        assert!(matches!(reservation, Err(StoreError::Busy)));
+        assert!(document_before.is_empty());
+        assert_eq!(store.load().unwrap(), [profile()]);
+    }
+
+    #[test]
+    fn ovpn_config_never_writes_through_untrusted_paths() {
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        let target_dir = f.path.join("target");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target_dir)
+            .unwrap();
+        let target = target_dir.join("test.ovpn");
+        fs::write(&target, "fixture").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = store.directory.join("ovpn");
+        symlink(&target_dir, &dir).unwrap();
+        assert_eq!(
+            store.save_ovpn_config("test", "no"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(
+            store.ovpn_config_exists("test"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(
+            store.remove_ovpn_config("test"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "fixture");
+        fs::remove_file(&dir).unwrap();
+
+        let dir = store.ovpn_dir().unwrap();
+        let path = dir.join("test.ovpn");
+        symlink(&target, &path).unwrap();
+        assert_eq!(
+            store.save_ovpn_config("test", "no"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(
+            store.ovpn_config_exists("test"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(
+            store.remove_ovpn_config("test"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(&path).unwrap();
+
+        fs::hard_link(&target, &path).unwrap();
+        assert_eq!(
+            store.save_ovpn_config("test", "no"),
+            Err(StoreError::UntrustedPath)
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "fixture");
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "untrusted-mode").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            store.ovpn_config_exists("test"),
+            Err(StoreError::UntrustedPath)
+        );
     }
 }

@@ -334,7 +334,10 @@ mod tests {
         };
         let request = AdminRequest {
             id: "fixture".into(),
-            command: AdminCommand::SaveProfile { profile },
+            command: AdminCommand::SaveProfile {
+                profile,
+                ovpn_config: None,
+            },
         };
         struct Marker(std::path::PathBuf);
         impl Drop for Marker {

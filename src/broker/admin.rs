@@ -86,18 +86,8 @@ impl<S: SecretStore> Broker<S> {
                 profile,
                 ovpn_config,
             } => {
-                if ovpn_config.is_some() {
-                    return Err(if profile.kind == VpnKind::Ovpn {
-                        "unsupported"
-                    } else {
-                        "invalid_profile"
-                    });
-                }
-                profile.validate()?;
-                (
-                    Change::Save(profile.clone()),
-                    AdminCommand::SaveProfile { profile },
-                )
+                let change = Change::Save(profile.clone());
+                (change, AdminCommand::for_save(profile, ovpn_config)?)
             }
             Command::RemoveProfile { id } => {
                 let kind = self

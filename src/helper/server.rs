@@ -327,10 +327,50 @@ fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message
             return Err(ErrorCode::Unavailable);
         }
         match request.command {
-            AdminCommand::SaveProfile { profile } => store.save(profile),
-            AdminCommand::RemoveProfile { id } => store.remove(&id),
+            AdminCommand::SaveProfile {
+                profile,
+                ovpn_config,
+            } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let normalized = if let Some(text) = ovpn_config {
+                        if profile.kind != crate::model::VpnKind::Ovpn {
+                            return Err(ErrorCode::InvalidRequest);
+                        }
+                        Some(
+                            crate::connection::ovpn::profile::inspect(text.as_bytes())
+                                .map_err(|_| ErrorCode::InvalidRequest)?
+                                .normalized,
+                        )
+                    } else {
+                        None
+                    };
+                    store
+                        .save_admin_profile(profile, normalized.as_deref())
+                        .map_err(|error| {
+                            if error == StoreError::InvalidData {
+                                ErrorCode::InvalidRequest
+                            } else {
+                                store_error(error)
+                            }
+                        })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if ovpn_config.is_some() {
+                        return Err(ErrorCode::InvalidRequest);
+                    }
+                    store.save(profile).map_err(store_error)
+                }
+            }
+            AdminCommand::RemoveProfile { id } => {
+                #[cfg(target_os = "linux")]
+                let result = store.remove_admin_profile(&id);
+                #[cfg(not(target_os = "linux"))]
+                let result = store.remove(&id);
+                result.map_err(store_error)
+            }
         }
-        .map_err(store_error)
     })();
     match result {
         Ok(()) => Message::Accepted { id: request.id },

@@ -67,7 +67,10 @@ fn request() -> AdminRequest {
     let profile:Profile=serde_json::from_value(serde_json::json!({"id":"one","name":"Fictional","kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap();
     AdminRequest {
         id: "admin-one".into(),
-        command: AdminCommand::SaveProfile { profile },
+        command: AdminCommand::SaveProfile {
+            profile,
+            ovpn_config: None,
+        },
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
