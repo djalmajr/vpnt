@@ -389,7 +389,9 @@ fn drive(
             }
             continue;
         }
-        if event == Event::MalformedEnv {
+        // Inside an UP block only well-formed lines may close it; anything
+        // malformed (a broken UPDOWN record or any unparsable line) rejects it.
+        if matches!(event, Event::MalformedEnv | Event::Malformed) {
             if matches!(block, Some(Some(_))) {
                 let _ = progress.send(Progress::BadNetwork(NetworkError::Malformed));
                 let _ = send(control, management::TERMINATE);
@@ -419,7 +421,7 @@ fn drive(
                 None
             }
             Event::EnvEnd => None,
-            Event::Env { .. } | Event::MalformedEnv => unreachable!(),
+            Event::Env { .. } | Event::MalformedEnv | Event::Malformed => unreachable!(),
             Event::Hold => Some(management::HOLD_RELEASE.to_owned()),
             Event::NeedCertificate => Some(match signer.certificate() {
                 Ok(der) => management::certificate(&der),
@@ -447,7 +449,7 @@ fn drive(
                 *lock(reason) = Some(Reason::Fatal);
                 None
             }
-            Event::Ignored | Event::Malformed => None,
+            Event::Ignored => None,
         };
         if let Some(reply) = reply {
             let _ = send(control, &reply);

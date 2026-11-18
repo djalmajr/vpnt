@@ -125,8 +125,9 @@ pub fn parse(line: &[u8]) -> Event {
                     key: key.into(),
                     value: value.into(),
                 },
-                _ if payload.starts_with("ENV,") => Event::MalformedEnv,
-                _ => Event::Malformed,
+                // Any other UPDOWN line is a broken record: inside an UP block it
+                // must invalidate the block, never close it with partial pairs.
+                _ => Event::MalformedEnv,
             },
         },
         "HOLD" => Event::Hold,

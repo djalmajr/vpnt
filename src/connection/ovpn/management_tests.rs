@@ -169,6 +169,8 @@ fn updown_events() {
     assert_eq!(parse(b">UPDOWN:ENV,END\n"), Event::EnvEnd);
     assert_eq!(parse(b">UPDOWN:ENV,=x\n"), Event::MalformedEnv);
     assert_eq!(parse(b">UPDOWN:ENV,broken\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:ENV\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:SOMETHING\n"), Event::MalformedEnv);
 }
 
 #[test]

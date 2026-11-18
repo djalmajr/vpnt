@@ -470,6 +470,9 @@ fn malformed_up_environment_rejects_block_and_terminates() {
         ">UPDOWN:ENV,broken\n",
         ">UPDOWN:ENV,=value\n",
         ">UPDOWN:ENV,key=\u{fffd}\n",
+        ">UPDOWN:ENV\n",
+        ">UPDOWN:UNKNOWN\n",
+        ">STATE:not-a-number\n",
     ] {
         let mut vpn = Openvpn::connect(FakeToken::default());
         vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n");
