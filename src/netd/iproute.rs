@@ -265,12 +265,13 @@ fn configure_commands(config: &Config) -> Vec<NetworkCommand> {
             ]),
         });
     }
-    if config.dns.servers.is_empty() {
-        commands.push(NetworkCommand {
-            dns: true,
-            args: strings(&["revert", name]),
-        });
-    } else {
+    // Revert first so that nothing from the previous configure survives: a
+    // replacement without domains must not keep the old routing domains.
+    commands.push(NetworkCommand {
+        dns: true,
+        args: strings(&["revert", name]),
+    });
+    if !config.dns.servers.is_empty() {
         let mut args = strings(&["dns", name]);
         args.extend(config.dns.servers.iter().map(ToString::to_string));
         commands.push(NetworkCommand { dns: true, args });

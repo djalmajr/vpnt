@@ -50,15 +50,27 @@ fn exact_argv_and_dns_branches() {
                 false,
                 vec!["route", "replace", "172.16.0.0/12", "dev", "vpnt0"]
             ),
+            (true, vec!["revert", "vpnt0"]),
             (true, vec!["dns", "vpnt0", "10.200.0.1", "1.1.1.1"]),
             (true, vec!["domain", "vpnt0", "~serpro", "~example.org"]),
             (true, vec!["default-route", "vpnt0", "false"]),
         ]
     );
+    // Servers without domains: the old routing domains are cleared by the
+    // revert and none are set again.
     let commands = configure_commands(&config(r#"["1.1.1.1"]"#, "[]"));
+    let dns: Vec<_> = commands
+        .iter()
+        .filter(|c| c.dns)
+        .map(|c| c.args.iter().map(String::as_str).collect::<Vec<_>>())
+        .collect();
     assert_eq!(
-        commands.last().unwrap().args,
-        ["default-route", "vpnt0", "true"]
+        dns,
+        vec![
+            vec!["revert", "vpnt0"],
+            vec!["dns", "vpnt0", "1.1.1.1"],
+            vec!["default-route", "vpnt0", "true"],
+        ]
     );
     let commands = configure_commands(&config("[]", "[]"));
     assert_eq!(commands.len(), 7);
