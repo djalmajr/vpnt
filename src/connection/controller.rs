@@ -2,9 +2,13 @@
 //! root helper supplies its own profiles/UID; requests contain no executable,
 //! interface, route or configuration paths. Shutdown retains pending cleanup.
 mod engine;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::run_linux;
 #[cfg(target_os = "macos")]
 mod native;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profiles;
 mod worker;
 use crate::{
