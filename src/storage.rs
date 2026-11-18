@@ -360,6 +360,11 @@ fn check_ancestors(path: &Path, owner: u32) -> Result<(), StoreError> {
     Ok(())
 }
 
+// Threat model: the store belongs to the user and the runtime runs as the
+// user. A process of the same user that swaps a parent for a link between the
+// checks and the mkdir can make the directory appear elsewhere in its own
+// files; that grants nothing it could not do directly, and open() still
+// refuses the result. Other users cannot write the ancestors (checked).
 fn create_private_dir_if_missing(
     path: &Path,
     owner: u32,
