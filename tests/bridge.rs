@@ -174,7 +174,7 @@ fn ovpn_bridge_parser_checks_the_three_command_shapes_and_limit() {
         assert!(parse_request(&wire(malformed)).is_err());
     }
     let mut body = wire(serde_json::json!({"type":"inspect_ovpn", "content":""}));
-    body.push_str(&" ".repeat(65536 - body.len()));
+    body.push_str(&" ".repeat(128 * 1024 - body.len()));
     assert!(parse_request(&body).is_ok());
     body.push(' ');
     assert!(parse_request(&body).is_err());

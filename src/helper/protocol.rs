@@ -23,7 +23,7 @@ pub const CLEANUP_ACK_SNAPSHOT_ID: &str = "snapshot-cleanup-ack-v1";
 /// predates it echoes the probe ID and never sends a note.
 pub const FAILURE_NOTE_PROBE_SNAPSHOT_ID: &str = "failure-note-v1";
 pub const FAILURE_NOTE_ACK_SNAPSHOT_ID: &str = "failure-note-ack-v1";
-pub const MAX_REQUEST_BYTES: usize = 65_536;
+pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

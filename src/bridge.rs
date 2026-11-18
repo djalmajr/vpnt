@@ -137,7 +137,7 @@ impl Reply {
 }
 
 pub fn parse_request(body: &str) -> Result<Request, &'static str> {
-    if body.len() > 65536 {
+    if body.len() > 128 * 1024 {
         return Err("invalid_request");
     }
     let request: Request = serde_json::from_str(body).map_err(|_| "invalid_request")?;

@@ -54,7 +54,7 @@ impl Client {
     }
     #[cfg(target_os = "linux")]
     pub fn runtime() -> Result<Self, Error> {
-        let path = std::env::current_exe().map_err(|_| Error::Untrusted)?;
+        let path = linux_executable().map_err(|_| Error::Untrusted)?;
         Self::linux_for_executable(&path)
     }
     /// Starts a Linux runtime using the supplied absolute executable.
@@ -169,6 +169,15 @@ impl Drop for Client {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn linux_executable() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("VPNT_TEST_EXECUTABLE") {
+        return Ok(path.into());
+    }
+    std::env::current_exe()
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn linux_command(path: &std::path::Path, mode: &str) -> Result<Command, Error> {
     if !path.is_absolute() {
         return Err(Error::Untrusted);
@@ -205,7 +214,19 @@ pub fn linux_build_identity() -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
     const LIMIT: u64 = 256 * 1024 * 1024;
-    let mut input = std::fs::File::open("/proc/self/exe").ok()?.take(LIMIT + 1);
+    #[cfg(debug_assertions)]
+    let path = if std::env::var_os("VPNT_TEST_EXECUTABLE").is_some() {
+        let selected = linux_executable().ok()?;
+        if !selected.is_absolute() {
+            return None;
+        }
+        std::fs::canonicalize(selected).ok()?
+    } else {
+        std::path::PathBuf::from("/proc/self/exe")
+    };
+    #[cfg(not(debug_assertions))]
+    let path = std::path::PathBuf::from("/proc/self/exe");
+    let mut input = std::fs::File::open(path).ok()?.take(LIMIT + 1);
     let mut hasher = Sha256::new();
     let mut count = 0u64;
     let mut buf = [0u8; 16384];

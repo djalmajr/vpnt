@@ -571,3 +571,332 @@ fn admin_save_protocol_remains_compatible_and_prepares_only_normalized_ovpn() {
             if profile == ovpn_profile() && config == NORMALIZED_OVPN
     ));
 }
+
+#[test]
+fn ovpn_size_boundary_survives_bridge_and_admin() {
+    use vpnt::bridge::{self, Command};
+    let mut content = "remote vpn.example.test 1194\n<ca>\nx\n</ca>\n".to_string();
+    let line = format!("#{}\n", "\"\\".repeat(125));
+    while content.len() + line.len() <= 32 * 1024 {
+        content.push_str(&line);
+    }
+    let remaining = 32 * 1024 - content.len();
+    if remaining >= 2 {
+        content.push('#');
+        content.push_str(&"\"".repeat(remaining - 2));
+        content.push('\n');
+    } else if remaining == 1 {
+        content.push('\n');
+    }
+    assert_eq!(content.len(), 32 * 1024);
+    let profile = ovpn_profile();
+    let body = serde_json::json!({"id":"size", "command":{"type":"save_profile", "profile":profile, "ovpn_config":content}}).to_string();
+    assert!(body.len() > 65_536);
+    let request = bridge::parse_request(&body).expect("32 KiB profile must cross bridge");
+    let Command::SaveProfile {
+        profile,
+        ovpn_config,
+    } = request.command
+    else {
+        panic!("wrong command")
+    };
+    let command = AdminCommand::for_save(profile, ovpn_config).unwrap();
+    let fixture = Fixture::new();
+    assert!(matches!(
+        run_admin(&fixture, serde_json::to_value(command).unwrap()),
+        Message::Accepted { .. }
+    ));
+    let file = fixture.0.join("vpnt/profiles/ovpn/first.ovpn");
+    assert_eq!(fs::read_to_string(file).unwrap(), content);
+    let mut too_large = content;
+    too_large.push('\n');
+    let oversized_body = serde_json::json!({"id":"size-over", "command":{"type":"save_profile", "profile":ovpn_profile(), "ovpn_config":too_large}}).to_string();
+    let oversized =
+        bridge::parse_request(&oversized_body).expect("oversized profile must reach validation");
+    let Command::SaveProfile {
+        profile,
+        ovpn_config,
+    } = oversized.command
+    else {
+        panic!("wrong command")
+    };
+    assert!(matches!(
+        AdminCommand::for_save(profile, ovpn_config),
+        Err("invalid_ovpn")
+    ));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn debug_override_starts_runtime_and_admin_with_matching_build() {
+    use vpnt::{
+        helper::client::{Client, linux_build_identity},
+        localization::Locale,
+    };
+    if std::env::var_os("VPNT_OVERRIDE_TEST_CHILD").is_some() {
+        let executable = std::env::var_os("VPNT_TEST_EXECUTABLE").unwrap();
+        let expected = format!("{:x}", Sha256::digest(fs::read(executable).unwrap()));
+        assert_eq!(linux_build_identity(), Some(expected));
+        let mut client = Client::runtime().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut ready = false;
+        while Instant::now() < deadline && !ready {
+            client
+                .send(Request {
+                    id: "snapshot".into(),
+                    command: RequestCommand::Snapshot {},
+                })
+                .ok();
+            thread::sleep(Duration::from_millis(30));
+            ready = client
+                .poll()
+                .unwrap()
+                .iter()
+                .any(|message| matches!(message, Message::Snapshot { .. }));
+        }
+        assert!(ready, "runtime did not respond");
+        client.close();
+        while !client.finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.finished());
+        let mut admin = vpnt::helper::admin_client::Admin::start(
+            AdminRequest {
+                id: "save".into(),
+                command: AdminCommand::SaveProfile {
+                    profile: profile(),
+                    ovpn_config: None,
+                },
+            },
+            Locale::EnUs,
+            Instant::now() + Duration::from_secs(8),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut result = None;
+        while result.is_none() && Instant::now() < deadline {
+            result = admin.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(result, Some(Ok(())));
+        return;
+    }
+    let f = Fixture::new();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "debug_override_starts_runtime_and_admin_with_matching_build",
+            "--nocapture",
+        ])
+        .env("VPNT_OVERRIDE_TEST_CHILD", "1")
+        .env("VPNT_TEST_EXECUTABLE", env!("CARGO_BIN_EXE_vpnt"))
+        .env("XDG_DATA_HOME", &f.0)
+        .env("XDG_CONFIG_HOME", &f.0)
+        .env("HOME", &f.0)
+        .status()
+        .unwrap();
+    assert!(status.success(), "debug override child failed: {status}");
+}
+
+#[cfg(all(debug_assertions, feature = "desktop"))]
+#[test]
+fn real_backend_saves_profile_through_bridge() {
+    use std::sync::mpsc;
+    use vpnt::bridge::parse_request;
+    if std::env::var_os("VPNT_BACKEND_TEST_CHILD").is_some() {
+        // The helper uses socketpair; prohibit all connect syscalls in this
+        // child and its descendants so the production netd path is never reached.
+        let filter = [
+            libc::sock_filter {
+                code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_connect as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0x00050000 | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: 0x7fff0000,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut _,
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0,
+            "no_new_privs: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+            0,
+            "seccomp: {}",
+            std::io::Error::last_os_error()
+        );
+        let (send, recv) = mpsc::channel();
+        let backend = vpnt::desktop::TestBackend::new(false, move |reply| {
+            let _ = send.send(reply);
+        })
+        .unwrap();
+        let send_request = |id: &str, command: serde_json::Value| {
+            let body = serde_json::json!({"id": id, "command":command}).to_string();
+            backend
+                .send(parse_request(&body).unwrap(), Instant::now())
+                .unwrap();
+            recv.recv_timeout(Duration::from_secs(15)).unwrap()
+        };
+        let initial = send_request("initial", serde_json::json!({"type":"get_snapshot"}));
+        assert!(
+            initial.snapshot.is_some(),
+            "initial snapshot: {:?}",
+            initial.error
+        );
+        let saved = send_request(
+            "save",
+            serde_json::json!({"type":"save_profile", "profile":profile()}),
+        );
+        assert!(saved.error.is_none(), "save: {:?}", saved.error);
+        let after = send_request("after", serde_json::json!({"type":"get_snapshot"}));
+        assert!(
+            after
+                .snapshot
+                .unwrap()
+                .vpns
+                .iter()
+                .any(|entry| entry.profile.id == "first")
+        );
+        drop(backend);
+        assert!(
+            matches!(
+                recv.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "actor did not stop"
+        );
+        let mut check = vpnt::helper::client::Client::runtime().unwrap();
+        check
+            .send(Request {
+                id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+                command: RequestCommand::Snapshot {},
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut seen = false;
+        while !seen && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            seen = check
+                .poll()
+                .unwrap()
+                .iter()
+                .any(|message| matches!(message, Message::Snapshot { .. }));
+        }
+        assert!(seen, "runtime lock was not released after backend drop");
+        check.close();
+        while !check.finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(check.finished(), "verification runtime did not exit");
+        return;
+    }
+    let f = Fixture::new();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "real_backend_saves_profile_through_bridge",
+            "--nocapture",
+        ])
+        .env("VPNT_BACKEND_TEST_CHILD", "1")
+        .env("VPNT_TEST_EXECUTABLE", env!("CARGO_BIN_EXE_vpnt"))
+        .env("XDG_DATA_HOME", &f.0)
+        .env("XDG_CONFIG_HOME", &f.0)
+        .env("HOME", &f.0)
+        .status()
+        .unwrap();
+    assert!(status.success(), "backend child: {status}");
+}
+
+#[test]
+fn concurrent_admin_ovpn_saves_leave_matching_profile_and_config() {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Barrier};
+    let fixture = Fixture::new();
+    let barrier = Arc::new(Barrier::new(3));
+    let outcomes = thread::scope(|scope| {
+        let workers: Vec<_> = ["alpha", "bravo"].into_iter().map(|name| {
+            let barrier = barrier.clone(); let fixture = &fixture;
+            scope.spawn(move || {
+                let mut profile = ovpn_profile(); profile.name = name.into();
+                let config = format!("# Name: {name}\nremote vpn.example.test 1194\n<ca>\n{name}\n</ca>\n");
+                barrier.wait();
+                run_admin(fixture, serde_json::json!({"type":"save_profile", "profile":profile, "ovpn_config":config}))
+            })
+        }).collect();
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        outcomes
+            .iter()
+            .any(|result| matches!(result, Message::Accepted { .. }))
+    );
+    assert!(outcomes.iter().all(|result| matches!(
+        result,
+        Message::Accepted { .. }
+            | Message::Failed {
+                error: vpnt::helper::protocol::ErrorCode::ProfileBusy,
+                ..
+            }
+    )));
+    let root = fixture.0.join("vpnt/profiles");
+    let store =
+        vpnt::storage::ProfileStore::open(&root, fs::metadata(&root).unwrap().uid()).unwrap();
+    let profiles = store.load().unwrap();
+    assert_eq!(profiles.len(), 1);
+    let config = fs::read_to_string(root.join("ovpn/first.ovpn")).unwrap();
+    assert!(config.starts_with(&format!("# Name: {}\n", profiles[0].name)));
+    assert!(config.contains(&format!("\n{}\n</ca>", profiles[0].name)));
+}
+
+#[test]
+fn ovpn_limit_counts_the_added_final_newline() {
+    // 32 KiB without a final newline normalizes to 32 KiB + 1: refused by the
+    // first inspection, so the admin process never sees a text it would refuse.
+    let mut content = "remote vpn.example.test 1194\n<ca>\nx\n</ca>\n".to_owned();
+    while content.len() + 200 <= 32 * 1024 {
+        content.push_str(&format!("#{}\n", "x".repeat(198)));
+    }
+    let remaining = 32 * 1024 - content.len();
+    if remaining > 0 {
+        content.push('#');
+        content.push_str(&"x".repeat(remaining - 1));
+    }
+    assert_eq!(content.len(), 32 * 1024);
+    assert!(!content.ends_with('\n'));
+    assert!(AdminCommand::for_save(ovpn_profile(), Some(content.clone())).is_err());
+    // One byte less, the normalized text fits exactly and reaches the admin.
+    content.pop();
+    let command = AdminCommand::for_save(ovpn_profile(), Some(content)).unwrap();
+    let fixture = Fixture::new();
+    assert!(matches!(
+        run_admin(&fixture, serde_json::to_value(command).unwrap()),
+        Message::Accepted { .. }
+    ));
+}

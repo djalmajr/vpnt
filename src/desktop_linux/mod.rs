@@ -6,6 +6,9 @@ const DEFAULT_HEIGHT: u32 = 480;
 const TRAY_ID: &str = "vpnt";
 
 mod backend;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use backend::Backend as TestBackend;
 mod icon;
 mod omarchy;
 mod placement;
