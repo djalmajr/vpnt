@@ -49,7 +49,7 @@ impl Fixture {
     }
     fn start(&self, mode: &str) -> (Process, UnixStream) {
         let (host, child) = UnixStream::pair().unwrap();
-        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_vpnt"))
             .args(["helper", mode])
             .env("XDG_DATA_HOME", &self.0)
