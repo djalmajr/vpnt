@@ -156,7 +156,9 @@ impl HealthRun {
             state: signals.state.clone(),
             events: receiver,
             worker: None,
-            prompt: (poll * 4).max(Duration::from_millis(50)).min(health / 4),
+            // 150 ms absorbs scheduling on a loaded runner; the cap keeps it
+            // well below `health`.
+            prompt: (poll * 4).max(Duration::from_millis(150)).min(health / 4),
         };
         let timing = Timing {
             poll,
@@ -283,13 +285,16 @@ fn connected_health_wait_keeps_cancellation_within_one_poll() {
 #[test]
 fn connected_health_command_probe_is_prompt_revalidated_and_resets_health_clock() {
     let poll = Duration::from_millis(10);
-    let health = Duration::from_millis(400);
+    // Long enough that the periodic check, about half of it away when the
+    // command arrives, cannot pass for the prompt probe even with `prompt`
+    // sized for a loaded runner.
+    let health = Duration::from_secs(1);
     let run = HealthRun::start(poll, health, 0);
     run.initial_probe();
     run.quiet_for(health / 2);
     run.probe.store(true, Ordering::Release);
     assert!(matches!(
-        run.events.recv_timeout(poll * 4).unwrap(),
+        run.events.recv_timeout(run.prompt).unwrap(),
         HealthEvent::Probe
     ));
     let revalidated = run.healthy_promptly();
