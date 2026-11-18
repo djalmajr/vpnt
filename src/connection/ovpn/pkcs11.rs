@@ -1,7 +1,10 @@
 //! An RSA key held by a PKCS#11 token and addressed by CKA_ID. Objects are
 //! found by class and id only: some modules (SerproID) reject label searches
 //! and refuse attribute queries that generic helpers make before signing.
-use super::signing::{Hash, Padding};
+use super::{
+    der,
+    signing::{Hash, Padding},
+};
 use cryptoki::{
     context::{CInitializeArgs, CInitializeFlags, Pkcs11},
     error::{Error, RvError},
@@ -15,6 +18,8 @@ use cryptoki::{
     types::Ulong,
 };
 use std::{
+    collections::HashSet,
+    fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -39,6 +44,95 @@ impl From<Error> for TokenError {
             Error::Pkcs11(code, _) => Self::Failed(code),
             _ => Self::Module,
         }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct CertificateInfo {
+    pub id: Vec<u8>,
+    pub subject: Option<String>,
+    pub issuer: Option<String>,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+}
+
+impl fmt::Debug for CertificateInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id: String = self.id.iter().map(|byte| format!("{byte:02x}")).collect();
+        f.debug_struct("CertificateInfo")
+            .field("id", &id)
+            .field("subject", &self.subject)
+            .field("issuer", &self.issuer)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .finish()
+    }
+}
+
+/// List certificates whose key object is visible without authenticating.
+pub fn list_certificates(module: &Path) -> Result<Vec<CertificateInfo>, TokenError> {
+    let pkcs11 = context(module)?;
+    let mut certificates = Vec::new();
+    let mut seen = HashSet::new();
+    for slot in pkcs11.get_slots_with_token()? {
+        let session = pkcs11.open_ro_session(slot)?;
+        // Finish the find before looking for private keys on the same session.
+        let objects = session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])?;
+        for object in objects {
+            let Some(attributes) = object_result(
+                session.get_attributes(object, &[AttributeType::Id, AttributeType::Value]),
+            )?
+            else {
+                continue;
+            };
+            let mut id = None;
+            let mut value = None;
+            for attribute in attributes {
+                match attribute {
+                    Attribute::Id(bytes) => id = Some(bytes),
+                    Attribute::Value(bytes) => value = Some(bytes),
+                    _ => {}
+                }
+            }
+            let (Some(id), Some(value)) = (id, value) else {
+                continue;
+            };
+            if id.is_empty() || seen.contains(&id) {
+                continue;
+            }
+            if !matches!(
+                object_result(find(&session, ObjectClass::PRIVATE_KEY, &id))?,
+                Some(Some(_))
+            ) {
+                continue;
+            }
+            let fields = der::read_certificate(&value);
+            seen.insert(id.clone());
+            certificates.push(CertificateInfo {
+                id,
+                subject: fields.subject,
+                issuer: fields.issuer,
+                not_before: fields.not_before,
+                not_after: fields.not_after,
+            });
+            if certificates.len() == 32 {
+                return Ok(certificates);
+            }
+        }
+    }
+    Ok(certificates)
+}
+
+fn object_result<T>(result: Result<T, Error>) -> Result<Option<T>, TokenError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(
+            error @ Error::Pkcs11(
+                RvError::SessionHandleInvalid | RvError::SessionClosed | RvError::DeviceRemoved,
+                _,
+            ),
+        ) => Err(error.into()),
+        Err(_) => Ok(None),
     }
 }
 
