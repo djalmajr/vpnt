@@ -2,6 +2,7 @@
 //! token. openvpn requests every TLS signature over the management channel
 //! and the token produces it, so no pkcs11-helper sits in between.
 pub mod management;
+pub mod network;
 pub mod pkcs11;
 mod private_dir;
 pub mod session;

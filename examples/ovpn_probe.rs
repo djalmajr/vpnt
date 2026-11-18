@@ -67,6 +67,7 @@ fn main() -> Result<(), String> {
     let launch = Launch {
         openvpn: openvpn.ok_or("--openvpn is required")?,
         config: config.ok_or("--config is required")?,
+        dev: None,
         signatures,
         extra,
         env: Vec::new(),
