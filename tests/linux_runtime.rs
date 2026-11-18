@@ -195,3 +195,184 @@ fn runtime_refuses_symlinked_lock_without_touching_target() {
     drop(stream);
     assert_eq!(process.wait().code(), Some(1));
 }
+
+#[test]
+fn linux_client_rejects_relative_executable() {
+    use vpnt::helper::client::{Client, Error};
+    assert!(matches!(
+        Client::linux_for_executable(std::path::Path::new("relative-vpnt")),
+        Err(Error::Untrusted)
+    ));
+    assert!(matches!(
+        Client::linux_for_executable(std::path::Path::new("/definitely-not-a-vpnt-binary")),
+        Err(Error::Untrusted)
+    ));
+    let mut existing_relative = PathBuf::new();
+    for part in std::env::current_dir().unwrap().components() {
+        if matches!(part, std::path::Component::Normal(_)) {
+            existing_relative.push("..");
+        }
+    }
+    existing_relative.push("usr/bin/true");
+    assert!(existing_relative.is_file());
+    assert!(matches!(
+        Client::linux_for_executable(&existing_relative),
+        Err(Error::Untrusted)
+    ));
+    let request = AdminRequest {
+        id: "relative".into(),
+        command: AdminCommand::SaveProfile { profile: profile() },
+    };
+    assert!(matches!(
+        vpnt::helper::admin_client::Admin::linux_for_executable(
+            &existing_relative,
+            request,
+            vpnt::localization::Locale::EnUs,
+            Instant::now() + Duration::from_secs(5)
+        ),
+        Err(vpnt::helper::admin_client::Error::Untrusted)
+    ));
+}
+
+#[test]
+fn linux_client_integration_child() {
+    use vpnt::{
+        helper::{
+            admin_client::Admin,
+            client::{Client, linux_build_identity},
+        },
+        localization::Locale,
+    };
+    if std::env::var_os("VPNT_CLIENT_TEST_CHILD").is_none() {
+        return;
+    }
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(fs::read(env!("CARGO_BIN_EXE_vpnt")).unwrap())
+    );
+    let own_hash = format!(
+        "{:x}",
+        Sha256::digest(fs::read(std::env::current_exe().unwrap()).unwrap())
+    );
+    assert_eq!(linux_build_identity(), Some(own_hash));
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_vpnt"));
+    fn wait_for(mut f: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(12);
+        while !f() {
+            assert!(Instant::now() < end, "client condition timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn get_snapshot(client: &mut Client, id: &str) -> Message {
+        client
+            .send(Request {
+                id: id.into(),
+                command: RequestCommand::Snapshot {},
+            })
+            .unwrap();
+        let mut found = None;
+        wait_for(|| {
+            for message in client.poll().unwrap() {
+                if matches!(message, Message::Snapshot { .. }) {
+                    found = Some(message);
+                    return true;
+                }
+            }
+            false
+        });
+        found.unwrap()
+    }
+    let mut client = Client::linux_for_executable(executable).unwrap();
+    assert!(
+        matches!(get_snapshot(&mut client,"first"), Message::Snapshot { profiles,build,.. } if profiles.is_empty() && build == Some(expected.clone()))
+    );
+    client.close();
+    wait_for(|| client.finished());
+    let mut admin = Admin::linux_for_executable(
+        executable,
+        AdminRequest {
+            id: "save-client".into(),
+            command: AdminCommand::SaveProfile { profile: profile() },
+        },
+        Locale::EnUs,
+        Instant::now() + Duration::from_secs(12),
+    )
+    .unwrap();
+    let mut result = None;
+    wait_for(|| {
+        result = admin.poll();
+        result.is_some()
+    });
+    assert_eq!(result, Some(Ok(())));
+    wait_for(|| admin.finished());
+    let mut client = Client::linux_for_executable(executable).unwrap();
+    assert!(
+        matches!(get_snapshot(&mut client,"second"), Message::Snapshot { profiles,build,.. } if profiles == [profile()] && build == Some(expected))
+    );
+    client.close();
+    wait_for(|| client.finished());
+
+    let root = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+    let fake = root.join("fake-vpnt");
+    fs::write(&fake, r##"#!/usr/bin/python3
+import os,sys
+from pathlib import Path
+allowed={'PATH','LANG','LC_ALL','HOME','USER','LOGNAME','XDG_DATA_HOME','XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS'}
+expected={'USER':'fixture-user','LOGNAME':'fixture-log','XDG_CONFIG_HOME':'/fixture/config','XDG_CACHE_HOME':'/fixture/cache','XDG_RUNTIME_DIR':'/fixture/runtime','DBUS_SESSION_BUS_ADDRESS':'unix:path=/fixture/bus'}
+ok=set(os.environ).issubset(allowed) and all(os.environ.get(k)==v for k,v in expected.items()) and os.environ.get('VPNT_MUST_NOT_REACH_HELPER') is None and os.environ.get('LANG')=='C' and os.environ.get('LC_ALL')=='C' and os.environ.get('PATH')=='/usr/bin:/bin:/usr/sbin:/sbin' and os.environ.get('HOME')==os.environ.get('XDG_DATA_HOME') and sys.argv[1] == 'helper' and sys.argv[2] in ('runtime','admin')
+Path(os.environ['XDG_DATA_HOME'], 'fake-'+sys.argv[2]).write_text('ok' if ok else 'bad')
+while os.read(0,1024): pass
+"##).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut fake_client = Client::linux_for_executable(&fake).unwrap();
+    wait_for(|| root.join("fake-runtime").exists());
+    assert_eq!(fs::read_to_string(root.join("fake-runtime")).unwrap(), "ok");
+    fake_client.close();
+    wait_for(|| fake_client.finished());
+    let mut fake_admin = Admin::linux_for_executable(
+        &fake,
+        AdminRequest {
+            id: "fake".into(),
+            command: AdminCommand::SaveProfile { profile: profile() },
+        },
+        Locale::EnUs,
+        Instant::now() + Duration::from_secs(12),
+    )
+    .unwrap();
+    wait_for(|| root.join("fake-admin").exists());
+    assert_eq!(fs::read_to_string(root.join("fake-admin")).unwrap(), "ok");
+    fake_admin.close();
+    wait_for(|| fake_admin.finished());
+}
+
+#[test]
+fn linux_clients_use_real_runtime_and_filter_child_environment() {
+    let f = Fixture::new();
+    let mut p = Process(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "linux_client_integration_child", "--nocapture"])
+            .env("VPNT_CLIENT_TEST_CHILD", "1")
+            .env("XDG_DATA_HOME", &f.0)
+            .env("HOME", &f.0)
+            .env("VPNT_MUST_NOT_REACH_HELPER", "fictional")
+            .env("USER", "fixture-user")
+            .env("LOGNAME", "fixture-log")
+            .env("XDG_CONFIG_HOME", "/fixture/config")
+            .env("XDG_CACHE_HOME", "/fixture/cache")
+            .env("XDG_RUNTIME_DIR", "/fixture/runtime")
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/fixture/bus")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = p.0.try_wait().unwrap() {
+            assert!(status.success(), "client child: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "client child timed out");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
