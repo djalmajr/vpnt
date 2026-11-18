@@ -193,3 +193,29 @@ fn diagnostics_do_not_include_profile_data() {
         assert!(!diagnostic.contains("FAKE-TLS-SECRET-MARKER"));
     }
 }
+
+#[test]
+fn control_characters_are_refused_even_in_comments() {
+    for control in [0x00u8, 0x01, 0x1b, 0x7f] {
+        let mut content = b"remote vpn.example.test 1194\n# note ".to_vec();
+        content.push(control);
+        content.extend_from_slice(b"\n<ca>\nx\n</ca>\n");
+        assert!(
+            matches!(inspect(&content), Err(ImportError::Malformed)),
+            "control 0x{control:02x} was accepted"
+        );
+    }
+    let tabs = b"remote vpn.example.test 1194\r\n#\tnote\r\n<ca>\nx\n</ca>\n";
+    assert!(inspect(tabs).is_ok());
+}
+
+#[test]
+fn accepted_profiles_escape_to_at_most_twice_their_size_in_json() {
+    let mut content = "remote vpn.example.test 1194\n<ca>\nx\n</ca>\n".to_owned();
+    while content.len() + 200 <= MAX_PROFILE_BYTES {
+        content.push_str(&format!("#{}\n", "\"\\é".repeat(49)));
+    }
+    let inspected = inspect(content.as_bytes()).unwrap();
+    let escaped = serde_json::to_string(&inspected.normalized).unwrap();
+    assert!(escaped.len() <= 2 * inspected.normalized.len() + 2);
+}

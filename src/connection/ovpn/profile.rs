@@ -63,7 +63,14 @@ pub fn inspect(content: &[u8]) -> Result<Inspected, ImportError> {
         return Err(ImportError::TooLarge);
     }
     let input = std::str::from_utf8(content).map_err(|_| ImportError::NotUtf8)?;
-    if content.contains(&0) {
+    // A profile is text: besides tab and line ends, control characters (even
+    // in comments) are refused. This also keeps the JSON escape of an
+    // accepted profile within twice its size (only quotes and backslashes
+    // grow), which the bridge and admin frame limits rely on.
+    if content
+        .iter()
+        .any(|&byte| byte.is_ascii_control() && !matches!(byte, b'\t' | b'\n' | b'\r'))
+    {
         return Err(ImportError::Malformed);
     }
     let lines = input.replace("\r\n", "\n").replace('\r', "\n");
