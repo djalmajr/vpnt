@@ -283,3 +283,88 @@ pub fn encode_response(response: &Response) -> Vec<u8> {
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod tests;
+
+impl From<&Config> for Configure {
+    fn from(config: &Config) -> Self {
+        Self {
+            ifname: config.name.to_string(),
+            address: config.address.to_string(),
+            prefix: config.prefix,
+            mtu: config.mtu,
+            routes: config
+                .routes
+                .iter()
+                .map(|route| WireRoute {
+                    network: route.network.to_string(),
+                    prefix: route.prefix,
+                })
+                .collect(),
+            dns: WireDns {
+                servers: config.dns.servers.iter().map(ToString::to_string).collect(),
+                domains: config.dns.domains.clone(),
+            },
+        }
+    }
+}
+
+pub fn encode_request(request: &Request) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(request).expect("request fields serialize infallibly");
+    bytes.push(b'\n');
+    bytes
+}
+
+pub fn decode_response(line: &[u8]) -> Result<Response, ErrorCode> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum WireResponse {
+        Version(VersionReply),
+        Opened(OpenedReply),
+        Error(ErrorReply),
+        Ok(OkReply),
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VersionReply {
+        ok: bool,
+        version: u32,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OpenedReply {
+        ok: bool,
+        ifname: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ErrorReply {
+        ok: bool,
+        error: ErrorCode,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OkReply {
+        ok: bool,
+    }
+
+    if line.len() > MAX_LINE || !line.ends_with(b"\n") || line[..line.len() - 1].contains(&b'\n') {
+        return Err(ErrorCode::BadRequest);
+    }
+    match serde_json::from_slice(line).map_err(|_| ErrorCode::BadRequest)? {
+        WireResponse::Version(reply) if reply.ok => Ok(Response::Version(reply.version)),
+        WireResponse::Opened(reply) if reply.ok => {
+            Ok(Response::Opened(TunName::parse(&reply.ifname)?))
+        }
+        WireResponse::Error(reply) if !reply.ok => Ok(Response::Error(reply.error)),
+        WireResponse::Ok(reply) if reply.ok => Ok(Response::Ok),
+        _ => Err(ErrorCode::BadRequest),
+    }
+}
+
+// Read at most MAX_LINE bytes, leaving following frames in the buffered reader.
+// An incomplete frame will be rejected by the wire decoder.
+pub(super) fn read_line(reader: &mut impl std::io::BufRead) -> std::io::Result<Vec<u8>> {
+    use std::io::{BufRead, Read};
+    let mut bytes = Vec::new();
+    reader.take(MAX_LINE as u64).read_until(b'\n', &mut bytes)?;
+    Ok(bytes)
+}

@@ -222,3 +222,41 @@ fn dns_rules() {
     )]);
     assert!(checked(&v).is_ok());
 }
+
+#[test]
+fn transport_encoders_round_trip_and_reject_inconsistent_responses() {
+    for request in [
+        json!({"op":"hello","version":1}),
+        json!({"op":"open_tun"}),
+        valid(),
+        json!({"op":"close_tun","ifname":"vpnt0"}),
+    ] {
+        let bytes = encode_request(&parse(&request).unwrap());
+        assert_eq!(
+            serde_json::to_value(parse_request(&bytes).unwrap()).unwrap(),
+            request
+        );
+    }
+    for response in [
+        Response::Ok,
+        Response::Version(1),
+        Response::Opened(TunName::parse("vpnt0").unwrap()),
+        Response::Error(ErrorCode::NotOwned),
+    ] {
+        let bytes = encode_response(&response);
+        assert_eq!(encode_response(&decode_response(&bytes).unwrap()), bytes);
+    }
+    for bad in [
+        "{\"ok\":true,\"error\":\"limit\"}\n",
+        "{\"ok\":false}\n",
+        "{\"ok\":true,\"ifname\":\"vpnt00\"}\n",
+        "{\"ok\":true,\"version\":1,\"extra\":0}\n",
+        "{\"ok\":true}",
+        "{\"ok\":true,\"ok\":false}\n",
+    ] {
+        assert_eq!(
+            decode_response(bad.as_bytes()).unwrap_err(),
+            ErrorCode::BadRequest
+        );
+    }
+}
