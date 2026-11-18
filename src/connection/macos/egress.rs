@@ -169,6 +169,30 @@ impl Egress {
     }
 }
 
+#[cfg(test)]
+impl Egress {
+    /// The egress `select` would have kept for `profile`, through an
+    /// interface that has since left the machine: `is_current` reads the real
+    /// interface list and answers `false`.
+    pub(crate) fn fixture_departed(profile: &Profile) -> Self {
+        Self {
+            profile: profile.id.clone(),
+            host: profile.gateway.clone(),
+            port: profile.port,
+            interface: Interface {
+                name: "vpnt-gone0".into(),
+                index: 7,
+                flags: libc::IFF_UP as u32,
+                addresses: ["192.0.2.10".parse().unwrap()].into(),
+            },
+            gateway: "192.0.2.90".parse().unwrap(),
+            next_hop: NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap())),
+            observed_key: None,
+            source: None,
+        }
+    }
+}
+
 pub(crate) fn prepare_ssl_plan<T>(
     networks: &[String],
     families: (bool, bool),
