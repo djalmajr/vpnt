@@ -151,7 +151,10 @@ fn runtime_protocol_lock_and_admin_round_trip() {
         &mut admin_stream,
         &AdminRequest {
             id: "save".into(),
-            command: AdminCommand::SaveProfile { profile: profile() },
+            command: AdminCommand::SaveProfile {
+                profile: profile(),
+                ovpn_config: None,
+            },
         },
     )
     .unwrap();
@@ -221,7 +224,10 @@ fn linux_client_rejects_relative_executable() {
     ));
     let request = AdminRequest {
         id: "relative".into(),
-        command: AdminCommand::SaveProfile { profile: profile() },
+        command: AdminCommand::SaveProfile {
+            profile: profile(),
+            ovpn_config: None,
+        },
     };
     assert!(matches!(
         vpnt::helper::admin_client::Admin::linux_for_executable(
@@ -292,7 +298,10 @@ fn linux_client_integration_child() {
         executable,
         AdminRequest {
             id: "save-client".into(),
-            command: AdminCommand::SaveProfile { profile: profile() },
+            command: AdminCommand::SaveProfile {
+                profile: profile(),
+                ovpn_config: None,
+            },
         },
         Locale::EnUs,
         Instant::now() + Duration::from_secs(12),
@@ -334,7 +343,10 @@ while os.read(0,1024): pass
         &fake,
         AdminRequest {
             id: "fake".into(),
-            command: AdminCommand::SaveProfile { profile: profile() },
+            command: AdminCommand::SaveProfile {
+                profile: profile(),
+                ovpn_config: None,
+            },
         },
         Locale::EnUs,
         Instant::now() + Duration::from_secs(12),
@@ -375,4 +387,187 @@ fn linux_clients_use_real_runtime_and_filter_child_environment() {
         assert!(Instant::now() < deadline, "client child timed out");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+const IMPORTED_OVPN: &str =
+    "# Name: Fixture  \r\nremote vpn.example.test 1194\t\r\n<ca>\r\nSYNTHETIC-CA\r\n</ca>\r\n";
+const NORMALIZED_OVPN: &str =
+    "# Name: Fixture\nremote vpn.example.test 1194\n<ca>\nSYNTHETIC-CA\n</ca>\n";
+
+fn ovpn_profile() -> Profile {
+    let mut value = serde_json::to_value(profile()).unwrap();
+    value["kind"] = "ovpn".into();
+    value["username"] = "".into();
+    value["port"] = 1194.into();
+    value["ovpn"] = serde_json::json!({"certificateId":"01ab","module":"/opt/fixture/token.so"});
+    let profile: Profile = serde_json::from_value(value).unwrap();
+    assert_eq!(profile.validate(), Ok(()));
+    profile
+}
+
+fn run_admin(fixture: &Fixture, command: serde_json::Value) -> Message {
+    use std::io::Write;
+    let (mut process, mut stream) = fixture.start("admin");
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    assert!(matches!(
+        protocol::read_message(&mut reader).unwrap(),
+        Some(Message::AdminReady { .. })
+    ));
+    let request = serde_json::json!({"id":"fixture-admin","command":command});
+    serde_json::to_writer(&mut stream, &request).unwrap();
+    stream.write_all(b"\n").unwrap();
+    stream.shutdown(Shutdown::Write).unwrap();
+    let result = protocol::read_message(&mut reader).unwrap().unwrap();
+    assert!(
+        process.wait().success(),
+        "admin rejected this frame: {result:?}"
+    );
+    result
+}
+
+#[test]
+fn admin_persists_normalized_ovpn_before_profile_and_cleans_up() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    use vpnt::{helper::protocol::ErrorCode, storage::ProfileStore};
+
+    let fixture = Fixture::new();
+    let mut profile_ovpn = ovpn_profile();
+    let save = |profile: &Profile, config: Option<&str>| {
+        let mut value = serde_json::json!({"type":"save_profile","profile":profile});
+        if let Some(config) = config {
+            value["ovpn_config"] = config.into();
+        }
+        run_admin(&fixture, value)
+    };
+    let root = fixture.0.join("vpnt/profiles");
+    let config = root.join("ovpn/first.ovpn");
+    use std::os::unix::fs::PermissionsExt;
+    let ovpn_dir = root.join("ovpn");
+    fs::create_dir_all(&ovpn_dir).unwrap();
+    for dir in [root.as_path(), ovpn_dir.as_path()] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let store = ProfileStore::open(&root, fs::metadata(&root).unwrap().uid()).unwrap();
+    let target = fixture.0.join("untouched");
+    fs::write(&target, "untouched").unwrap();
+    symlink(&target, &config).unwrap();
+    assert!(matches!(
+        save(&profile_ovpn, Some(IMPORTED_OVPN)),
+        Message::Failed {
+            error: ErrorCode::Unavailable,
+            ..
+        }
+    ));
+    assert!(store.load().unwrap().is_empty());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+    assert!(fs::symlink_metadata(&config).unwrap().is_symlink());
+    fs::remove_file(&config).unwrap();
+
+    assert!(matches!(
+        save(&profile_ovpn, None),
+        Message::Failed {
+            error: ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+    assert!(matches!(
+        save(&profile_ovpn, Some("up SYNTHETIC-DO-NOT-PRINT")),
+        Message::Failed {
+            error: ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+    assert!(!config.exists());
+
+    assert!(store.load().unwrap().is_empty());
+
+    assert!(matches!(
+        save(&profile_ovpn, Some(IMPORTED_OVPN)),
+        Message::Accepted { .. }
+    ));
+    assert_eq!(fs::read_to_string(&config).unwrap(), NORMALIZED_OVPN);
+    assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(store.load().unwrap(), [profile_ovpn.clone()]);
+
+    profile_ovpn.name = "Edited fixture".into();
+    let guard = store.reserve(&profile_ovpn.id).unwrap();
+    assert!(matches!(
+        save(
+            &profile_ovpn,
+            Some(&IMPORTED_OVPN.replace("Fixture", "New"))
+        ),
+        Message::Failed {
+            error: ErrorCode::ProfileBusy,
+            ..
+        }
+    ));
+    assert_eq!(fs::read_to_string(&config).unwrap(), NORMALIZED_OVPN);
+    drop(guard);
+    assert!(matches!(
+        save(&profile_ovpn, None),
+        Message::Accepted { .. }
+    ));
+    assert_eq!(store.load().unwrap(), [profile_ovpn.clone()]);
+    assert_eq!(fs::read_to_string(&config).unwrap(), NORMALIZED_OVPN);
+
+    let ssl = profile();
+    assert!(matches!(
+        save(&ssl, Some(IMPORTED_OVPN)),
+        Message::Failed {
+            error: ErrorCode::InvalidRequest,
+            ..
+        }
+    ));
+    assert!(matches!(save(&ssl, None), Message::Accepted { .. }));
+    assert!(!config.exists());
+    assert_eq!(store.load().unwrap(), [ssl]);
+    assert!(matches!(
+        save(&profile_ovpn, Some(IMPORTED_OVPN)),
+        Message::Accepted { .. }
+    ));
+    assert!(matches!(
+        run_admin(
+            &fixture,
+            serde_json::json!({"type":"remove_profile","id":"first"})
+        ),
+        Message::Accepted { .. }
+    ));
+    assert!(!config.exists());
+    assert!(store.load().unwrap().is_empty());
+}
+
+#[test]
+fn admin_save_protocol_remains_compatible_and_prepares_only_normalized_ovpn() {
+    let legacy = profile();
+    let expected = format!(
+        "{{\"id\":\"legacy\",\"command\":{{\"type\":\"save_profile\",\"profile\":{}}}}}\n",
+        serde_json::to_string(&legacy).unwrap()
+    );
+    let request = protocol::read_admin_request(&mut expected.as_bytes()).unwrap();
+    assert!(
+        matches!(&request.command, AdminCommand::SaveProfile { profile, ovpn_config: None } if profile == &legacy)
+    );
+    let mut wire = Vec::new();
+    protocol::write_admin_request(&mut wire, &request).unwrap();
+    assert_eq!(wire, expected.as_bytes());
+
+    assert!(matches!(
+        AdminCommand::for_save(legacy, Some(IMPORTED_OVPN.into())),
+        Err("invalid_profile")
+    ));
+    assert!(matches!(
+        AdminCommand::for_save(ovpn_profile(), Some("up SYNTHETIC-DO-NOT-PRINT".into())),
+        Err("invalid_ovpn")
+    ));
+    let request = AdminRequest {
+        id: "normalized".into(),
+        command: AdminCommand::for_save(ovpn_profile(), Some(IMPORTED_OVPN.into())).unwrap(),
+    };
+    let mut wire = Vec::new();
+    protocol::write_admin_request(&mut wire, &request).unwrap();
+    let parsed = protocol::read_admin_request(&mut wire.as_slice()).unwrap();
+    assert!(matches!(parsed.command,
+        AdminCommand::SaveProfile { profile, ovpn_config: Some(config) }
+            if profile == ovpn_profile() && config == NORMALIZED_OVPN
+    ));
 }

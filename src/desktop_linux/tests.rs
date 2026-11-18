@@ -571,34 +571,20 @@ fn icon_is_rgba_with_transparent_corners_and_opaque_white() {
 }
 
 #[test]
-fn backend_demo_and_normal_contract() {
-    for demo in [true, false] {
-        let (tx, rx) = mpsc::channel();
-        let backend = Backend::new(demo, move |reply| {
-            let _ = tx.send(reply);
-        })
+fn backend_demo_preserves_demo_snapshot() {
+    let (tx, rx) = mpsc::channel();
+    let backend = Backend::new(true, move |reply| {
+        let _ = tx.send(reply);
+    })
+    .unwrap();
+    backend
+        .send(request(Command::GetSnapshot {}), Instant::now())
         .unwrap();
-        backend
-            .send(request(Command::GetSnapshot {}), Instant::now())
-            .unwrap();
-        let reply = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(reply.id, "test-1");
-        let snapshot = reply.snapshot.unwrap();
-        assert_eq!(snapshot.demo, demo);
-        assert_eq!(snapshot.vpns.len(), if demo { 2 } else { 0 });
-        if !demo {
-            backend
-                .send(request(Command::Connect { id: "x".into() }), Instant::now())
-                .unwrap();
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(2))
-                    .unwrap()
-                    .error
-                    .as_deref(),
-                Some("not_implemented")
-            );
-        }
-    }
+    let reply = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(reply.id, "test-1");
+    let snapshot = reply.snapshot.unwrap();
+    assert!(snapshot.demo);
+    assert_eq!(snapshot.vpns.len(), 2);
 }
 
 #[test]

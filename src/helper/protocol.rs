@@ -1,6 +1,6 @@
 //! Private pipe protocol. Runtime commands cannot modify administrative policy.
 use crate::{
-    model::{Profile, valid_profile_id},
+    model::{Profile, VpnKind, valid_profile_id},
     preferences::ProbeInterval,
     secrets::Credentials,
     session::ConnectionState,
@@ -85,8 +85,40 @@ pub struct AdminRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminCommand {
-    SaveProfile { profile: Profile },
-    RemoveProfile { id: String },
+    SaveProfile {
+        profile: Profile,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ovpn_config: Option<String>,
+    },
+    RemoveProfile {
+        id: String,
+    },
+}
+
+impl AdminCommand {
+    /// Validates a bridge save before it is sent across the administration channel.
+    pub fn for_save(profile: Profile, ovpn_config: Option<String>) -> Result<Self, &'static str> {
+        if ovpn_config.is_some() && profile.kind != VpnKind::Ovpn {
+            return Err("invalid_profile");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if ovpn_config.is_some() {
+            return Err("unsupported");
+        }
+        #[cfg(target_os = "linux")]
+        let ovpn_config = ovpn_config
+            .map(|text| {
+                crate::connection::ovpn::profile::inspect(text.as_bytes())
+                    .map(|config| config.normalized)
+                    .map_err(|_| "invalid_ovpn")
+            })
+            .transpose()?;
+        profile.validate()?;
+        Ok(Self::SaveProfile {
+            profile,
+            ovpn_config,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -254,7 +286,7 @@ pub fn read_admin_request(reader: &mut impl BufRead) -> Result<AdminRequest, Pro
         return Err(ProtocolError::InvalidRequest);
     }
     match &request.command {
-        AdminCommand::SaveProfile { profile } => profile
+        AdminCommand::SaveProfile { profile, .. } => profile
             .validate()
             .map_err(|_| ProtocolError::InvalidRequest)?,
         AdminCommand::RemoveProfile { id } if valid_profile_id(id) => {}

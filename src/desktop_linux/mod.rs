@@ -9,6 +9,7 @@ mod backend;
 mod icon;
 mod omarchy;
 mod placement;
+mod preferences;
 #[cfg(test)]
 mod tests;
 

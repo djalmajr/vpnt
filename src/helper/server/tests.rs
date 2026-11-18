@@ -420,6 +420,7 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
             id: "save-one".into(),
             command: AdminCommand::SaveProfile {
                 profile: profile.clone(),
+                ovpn_config: None,
             },
         },
     )
@@ -486,7 +487,10 @@ fn half_closed_administration_waits_for_eof_and_never_mutates_on_a_second_docume
         &store,
         protocol::AdminRequest {
             id: "invalid-lock".into(),
-            command: AdminCommand::SaveProfile { profile },
+            command: AdminCommand::SaveProfile {
+                profile,
+                ovpn_config: None,
+            },
         },
     );
     assert!(matches!(
