@@ -12,6 +12,8 @@ default-run = "vpnt"
 default = ["desktop"]
 desktop = [
     "dep:tao",
+    "dep:toml",
+    "dep:glib",
     "dep:wry",
     "dep:tray-icon",
     "dep:objc2",
@@ -97,6 +99,14 @@ objc2-user-notifications = { version = "0.3.2", optional = true, default-feature
     "block2",
 ] }
 block2 = { version = "0.6.2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+toml = { version = "0.8", optional = true }
+glib = { version = "0.18.5", optional = true }
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", optional = true }
+# KSNI reports tray clicks; the default AppIndicator backend does not.
+tray-icon = { version = "0.26.1", optional = true, default-features = false, features = ["ksni"] }
 
 [build-dependencies]
 # Locked transitive version; builds only the macOS SDK utun shim.

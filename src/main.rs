@@ -40,7 +40,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        #[cfg(all(target_os = "macos", feature = "desktop"))]
+        #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "desktop"))]
         Options::App { demo, show } => {
             if let Err(error) = vpnt::desktop::run(demo, show) {
                 eprintln!("{error}");
@@ -49,7 +49,7 @@ fn main() {
         }
         #[allow(unreachable_patterns)]
         _ => {
-            eprintln!("The desktop app currently requires macOS and the desktop feature.");
+            eprintln!("The desktop app currently requires macOS or Linux and the desktop feature.");
             std::process::exit(1);
         }
     }
