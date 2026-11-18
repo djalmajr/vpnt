@@ -118,6 +118,7 @@ pub(crate) fn icon_for(snapshot: Option<&Snapshot>, error: bool) -> Icon {
             // reads like Off, so the triangle is kept for what needs attention.
             ConnectionState::Off
             | ConnectionState::Connecting
+            | ConnectionState::AwaitingApproval
             | ConnectionState::Verifying
             | ConnectionState::Reconnecting
             | ConnectionState::Disconnecting => {}

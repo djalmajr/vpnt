@@ -123,6 +123,24 @@ impl App {
         ) {
             return Ok(self.snapshot_at(now));
         }
+        if let Command::SaveProfile {
+            profile,
+            ovpn_config,
+        } = &command
+        {
+            if profile.kind != VpnKind::Ovpn && ovpn_config.is_some() {
+                return Err("invalid_profile");
+            }
+            if profile.kind == VpnKind::Ovpn {
+                if let Some(content) = ovpn_config {
+                    crate::bridge::ovpn::validate_config(content)?;
+                } else if !self.connections.iter().any(|connection| {
+                    connection.profile.id == profile.id && connection.profile.kind == VpnKind::Ovpn
+                }) {
+                    return Err("invalid_profile");
+                }
+            }
+        }
         if !self.demo {
             return Err("not_implemented");
         }
@@ -180,7 +198,7 @@ impl App {
                     Self::log(connection);
                 }
             }
-            Command::SaveProfile { profile } => {
+            Command::SaveProfile { profile, .. } => {
                 profile.validate()?;
                 if let Some(connection) = self
                     .connections
@@ -190,14 +208,26 @@ impl App {
                     if connection.session.state().active() {
                         return Err("profile_active");
                     }
+                    if profile.kind == VpnKind::Ovpn {
+                        connection.has_password = false;
+                        connection.has_psk = false;
+                        if connection.session.state() == ConnectionState::MissingSecret {
+                            connection.session = Session::default();
+                        }
+                    }
                     connection.profile = profile;
                 } else {
                     if self.connections.len() >= 64 {
                         return Err("profile_limit");
                     }
+                    let state = if profile.kind == VpnKind::Ovpn {
+                        ConnectionState::Off
+                    } else {
+                        ConnectionState::MissingSecret
+                    };
                     self.connections.push(Connection {
                         profile,
-                        session: Session::with_state(ConnectionState::MissingSecret),
+                        session: Session::with_state(state),
                         has_password: false,
                         has_psk: false,
                         log: vec![],
@@ -227,6 +257,9 @@ impl App {
             }
             Command::SetPreferences { preferences } => self.preferences = preferences,
             Command::InstallHelper {} | Command::RemoveHelper {} => return Err("not_implemented"),
+            Command::InspectOvpn { .. } | Command::ListCertificates { .. } => {
+                return Err("unsupported");
+            }
             Command::GetSnapshot {}
             | Command::Quit {}
             | Command::Hide {}

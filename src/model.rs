@@ -34,19 +34,23 @@ pub struct OvpnSettings {
 
 impl OvpnSettings {
     fn is_valid(&self) -> bool {
-        let path = Path::new(&self.module);
         (2..=128).contains(&self.certificate_id.len())
             && self.certificate_id.len().is_multiple_of(2)
             && self
                 .certificate_id
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            && self.module.len() <= 4096
-            && !self.module.chars().any(char::is_control)
-            && self.module.ends_with(".so")
-            && path.is_absolute()
-            && !path.components().any(|part| part == Component::ParentDir)
+            && valid_module_path(&self.module)
     }
+}
+
+pub(crate) fn valid_module_path(path: &str) -> bool {
+    let module = Path::new(path);
+    path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && path.ends_with(".so")
+        && module.is_absolute()
+        && !module.components().any(|part| part == Component::ParentDir)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

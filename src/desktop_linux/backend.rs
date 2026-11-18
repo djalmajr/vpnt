@@ -25,18 +25,13 @@ impl Backend {
                 let mut app = if demo { App::demo() } else { App::new() };
                 while let Ok(work) = requests.recv() {
                     let id = work.request.id;
-                    let response = match app.dispatch_at(work.request.command, work.received) {
-                        Ok(snapshot) => Reply {
-                            id,
-                            snapshot: Some(snapshot),
-                            error: None,
-                        },
-                        Err(code) => Reply {
-                            id,
-                            snapshot: None,
-                            error: Some(code.into()),
-                        },
-                    };
+                    let response = crate::bridge::ovpn::reply(&id, &work.request.command)
+                        .unwrap_or_else(|| {
+                            Reply::from_result(
+                                id,
+                                app.dispatch_at(work.request.command, work.received),
+                            )
+                        });
                     reply(response);
                 }
             })?;

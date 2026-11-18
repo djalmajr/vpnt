@@ -57,18 +57,8 @@ pub fn serve(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> 
                 continue;
             }
             let reply = match parse_request(&body) {
-                Ok(input) => match app.dispatch(input.command) {
-                    Ok(snapshot) => Reply {
-                        id: input.id,
-                        snapshot: Some(snapshot),
-                        error: None,
-                    },
-                    Err(error) => Reply {
-                        id: input.id,
-                        snapshot: None,
-                        error: Some(error.into()),
-                    },
-                },
+                Ok(input) => crate::bridge::ovpn::reply(&input.id, &input.command)
+                    .unwrap_or_else(|| Reply::from_result(input.id, app.dispatch(input.command))),
                 Err(_) => {
                     let _ = request.respond(Response::empty(400));
                     continue;
