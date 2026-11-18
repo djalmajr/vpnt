@@ -60,6 +60,7 @@ pub struct Broker<S: SecretStore> {
     epoch: u64,
     preferences: Preferences,
     notifier: Box<dyn crate::notifications::Notifier>,
+    #[cfg(any(test, feature = "desktop"))]
     locale: crate::localization::Locale,
     automatic: std::collections::VecDeque<automatic::Action>,
     sent_interval: Option<crate::preferences::ProbeInterval>,
@@ -122,6 +123,7 @@ impl<S: SecretStore> Broker<S> {
             epoch: 1,
             preferences: Preferences::default(),
             notifier: Box::new(crate::notifications::Noop),
+            #[cfg(any(test, feature = "desktop"))]
             locale: crate::localization::Locale::default(),
             automatic: automatic::queue(),
             sent_interval: None,

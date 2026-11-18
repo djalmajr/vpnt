@@ -66,12 +66,14 @@ impl Policy {
         self.attempted = Some(generation);
         self.queued = false;
     }
+    #[cfg(any(test, feature = "desktop"))]
     pub fn defer(&mut self, generation: u64) {
         if self.attempted == Some(generation) {
             self.attempted = None;
         }
         self.queued = true;
     }
+    #[cfg(any(test, feature = "desktop"))]
     pub fn unqueue(&mut self) {
         self.queued = false;
     }
