@@ -19,7 +19,11 @@ fn main() {
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     // SAFETY: standalone main before threads. The activation descriptor is still unowned.
-    std::process::exit(unsafe { vpnt::netd::server::run_linux(&args) });
+    let code = unsafe { vpnt::netd::server::run_linux(&args) };
+    if code == 64 {
+        eprintln!("vpnt-helper: started by systemd through vpnt-helper.socket; not for direct use");
+    }
+    std::process::exit(code);
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {

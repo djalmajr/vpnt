@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Tray
+Exec=vpnt
+Icon=vpnt
+Categories=Network;
+Terminal=false
+StartupNotify=false
