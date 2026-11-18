@@ -52,6 +52,44 @@ fn config_base_prefers_absolute_xdg_and_falls_back_to_absolute_home() {
 }
 
 #[test]
+fn coordinator_applies_explicit_startup_choice_to_linux_backend() {
+    use std::time::{Duration, Instant};
+
+    let fixture = Fixture::new();
+    let backend = fixture.backend("/usr/bin/vpnt");
+    let entry = backend.base.join("autostart/vpnt.desktop");
+    let mut host = Coordinator::restore(backend).unwrap();
+    assert!(!entry.exists());
+
+    let desired = Preferences {
+        startup: true,
+        ..host.current()
+    };
+    assert_eq!(
+        host.apply(desired, Instant::now() + Duration::from_secs(2)),
+        Ok(desired)
+    );
+    assert!(
+        fs::read_to_string(&entry)
+            .unwrap()
+            .lines()
+            .any(|line| line == "Exec=/usr/bin/vpnt")
+    );
+    let restored = Coordinator::restore(fixture.backend("/usr/bin/vpnt")).unwrap();
+    assert!(restored.current().startup);
+
+    let disabled = Preferences {
+        startup: false,
+        ..desired
+    };
+    assert_eq!(
+        host.apply(disabled, Instant::now() + Duration::from_secs(2)),
+        Ok(disabled)
+    );
+    assert!(!entry.exists());
+}
+
+#[test]
 fn restores_without_writes_and_persists_closed_preferences_with_private_modes() {
     let fixture = Fixture::new();
     let mut backend = fixture.backend("/usr/bin/vpnt");
