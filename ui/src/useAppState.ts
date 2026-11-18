@@ -132,6 +132,7 @@ export function useAppState() {
           invalid_gateway: "invalidGateway",
           invalid_network: "invalidNetwork",
           invalid_probe: "invalidProbe",
+          ovpnTooLarge: "ovpnTooLarge",
           backend_unavailable: "backendUnavailable",
           admin_busy: "adminBusy",
           profile_busy: "profileBusy",

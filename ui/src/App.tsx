@@ -141,6 +141,7 @@ export function App() {
                       run={run}
                       navigate={navigate}
                       secrets={() =>
+                        vpn.profile.kind !== "ovpn" &&
                         setModal({
                           type: "secrets",
                           id: vpn.profile.id,
@@ -189,7 +190,7 @@ export function App() {
                   t={t}
                 />
                 <h2 className="section-title">{t("chooseType")}</h2>
-                {(["ipsec", "ssl"] as const).map((kind) => (
+                {(["ipsec", "ssl", "ovpn"] as const).map((kind) => (
                   <Group key={kind}>
                     <button
                       type="button"
@@ -204,9 +205,7 @@ export function App() {
                     >
                       <span>
                         {t(kind)}
-                        <small>
-                          {t(kind === "ipsec" ? "ipsecHint" : "sslHint")}
-                        </small>
+                        <small>{t(`${kind}Hint`)}</small>
                       </span>
                       <Icon name="chevron" />
                     </button>
@@ -228,6 +227,7 @@ export function App() {
                 t={t}
                 secrets={() =>
                   selected &&
+                  selected.profile.kind !== "ovpn" &&
                   setModal({ type: "secrets", id: selected.profile.id })
                 }
                 remove={() =>
@@ -306,11 +306,17 @@ export function App() {
                         })
                       }
                     >
-                      {states.map((state) => (
-                        <option key={state} value={state}>
-                          {t(`state.${state}`)}
-                        </option>
-                      ))}
+                      {states
+                        .filter(
+                          (state) =>
+                            state !== "awaiting_approval" ||
+                            vpn.profile.kind === "ovpn",
+                        )
+                        .map((state) => (
+                          <option key={state} value={state}>
+                            {t(`state.${state}`)}
+                          </option>
+                        ))}
                     </select>
                   </label>
                 ))}
@@ -319,13 +325,15 @@ export function App() {
             {modal &&
               modalVpn &&
               (modal.type === "secrets" ? (
-                <SecretsDialog
-                  vpn={modalVpn}
-                  connect={!!modal.connect}
-                  run={run}
-                  close={() => setModal(undefined)}
-                  t={t}
-                />
+                modalVpn.profile.kind !== "ovpn" && (
+                  <SecretsDialog
+                    vpn={modalVpn}
+                    connect={!!modal.connect}
+                    run={run}
+                    close={() => setModal(undefined)}
+                    t={t}
+                  />
+                )
               ) : (
                 <RemoveDialog
                   vpn={modalVpn}

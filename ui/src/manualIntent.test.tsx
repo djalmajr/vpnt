@@ -155,6 +155,7 @@ for (const locale of ["pt-BR", "en-US"] as const) {
               "cleanup_unconfirmed",
               "disconnecting",
               "connecting",
+              "awaiting_approval",
               "reconnecting",
             ].includes(state);
           expect(control.type).toBe("button");
@@ -235,7 +236,10 @@ for (const locale of ["pt-BR", "en-US"] as const) {
             dots.push(element);
         });
         expect(dots).toHaveLength(1);
-        const cancelable = state === "connecting" || state === "reconnecting";
+        const cancelable =
+          state === "connecting" ||
+          state === "awaiting_approval" ||
+          state === "reconnecting";
         const cancel = buttons(s.tree).find(
           (button) =>
             props(button)["aria-label"] === translate(locale, "cancel"),
