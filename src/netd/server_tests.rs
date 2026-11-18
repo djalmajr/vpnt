@@ -756,6 +756,56 @@ fn close_retry_refuses_to_delete_unmarked_replacement() {
 }
 
 #[test]
+fn disconnect_after_failed_close_keeps_an_unmarked_replacement() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    let name = TunName::parse("vpnt0").unwrap();
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Error(ErrorCode::Backend)
+    ));
+    f.fake.fail_delete.store(false, Ordering::SeqCst);
+    assert!(f.fake.names.lock().unwrap().remove(&name));
+    assert!(f.fake.foreign.lock().unwrap().insert(name.clone()));
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    assert!(f.fake.foreign.lock().unwrap().contains(&name));
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    assert_eq!(
+        f.fake
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "delete vpnt0")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn disconnect_after_failed_close_deletes_our_marked_tun() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    let name = TunName::parse("vpnt0").unwrap();
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Error(ErrorCode::Backend)
+    ));
+    f.fake.fail_delete.store(false, Ordering::SeqCst);
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    assert!(!f.fake.names.lock().unwrap().contains(&name));
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+}
+
+#[test]
 fn close_retry_releases_a_missing_interface() {
     let f = Fixture::new(HELLO_TIMEOUT);
     let (mut wire, worker) = f.connection(1000);

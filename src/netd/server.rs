@@ -232,6 +232,7 @@ impl<B: Backend + 'static> Server<B> {
             server: self,
             uid,
             owned: Vec::new(),
+            close_failed: Vec::new(),
         };
         loop {
             let idle = lease
@@ -373,6 +374,9 @@ struct Session<'a, B: Backend + 'static> {
     server: &'a Arc<Server<B>>,
     uid: u32,
     owned: Vec<TunName>,
+    /// Owned names whose close_tun failed. Another actor may have replaced the
+    /// device since, so any later delete, retry or disconnect, checks the mark.
+    close_failed: Vec<TunName>,
 }
 impl<B: Backend + 'static> Session<'_, B> {
     fn handle(&mut self, request: Request) -> Response {
@@ -415,30 +419,42 @@ impl<B: Backend + 'static> Session<'_, B> {
                 if !self.owned.contains(&name) {
                     return Err(ErrorCode::NotOwned);
                 }
-                let existing = self
-                    .server
-                    .backend
-                    .existing()
-                    .map_err(|_| ErrorCode::Backend)?;
-                match existing.iter().find(|entry| entry.name == name) {
-                    None => {}
-                    Some(entry) if !CleanupProof::Marked.matches(entry) => {
-                        log_tun("close_name_conflict", self.uid, &name);
+                if let Err(error) = self.delete_marked(&name) {
+                    if !self.close_failed.contains(&name) {
+                        self.close_failed.push(name);
                     }
-                    Some(_) => {
-                        // The helper trusts other CAP_NET_ADMIN actors: they could
-                        // replace a link between this inventory and deletion by name.
-                        self.server.backend.delete_tun(&name).map_err(|_| {
-                            log_tun("delete_failed", self.uid, &name);
-                            ErrorCode::Backend
-                        })?;
-                    }
+                    return Err(error);
                 }
                 self.server.release(&name);
                 self.owned.retain(|owned| *owned != name);
+                self.close_failed.retain(|failed| *failed != name);
                 Ok(Response::Ok)
             }
         }
+    }
+    /// Deletes the device only while it is still a marked helper tun: a
+    /// missing device needs nothing, and an unmarked one is not ours anymore.
+    fn delete_marked(&self, name: &TunName) -> Result<(), ErrorCode> {
+        let existing = self
+            .server
+            .backend
+            .existing()
+            .map_err(|_| ErrorCode::Backend)?;
+        match existing.iter().find(|entry| entry.name == *name) {
+            None => {}
+            Some(entry) if !CleanupProof::Marked.matches(entry) => {
+                log_tun("close_name_conflict", self.uid, name);
+            }
+            Some(_) => {
+                // The helper trusts other CAP_NET_ADMIN actors: they could
+                // replace a link between this inventory and deletion by name.
+                self.server.backend.delete_tun(name).map_err(|_| {
+                    log_tun("delete_failed", self.uid, name);
+                    ErrorCode::Backend
+                })?;
+            }
+        }
+        Ok(())
     }
     fn delete(&self, name: &TunName) -> Result<(), ErrorCode> {
         self.server.backend.delete_tun(name).map_err(|_| {
@@ -454,7 +470,14 @@ impl<B: Backend + 'static> Session<'_, B> {
 impl<B: Backend + 'static> Drop for Session<'_, B> {
     fn drop(&mut self) {
         for name in &self.owned {
-            let _ = self.delete(name);
+            if !self.close_failed.contains(name) {
+                let _ = self.delete(name);
+            } else if self.delete_marked(name).is_ok() {
+                self.server.release(name);
+                log_tun("deleted", self.uid, name);
+            } else {
+                self.server.defer(name, CleanupProof::Marked);
+            }
         }
     }
 }
