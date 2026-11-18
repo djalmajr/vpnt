@@ -149,7 +149,9 @@ export function Profile({
   }, [dirty, saving, registerNavigationGuard]);
   const back = () => navigate(profileOriginRoute(origin));
   const usernameErrorId = useId();
-  const usernameError = hasShellExpression(value.username);
+  // OVPN has no username: a value typed under another kind is hidden and not
+  // sent, so it must not keep the form from saving.
+  const usernameError = !isOvpn && hasShellExpression(value.username);
   const canSave =
     !usernameError &&
     !!value.name.trim() &&

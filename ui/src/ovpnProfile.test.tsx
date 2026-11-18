@@ -230,6 +230,38 @@ test("OVPN import fills metadata, keeps the text out of the DOM and sends it whe
   expect(document.body.innerHTML).not.toContain(marker);
 });
 
+async function selectKind(kind: string) {
+  const select = [...document.querySelectorAll("label.field")]
+    .find((el) => el.querySelector("span")?.textContent === "Type")
+    ?.querySelector("select");
+  if (!select) throw new Error("Missing type select");
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLSelectElement.prototype,
+    "value",
+  )?.set;
+  if (!setter) throw new Error("Missing select setter");
+  await act(async () => {
+    setter.call(select, kind);
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+test("A username typed under SSL does not block saving after switching to OVPN", async () => {
+  await createProfile();
+  await selectKind("ssl");
+  await edit("Username", "$(copied)");
+  await selectKind("ovpn");
+  await chooseFile(content);
+  await edit("Address", "192.0.2.1");
+  await click(button("List certificates"));
+  const choice = document.querySelector<HTMLInputElement>(
+    'input[type="radio"]',
+  );
+  if (!choice) throw new Error("Missing certificate choice");
+  await click(choice);
+  expect(button("Save").disabled).toBe(false);
+});
+
 test("OVPN import localizes a refusal and rejects oversized file and JSON before transport", async () => {
   await createProfile();
   replyFor = () => ({ error: "invalid_ovpn", detail: "up" });
