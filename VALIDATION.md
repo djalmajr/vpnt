@@ -27,12 +27,20 @@ bun scripts/design/check-tokens.ts
 bun scripts/design/check-classes.ts
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo test --locked --all-targets --all-features
 cargo test --locked --no-default-features
 cargo build --locked
 python3 scripts/macos/package-app.py --replace
 python3 scripts/macos/check-askpass.py
+python3 scripts/macos/check-charon-config.py
 ```
+
+O clippy sem a feature `desktop` roda só no job macOS: no Linux, os módulos
+do helper e do broker são exclusivos do macOS e ainda deixam código morto.
+O oráculo do charon lê o runtime preparado: rode antes
+`python3 scripts/macos/build-runtime.py` (seção do runtime, mais abaixo). No CI
+ele roda no job `runtime-handoff`, depois desse build.
 
 O gate de tokens compara as 94 entradas mapeadas em `DESIGN.md` com o CSS.
 O gate de classes ainda não tem classes proibidas configuradas; sua execução
