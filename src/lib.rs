@@ -22,6 +22,8 @@ pub mod install;
 pub mod keychain;
 pub mod localization;
 pub mod model;
+#[cfg(target_os = "linux")]
+pub mod netd;
 pub mod notifications;
 pub mod preferences;
 #[cfg(feature = "desktop")]
