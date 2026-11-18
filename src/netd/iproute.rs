@@ -365,6 +365,10 @@ impl Backend for IpRoute {
             Err(error) => {
                 // No identity was established. Compensate the successful create,
                 // but never grant an unmarked link retry authority without a proof.
+                // Accepted limit: if this rollback fails too (three consecutive ip
+                // failures), the unconfigured tun stays as a foreign, reserved name
+                // until it is removed by hand or the machine restarts. It carries no
+                // address, route or DNS, so the network is unaffected.
                 if self.run(false, &delete_args(name)).is_err() {
                     return Err(command_error(
                         "ip",
