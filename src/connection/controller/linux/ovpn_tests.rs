@@ -711,8 +711,16 @@ fn dead_session_is_not_healthy_while_the_signer_is_blocked() {
     let health_began = Instant::now();
     let health = a.healthy();
     let health_elapsed = health_began.elapsed();
-    let _ = release.send(());
+    // The signer is still blocked: cleanup must not spend a second drain
+    // budget on the exit that ready already waited for.
+    let cleanup_began = Instant::now();
     assert!(a.cleanup());
+    let cleanup_elapsed = cleanup_began.elapsed();
+    let _ = release.send(());
+    assert!(
+        cleanup_elapsed < Duration::from_millis(500),
+        "{cleanup_elapsed:?}"
+    );
     assert_eq!(result.unwrap_err().step, Step::Tunnel);
     assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
     assert_eq!(health.unwrap_err().step, Step::Health);

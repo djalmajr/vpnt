@@ -435,7 +435,17 @@ impl Session {
     /// the token gives up (cryptoki exposes no C_SessionCancel).
     pub fn wait(mut self) -> io::Result<Outcome> {
         let status = self.openvpn.0.wait()?;
-        match self.finished.recv_timeout(DRAIN_TIMEOUT) {
+        // The drain budget counts from the first time the exit was seen, so an
+        // exit already observed (and waited for) by `exited` is not waited
+        // for again here.
+        #[cfg(target_os = "linux")]
+        let drain = {
+            let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
+            (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let drain = DRAIN_TIMEOUT;
+        match self.finished.recv_timeout(drain) {
             Err(RecvTimeoutError::Timeout) => {
                 let _ = lock(&self.control).shutdown(Shutdown::Both);
             }
