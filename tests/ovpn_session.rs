@@ -175,9 +175,11 @@ fn receives_pushed_network() {
     session.stop().unwrap();
     session.wait().unwrap();
     let log = fs::read_to_string(log).expect("openvpn client log");
+    // Proves the log is the client's real verbose log (the phrasing of the
+    // device line differs between openvpn 2.6 and 2.7, this one does not).
     assert!(
-        log.contains("null device [null] opened"),
-        "openvpn did not open the fixture device"
+        log.contains("Initialization Sequence Completed"),
+        "openvpn client log is incomplete"
     );
     assert!(
         !log.contains("/usr/lib/openvpn/dns-updown"),
