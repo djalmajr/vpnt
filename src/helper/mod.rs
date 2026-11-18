@@ -25,8 +25,10 @@ pub mod runtime;
 #[cfg(unix)]
 pub mod vici;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod server;
+#[cfg(target_os = "linux")]
+mod user_lock;
 
 #[cfg(target_os = "macos")]
 pub mod admin_client;

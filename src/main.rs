@@ -10,6 +10,18 @@ fn main() {
         }
     };
     match options {
+        #[cfg(target_os = "linux")]
+        Options::Helper(mode) => {
+            if let Err(error) = unsafe { vpnt::helper::server::linux_run(mode) } {
+                std::process::exit(
+                    if error == vpnt::helper::protocol::ErrorCode::PermissionDenied {
+                        77
+                    } else {
+                        1
+                    },
+                );
+            }
+        }
         Options::Help => println!("{USAGE}"),
         Options::Version => println!("vpnt {}", env!("CARGO_PKG_VERSION")),
         Options::InspectComponent => {

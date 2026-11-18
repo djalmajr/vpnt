@@ -104,6 +104,16 @@ impl ProfileStore {
         Self::open(dir, uid)
     }
 
+    /// Path of a file directly in the validated store directory, for state
+    /// such as the runtime lock. The name is fixed by the caller, never IPC.
+    pub fn private_file(&self, name: &'static str) -> Result<PathBuf, StoreError> {
+        self.check_directory()?;
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return Err(StoreError::UntrustedPath);
+        }
+        Ok(self.directory.join(name))
+    }
+
     /// Directory for imported OpenVPN profiles.
     pub fn ovpn_dir(&self) -> Result<PathBuf, StoreError> {
         self.check_directory()?;

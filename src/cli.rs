@@ -1,15 +1,30 @@
 #[derive(Debug)]
 pub enum Options {
+    #[cfg(target_os = "linux")]
+    Helper(crate::helper::server::Mode),
     Help,
     Version,
     InspectComponent,
-    App { demo: bool, show: bool },
-    DemoServer { port: u16 },
+    App {
+        demo: bool,
+        show: bool,
+    },
+    DemoServer {
+        port: u16,
+    },
 }
 
 pub const USAGE: &str = "vpnt [--demo] [--show]\nvpnt --demo-server <port>\nvpnt --inspect-component\nvpnt --help\nvpnt --version";
 
 pub fn parse(args: &[String]) -> Result<Options, &'static str> {
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("helper") {
+        let args: Vec<std::ffi::OsString> =
+            args[1..].iter().map(std::ffi::OsString::from).collect();
+        return crate::helper::server::Mode::parse(&args)
+            .map(Options::Helper)
+            .ok_or("Unknown argument.");
+    }
     if args == ["--help"] || args == ["-h"] {
         return Ok(Options::Help);
     }
