@@ -260,11 +260,13 @@ fn connected_health_is_immediate_then_counted_by_health_cadence_not_poll() {
 
 #[test]
 fn connected_health_wait_keeps_cancellation_within_one_poll() {
-    let poll = Duration::from_millis(200);
-    let mut run = HealthRun::start(poll, Duration::from_secs(1), 0);
+    let poll = Duration::from_millis(400);
+    let mut run = HealthRun::start(poll, Duration::from_secs(2), 0);
     run.initial_probe();
-    // Observe the worker waiting between polls before canceling. This leaves
-    // scheduling margin while still bounding the actual response by one poll.
+    // Observe the worker sleeping between polls before canceling: it notices
+    // within the rest of that poll, about half of one, which leaves cleanup
+    // and the join the other half, 200 ms, on a loaded runner. A worker that
+    // waits one poll more, or out the two-second health period, overruns.
     run.quiet_for(poll / 2);
     let canceled_at = Instant::now();
     run.canceled.store(true, Ordering::Release);
