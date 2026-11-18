@@ -60,6 +60,119 @@ estrutural passou. O CI9 concluiu os três grupos com sucesso no head `f7f5314`;
 o CI8 histórico parou na pré-checagem do namespace IPsec, conforme registrado abaixo.
 O CI7 usava a distribuição serial anterior e foi supersedido pelo envio do CI8.
 
+## Linux: helper de rede, OVPN e pacote do Arch
+
+### Gates
+
+```sh
+(cd ui && bun run lint && bun run typecheck && bun test && bun run build)
+bun scripts/design/check-tokens.ts
+cargo fmt --check
+cargo test --locked --all-targets --all-features
+cargo test --locked --no-default-features
+```
+
+Os gates verificam UI, formatação e testes Rust; não provam uma VPN real. No
+Linux, o clippy pode apontar código morto usado no macOS; examine os demais
+avisos separadamente.
+
+### Testes opt-in
+
+```sh
+VPNT_TEST_NETNS=1 cargo test --locked --test netd_netns
+VPNT_TEST_OPENVPN=/usr/bin/openvpn cargo test --locked --test ovpn_session
+VPNT_TEST_SECRET_SERVICE=1 cargo test --locked --test secret_service
+VPNT_TEST_SOFTHSM=/caminho/absoluto/do/modulo.so cargo test --locked --test ovpn_token
+```
+
+- `netd_netns` exercita rede em namespace sem privilégio; exige `unshare` e
+  permissão para namespaces de usuário. No CI Ubuntu, a política AppArmor é
+  ajustada com `kernel.apparmor_restrict_unprivileged_userns=0`; essa alteração
+  de sistema exige decisão do dono da máquina.
+- `ovpn_session` usa OpenVPN 2.6 ou 2.7 real em loopback, servidor e chaves de
+  fixture; exige o binário no caminho indicado e `openssl`. Não usa VPN real.
+- `secret_service` usa sessão D-Bus e chaveiro temporários; exige
+  `/usr/bin/dbus-run-session`, `/usr/bin/gnome-keyring-daemon`,
+  `/usr/bin/dbus-send` e `/usr/bin/secret-tool`.
+- `ovpn_token` exercita um token SoftHSM de fixture; substitua o caminho pelo
+  módulo SoftHSM instalado. Exige `openssl` e `softhsm2-util` ou `pkcs11-tool`.
+  O valor da variável é o caminho do módulo, não `1`.
+
+Essas fixtures não demonstram conexão com servidor ou token reais.
+
+### Pacote Arch
+
+```sh
+packaging/arch/build.sh
+```
+
+O script arquiva o `HEAD` e executa `makepkg -f -d --noconfirm`; alterações
+locais não entram no arquivo. Instale antes as dependências listadas no
+`packaging/arch/PKGBUILD`: `-d` desativa a checagem de dependências do makepkg.
+Para inspecionar, substitua o marcador pelo arquivo gerado:
+
+```sh
+pacote="packaging/arch/<arquivo-gerado>"
+bsdtar -tvf "$pacote"
+inspecao=$(mktemp -d)
+bsdtar -xf "$pacote" -C "$inspecao"
+systemd-analyze verify "$inspecao/usr/lib/systemd/system/vpnt-helper.service" "$inspecao/usr/lib/systemd/system/vpnt-helper.socket"
+namcap "$pacote" # se instalado
+```
+
+A inspeção verifica o conteúdo e as units; não instala nem comprova a operação.
+O `systemd-analyze` também verifica referências no host e pode exigir o binário
+no caminho instalado. Instalação e ativação são feitas pelo dono da máquina:
+
+```sh
+sudo pacman -U "$pacote"
+sudo usermod -aG vpnt "$USER"
+sudo systemctl enable --now vpnt-helper.socket
+```
+
+Saia e entre na sessão para obter o grupo. Para testar antes disso, abra o app
+a partir de um terminal com o grupo novo: `newgrp vpnt` e, nele, `vpnt &`.
+
+### Validação real manual
+
+Resultado: **pendente**. Execute somente no host autorizado, com servidor de VPN,
+domínio interno e host interno próprios. Guarde o estado de rede antes:
+
+```sh
+estado_rede() {
+  ip -br link
+  ip route
+  ip -4 rule
+  resolvectl status
+}
+estado_rede > rede-antes.txt
+```
+
+1. Importe o `.ovpn` e escolha o certificado do token. Conecte pelo ícone e
+   aprove no celular.
+2. Confira a interface `vpntN` e o endereço e as rotas recebidos, o DNS por
+   domínio e o acesso ao host interno pelo túnel.
+3. Desconecte e compare o estado; o diff esperado é vazio:
+
+```sh
+estado_rede > rede-depois.txt
+diff -u rede-antes.txt rede-depois.txt
+```
+
+4. Repita a conexão, mate apenas o processo do app escolhido pelo dono e
+   confira que o helper limpa a tun. Compare novamente o estado de rede.
+
+```sh
+read -r -p "PID do vpnt: " pid_vpnt
+kill -9 "$pid_vpnt"
+```
+
+5. Confira que não há regra sudoers do vpnt, inclusive nos arquivos incluídos;
+   revise os arquivos de sudoers conforme a configuração do host.
+
+IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
+fixture não substitui essa validação com VPN real.
+
 ## Checkpoint atual — 14/11/2026
 
 [PARCIAL, estado geral] A validação permanece parcial. Continuam pendentes:
