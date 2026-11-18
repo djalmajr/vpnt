@@ -529,22 +529,17 @@ fn open_retries_pending_and_never_deletes_missing_or_unmarked_interface() {
         let (mut wire, worker) = f.connection(1000);
         hello(&mut wire);
         open(&mut wire, "vpnt0");
+        let (mut next, next_worker) = f.connection(1001);
+        hello(&mut next);
         let name = TunName::parse("vpnt0").unwrap();
         f.fake.fail_delete.store(true, Ordering::SeqCst);
-        let close = "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n";
-        assert!(matches!(
-            exchange(&mut wire, close),
-            Response::Error(ErrorCode::Backend)
-        ));
-        assert!(matches!(
-            exchange(&mut wire, close),
-            Response::Error(ErrorCode::NotOwned)
-        ));
+        drop(wire);
+        worker.unwrap().join().unwrap();
         f.fake.names.lock().unwrap().remove(&name);
         if foreign {
             f.fake.foreign.lock().unwrap().insert(name.clone());
         }
-        open(&mut wire, if foreign { "vpnt1" } else { "vpnt0" });
+        open(&mut next, if foreign { "vpnt1" } else { "vpnt0" });
         assert_eq!(
             f.fake
                 .events
@@ -560,8 +555,8 @@ fn open_retries_pending_and_never_deletes_missing_or_unmarked_interface() {
             foreign
         );
         assert_eq!(f.fake.foreign.lock().unwrap().contains(&name), foreign);
-        drop(wire);
-        worker.unwrap().join().unwrap();
+        drop(next);
+        next_worker.unwrap().join().unwrap();
     }
 }
 
@@ -573,30 +568,29 @@ fn slow_pending_delete_does_not_hold_open_past_retry_budget() {
     let (mut wire, worker) = f.connection(1000);
     hello(&mut wire);
     open(&mut wire, "vpnt0");
+    let (mut next, next_worker) = f.connection(1001);
+    hello(&mut next);
     f.fake.fail_delete.store(true, Ordering::SeqCst);
-    let close = "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n";
-    assert!(matches!(
-        exchange(&mut wire, close),
-        Response::Error(ErrorCode::Backend)
-    ));
+    drop(wire);
+    worker.unwrap().join().unwrap();
     let (started, arrived) = channel();
     let (resume, proceed) = channel();
     *f.fake.pause_delete.lock().unwrap() = Some((started, proceed));
 
-    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    next.get_mut().write_all(OPEN.as_bytes()).unwrap();
     arrived.recv_timeout(Duration::from_secs(1)).unwrap();
-    wire.get_ref()
+    next.get_ref()
         .set_read_timeout(Some(Duration::from_millis(500)))
         .unwrap();
-    let response = read_line(&mut wire);
+    let response = read_line(&mut next);
     // Release the parked worker before asserting the result, including on a timeout.
     resume.send(()).unwrap();
     assert!(
         matches!(decode_response(&response.unwrap()).unwrap(), Response::Opened(name) if name.as_str() == "vpnt1")
     );
-    open(&mut wire, "vpnt0");
-    drop(wire);
-    worker.unwrap().join().unwrap();
+    open(&mut next, "vpnt0");
+    drop(next);
+    next_worker.unwrap().join().unwrap();
     assert!(f.fake.existing().unwrap().is_empty());
 }
 
@@ -669,4 +663,124 @@ fn partial_create_does_not_delete_a_replacement_link() {
         drop(next);
         worker.unwrap().join().unwrap();
     }
+}
+
+#[test]
+fn close_failure_retains_ownership_until_retry_succeeds() {
+    struct End {
+        stream: UnixStream,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for End {
+        fn drop(&mut self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    let _end = End {
+        stream: wire.get_ref().try_clone().unwrap(),
+        worker,
+    };
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    let name = TunName::parse("vpnt0").unwrap();
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Error(ErrorCode::Backend)
+    ));
+    assert!(!f.server.pending.lock().unwrap().contains_key(&name));
+    assert!(f.server.reserved.lock().unwrap().contains(&name));
+    assert!(matches!(
+        exchange(&mut wire, &configure("vpnt0")),
+        Response::Ok
+    ));
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Ok
+    ));
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+}
+
+#[test]
+fn close_retry_refuses_to_delete_unmarked_replacement() {
+    struct End {
+        stream: UnixStream,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for End {
+        fn drop(&mut self) {
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    let _end = End {
+        stream: wire.get_ref().try_clone().unwrap(),
+        worker,
+    };
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    let name = TunName::parse("vpnt0").unwrap();
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Error(ErrorCode::Backend)
+    ));
+    assert!(f.fake.names.lock().unwrap().remove(&name));
+    assert!(f.fake.foreign.lock().unwrap().insert(name.clone()));
+    assert!(matches!(
+        exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n"),
+        Response::Ok
+    ));
+    assert!(f.fake.foreign.lock().unwrap().contains(&name));
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    assert_eq!(
+        f.fake
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "delete vpnt0")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn close_retry_releases_a_missing_interface() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    let name = TunName::parse("vpnt0").unwrap();
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    let close = "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n";
+    assert!(matches!(
+        exchange(&mut wire, close),
+        Response::Error(ErrorCode::Backend)
+    ));
+    assert!(f.fake.names.lock().unwrap().remove(&name));
+    assert!(matches!(exchange(&mut wire, close), Response::Ok));
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    assert_eq!(
+        f.fake
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "delete vpnt0")
+            .count(),
+        1
+    );
+    drop(wire);
+    worker.unwrap().join().unwrap();
 }

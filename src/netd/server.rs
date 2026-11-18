@@ -415,8 +415,27 @@ impl<B: Backend + 'static> Session<'_, B> {
                 if !self.owned.contains(&name) {
                     return Err(ErrorCode::NotOwned);
                 }
+                let existing = self
+                    .server
+                    .backend
+                    .existing()
+                    .map_err(|_| ErrorCode::Backend)?;
+                match existing.iter().find(|entry| entry.name == name) {
+                    None => {}
+                    Some(entry) if !CleanupProof::Marked.matches(entry) => {
+                        log_tun("close_name_conflict", self.uid, &name);
+                    }
+                    Some(_) => {
+                        // The helper trusts other CAP_NET_ADMIN actors: they could
+                        // replace a link between this inventory and deletion by name.
+                        self.server.backend.delete_tun(&name).map_err(|_| {
+                            log_tun("delete_failed", self.uid, &name);
+                            ErrorCode::Backend
+                        })?;
+                    }
+                }
+                self.server.release(&name);
                 self.owned.retain(|owned| *owned != name);
-                self.delete(&name)?;
                 Ok(Response::Ok)
             }
         }

@@ -195,7 +195,7 @@ fn worker_publishes_changed_phase_and_default_phase_stays_silent() {
             Ok(false)
         }
         fn phase(&self) -> Option<ConnectionState> {
-            self.publish.then_some(ConnectionState::Reconnecting)
+            self.publish.then_some(ConnectionState::AwaitingApproval)
         }
         fn healthy(&mut self) -> Result<(), Failure> {
             Ok(())
@@ -264,7 +264,7 @@ fn worker_publishes_changed_phase_and_default_phase_stays_silent() {
             }
             assert_eq!(
                 state.lock().unwrap().as_ref().unwrap().state,
-                ConnectionState::Reconnecting
+                ConnectionState::AwaitingApproval
             );
         } else {
             assert!(
