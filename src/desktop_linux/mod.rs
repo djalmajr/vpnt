@@ -278,14 +278,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let id = request.id.clone();
                     if backend.send(request, received).is_err() {
-                        send_reply(
-                            &webview,
-                            &Reply {
-                                id,
-                                snapshot: None,
-                                error: Some("backend_unavailable".into()),
-                            },
-                        );
+                        send_reply(&webview, &Reply::error(id, "backend_unavailable"));
                     }
                 }
             }

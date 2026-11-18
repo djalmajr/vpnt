@@ -239,18 +239,7 @@ impl Worker {
     }
 }
 fn response(id: String, result: Result<crate::model::Snapshot, &'static str>) -> Reply {
-    match result {
-        Ok(snapshot) => Reply {
-            id,
-            snapshot: Some(snapshot),
-            error: None,
-        },
-        Err(error) => Reply {
-            id,
-            snapshot: None,
-            error: Some(error.into()),
-        },
-    }
+    Reply::from_result(id, result)
 }
 
 #[cfg(test)]
@@ -340,7 +329,7 @@ mod tests {
             work.expires.duration_since(received),
             Duration::from_secs(119)
         );
-        let crate::bridge::Command::SaveProfile { profile } = work.request.command else {
+        let crate::bridge::Command::SaveProfile { profile, .. } = work.request.command else {
             panic!("wrong command");
         };
         let request = AdminRequest {

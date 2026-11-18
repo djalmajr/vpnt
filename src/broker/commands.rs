@@ -137,6 +137,9 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Command::SetDemoState { .. } => return Err("invalid_request"),
+            Command::InspectOvpn { .. } | Command::ListCertificates { .. } => {
+                return Err("unsupported");
+            }
             Command::SaveProfile { .. }
             | Command::RemoveProfile { .. }
             | Command::InstallHelper {}

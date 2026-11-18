@@ -141,6 +141,14 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     if let (Some(menu), Some(locale)) = (native_edit.as_mut(), request.locale) {
                         menu.set_locale(locale);
                     }
+                    if let Some(reply) = crate::bridge::ovpn::reply(&request.id, &request.command) {
+                        if let Ok(json) = serde_json::to_string(&reply) {
+                            let _ =
+                                webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
+                        }
+                        // Metadata replies do not change the authoritative tray snapshot.
+                        return;
+                    }
                     if matches!(request.command, Command::Quit {}) {
                         *control_flow = ControlFlow::Exit;
                     }
@@ -162,11 +170,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let id = request.id.clone();
                     if application.send(request, received).is_err() {
-                        let reply = Reply {
-                            id,
-                            snapshot: None,
-                            error: Some("backend_unavailable".into()),
-                        };
+                        let reply = Reply::error(id, "backend_unavailable");
                         // A failed request is never a verified tunnel.
                         show_icon(&mut icons, reply.snapshot.as_ref(), reply.error.is_some());
                         if let Ok(json) = serde_json::to_string(&reply) {

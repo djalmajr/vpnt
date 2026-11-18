@@ -6,6 +6,7 @@ pub enum ConnectionState {
     #[default]
     Off,
     Connecting,
+    AwaitingApproval,
     Verifying,
     Connected,
     Unresponsive,
@@ -26,6 +27,7 @@ impl ConnectionState {
         matches!(
             self,
             Self::Connecting
+                | Self::AwaitingApproval
                 | Self::Verifying
                 | Self::Connected
                 | Self::Unresponsive
@@ -92,7 +94,9 @@ impl Session {
             return false;
         }
         self.state = match (self.state, result) {
-            (S::Connecting | S::Reconnecting, Completion::TunnelReady) => S::Verifying,
+            (S::Connecting | S::AwaitingApproval | S::Reconnecting, Completion::TunnelReady) => {
+                S::Verifying
+            }
             (S::Verifying | S::Connected | S::Unresponsive, Completion::ProbePassed) => {
                 S::Connected
             }
@@ -101,12 +105,53 @@ impl Session {
             }
             (S::Disconnecting, Completion::Stopped) => S::Off,
             (state, Completion::UnexpectedExit) if state.active() => S::Dropped,
-            (S::Connecting | S::Reconnecting, Completion::CredentialsRejected) => {
-                S::CredentialsRejected
+            (
+                S::Connecting | S::AwaitingApproval | S::Reconnecting,
+                Completion::CredentialsRejected,
+            ) => S::CredentialsRejected,
+            (S::Connecting | S::AwaitingApproval | S::Reconnecting, Completion::GatewayTimeout) => {
+                S::GatewayTimeout
             }
-            (S::Connecting | S::Reconnecting, Completion::GatewayTimeout) => S::GatewayTimeout,
             _ => return false,
         };
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn awaiting_approval_is_active_and_serializes_in_snake_case() {
+        let state = ConnectionState::AwaitingApproval;
+        assert!(state.active());
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            r#""awaiting_approval""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ConnectionState>(r#""awaiting_approval""#).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn awaiting_approval_has_the_same_completion_paths_as_connecting() {
+        for (completion, expected) in [
+            (Completion::TunnelReady, ConnectionState::Verifying),
+            (
+                Completion::CredentialsRejected,
+                ConnectionState::CredentialsRejected,
+            ),
+            (Completion::GatewayTimeout, ConnectionState::GatewayTimeout),
+            (Completion::UnexpectedExit, ConnectionState::Dropped),
+        ] {
+            let mut session = Session::with_state(ConnectionState::AwaitingApproval);
+            assert!(!session.complete(1, completion));
+            assert_eq!(session.state(), ConnectionState::AwaitingApproval);
+            assert!(session.complete(session.generation(), completion));
+            assert_eq!(session.state(), expected);
+        }
     }
 }

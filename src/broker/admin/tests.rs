@@ -155,6 +155,7 @@ fn a_profile_change_waits_for_reap_and_fresh_metadata_while_another_profile_rema
     edited.name = "Edited by administrator".into();
     let token = h.begin(Command::SaveProfile {
         profile: edited.clone(),
+        ovpn_config: None,
     });
     h.command(Command::Probe { id: "one".into() });
     wait(|| h.broker.snapshot().vpns[0].state == State::Unresponsive);
@@ -229,7 +230,10 @@ fn expired_administration_never_sends_a_document_or_replays_after_a_late_authori
     let p = h.broker.snapshot().vpns[0].profile.clone();
     h.broker
         .begin_admin(
-            Command::SaveProfile { profile: p },
+            Command::SaveProfile {
+                profile: p,
+                ovpn_config: None,
+            },
             Locale::PtBr,
             // This deadline is the expiration being tested.
             Instant::now() + Duration::from_millis(150),

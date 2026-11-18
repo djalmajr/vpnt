@@ -82,7 +82,17 @@ impl<S: SecretStore> Broker<S> {
             return Err("admin_busy");
         }
         let (change, command) = match command {
-            Command::SaveProfile { profile } => {
+            Command::SaveProfile {
+                profile,
+                ovpn_config,
+            } => {
+                if ovpn_config.is_some() {
+                    return Err(if profile.kind == VpnKind::Ovpn {
+                        "unsupported"
+                    } else {
+                        "invalid_profile"
+                    });
+                }
                 profile.validate()?;
                 (
                     Change::Save(profile.clone()),
