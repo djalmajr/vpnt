@@ -11,7 +11,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     },
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -44,6 +44,59 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
+    /// Opens the Linux user's XDG profile store without accepting paths over IPC.
+    #[cfg(target_os = "linux")]
+    pub fn for_current_user() -> Result<Self, StoreError> {
+        Self::for_user_environment(
+            std::env::var_os("XDG_DATA_HOME"),
+            std::env::var_os("HOME"),
+            unsafe { libc::geteuid() },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn for_user_environment(
+        xdg: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        uid: u32,
+    ) -> Result<Self, StoreError> {
+        if uid == 0 {
+            return Err(StoreError::InvalidData);
+        }
+        let xdg = xdg.filter(|s| !s.is_empty());
+        if let Some(value) = &xdg {
+            reject_dot_components(Path::new(value))?;
+        }
+        let base = match xdg.as_deref().map(Path::new).filter(|p| p.is_absolute()) {
+            Some(path) => path.to_path_buf(),
+            None => {
+                let home = home
+                    .as_deref()
+                    .map(Path::new)
+                    .filter(|p| p.is_absolute())
+                    .ok_or(StoreError::UntrustedPath)?;
+                reject_dot_components(home)?;
+                let parent = home.join(".local");
+                check_ancestors(&parent, uid)?;
+                let share = parent.join("share");
+                create_private_dir_if_missing(&share, uid, false)?;
+                share
+            }
+        };
+        check_ancestors(&base, uid)?;
+        let dir = base.join("vpnt");
+        create_private_dir_if_missing(&dir, uid, true)?;
+        Self::open(dir, uid)
+    }
+
+    /// Directory for imported OpenVPN profiles.
+    pub fn ovpn_dir(&self) -> Result<PathBuf, StoreError> {
+        self.check_directory()?;
+        let dir = self.directory.join("ovpn");
+        create_private_dir_if_missing(&dir, self.owner, true)?;
+        Ok(dir)
+    }
+
     /// Fixed production location. No path or ownership policy comes from IPC.
     pub fn for_user(uid: u32) -> Result<Self, StoreError> {
         if uid == 0 {
@@ -245,5 +298,201 @@ struct Temporary(PathBuf);
 impl Drop for Temporary {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reject_dot_components(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::ffi::OsStrExt;
+    if path
+        .as_os_str()
+        .as_bytes()
+        .split(|b| *b == b'/')
+        .any(|s| s == b"." || s == b"..")
+    {
+        Err(StoreError::UntrustedPath)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_ancestors(path: &Path, owner: u32) -> Result<(), StoreError> {
+    if !path.is_absolute() {
+        return Err(StoreError::UntrustedPath);
+    }
+    reject_dot_components(path)?;
+    for part in path.ancestors() {
+        let metadata = fs::symlink_metadata(part).map_err(|_| StoreError::UntrustedPath)?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != owner)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(StoreError::UntrustedPath);
+        }
+        crate::fs_permissions::check_path(part, false).map_err(|_| StoreError::UntrustedPath)?;
+    }
+    Ok(())
+}
+
+fn create_private_dir_if_missing(
+    path: &Path,
+    owner: u32,
+    private_existing: bool,
+) -> Result<(), StoreError> {
+    let created = match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+        Err(_) => return Err(StoreError::Io),
+    };
+    let meta = fs::symlink_metadata(path).map_err(|_| StoreError::UntrustedPath)?;
+    if !meta.is_dir()
+        || (created || private_existing) && (meta.uid() != owner || meta.mode() & 0o7777 != 0o700)
+    {
+        return Err(StoreError::UntrustedPath);
+    }
+    crate::fs_permissions::check_path(path, created || private_existing)
+        .map_err(|_| StoreError::UntrustedPath)?;
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::{
+        ffi::OsString,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture {
+        path: PathBuf,
+        uid: u32,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let uid = unsafe { libc::geteuid() };
+            assert_ne!(uid, 0, "fixture requires an unprivileged user");
+            let path = PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache")
+                .join(format!(
+                    "vpnt-storage-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self { path, uid }
+        }
+        fn home(&self) -> PathBuf {
+            let home = self.path.join("home");
+            fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(home.join(".local"))
+                .unwrap();
+            home
+        }
+        fn make(
+            &self,
+            xdg: Option<OsString>,
+            home: Option<OsString>,
+        ) -> Result<ProfileStore, StoreError> {
+            ProfileStore::for_user_environment(xdg, home, self.uid)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).unwrap();
+        }
+    }
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+    fn profile() -> Profile {
+        serde_json::from_value(serde_json::json!({ "id":"a","name":"Profile a","kind":"ipsec","gateway":"vpn.example.com","username":"fictional","networks":["10.20.0.0/24"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp" })).unwrap()
+    }
+    #[test]
+    fn xdg_store_is_private_and_profiles_round_trip() {
+        let f = Fixture::new();
+        let base = f.path.join("xdg");
+        fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
+        let store = f.make(Some(base.clone().into_os_string()), None).unwrap();
+        assert_eq!(store.directory, base.join("vpnt"));
+        assert_eq!(mode(&store.directory), 0o700);
+        let expected = profile();
+        store.save(expected.clone()).unwrap();
+        assert_eq!(store.load().unwrap(), vec![expected]);
+    }
+    #[test]
+    fn relative_or_empty_xdg_uses_home_and_creates_only_share() {
+        for xdg in [
+            Some(OsString::from("relative")),
+            Some(OsString::new()),
+            None,
+        ] {
+            let f = Fixture::new();
+            let home = f.home();
+            let store = f.make(xdg, Some(home.clone().into_os_string())).unwrap();
+            assert_eq!(store.directory, home.join(".local/share/vpnt"));
+            assert_eq!(mode(&home.join(".local/share")), 0o700);
+            assert_eq!(mode(&store.directory), 0o700);
+        }
+    }
+    #[test]
+    fn rejects_invalid_paths_and_root() {
+        let f = Fixture::new();
+        let home = f.home();
+        assert!(matches!(
+            f.make(None, Some("relative".into())),
+            Err(StoreError::UntrustedPath)
+        ));
+        for value in [
+            format!("{}/./bad", f.path.display()),
+            format!("{}/../bad", f.path.display()),
+        ] {
+            assert!(matches!(
+                f.make(Some(value.into()), Some(home.clone().into_os_string())),
+                Err(StoreError::UntrustedPath)
+            ));
+        }
+        assert!(matches!(
+            ProfileStore::for_user_environment(Some(f.path.clone().into_os_string()), None, 0),
+            Err(StoreError::InvalidData)
+        ));
+    }
+    #[test]
+    fn existing_wrong_mode_and_symlink_are_refused_without_changes() {
+        let f = Fixture::new();
+        let dir = f.path.join("vpnt");
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            f.make(Some(f.path.clone().into_os_string()), None),
+            Err(StoreError::UntrustedPath)
+        ));
+        assert_eq!(mode(&dir), 0o755);
+        fs::remove_dir(&dir).unwrap();
+        let target = f.path.join("target");
+        fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        symlink(&target, &dir).unwrap();
+        assert!(matches!(
+            f.make(Some(f.path.clone().into_os_string()), None),
+            Err(StoreError::UntrustedPath)
+        ));
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
+        assert_eq!(mode(&target), 0o700);
+    }
+    #[test]
+    fn ovpn_directory_is_private_and_never_follows_symlinks() {
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        let dir = store.ovpn_dir().unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(store.ovpn_dir().unwrap(), dir);
+        fs::remove_dir(&dir).unwrap();
+        let target = f.path.join("target");
+        fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
+        symlink(&target, &dir).unwrap();
+        assert!(matches!(store.ovpn_dir(), Err(StoreError::UntrustedPath)));
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
     }
 }
