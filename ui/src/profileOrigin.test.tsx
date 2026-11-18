@@ -1331,7 +1331,112 @@ for (const locale of ["pt-BR", "en-US"] as const) {
     close.focus();
     await click(close);
     expect(document.querySelector('[role="alert"]')).toBeNull();
-    expect(document.activeElement).not.toBe(document.body);
-    expect(document.activeElement).not.toBe(close);
+    expect(document.activeElement === byLabel(t(locale, "preferences"))).toBe(
+      true,
+    );
+  });
+}
+
+async function receiveVpns(vpns: VpnView[]) {
+  snapshot = { ...snapshot, vpns };
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 650));
+  });
+}
+
+for (const state of ["missing_program", "gateway_timeout"] as const) {
+  test(`${state}: observed off invalidates dismissal even with same second or empty log`, async () => {
+    const log = state === "missing_program" ? [{ state, timestamp: 12 }] : [];
+    const initial = { ...vpn, state, log };
+    await mountComponentScenario(componentSnapshot("installed", [initial]));
+    await click(byLabel(t("en-US", "dismissNotice")));
+    expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+    await receiveVpns([{ ...initial, state: "off" }]);
+    expect(document.querySelector(".card-state")?.textContent).toContain(
+      t("en-US", "state.off"),
+    );
+    const returnedLog =
+      state === "missing_program"
+        ? [
+            ...log,
+            { state: "off" as const, timestamp: 12 },
+            { state, timestamp: 12 },
+          ]
+        : [];
+    await receiveVpns([{ ...initial, log: returnedLog }]);
+    expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+  });
+}
+
+test("same second with additional log entry reopens without observed off", async () => {
+  const initial: VpnView = {
+    ...vpn,
+    state: "missing_program",
+    log: [{ state: "missing_program", timestamp: 12 }],
+  };
+  await mountComponentScenario(componentSnapshot("installed", [initial]));
+  await click(byLabel(t("en-US", "dismissNotice")));
+  expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+  await receiveVpns([
+    {
+      ...initial,
+      log: [...initial.log, { state: "missing_program", timestamp: 12 }],
+    },
+  ]);
+  expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+});
+
+test("removed profile forgets dismissal when it returns", async () => {
+  const initial: VpnView = { ...vpn, state: "missing_program" };
+  await mountComponentScenario(componentSnapshot("installed", [initial]));
+  await click(byLabel(t("en-US", "dismissNotice")));
+  expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+  await receiveVpns([]);
+  expect(document.querySelector(".vpn-card")).toBeNull();
+  await receiveVpns([initial]);
+  expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+});
+
+for (const [state, cleaning] of [
+  ["missing_program", false],
+  ["dropped", true],
+] as const) {
+  test(`${state} cleaning=${cleaning}: dismissed disabled switch is inert to pointer and keyboard`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("installed", [{ ...vpn, state, cleaning }]),
+    );
+    await click(byLabel(t("en-US", "dismissNotice")));
+    const toggle =
+      document.querySelector<HTMLButtonElement>(".vpn-card .switch");
+    if (!toggle) throw new Error("switch missing");
+    expect(toggle.getAttribute("aria-disabled")).toBe("true");
+    commands.length = 0;
+    const tunnelCommands = () =>
+      commands
+        .filter((command) =>
+          ["connect", "disconnect", "reconnect"].includes(command.type),
+        )
+        .map((command) => command.type);
+    await click(toggle);
+    expect(tunnelCommands()).toEqual([]);
+    for (const key of ["Enter", " "]) {
+      await act(async () => {
+        const down = new KeyboardEvent("keydown", {
+          key,
+          bubbles: true,
+          cancelable: true,
+        });
+        const up = new KeyboardEvent("keyup", {
+          key,
+          bubbles: true,
+          cancelable: true,
+        });
+        const allowed = toggle.dispatchEvent(down);
+        toggle.dispatchEvent(up);
+        // happy-dom does not implement native button keyboard activation.
+        if (allowed) toggle.click();
+      });
+      expect(tunnelCommands()).toEqual([]);
+    }
   });
 }

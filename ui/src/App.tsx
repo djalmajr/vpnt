@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ComponentDialog,
   ComponentStatus,
@@ -45,8 +45,22 @@ export function App() {
   } = useAppState();
   const panelRef = useRef<HTMLElement>(null);
   const [dismissedNotices, setDismissedNotices] = useState<
-    Record<string, string>
+    Record<string, { state: string; identity: string }>
   >({});
+  useEffect(() => {
+    if (!snapshot) return;
+    setDismissedNotices((previous) => {
+      const current = new Map(
+        snapshot.vpns.map((vpn) => [vpn.profile.id, vpn.state]),
+      );
+      const entries = Object.entries(previous).filter(
+        ([id, notice]) => current.get(id) === notice.state,
+      );
+      return entries.length === Object.keys(previous).length
+        ? previous
+        : Object.fromEntries(entries);
+    });
+  }, [snapshot]);
   const installBusy = !!installAttempt || !!snapshot?.componentOperation;
   const installBlocked = snapshot ? componentBlocked(snapshot) : false;
   const updating = installAttempt?.updating ?? snapshot?.helper === "outdated";
@@ -149,19 +163,24 @@ export function App() {
                       key={vpn.profile.id}
                       vpn={vpn}
                       dismissed={
-                        dismissedNotices[vpn.profile.id] ===
+                        dismissedNotices[vpn.profile.id]?.identity ===
                         JSON.stringify([
                           vpn.state,
                           vpn.log.at(-1)?.timestamp ?? null,
+                          vpn.log.length,
                         ])
                       }
                       dismiss={() =>
                         setDismissedNotices((previous) => ({
                           ...previous,
-                          [vpn.profile.id]: JSON.stringify([
-                            vpn.state,
-                            vpn.log.at(-1)?.timestamp ?? null,
-                          ]),
+                          [vpn.profile.id]: {
+                            state: vpn.state,
+                            identity: JSON.stringify([
+                              vpn.state,
+                              vpn.log.at(-1)?.timestamp ?? null,
+                              vpn.log.length,
+                            ]),
+                          },
                         }))
                       }
                       t={t}
