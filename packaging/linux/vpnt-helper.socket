@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN Tray network helper socket
+Documentation=https://github.com/djalmajr/vpnt
+
+[Socket]
+ListenStream=/run/vpnt/netd.sock
+SocketUser=root
+SocketGroup=vpnt
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+Accept=no
+
+[Install]
+WantedBy=sockets.target
