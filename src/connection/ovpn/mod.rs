@@ -4,6 +4,7 @@
 pub mod management;
 pub mod pkcs11;
 mod private_dir;
+pub mod profile;
 pub mod session;
 pub mod signing;
 
