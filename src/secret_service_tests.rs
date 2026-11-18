@@ -193,11 +193,8 @@ fn invalid_profile_ids_and_invalid_credentials_never_call_secret_tool() {
 }
 
 #[test]
-fn ovpn_does_not_call_secret_tool_when_the_kind_is_available() {
-    let Ok(kind) = serde_json::from_str::<VpnKind>(r#""ovpn""#) else {
-        eprintln!("skipped: VpnKind::Ovpn is not available on this base");
-        return;
-    };
+fn ovpn_does_not_call_secret_tool() {
+    let kind = VpnKind::Ovpn;
     let fixture = Fixture::new();
     let store = fixture.store("printf invoked >> calls\nexit 1");
     assert_eq!(store.contains(PROFILE, kind), Ok(false));

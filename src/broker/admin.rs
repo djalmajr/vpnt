@@ -55,7 +55,7 @@ impl Flow {
     }
 }
 impl<S: SecretStore> Broker<S> {
-    #[cfg(all(test, feature = "desktop"))]
+    #[cfg(all(test, feature = "desktop", target_os = "macos"))]
     pub(crate) fn administrative_fixture(
         client: Client,
         secrets: S,
@@ -275,5 +275,5 @@ fn map_error(error: AdminError) -> &'static str {
         _ => "admin_unconfirmed",
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;

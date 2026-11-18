@@ -35,5 +35,5 @@ pub mod session;
 #[cfg(unix)]
 pub mod storage;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod broker;
