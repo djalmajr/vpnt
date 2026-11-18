@@ -478,7 +478,7 @@ fn version_detection_caches_and_times_out() {
     assert_eq!(version_for(&executable).unwrap(), Some((2, 7)));
     assert_eq!(fs::read(&marker).unwrap(), b"x");
     let slow = dir.path.join("slow");
-    fs::write(&slow, "#!/bin/sh\nexec /usr/bin/sleep 30\n").unwrap();
+    fs::write(&slow, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
     fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
     let start = Instant::now();
     assert_eq!(
