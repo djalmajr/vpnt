@@ -12,10 +12,23 @@ use crate::{
     model::valid_module_path,
 };
 #[cfg(all(unix, not(target_os = "macos")))]
-use std::{path::Path, sync::mpsc, thread, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const CERTIFICATE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// At most one listing runs at a time. A module stuck in a native call keeps
+/// its thread alive after the reply times out; until that thread returns,
+/// further requests are answered at once instead of piling up threads.
+#[cfg(all(unix, not(target_os = "macos")))]
+static LISTING: AtomicBool = AtomicBool::new(false);
 
 pub fn reply(id: &str, command: &Command) -> Option<Reply> {
     match command {
@@ -27,7 +40,13 @@ pub fn reply(id: &str, command: &Command) -> Option<Reply> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn certificates_reply(id: &str, module: &str) -> Reply {
-    certificates_reply_with(id, module, CERTIFICATE_LIST_TIMEOUT, list_certificates)
+    certificates_reply_with(
+        id,
+        module,
+        CERTIFICATE_LIST_TIMEOUT,
+        &LISTING,
+        list_certificates,
+    )
 }
 
 #[cfg(any(not(unix), target_os = "macos"))]
@@ -40,19 +59,32 @@ fn certificates_reply_with(
     id: &str,
     module: &str,
     timeout: Duration,
+    listing: &'static AtomicBool,
     list: impl FnOnce(&Path) -> Result<Vec<CertificateInfo>, TokenError> + Send + 'static,
 ) -> Reply {
     if !valid_module_path(module) {
         return Reply::error(id.into(), "invalid_module");
     }
+    if listing.swap(true, Ordering::AcqRel) {
+        return Reply::error(id.into(), "token_unavailable");
+    }
+    struct Done(&'static AtomicBool);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
     let module = module.to_owned();
     let (send, receive) = mpsc::channel();
+    let done = Done(listing);
     let Ok(_worker) = thread::Builder::new()
         .name("vpnt-certificate-list".into())
         .spawn(move || {
+            let _done = done;
             let _ = send.send(list(Path::new(&module)));
         })
     else {
+        // The closure (and the guard it owned) was dropped with the error.
         return Reply::error(id.into(), "token_unavailable");
     };
 
@@ -140,10 +172,12 @@ mod tests {
     fn certificate_listing_deadline_returns_before_provider_finishes() {
         let (release, wait) = mpsc::channel::<()>();
         let (finish, finished) = mpsc::channel();
+        static DEADLINE: AtomicBool = AtomicBool::new(false);
         let reply = certificates_reply_with(
             "deadline",
             "/unused/token.so",
             Duration::from_millis(20),
+            &DEADLINE,
             move |_| {
                 // The fallback lets the test finish if the reply stops enforcing a deadline.
                 let _ = wait.recv_timeout(Duration::from_secs(1));
@@ -159,11 +193,67 @@ mod tests {
     }
 
     #[test]
+    fn a_stuck_listing_blocks_new_threads_until_it_returns() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let (release, wait) = mpsc::channel::<()>();
+        let (finish, finished) = mpsc::channel();
+        let first = certificates_reply_with(
+            "stuck",
+            "/unused/token.so",
+            Duration::from_millis(20),
+            &BUSY,
+            move |_| {
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+                let _ = finish.send(());
+                Ok(vec![])
+            },
+        );
+        assert_eq!(first.error.as_deref(), Some("token_unavailable"));
+        // The provider is still inside its call: a new request must not start
+        // another thread or call the provider.
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let second = certificates_reply_with(
+            "second",
+            "/unused/token.so",
+            Duration::from_secs(1),
+            &BUSY,
+            move |_| {
+                flag.store(true, Ordering::Release);
+                Ok(vec![])
+            },
+        );
+        assert_eq!(second.error.as_deref(), Some("token_unavailable"));
+        assert!(!called.load(Ordering::Acquire));
+        drop(release);
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while BUSY.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listing flag never cleared"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let third = certificates_reply_with(
+            "third",
+            "/unused/token.so",
+            Duration::from_secs(1),
+            &BUSY,
+            |_| Ok(vec![]),
+        );
+        assert_eq!(third.error, None);
+        assert_eq!(third.certificates.map(|list| list.len()), Some(0));
+    }
+
+    #[test]
     fn certificate_listing_maps_ids_and_optional_metadata() {
+        static LIST: AtomicBool = AtomicBool::new(false);
         let reply = certificates_reply_with(
             "list",
             "/unused/token.so",
             CERTIFICATE_LIST_TIMEOUT,
+            &LIST,
             |module| {
                 assert_eq!(module, Path::new("/unused/token.so"));
                 Ok(vec![CertificateInfo {

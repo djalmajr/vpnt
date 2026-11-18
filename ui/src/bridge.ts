@@ -123,7 +123,15 @@ async function request(command: Command): Promise<Reply> {
   ].includes(command.type);
   const component =
     command.type === "install_helper" || command.type === "remove_helper";
-  const timeout = component ? 610000 : interactive ? 120000 : 10000;
+  // The app waits up to 30 s for a token module to list its certificates.
+  const listing = command.type === "list_certificates";
+  const timeout = component
+    ? 610000
+    : interactive
+      ? 120000
+      : listing
+        ? 40000
+        : 10000;
   const id = `ui-${++sequence}`;
   const locale = document.documentElement.lang === "pt-BR" ? "pt-BR" : "en-US";
   const body = JSON.stringify({ id, command, locale });

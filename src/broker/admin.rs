@@ -30,6 +30,9 @@ pub(super) struct Query {
     pub epoch: u64,
     pub observed: BTreeMap<String, u64>,
 }
+// One change at a time is pending per broker, so the size of Save (a whole
+// profile, OVPN settings included) costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 enum Change {
     Save(Profile),
     Remove { id: String, kind: VpnKind },
