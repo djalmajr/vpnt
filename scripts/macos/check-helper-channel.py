@@ -25,7 +25,9 @@ def replace(source, before, after, count=1):
 
 def run(copy, label, selector, failed=None):
     command = ["cargo", "test", "--locked", "--offline", "--no-default-features", *selector]
-    result = subprocess.run(command, cwd=copy, capture_output=True, timeout=45)
+    # The first baseline compiles the fresh copy from scratch, so the limit
+    # covers a cold build on a loaded runner, as in check-broker.py.
+    result = subprocess.run(command, cwd=copy, capture_output=True, timeout=240)
     log = result.stdout + result.stderr
     (REPORTS / f"{label}.log").write_bytes(log)
     expected = 101 if failed else 0
