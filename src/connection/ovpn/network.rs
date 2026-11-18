@@ -165,10 +165,10 @@ pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkErro
     let mut dns_domains = Vec::new();
     let mut foreign = Vec::new();
     for (&key, &value) in &vars {
-        if let Some(suffix) = key.strip_prefix("foreign_option_") {
-            if let Some(n) = index(suffix)? {
-                foreign.push((n, value));
-            }
+        if let Some(suffix) = key.strip_prefix("foreign_option_")
+            && let Some(n) = index(suffix)?
+        {
+            foreign.push((n, value));
         }
     }
     foreign.sort_by_key(|entry| entry.0);
