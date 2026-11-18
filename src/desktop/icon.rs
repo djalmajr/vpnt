@@ -111,6 +111,7 @@ pub(crate) fn icon_for(snapshot: Option<&Snapshot>, error: bool) -> Icon {
                 kinds |= match view.profile.kind {
                     VpnKind::Ipsec => IPSEC,
                     VpnKind::Ssl => SSL,
+                    VpnKind::Ovpn => return Icon::Warning,
                 };
             }
             // Work in progress proves no tunnel and is not a problem either: it

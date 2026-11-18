@@ -501,6 +501,7 @@ mod tests {
 
     fn profile(host: &str) -> Profile {
         Profile {
+            ovpn: None,
             dns_domains: Vec::new(),
             id: "egress-fixture".into(),
             name: "Egress fixture".into(),

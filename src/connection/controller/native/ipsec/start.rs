@@ -175,6 +175,7 @@ mod tests {
             })
             .unwrap();
         let profile = Profile {
+            ovpn: None,
             dns_domains: Vec::new(),
             id: "example".into(),
             name: "example".into(),

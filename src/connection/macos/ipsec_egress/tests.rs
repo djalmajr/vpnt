@@ -107,6 +107,7 @@ fn record(remote: IpAddr, index: u16, next: NextHop, source: Option<Address>) ->
 
 fn profile(kind: VpnKind, host: &str, port: u16) -> Profile {
     Profile {
+        ovpn: None,
         dns_domains: Vec::new(),
         id: "ipsec-egress".into(),
         name: "IPsec egress".into(),

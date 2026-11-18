@@ -46,6 +46,7 @@ impl App {
         ] {
             app.connections.push(Connection {
                 profile: Profile {
+                    ovpn: None,
                     dns_domains: Vec::new(),
                     id: id.into(),
                     name: name.into(),
