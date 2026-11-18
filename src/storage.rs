@@ -20,7 +20,7 @@ use std::{
 
 const MAX_BYTES: u64 = 1_048_576;
 const MAX_PROFILES: usize = 64;
-const MAX_OVPN_BYTES: usize = 256 * 1024;
+const MAX_OVPN_BYTES: usize = 32 * 1024;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +43,12 @@ struct Document {
 pub struct ProfileStore {
     directory: PathBuf,
     owner: u32,
+}
+
+enum ConfigChange {
+    None,
+    Remove,
+    Replace(Option<Vec<u8>>),
 }
 
 impl ProfileStore {
@@ -125,15 +131,18 @@ impl ProfileStore {
     }
 
     pub fn save_ovpn_config(&self, id: &str, text: &str) -> Result<(), StoreError> {
+        self.save_ovpn_bytes(id, text.as_bytes())
+    }
+
+    fn save_ovpn_bytes(&self, id: &str, bytes: &[u8]) -> Result<(), StoreError> {
         let name = ovpn_name(id)?;
-        if text.len() > MAX_OVPN_BYTES {
+        if bytes.len() > MAX_OVPN_BYTES {
             return Err(StoreError::Limit);
         }
         let dir = self.ovpn_directory(true)?.ok_or(StoreError::Io)?;
         self.ovpn_file(&dir, &name)?;
         let (mut temp, mut file) = OvpnTemporary::create(&dir)?;
-        file.write_all(text.as_bytes())
-            .map_err(|_| StoreError::Io)?;
+        file.write_all(bytes).map_err(|_| StoreError::Io)?;
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|_| StoreError::Io)?;
         file.sync_all().map_err(|_| StoreError::Io)?;
@@ -160,6 +169,34 @@ impl ProfileStore {
             return Ok(false);
         };
         self.ovpn_file(&dir, &name).map(|file| file.is_some())
+    }
+
+    fn read_ovpn_config(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let name = ovpn_name(id)?;
+        let Some(dir) = self.ovpn_directory(false)? else {
+            return Ok(None);
+        };
+        let Some(file) = self.ovpn_file(&dir, &name)? else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        file.take(MAX_OVPN_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| StoreError::Io)?;
+        if data.len() > MAX_OVPN_BYTES {
+            return Err(StoreError::Limit);
+        }
+        Ok(Some(data))
+    }
+
+    fn restore_ovpn_config(&self, id: &str, old: Option<&[u8]>) {
+        let restored = match old {
+            Some(bytes) => self.save_ovpn_bytes(id, bytes),
+            None => self.remove_ovpn_config(id),
+        };
+        if restored.is_err() {
+            eprintln!("ovpn_rollback_failed");
+        }
     }
 
     pub fn remove_ovpn_config(&self, id: &str) -> Result<(), StoreError> {
@@ -283,7 +320,7 @@ impl ProfileStore {
     }
 
     pub fn save(&self, profile: Profile) -> Result<(), StoreError> {
-        self.save_profile_with(profile, |_| Ok(false))
+        self.save_profile_with(profile, |_| Ok(ConfigChange::None), |data| self.write(data))
     }
 
     #[cfg(target_os = "linux")]
@@ -292,36 +329,62 @@ impl ProfileStore {
         profile: Profile,
         config: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.save_admin_profile_with(profile, config, |data| self.write(data))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn save_admin_profile_with(
+        &self,
+        profile: Profile,
+        config: Option<&str>,
+        write_profile: impl FnOnce(&[u8]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let id = profile.id.clone();
         let kind = profile.kind;
-        self.save_profile_with(profile, |previous| {
-            if kind != VpnKind::Ovpn {
-                // Refuse an untrusted cleanup target before replacing the profile.
-                if previous == Some(VpnKind::Ovpn) {
-                    return self.ovpn_config_exists(&id);
+        self.save_profile_with(
+            profile,
+            |previous| {
+                if kind != VpnKind::Ovpn {
+                    // Refuse an untrusted cleanup target before replacing the profile.
+                    if previous == Some(VpnKind::Ovpn) {
+                        return self.ovpn_config_exists(&id).map(|exists| {
+                            if exists {
+                                ConfigChange::Remove
+                            } else {
+                                ConfigChange::None
+                            }
+                        });
+                    }
+                    return Ok(ConfigChange::None);
                 }
-                return Ok(false);
-            }
-            if let Some(config) = config {
-                self.save_ovpn_config(&id, config)
-                    .map_err(|_| StoreError::Io)?;
-            } else if !self.ovpn_config_exists(&id)? {
-                return Err(StoreError::InvalidData);
-            }
-            Ok(false)
-        })
+                if let Some(config) = config {
+                    let old = self.read_ovpn_config(&id).map_err(|_| StoreError::Io)?;
+                    if self.save_ovpn_config(&id, config).is_err() {
+                        self.restore_ovpn_config(&id, old.as_deref());
+                        return Err(StoreError::Io);
+                    }
+                    return Ok(ConfigChange::Replace(old));
+                } else if !self.ovpn_config_exists(&id)? {
+                    return Err(StoreError::InvalidData);
+                }
+                Ok(ConfigChange::None)
+            },
+            write_profile,
+        )
     }
 
     fn save_profile_with(
         &self,
         profile: Profile,
-        prepare_config: impl FnOnce(Option<VpnKind>) -> Result<bool, StoreError>,
+        prepare_config: impl FnOnce(Option<VpnKind>) -> Result<ConfigChange, StoreError>,
+        write_profile: impl FnOnce(&[u8]) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         profile.validate().map_err(|_| StoreError::InvalidData)?;
         let id = profile.id.clone();
         let reservation = self.reserve(&id)?;
         let _lock = self.lock()?;
         let mut profiles = self.load()?;
+        let original = profiles.clone();
         let previous =
             if let Some(existing) = profiles.iter_mut().find(|existing| existing.id == id) {
                 let kind = existing.kind;
@@ -336,11 +399,29 @@ impl ProfileStore {
             };
         let data = encode_profiles(profiles)?;
         reservation.validate()?;
-        let remove_config = prepare_config(previous)?;
-        reservation.validate()?;
-        self.write(&data)?;
-        if remove_config {
-            self.remove_ovpn_config(&id)?;
+        let change = prepare_config(previous)?;
+        let result = reservation.validate().and_then(|()| write_profile(&data));
+        if let Err(error) = result {
+            match self.load() {
+                Ok(current) if current != original => {
+                    if encode_profiles(original)
+                        .and_then(|prior| self.write(&prior))
+                        .is_err()
+                    {
+                        eprintln!("profile_rollback_failed");
+                    }
+                }
+                Err(_) => eprintln!("profile_rollback_unconfirmed"),
+                _ => {}
+            }
+            if let ConfigChange::Replace(old) = change {
+                self.restore_ovpn_config(&id, old.as_deref());
+            }
+            return Err(error);
+        }
+        // A crash between these writes can leave the user's new config with the old profile.
+        if matches!(change, ConfigChange::Remove) && self.remove_ovpn_config(&id).is_err() {
+            eprintln!("ovpn_orphan");
         }
         Ok(())
     }
@@ -368,11 +449,14 @@ impl ProfileStore {
             return Err(StoreError::NotFound);
         }
         reservation.validate()?;
+        if remove_config {
+            self.ovpn_config_exists(id)?;
+        }
         if found {
             self.write(&encode_profiles(profiles)?)?;
         }
-        if remove_config {
-            self.remove_ovpn_config(id)?;
+        if remove_config && self.remove_ovpn_config(id).is_err() {
+            eprintln!("ovpn_orphan");
         }
         if found {
             Ok(())
@@ -845,6 +929,73 @@ mod linux_tests {
     }
 
     #[test]
+    fn removing_profile_rejects_symlink_before_changing_document() {
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        let mut value = serde_json::to_value(profile()).unwrap();
+        value["kind"] = "ovpn".into();
+        value["username"] = "".into();
+        value["networks"] = serde_json::json!([]);
+        value["ovpn"] = serde_json::json!({"certificateId":"01", "module":"/fixture.so"});
+        let old: Profile = serde_json::from_value(value).unwrap();
+        store.save(old.clone()).unwrap();
+        let dir = store.ovpn_dir().unwrap();
+        let target = f.path.join("target");
+        fs::write(&target, "untouched").unwrap();
+        symlink(&target, dir.join("a.ovpn")).unwrap();
+        assert!(store.remove_admin_profile("a").is_err());
+        assert_eq!(store.load().unwrap(), [old]);
+        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn failed_profile_write_restores_or_removes_config() {
+        for previous in [None, Some(&b"old\xffconfig"[..])] {
+            let f = Fixture::new();
+            let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+            let mut value = serde_json::to_value(profile()).unwrap();
+            value["kind"] = "ovpn".into();
+            value["username"] = "".into();
+            value["networks"] = serde_json::json!([]);
+            value["ovpn"] = serde_json::json!({"certificateId":"01", "module":"/fixture.so"});
+            let ovpn: Profile = serde_json::from_value(value).unwrap();
+            if let Some(old) = previous {
+                store.save_ovpn_bytes("a", old).unwrap();
+                store.save(ovpn.clone()).unwrap();
+            }
+            let before = store.load().unwrap();
+            let error =
+                store.save_admin_profile_with(ovpn, Some("new config"), |_| Err(StoreError::Io));
+            assert_eq!(error, Err(StoreError::Io));
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(store.read_ovpn_config("a").unwrap().as_deref(), previous);
+        }
+    }
+
+    #[test]
+    fn failed_profile_write_after_rename_restores_both_files() {
+        let f = Fixture::new();
+        let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
+        let mut value = serde_json::to_value(profile()).unwrap();
+        value["kind"] = "ovpn".into();
+        value["username"] = "".into();
+        value["networks"] = serde_json::json!([]);
+        value["ovpn"] = serde_json::json!({"certificateId":"01", "module":"/fixture.so"});
+        let old: Profile = serde_json::from_value(value).unwrap();
+        store.save_ovpn_bytes("a", b"old").unwrap();
+        store.save(old.clone()).unwrap();
+        let mut new = old.clone();
+        new.name = "Changed".into();
+        let result = store.save_admin_profile_with(new, Some("new"), |data| {
+            store.write(data)?;
+            Err(StoreError::Io)
+        });
+        assert_eq!(result, Err(StoreError::Io));
+        assert_eq!(store.load().unwrap(), [old]);
+        assert_eq!(store.read_ovpn_config("a").unwrap().unwrap(), b"old");
+    }
+
+    #[test]
     fn ovpn_config_is_atomic_private_and_bounded() {
         let f = Fixture::new();
         let store = f.make(Some(f.path.clone().into_os_string()), None).unwrap();
@@ -898,12 +1049,16 @@ mod linux_tests {
             let (resume, await_resume) = mpsc::channel();
             let writer_store = &store;
             let writer = scope.spawn(move || {
-                writer_store.save_profile_with(expected.clone(), move |_| {
-                    writer_store.save_ovpn_config(&expected.id, "synthetic")?;
-                    file_saved.send(()).unwrap();
-                    await_resume.recv_timeout(Duration::from_secs(5)).unwrap();
-                    Ok(false)
-                })
+                writer_store.save_profile_with(
+                    expected.clone(),
+                    move |_| {
+                        writer_store.save_ovpn_config(&expected.id, "synthetic")?;
+                        file_saved.send(()).unwrap();
+                        await_resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(ConfigChange::None)
+                    },
+                    |data| writer_store.write(data),
+                )
             });
             await_file.recv_timeout(Duration::from_secs(5)).unwrap();
             let reservation = store.reserve(&profile().id);

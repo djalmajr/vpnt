@@ -8,10 +8,11 @@ use crate::{
 };
 use std::time::Instant;
 
-pub(super) struct Backend(Actor);
+#[doc(hidden)]
+pub struct Backend(Actor);
 
 impl Backend {
-    pub(super) fn new(demo: bool, reply: impl Fn(Reply) + Send + 'static) -> std::io::Result<Self> {
+    pub fn new(demo: bool, reply: impl Fn(Reply) + Send + 'static) -> std::io::Result<Self> {
         Actor::spawn(
             move || {
                 if demo {
@@ -25,7 +26,11 @@ impl Backend {
         .map(Self)
     }
 
-    pub(super) fn send(&self, request: Request, received: Instant) -> Result<(), ()> {
+    #[allow(
+        clippy::result_unit_err,
+        reason = "preserve the desktop backend interface"
+    )]
+    pub fn send(&self, request: Request, received: Instant) -> Result<(), ()> {
         self.0.send(request, received)
     }
 }

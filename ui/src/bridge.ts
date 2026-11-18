@@ -39,10 +39,11 @@ export class BridgeError extends Error {
   }
 }
 
-const maxOvpnRequestBytes = 64 * 1024;
+const maxOvpnFileBytes = 32 * 1024;
+const maxOvpnRequestBytes = 128 * 1024;
 
 export async function readOvpnFile(file: File): Promise<string> {
-  if (file.size > maxOvpnRequestBytes) {
+  if (file.size > maxOvpnFileBytes) {
     throw new BridgeError("invalid_ovpn", "too_large");
   }
   const bytes = await file.arrayBuffer();

@@ -45,7 +45,7 @@ impl Admin {
     }
     #[cfg(target_os = "linux")]
     pub fn start(request: AdminRequest, locale: Locale, expires: Instant) -> Result<Self, Error> {
-        let path = std::env::current_exe().map_err(|_| Error::Untrusted)?;
+        let path = super::client::linux_executable().map_err(|_| Error::Untrusted)?;
         Self::linux_for_executable(&path, request, locale, expires)
     }
     #[cfg(target_os = "linux")]

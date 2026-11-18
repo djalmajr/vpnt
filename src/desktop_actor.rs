@@ -17,6 +17,36 @@ use std::{
 
 type ResultSnapshot = Result<Snapshot, &'static str>;
 
+#[cfg(target_os = "linux")]
+fn list_certificates(id: String, module: String) -> Reply {
+    if !crate::model::valid_module_path(&module) {
+        return Reply::error(id, "invalid_module");
+    }
+    match crate::connection::ovpn::pkcs11::list_certificates(std::path::Path::new(&module)) {
+        Ok(certificates) => Reply {
+            id,
+            certificates: Some(
+                certificates
+                    .into_iter()
+                    .map(|certificate| crate::bridge::CertificateView {
+                        id: certificate
+                            .id
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect(),
+                        subject: certificate.subject,
+                        issuer: certificate.issuer,
+                        not_before: certificate.not_before,
+                        not_after: certificate.not_after,
+                    })
+                    .collect(),
+            ),
+            ..Reply::default()
+        },
+        Err(_) => Reply::error(id, "token_unavailable"),
+    }
+}
+
 trait Runtime {
     fn poll(&mut self);
     fn take_admin_result(&mut self) -> Option<(u64, ResultSnapshot)>;
@@ -117,6 +147,19 @@ impl Actor {
         init: impl FnOnce() -> (Option<App>, Option<B>) + Send + 'static,
         reply: impl Fn(Reply) + Send + 'static,
     ) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        return Self::spawn_with_listing(init, reply, list_certificates);
+        #[cfg(not(target_os = "linux"))]
+        Self::spawn_with_listing(init, reply, |id, module| {
+            crate::bridge::ovpn::reply(&id, &Command::ListCertificates { module }).unwrap()
+        })
+    }
+
+    fn spawn_with_listing<B: Runtime + 'static>(
+        init: impl FnOnce() -> (Option<App>, Option<B>) + Send + 'static,
+        reply: impl Fn(Reply) + Send + 'static,
+        list: impl Fn(String, String) -> Reply + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
         let (input, requests) = mpsc::sync_channel::<Work>(32);
         let intent = Arc::new(AtomicU64::new(1));
         let actor_intent = intent.clone();
@@ -124,12 +167,47 @@ impl Actor {
         let idle_cycles = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let actor_idle_cycles = idle_cycles.clone();
+        #[cfg(target_os = "linux")]
+        let list = Arc::new(list);
+        #[cfg(not(target_os = "linux"))]
+        let _ = list;
         std::thread::Builder::new()
             .name("vpnt-application".into())
             .spawn(move || {
                 let (mut demo, mut normal) = init();
                 let mut administrative = std::collections::BTreeMap::new();
+                #[cfg(target_os = "linux")]
+                let mut listing: Option<(
+                    String,
+                    mpsc::Receiver<Reply>,
+                    Instant,
+                    bool,
+                )> = None;
                 loop {
+                    #[cfg(target_os = "linux")]
+                    if let Some((id, receiver, expires, reported)) = &mut listing {
+                        match receiver.try_recv() {
+                            Ok(value) => {
+                                if !*reported {
+                                    reply(value);
+                                }
+                                listing = None;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                if !*reported {
+                                    reply(Reply::error(id.clone(), "token_unavailable"));
+                                }
+                                listing = None;
+                            }
+                            Err(mpsc::TryRecvError::Empty)
+                                if !*reported && Instant::now() >= *expires =>
+                            {
+                                reply(Reply::error(id.clone(), "token_unavailable"));
+                                *reported = true;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
                     if let Some(normal) = &mut normal {
                         normal.poll();
                         if let Some((token, result)) = normal.take_admin_result()
@@ -146,6 +224,35 @@ impl Actor {
                     let observed_intent = actor_intent.load(Ordering::Acquire);
                     match requests.recv_timeout(Duration::from_millis(20)) {
                         Ok(work) => {
+                            #[cfg(target_os = "linux")]
+                            if let Command::ListCertificates { module } = &work.request.command {
+                                let id = work.request.id.clone();
+                                if listing.is_some() {
+                                    reply(Reply::error(id, "token_unavailable"));
+                                    continue;
+                                }
+                                let module = module.clone();
+                                let list = list.clone();
+                                let (send, recv) = mpsc::channel();
+                                let worker_id = id.clone();
+                                if std::thread::Builder::new()
+                                    .name("vpnt-certificate-reply".into())
+                                    .spawn(move || {
+                                        let _ = send.send(list(worker_id, module));
+                                    })
+                                    .is_err()
+                                {
+                                    reply(Reply::error(id, "token_unavailable"));
+                                } else {
+                                    listing = Some((
+                                        id,
+                                        recv,
+                                        Instant::now() + Duration::from_secs(30),
+                                        false,
+                                    ));
+                                }
+                                continue;
+                            }
                             #[cfg(target_os = "linux")]
                             if let Some(metadata) =
                                 crate::bridge::ovpn::reply(&work.request.id, &work.request.command)

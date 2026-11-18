@@ -1,7 +1,7 @@
 //! Inspection of untrusted client profiles before handing them to OpenVPN.
 use std::{fmt, net::Ipv4Addr};
 
-const MAX_PROFILE_BYTES: usize = 256 * 1024;
+const MAX_PROFILE_BYTES: usize = 32 * 1024;
 // OpenVPN's 256-byte option line buffer also needs the LF and trailing NUL.
 const MAX_LINE_BYTES: usize = 254;
 const INLINE: &[&str] = &["ca", "tls-crypt", "tls-auth", "tls-crypt-v2", "extra-certs"];
@@ -156,6 +156,11 @@ pub fn inspect(content: &[u8]) -> Result<Inspected, ImportError> {
     }
     if !has_ca {
         return Err(ImportError::MissingBlock("ca"));
+    }
+    // Normalizing can add a final newline. The limit holds for the stored text
+    // too, so inspecting the normalized text again accepts it.
+    if normalized.len() > MAX_PROFILE_BYTES {
+        return Err(ImportError::TooLarge);
     }
     Ok(Inspected {
         name,

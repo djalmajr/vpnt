@@ -56,7 +56,10 @@ impl Runtime for FixtureRuntime {
     }
 
     fn dispatch(&mut self, command: Command, _: Instant) -> ResultSnapshot {
-        assert!(matches!(command, Command::GetSnapshot {}));
+        assert!(matches!(
+            command,
+            Command::GetSnapshot {} | Command::Disconnect { .. }
+        ));
         Ok(snapshot())
     }
 
@@ -189,4 +192,82 @@ fn actor_correlates_administrative_replies_by_token_out_of_order() {
     let first = fixture.reply();
     assert_eq!(first.id, "first-admin");
     assert!(first.snapshot.is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn blocked_certificate_listing_does_not_block_actor() {
+    let (started, _begins) = mpsc::channel();
+    let (complete, completions) = mpsc::channel();
+    let (stop, stopped) = mpsc::channel();
+    let (reply, replies) = mpsc::channel();
+    let (list_started, list_begins) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let runtime = FixtureRuntime {
+        polls: polls.clone(),
+        started,
+        completions,
+        stopped: stop,
+    };
+    let actor = Actor::spawn_with_listing(
+        move || (None, Some(runtime)),
+        move |r| {
+            let _ = reply.send(r);
+        },
+        move |id, _| {
+            let _ = list_started.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3));
+            Reply::error(id, "token_unavailable")
+        },
+    )
+    .unwrap();
+    let send = |id: &str, command| {
+        actor
+            .send(
+                Request {
+                    id: id.into(),
+                    command,
+                    locale: None,
+                },
+                Instant::now(),
+            )
+            .unwrap()
+    };
+    send(
+        "listing",
+        Command::ListCertificates {
+            module: "/fixture.so".into(),
+        },
+    );
+    list_begins.recv_timeout(Duration::from_secs(2)).unwrap();
+    let before = polls.load(Ordering::Relaxed);
+    send("snapshot", Command::GetSnapshot {});
+    send("disconnect", Command::Disconnect { id: "one".into() });
+    send(
+        "duplicate",
+        Command::ListCertificates {
+            module: "/fixture.so".into(),
+        },
+    );
+    let a = replies.recv_timeout(Duration::from_millis(500));
+    let b = replies.recv_timeout(Duration::from_millis(500));
+    let duplicate = replies.recv_timeout(Duration::from_millis(500));
+    let after = polls.load(Ordering::Relaxed);
+    let _ = release.send(());
+    let listing = replies.recv_timeout(Duration::from_secs(2));
+    drop(actor);
+    drop(complete);
+    let _ = stopped.recv_timeout(Duration::from_secs(2));
+    let ids = [a.unwrap().id, b.unwrap().id];
+    assert_eq!(ids, ["snapshot", "disconnect"]);
+    let duplicate = duplicate.unwrap();
+    assert_eq!(duplicate.id, "duplicate");
+    assert_eq!(duplicate.error.as_deref(), Some("token_unavailable"));
+    assert!(after > before, "poll must continue during listing");
+    assert_eq!(listing.unwrap().id, "listing");
 }
