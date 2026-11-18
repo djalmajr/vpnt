@@ -1,17 +1,16 @@
-//! Linux controller entry point. No VPN driver is available yet.
-use super::{Attempt, Factory, Failure, Timing, engine, profiles::Profiles};
+//! Linux controller entry point.
+use super::{Factory, Timing, engine, profiles::Profiles};
+mod ovpn;
 use crate::{
-    helper::protocol::{ErrorCode, Message, Request, Step},
+    helper::protocol::{ErrorCode, Message, Request},
     model::{Profile, VpnKind},
     secrets::Credentials,
 };
-use std::{
-    sync::{
-        Arc,
-        atomic::AtomicBool,
-        mpsc::{Receiver, SyncSender},
-    },
-    time::{Duration, Instant},
+use ovpn::{OvpnAttempt, RealNetwork, RealTunnel};
+use std::sync::{
+    Arc,
+    atomic::AtomicBool,
+    mpsc::{Receiver, SyncSender},
 };
 
 pub fn run_linux(
@@ -41,46 +40,28 @@ pub fn run_linux(
 struct LinuxFactory {
     profiles: Arc<Profiles>,
 }
-struct UnsupportedAttempt;
 impl Factory for LinuxFactory {
-    type Attempt = UnsupportedAttempt;
+    type Attempt = OvpnAttempt<RealNetwork, RealTunnel>;
     fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
         self.profiles
             .load()
             .map(Some)
             .map_err(|_| ErrorCode::UntrustedConfiguration)
     }
-    fn supports(&self, _: VpnKind) -> bool {
-        false
+    fn supports(&self, kind: VpnKind) -> bool {
+        kind == VpnKind::Ovpn
     }
     fn create(
         &self,
-        _: Profile,
-        _: u32,
+        profile: Profile,
+        uid: u32,
         _: u64,
         _: Credentials,
         _: Arc<AtomicBool>,
-    ) -> UnsupportedAttempt {
-        UnsupportedAttempt
+    ) -> Self::Attempt {
+        OvpnAttempt::new(profile, uid)
     }
     fn idle(&self) -> bool {
-        true
-    }
-}
-impl Attempt for UnsupportedAttempt {
-    fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
-        Err(Failure::at(Step::Profile))
-    }
-    fn ready(&mut self) -> Result<bool, Failure> {
-        Err(Failure::at(Step::Profile))
-    }
-    fn healthy(&mut self) -> Result<(), Failure> {
-        Err(Failure::at(Step::Profile))
-    }
-    fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
-        Err(Failure::at(Step::Profile))
-    }
-    fn cleanup(&mut self) -> bool {
         true
     }
 }

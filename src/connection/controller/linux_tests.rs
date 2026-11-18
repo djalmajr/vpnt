@@ -1,4 +1,6 @@
 use super::*;
+use crate::connection::controller::{Attempt, Failure};
+use crate::helper::protocol::Step;
 use crate::{
     helper::protocol::Command as RequestCommand,
     preferences::ProbeInterval,
@@ -7,7 +9,7 @@ use crate::{
 };
 use std::{
     fs,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -54,9 +56,45 @@ fn linux_controller_child() {
     let mut second = profile("second");
     second.kind = VpnKind::Ipsec;
     store.save(second.clone()).unwrap();
+    let mut third = profile("third");
+    third.kind = VpnKind::Ovpn;
+    third.username.clear();
+    third.ovpn = Some(crate::model::OvpnSettings {
+        certificate_id: "01".into(),
+        module: "/fixture.so".into(),
+        tls: crate::model::OvpnTls::Pkcs1Only,
+    });
+    store.save(third.clone()).unwrap();
     let factory = LinuxFactory {
         profiles: Arc::new(Profiles::for_current_user().unwrap()),
     };
+    assert!(factory.supports(VpnKind::Ovpn));
+    assert!(!factory.supports(VpnKind::Ssl));
+    assert!(!factory.supports(VpnKind::Ipsec));
+    let config = store.ovpn_dir().unwrap().join("third.ovpn");
+    fs::write(&config, b"fixture").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut insecure = factory.create(
+        third.clone(),
+        uid,
+        1,
+        Credentials {
+            password: Secret::from(""),
+            psk: Secret::from(""),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        insecure
+            .start(
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap_err()
+            .step,
+        Step::Profile
+    );
+    assert!(insecure.cleanup());
     let mut attempt = factory.create(
         profile("first"),
         uid,
@@ -68,7 +106,10 @@ fn linux_controller_child() {
         Arc::new(AtomicBool::new(false)),
     );
     let error = attempt
-        .start(&AtomicBool::new(false), Instant::now())
+        .start(
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(1),
+        )
         .unwrap_err();
     assert_eq!(error.step, Step::Profile);
     assert!(attempt.cleanup());
@@ -87,7 +128,7 @@ fn linux_controller_child() {
     match messages.recv_timeout(Duration::from_secs(3)).unwrap() {
         Message::Snapshot { id, profiles, .. } => {
             assert_eq!(id, "snapshot");
-            assert_eq!(profiles, [profile("first"), second]);
+            assert_eq!(profiles, [profile("first"), second, third]);
         }
         other => panic!("unexpected snapshot response: {other:?}"),
     }
@@ -125,6 +166,36 @@ fn linux_controller_child() {
     assert!(
         matches!(messages.recv_timeout(Duration::from_secs(3)).unwrap(), Message::Failed { id, error: ErrorCode::MissingProgram } if id == "connect-ipsec")
     );
+    requests
+        .send(Request {
+            id: "connect-ovpn".into(),
+            command: RequestCommand::Connect {
+                id: "third".into(),
+                generation: 1,
+                interval: ProbeInterval::TEN,
+                credentials: Credentials {
+                    password: Secret::from(""),
+                    psk: Secret::from(""),
+                },
+            },
+        })
+        .unwrap();
+    assert!(
+        matches!(messages.recv_timeout(Duration::from_secs(3)).unwrap(), Message::Accepted { id } if id == "connect-ovpn")
+    );
+    loop {
+        match messages.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Message::Changed {
+                profile_id,
+                state: crate::session::ConnectionState::Dropped,
+                ..
+            } if profile_id == "third" => break,
+            Message::Failed { id, error } if id == "connect-ovpn" => {
+                panic!("OVPN rejected before create: {error:?}")
+            }
+            _ => {}
+        }
+    }
     drop(requests);
     assert_eq!(result.recv_timeout(Duration::from_secs(3)).unwrap(), Ok(()));
     worker.join().unwrap();
@@ -219,7 +290,7 @@ fn worker_publishes_changed_phase_and_default_phase_stays_silent() {
             }
         }
     }
-    assert_eq!(UnsupportedAttempt.phase(), None);
+
     for publish in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
         let cancel = Arc::new(AtomicBool::new(false));

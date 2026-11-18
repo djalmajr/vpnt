@@ -293,6 +293,25 @@ impl Session {
         })
     }
 
+    /// Observe exit without reaping; `wait` still owns the final status.
+    #[cfg(target_os = "linux")]
+    pub fn exited(&self) -> Option<Option<Reason>> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.openvpn.0.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 && unsafe { info.si_pid() } != 0 {
+            Some(*lock(&self.reason))
+        } else {
+            None
+        }
+    }
+
     pub fn progress(&self) -> &mpsc::Receiver<Progress> {
         &self.progress
     }
