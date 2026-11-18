@@ -1258,3 +1258,80 @@ test("sessão anterior reconcilia onboarding durante instalação pendente", asy
   expect(actions()).toEqual([{ type: "install_helper" }]);
   await act(async () => pendingInstall?.(false));
 });
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  for (const state of [
+    "dropped",
+    "credentials_rejected",
+    "gateway_timeout",
+    "missing_program",
+  ] as const) {
+    test(`${locale} ${state}: dismiss preserves state and focus across navigation`, async () => {
+      await mountComponentScenario(
+        componentSnapshot("installed", [
+          { ...vpn, state, log: [{ state, timestamp: 1 }] },
+        ]),
+        false,
+        locale,
+      );
+      const close = byLabel(t(locale, "dismissNotice"));
+      expect(close.title).toBe(t(locale, "dismissNotice"));
+      close.focus();
+      await click(close);
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+      expect(document.querySelector(".card-state")?.textContent).toContain(
+        t(locale, `state.${state}`),
+      );
+      expect(document.activeElement).toBe(
+        document.querySelector(".vpn-card .switch"),
+      );
+      await click(
+        byLabel(t(locale, "profileDetails", { name: vpn.profile.name })),
+      );
+      await click(byLabel(t(locale, "back")));
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+      snapshot = {
+        ...snapshot,
+        vpns: [{ ...vpn, state, log: [{ state, timestamp: 2 }] }],
+      };
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+      expect(
+        document.querySelector(".vpn-card .notice-dismiss"),
+      ).not.toBeNull();
+    });
+  }
+  for (const state of ["cleanup_unconfirmed", "unresponsive"] as const) {
+    test(`${locale} ${state}: notice cannot be dismissed`, async () => {
+      await mountComponentScenario(
+        componentSnapshot("installed", [{ ...vpn, state }]),
+        false,
+        locale,
+      );
+      expect(document.querySelector(".vpn-card .notice")).not.toBeNull();
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+    });
+  }
+  test(`${locale}: command error dismisses with icon and restores focus`, async () => {
+    await mount(locale);
+    globalThis.fetch = (async () =>
+      new Response("error", { status: 500 })) as unknown as typeof fetch;
+    const toggle =
+      document.querySelector<HTMLButtonElement>(".vpn-card .switch");
+    if (!toggle) throw new Error("switch missing");
+    await click(toggle);
+    const close = byLabel(t(locale, "dismissNotice"));
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
+    expect(
+      [...document.querySelectorAll("button")].some(
+        (button) => button.textContent?.trim() === t(locale, "close"),
+      ),
+    ).toBe(false);
+    close.focus();
+    await click(close);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).not.toBe(close);
+  });
+}

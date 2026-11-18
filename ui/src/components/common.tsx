@@ -1,4 +1,5 @@
 import {
+  type MouseEvent,
   type ReactNode,
   type SelectHTMLAttributes,
   useId,
@@ -20,6 +21,7 @@ const paths = {
   settings:
     "M21 4h-7 M10 4H3 M21 12h-9 M8 12H3 M21 20h-5 M12 20H3 M14 2v4 M8 10v4 M16 18v4",
   back: "M15 18l-6-6 6-6",
+  x: "M18 6 6 18 M6 6l12 12",
   chevron: "M9 18l6-6-6-6",
   down: "M6 9l6 6 6-6",
   plus: "M12 5v14 M5 12h14",
@@ -277,11 +279,30 @@ export function Group({ children }: { children: ReactNode }) {
 export function Notice({
   tone = "info",
   children,
+  onDismiss,
+  t,
 }: {
   tone?: "info" | "warn" | "error";
   children: ReactNode;
+  onDismiss?: (event: MouseEvent<HTMLButtonElement>) => void;
+  t?: T;
 }) {
-  return <div className={`notice ${tone}`}>{children}</div>;
+  return (
+    <div className={`notice ${tone} ${onDismiss ? "dismissible" : ""}`}>
+      {onDismiss && t && (
+        <button
+          type="button"
+          className="icon-button notice-dismiss"
+          aria-label={t("dismissNotice")}
+          title={t("dismissNotice")}
+          onClick={onDismiss}
+        >
+          <Icon name="x" />
+        </button>
+      )}
+      {children}
+    </div>
+  );
 }
 export function Dialog({
   title,
