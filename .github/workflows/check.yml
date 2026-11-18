@@ -38,6 +38,12 @@ jobs:
         run: |
           cargo +1.99.0 build --locked
           cargo +1.99.0 test --locked --all-targets --all-features
+      - name: Test the network helper in an isolated network namespace
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor;
+        # the test only touches devices and routes inside its own namespace.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          VPNT_TEST_NETNS=1 cargo +1.99.0 test --locked --test netd_netns
 
   macos:
     runs-on: macos-15

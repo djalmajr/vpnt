@@ -1,0 +1,36 @@
+[Unit]
+Description=VPN Tray network helper
+Documentation=https://github.com/djalmajr/vpnt
+Requires=vpnt-helper.socket
+After=vpnt-helper.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/vpnt/vpnt-helper
+# The helper creates tun devices owned by the caller and applies addresses,
+# routes and per-link DNS. It needs CAP_NET_ADMIN and nothing else.
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+UMask=0077
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Netlink for ip, AF_UNIX for the listening socket and D-Bus (resolvectl).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+IPAddressDeny=any
