@@ -57,14 +57,14 @@ impl<'a> NativeBackend<'a> {
         });
     }
     #[cfg(test)]
-    pub(crate) fn fixture_scope(&mut self, owner: Owner, route: Route) {
+    pub(crate) fn fixture_scope(&mut self, owner: Owner, route: Route) -> InterfaceToken {
         self.registry
             .register(
                 RegisteredScope::Fixture(route.interface),
                 owner,
                 vec![route],
             )
-            .unwrap();
+            .unwrap()
     }
     #[cfg(test)]
     pub(crate) fn fixture_has_scope(&self, owner: &Owner) -> bool {
