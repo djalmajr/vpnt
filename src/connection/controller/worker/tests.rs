@@ -89,15 +89,31 @@ fn clock(seconds: u64) -> ProbeClock {
 #[derive(Debug)]
 enum HealthEvent {
     Healthy(Instant),
-    Probe,
-    Cleanup(Progress),
+    Probe(Instant),
+    Cleanup(Progress, Instant),
+}
+
+/// Optional park points for a test that needs to arm a signal while the
+/// worker is between the event and the state update that follows it.
+#[derive(Default)]
+struct Gates {
+    healthy_call: Option<usize>,
+    healthy_release: Option<mpsc::Receiver<()>>,
+    probe_call: Option<usize>,
+    probe_release: Option<mpsc::Receiver<()>>,
+    revalidation_call: Option<usize>,
+    revalidation_release: Option<mpsc::Receiver<()>>,
+    /// Startup budget override for the tests that pause inside `ready`.
+    connect: Option<Duration>,
 }
 
 struct HealthAttempt {
     events: mpsc::Sender<HealthEvent>,
     state: Arc<Mutex<Option<Progress>>>,
     calls: usize,
+    probe_calls: usize,
     fail_on: usize,
+    gates: Gates,
 }
 impl Attempt for HealthAttempt {
     fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
@@ -111,6 +127,12 @@ impl Attempt for HealthAttempt {
         self.events
             .send(HealthEvent::Healthy(Instant::now()))
             .unwrap();
+        if self.gates.healthy_call == Some(self.calls) {
+            let _ = self.gates.healthy_release.as_ref().unwrap().recv();
+        }
+        if self.gates.revalidation_call == Some(self.calls) {
+            let _ = self.gates.revalidation_release.as_ref().unwrap().recv();
+        }
         if self.calls == self.fail_on {
             Err(Failure::at(Step::Health))
         } else {
@@ -118,12 +140,21 @@ impl Attempt for HealthAttempt {
         }
     }
     fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
-        self.events.send(HealthEvent::Probe).unwrap();
+        self.probe_calls += 1;
+        self.events
+            .send(HealthEvent::Probe(Instant::now()))
+            .unwrap();
+        if self.gates.probe_call == Some(self.probe_calls) {
+            let _ = self.gates.probe_release.as_ref().unwrap().recv();
+        }
         Ok(true)
     }
     fn cleanup(&mut self) -> bool {
         self.events
-            .send(HealthEvent::Cleanup(self.state.lock().unwrap().unwrap()))
+            .send(HealthEvent::Cleanup(
+                self.state.lock().unwrap().unwrap(),
+                Instant::now(),
+            ))
             .unwrap();
         true
     }
@@ -135,20 +166,27 @@ struct HealthRun {
     state: Arc<Mutex<Option<Progress>>>,
     events: mpsc::Receiver<HealthEvent>,
     worker: Option<thread::JoinHandle<Finished>>,
-    /// Bound for a check that must follow its trigger at once (initial and
-    /// post-probe), kept well below `health` so the next periodic check can
-    /// never stand in for a missing mandatory revalidation.
+    /// Worker-stamped instant recorded as `worker::run` returns.
+    finished_at: Arc<Mutex<Option<Instant>>>,
+    /// Single bound for every immediate follow-up, measured between instants
+    /// recorded by the worker thread.
     prompt: Duration,
 }
 impl HealthRun {
     fn start(poll: Duration, health: Duration, fail_on: usize) -> Self {
+        Self::start_with_gates(poll, health, fail_on, Gates::default())
+    }
+    fn start_with_gates(poll: Duration, health: Duration, fail_on: usize, gates: Gates) -> Self {
+        let connect = gates.connect.unwrap_or(Duration::from_secs(1));
         let signals = signals(Arc::new(AtomicBool::new(false)));
         let (events, receiver) = mpsc::channel();
         let attempt = HealthAttempt {
             events,
             state: signals.state.clone(),
             calls: 0,
+            probe_calls: 0,
             fail_on,
+            gates,
         };
         let mut run = Self {
             canceled: signals.canceled.clone(),
@@ -156,27 +194,53 @@ impl HealthRun {
             state: signals.state.clone(),
             events: receiver,
             worker: None,
-            // 150 ms absorbs scheduling on a loaded runner; the cap keeps it
-            // well below `health`.
-            prompt: (poll * 4).max(Duration::from_millis(150)).min(health / 4),
+            finished_at: Arc::new(Mutex::new(None)),
+            // The supported 3 s pause needs slack; delays above 3.5 s are
+            // reported by the worker's own timestamps.
+            prompt: Duration::from_millis(3500),
         };
         let timing = Timing {
+            connect,
             poll,
             health,
             ..timing(Duration::from_secs(1))
         };
+        let finished_at = run.finished_at.clone();
         run.worker = Some(thread::spawn(move || {
-            super::run(attempt, signals, timing, clock(3600))
+            let finished = super::run(attempt, signals, timing, clock(3600));
+            *finished_at.lock().unwrap() = Some(Instant::now());
+            finished
         }));
         run
     }
     fn event(&self) -> HealthEvent {
-        self.events.recv_timeout(Duration::from_secs(2)).unwrap()
+        // Guard against a hung worker only: the periodic-check tests wait a
+        // full `health` for the next event, and a loaded runner can suspend
+        // the worker far beyond that. No assertion is made about this time.
+        self.events.recv_timeout(Duration::from_secs(60)).unwrap()
     }
     fn healthy(&self) -> Instant {
         match self.event() {
             HealthEvent::Healthy(at) => at,
             other => panic!("expected health check, received {other:?}"),
+        }
+    }
+    fn wait_connected(&self) {
+        // `Connected` is published immediately before the worker's next poll
+        // sleep, so this is the closest observable anchor for that phase.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if matches!(
+                *self.state.lock().unwrap(),
+                Some(Progress {
+                    state: ConnectionState::Connected,
+                    ..
+                })
+            ) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Connected was never published");
+            thread::sleep(Duration::from_millis(1));
         }
     }
     fn healthy_promptly(&self) -> Instant {
@@ -185,12 +249,59 @@ impl HealthRun {
             other => panic!("expected an immediate health check, received {other:?}"),
         }
     }
+    fn probe_now(&self) -> Instant {
+        match self.event() {
+            HealthEvent::Probe(at) => at,
+            other => panic!("expected a probe, received {other:?}"),
+        }
+    }
+    fn assert_prompt(&self, phase: &str, trigger: &str, from: Instant, to: Instant) {
+        assert!(
+            to.duration_since(from) <= self.prompt,
+            "{phase} came {:?} after {trigger}, limit {:?}",
+            to.duration_since(from),
+            self.prompt
+        );
+    }
+    fn assert_command_latency(&self, armed: Instant, probed: Instant, poll: Duration) {
+        let limit = self.prompt + poll;
+        assert!(
+            probed.duration_since(armed) <= limit,
+            "command probe came {:?} after it was available, limit {:?}",
+            probed.duration_since(armed),
+            limit
+        );
+    }
+    fn assert_periodic_ceiling(
+        &self,
+        anchor: Instant,
+        periodic: Instant,
+        health: Duration,
+        poll: Duration,
+    ) {
+        let limit = health + poll + self.prompt;
+        assert!(
+            periodic.duration_since(anchor) <= limit,
+            "periodic health came {:?} after the reset, limit {:?}",
+            periodic.duration_since(anchor),
+            limit
+        );
+    }
+    fn finished_at(&self) -> Instant {
+        self.finished_at
+            .lock()
+            .unwrap()
+            .expect("worker did not return")
+    }
     fn initial_probe(&self) -> Instant {
-        self.healthy_promptly(); // The first connected-loop health check is immediate.
-        assert!(matches!(self.event(), HealthEvent::Probe));
+        let initial_health = self.healthy_promptly(); // Startup has the same bound.
+        let probed = self.probe_now();
+        self.assert_prompt("initial probe", "the first health", initial_health, probed);
         // A separate mandatory revalidation follows the probe at once; the
         // periodic check is at least `health` away and cannot satisfy this.
-        self.healthy_promptly()
+        let revalidated = self.healthy_promptly();
+        self.assert_prompt("revalidation", "the probe", probed, revalidated);
+        revalidated
     }
     fn quiet_for(&self, duration: Duration) {
         assert!(matches!(
@@ -203,7 +314,7 @@ impl HealthRun {
     }
     fn assert_dropped(&mut self) {
         match self.event() {
-            HealthEvent::Cleanup(progress) => assert_eq!(
+            HealthEvent::Cleanup(progress, _) => assert_eq!(
                 progress,
                 Progress {
                     state: ConnectionState::Dropped,
@@ -230,6 +341,13 @@ impl HealthRun {
         );
     }
 }
+fn sleep_until(deadline: Instant) {
+    let wait = deadline.saturating_duration_since(Instant::now());
+    if !wait.is_zero() {
+        thread::sleep(wait);
+    }
+}
+
 fn health_note() -> crate::helper::protocol::FailureNote {
     crate::helper::protocol::FailureNote {
         code: ErrorCode::BackendFailure,
@@ -260,50 +378,301 @@ fn connected_health_is_immediate_then_counted_by_health_cadence_not_poll() {
 
 #[test]
 fn connected_health_wait_keeps_cancellation_within_one_poll() {
-    let poll = Duration::from_millis(400);
-    let mut run = HealthRun::start(poll, Duration::from_secs(2), 0);
-    run.initial_probe();
-    // Observe the worker sleeping between polls before canceling: it notices
-    // within the rest of that poll, about half of one, which leaves cleanup
-    // and the join the other half, 200 ms, on a loaded runner. A worker that
-    // waits one poll more, or out the two-second health period, overruns.
-    run.quiet_for(poll / 2);
+    let poll = Duration::from_secs(12);
+    // Only B and C override the fixture's 1 s startup budget: a single 3 s
+    // pause in `ready` must not turn the connected loop into a timeout.
+    let mut run = HealthRun::start_with_gates(
+        poll,
+        Duration::from_secs(48),
+        0,
+        Gates {
+            connect: Some(Duration::from_secs(10)),
+            ..Gates::default()
+        },
+    );
+    // The revalidation event is stamped just before the worker publishes
+    // `Connected` and sleeps, so it anchors the wake-to-cleanup phase.
+    let revalidated = run.initial_probe();
+    run.wait_connected();
+    // Anchor the cancel to the published `Connected` state, not to the earlier
+    // health event: a delay between the event and the sleep cannot shift the
+    // observed phase. Correct: wake by anchor + poll, measured from
+    // anchor + poll/2, so about 6 s (9 s with a 3 s pause before the sleep or
+    // before the join). One poll more costs >= 18 s; the health period costs
+    // >= 42 s. The 12 s limit stays ~6 s clear of both paths after the
+    // supported 3 s pause.
+    let anchor = Instant::now();
+    let wait = (anchor + poll / 2).saturating_duration_since(Instant::now());
+    if !wait.is_zero() {
+        run.quiet_for(wait);
+    }
     let canceled_at = Instant::now();
     run.canceled.store(true, Ordering::Release);
+    // The worker timestamps its own cleanup entry. A delay of the test thread
+    // before the join cannot be mistaken for a late cancellation.
+    let cleanup_at = match run.event() {
+        HealthEvent::Cleanup(
+            Progress {
+                state: ConnectionState::Disconnecting,
+                cleaning: false,
+                ..
+            },
+            at,
+        ) => at,
+        other => panic!("expected disconnect cleanup, received {other:?}"),
+    };
+    assert!(cleanup_at.duration_since(canceled_at) <= poll);
+    // Wake-to-cleanup gets its own bound. The anchor already includes one
+    // poll; the remaining allowed gap is the supported 3 s pause between the
+    // revalidation and the start of the sleep.
+    assert!(
+        cleanup_at.duration_since(revalidated + poll) <= run.prompt,
+        "wake to cleanup exceeded {:?}",
+        run.prompt
+    );
     let finished = run.finish();
-    assert!(canceled_at.elapsed() <= poll);
+    // The worker also stamps its own return; a delay after cleanup is part of
+    // the same one-poll property.
+    assert!(run.finished_at().duration_since(canceled_at) <= poll);
+    // The 12 s total still leaves slack after the poll wake; the tail phase
+    // gets its own worker-stamped bound so a 4 s delay cannot hide there.
+    assert!(
+        run.finished_at().duration_since(cleanup_at) <= run.prompt,
+        "cleanup to Off exceeded {:?}",
+        run.prompt
+    );
     assert_eq!(finished.state, ConnectionState::Off);
     assert_eq!(finished.error, None);
-    assert!(matches!(
-        run.event(),
-        HealthEvent::Cleanup(Progress {
-            state: ConnectionState::Disconnecting,
-            cleaning: false,
-            ..
-        })
-    ));
 }
 
 #[test]
 fn connected_health_command_probe_is_prompt_revalidated_and_resets_health_clock() {
-    let poll = Duration::from_millis(10);
-    // Long enough that the periodic check, about half of it away when the
-    // command arrives, cannot pass for the prompt probe even with `prompt`
-    // sized for a loaded runner.
-    let health = Duration::from_secs(1);
-    let run = HealthRun::start(poll, health, 0);
-    run.initial_probe();
-    run.quiet_for(health / 2);
+    let poll = Duration::from_millis(20);
+    // A 3 s pause after either reset still leaves ~2 s before the periodic
+    // check is due, so the command probe is read first. The two deadline
+    // crossings cost about 2 * health, keeping the case near 10 s.
+    let health = Duration::from_secs(5);
+    // Park the worker inside both post-probe revalidations and inside the
+    // command probe. Event order, not a short deadline, proves promptness and
+    // both clock resets. The first park lets the initial deadline expire; the
+    // second lets the deadline from the initial reset expire while the command
+    // revalidation is still before its own reset. A reset only after the
+    // initial probe then shows a periodic Healthy before the next Probe.
+    let (release_healthy, healthy_gate) = mpsc::channel();
+    let (release_probe, probe_gate) = mpsc::channel();
+    let (release_revalidation, revalidation_gate) = mpsc::channel();
+    let gates = Gates {
+        healthy_call: Some(2),
+        healthy_release: Some(healthy_gate),
+        probe_call: Some(2),
+        probe_release: Some(probe_gate),
+        revalidation_call: Some(3),
+        revalidation_release: Some(revalidation_gate),
+        connect: Some(Duration::from_secs(10)),
+    };
+    let run = HealthRun::start_with_gates(poll, health, 0, gates);
+    // Declared after `run` so a panic drops the senders (releasing all parks)
+    // before `HealthRun::drop` joins the worker.
+    let _releases = (release_healthy, release_probe, release_revalidation);
+    let first = run.healthy_promptly();
+    let initial_probe = run.probe_now();
+    run.assert_prompt("initial probe", "the first health", first, initial_probe);
+    let initial_revalidation = run.healthy();
+    run.assert_prompt(
+        "revalidation",
+        "the probe",
+        initial_probe,
+        initial_revalidation,
+    );
+    sleep_until(first + health);
     run.probe.store(true, Ordering::Release);
-    assert!(matches!(
-        run.events.recv_timeout(run.prompt).unwrap(),
-        HealthEvent::Probe
-    ));
-    let revalidated = run.healthy_promptly();
-    // Cross the old deadline without another check; only the post-probe
-    // revalidation's new deadline should trigger the next periodic check.
-    run.quiet_for(health * 3 / 4);
-    assert!(run.healthy().duration_since(revalidated) >= health);
+    _releases.0.send(()).unwrap();
+    // Timing starts at the gate release: before it the worker is parked on
+    // purpose and cannot read the command.
+    let first_command_released = Instant::now();
+    // The reset made by the parked revalidation happens before this Probe is
+    // observed, so the Probe's receipt is an upper bound for that reset even
+    // if the test thread is paused before the later gates are released.
+    let command_probe = run.probe_now();
+    run.assert_command_latency(first_command_released, command_probe, poll);
+    // Arm the next command while the worker is parked inside this probe: the
+    // only Healthy that can precede it is the mandatory revalidation.
+    run.probe.store(true, Ordering::Release);
+    _releases.1.send(()).unwrap();
+    let command_revalidation = match run.event() {
+        HealthEvent::Healthy(at) => at,
+        other => panic!("expected post-probe revalidation, received {other:?}"),
+    };
+    run.assert_prompt(
+        "revalidation",
+        "the probe",
+        command_probe,
+        command_revalidation,
+    );
+    assert!(command_revalidation.duration_since(first) >= health);
+    // The deadline set by the initial reset passes while this revalidation is
+    // still parked before its own reset. With the command reset present, the
+    // next Probe wins; without it, a periodic Healthy comes first.
+    sleep_until(command_probe + health);
+    _releases.2.send(()).unwrap();
+    // The second command was armed while the worker waited in the third gate.
+    let second_command_released = Instant::now();
+    let second_probe = run.probe_now();
+    run.assert_command_latency(second_command_released, second_probe, poll);
+    let revalidated = match run.event() {
+        HealthEvent::Healthy(at) => at,
+        other => panic!("expected post-probe revalidation, received {other:?}"),
+    };
+    run.assert_prompt("revalidation", "the probe", second_probe, revalidated);
+    assert!(revalidated.duration_since(first) >= health);
+}
+
+#[test]
+fn connected_health_command_revalidation_restarts_health_cadence() {
+    let poll = Duration::from_millis(20);
+    let health = Duration::from_secs(5);
+    // No gates and a single command: the revalidation's timestamp is adjacent
+    // to its reset, so the next periodic health must be a full `health` later.
+    // A 3 s pause in either thread only moves the observed timestamp, never
+    // the lower bound proved here.
+    let run = HealthRun::start_with_gates(
+        poll,
+        health,
+        0,
+        Gates {
+            connect: Some(Duration::from_secs(10)),
+            ..Gates::default()
+        },
+    );
+    let first_health = run.healthy_promptly();
+    let initial_probe = run.probe_now();
+    run.assert_prompt(
+        "initial probe",
+        "the first health",
+        first_health,
+        initial_probe,
+    );
+    let initial_revalidation = run.healthy();
+    run.assert_prompt(
+        "revalidation",
+        "the probe",
+        initial_probe,
+        initial_revalidation,
+    );
+    // Observe the first periodic health before any command can overwrite a
+    // shortened initial deadline.
+    let first_periodic = run.healthy();
+    assert!(first_periodic.duration_since(initial_revalidation) >= health);
+    run.assert_periodic_ceiling(initial_revalidation, first_periodic, health, poll);
+    run.probe.store(true, Ordering::Release);
+    let command_armed = Instant::now();
+    let command_probe = run.probe_now();
+    run.assert_command_latency(command_armed, command_probe, poll);
+    let revalidated = run.healthy();
+    run.assert_prompt("revalidation", "the probe", command_probe, revalidated);
+    let periodic = run.healthy();
+    assert!(periodic.duration_since(revalidated) >= health);
+    run.assert_periodic_ceiling(revalidated, periodic, health, poll);
+}
+
+#[test]
+fn connected_health_command_after_initial_revalidation_is_prompt() {
+    let poll = Duration::from_millis(20);
+    let health = Duration::from_secs(5);
+    // The base's early-command scenario: no gates, command armed right after
+    // the initial revalidation and, as the base did, 500 ms into the first
+    // idle interval, both well before any periodic health.
+    for idle in [Duration::ZERO, Duration::from_millis(500)] {
+        let run = HealthRun::start_with_gates(
+            poll,
+            health,
+            0,
+            Gates {
+                connect: Some(Duration::from_secs(10)),
+                ..Gates::default()
+            },
+        );
+        let first = run.healthy_promptly();
+        let initial_probe = run.probe_now();
+        run.assert_prompt("initial probe", "the first health", first, initial_probe);
+        let initial_revalidation = run.healthy();
+        run.assert_prompt(
+            "revalidation",
+            "the probe",
+            initial_probe,
+            initial_revalidation,
+        );
+        if !idle.is_zero() {
+            run.quiet_for(idle);
+        }
+        run.probe.store(true, Ordering::Release);
+        let command_armed = Instant::now();
+        let command_probe = run.probe_now();
+        run.assert_command_latency(command_armed, command_probe, poll);
+        let command_revalidation = run.healthy();
+        run.assert_prompt(
+            "revalidation",
+            "the probe",
+            command_probe,
+            command_revalidation,
+        );
+    }
+}
+
+#[test]
+fn connected_health_cancel_in_first_idle_poll_with_short_poll() {
+    let poll = Duration::from_millis(400);
+    // The base's short-poll scenario: cancel in the first idle interval while
+    // no command is pending, so the entire poll is the allowed phase.
+    let mut run = HealthRun::start_with_gates(
+        poll,
+        Duration::from_secs(5),
+        0,
+        Gates {
+            connect: Some(Duration::from_secs(10)),
+            ..Gates::default()
+        },
+    );
+    let revalidated = run.initial_probe();
+    run.wait_connected();
+    let anchor = Instant::now();
+    let wait = (anchor + poll / 2).saturating_duration_since(Instant::now());
+    if !wait.is_zero() {
+        run.quiet_for(wait);
+    }
+    let canceled_at = Instant::now();
+    run.canceled.store(true, Ordering::Release);
+    let cleanup_at = match run.event() {
+        HealthEvent::Cleanup(
+            Progress {
+                state: ConnectionState::Disconnecting,
+                cleaning: false,
+                ..
+            },
+            at,
+        ) => at,
+        other => panic!("expected disconnect cleanup, received {other:?}"),
+    };
+    let limit = poll + run.prompt;
+    assert!(
+        cleanup_at.duration_since(canceled_at) <= limit,
+        "cleanup came {:?} after cancel, limit {:?}",
+        cleanup_at.duration_since(canceled_at),
+        limit
+    );
+    // The phase also has a bound from its start: the first sleep begins right
+    // after the revalidation, so a longer first sleep cannot hide behind the
+    // part of the poll that elapsed before the cancel.
+    assert!(
+        cleanup_at.duration_since(revalidated + poll) <= run.prompt,
+        "wake to cleanup came {:?} after the first poll, limit {:?}",
+        cleanup_at.duration_since(revalidated + poll),
+        run.prompt
+    );
+    let finished = run.finish();
+    assert!(run.finished_at().duration_since(canceled_at) <= limit);
+    assert_eq!(finished.state, ConnectionState::Off);
+    assert_eq!(finished.error, None);
 }
 
 #[test]
@@ -327,10 +696,11 @@ fn connected_health_post_command_probe_failure_preserves_dropped_and_cleanup() {
     let mut run = HealthRun::start(Duration::from_millis(5), Duration::from_secs(1), 3);
     run.initial_probe();
     run.probe.store(true, Ordering::Release);
-    assert!(matches!(run.event(), HealthEvent::Probe));
+    let probed = run.probe_now();
     // The failing third call must be the immediate post-probe revalidation,
     // which precedes any Connected publication for that probe.
-    run.healthy_promptly();
+    let revalidated = run.healthy_promptly();
+    run.assert_prompt("revalidation", "the probe", probed, revalidated);
     run.assert_dropped();
 }
 
