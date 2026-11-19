@@ -961,6 +961,18 @@ fn hidden_panel_is_sized_before_its_placement_is_queued() {
         unsupported.take(),
         [SizeOp::Release, SizeOp::SetHeight(480), SizeOp::Fix(480)]
     );
+    // Before a frame bounds it by the monitor, a tall request opens GTK at the
+    // old ceiling while the positioner still gets the full request.
+    let tall = SizeRecorder::new(true, true);
+    assert!(super::reposition(
+        &tall,
+        &tall,
+        placement::click_request(3, None, 1400),
+    ));
+    assert_eq!(
+        tall.take(),
+        [SizeOp::Release, SizeOp::SetHeight(720), SizeOp::Send(1400)]
+    );
 }
 
 #[test]
