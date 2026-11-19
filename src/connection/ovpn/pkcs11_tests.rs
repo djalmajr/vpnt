@@ -123,6 +123,16 @@ struct ApplicationBundle {
     bundle: PathBuf,
     module: PathBuf,
     gid: u32,
+    uid: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl ApplicationBundle {
+    /// The tolerated directory as the production rule names it in the fixture:
+    /// canonical path, the gid it must carry and the uid it must carry.
+    fn tolerated(&self) -> Option<(&Path, u32, u32)> {
+        Some((self.applications.as_path(), self.gid, self.uid))
+    }
 }
 
 /// An app bundle shaped like an installed one: the tolerated directory carries
@@ -144,11 +154,13 @@ fn application_bundle(root: &Path, directory: &str) -> ApplicationBundle {
     std::fs::write(&module, b"not a library").unwrap();
     std::fs::set_permissions(&module, std::fs::Permissions::from_mode(0o644)).unwrap();
     let gid = std::fs::metadata(&applications).unwrap().gid();
+    let uid = std::fs::metadata(&applications).unwrap().uid();
     ApplicationBundle {
         applications,
         bundle,
         module,
         gid,
+        uid,
     }
 }
 
@@ -161,14 +173,14 @@ fn temporary_root() -> super::super::private_dir::PrivateDir {
 fn admission(
     path: &Path,
     owners: &[u32],
-    tolerated: Option<(&Path, u32)>,
+    tolerated: Option<(&Path, u32, u32)>,
     stop: &Path,
 ) -> Result<PathBuf, TokenError> {
     admit_module_with(
         path.to_str().unwrap(),
         owners,
         stop,
-        tolerated.map(|(tolerated, gid)| (tolerated.to_str().unwrap(), gid)),
+        tolerated.map(|(tolerated, gid, uid)| (tolerated.to_str().unwrap(), gid, uid)),
     )
 }
 
@@ -183,7 +195,7 @@ fn an_app_bundle_inside_the_tolerated_directory_is_admitted() {
     let root = temporary_root();
     let app = application_bundle(&root.path, "Applications");
     let owners = trusted_owners();
-    let tolerated = Some((app.applications.as_path(), app.gid));
+    let tolerated = app.tolerated();
     assert_eq!(
         admission(&app.module, &owners, tolerated, &root.path).unwrap(),
         std::fs::canonicalize(&app.module).unwrap()
@@ -202,7 +214,7 @@ fn the_tolerated_directory_writable_by_others_is_refused() {
     let root = temporary_root();
     let app = application_bundle(&root.path, "Applications");
     let owners = trusted_owners();
-    let tolerated = Some((app.applications.as_path(), app.gid));
+    let tolerated = app.tolerated();
     std::fs::set_permissions(&app.applications, std::fs::Permissions::from_mode(0o777)).unwrap();
     assert_eq!(
         admission(&app.module, &owners, tolerated, &root.path),
@@ -221,7 +233,31 @@ fn the_tolerated_directory_with_another_group_is_refused() {
         admission(
             &app.module,
             &owners,
-            Some((app.applications.as_path(), other_gid)),
+            Some((app.applications.as_path(), other_gid, app.uid)),
+            &root.path
+        ),
+        Err(TokenError::UntrustedModule)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_tolerated_directory_owned_by_another_uid_is_refused() {
+    let root = temporary_root();
+    let app = application_bundle(&root.path, "Applications");
+    let owners = trusted_owners();
+    assert_eq!(
+        admission(&app.module, &owners, app.tolerated(), &root.path).unwrap(),
+        std::fs::canonicalize(&app.module).unwrap()
+    );
+    // The fixture's owner stays in `owners` and the group is right, so only the
+    // uid the exception expects changes: the refusal comes from that comparison.
+    let other_uid = app.uid.wrapping_add(1);
+    assert_eq!(
+        admission(
+            &app.module,
+            &owners,
+            Some((app.applications.as_path(), app.gid, other_uid)),
             &root.path
         ),
         Err(TokenError::UntrustedModule)
@@ -236,7 +272,7 @@ fn a_group_writable_directory_that_is_not_the_tolerated_one_is_refused() {
     let app = application_bundle(&root.path, "Applications");
     let elsewhere = application_bundle(&root.path, "Elsewhere");
     let owners = trusted_owners();
-    let tolerated = Some((app.applications.as_path(), app.gid));
+    let tolerated = app.tolerated();
     // The bundle below the tolerated directory is not tolerated itself.
     std::fs::set_permissions(&app.bundle, std::fs::Permissions::from_mode(0o775)).unwrap();
     assert_eq!(
@@ -262,7 +298,7 @@ fn a_group_writable_module_inside_the_tolerated_directory_is_refused() {
     let root = temporary_root();
     let app = application_bundle(&root.path, "Applications");
     let owners = trusted_owners();
-    let tolerated = Some((app.applications.as_path(), app.gid));
+    let tolerated = app.tolerated();
     assert_eq!(
         admission(&app.module, &owners, tolerated, &root.path).unwrap(),
         std::fs::canonicalize(&app.module).unwrap()
@@ -281,12 +317,7 @@ fn the_tolerated_directory_owned_outside_the_allowed_users_is_refused() {
     let app = application_bundle(&root.path, "Applications");
     let stranger = unsafe { libc::geteuid() }.wrapping_add(1);
     assert_eq!(
-        admission(
-            &app.module,
-            &[stranger],
-            Some((app.applications.as_path(), app.gid)),
-            &root.path
-        ),
+        admission(&app.module, &[stranger], app.tolerated(), &root.path),
         Err(TokenError::UntrustedModule)
     );
 }
@@ -298,7 +329,7 @@ fn a_link_inside_the_bundle_that_leaves_the_root_is_refused() {
     let root = temporary_root();
     let app = application_bundle(&root.path, "Applications");
     let owners = trusted_owners();
-    let tolerated = Some((app.applications.as_path(), app.gid));
+    let tolerated = app.tolerated();
     let outside = temporary_root();
     let target = outside.path.join("liboutside.so");
     std::fs::write(&target, b"not a library").unwrap();
@@ -329,7 +360,7 @@ fn the_tolerated_directory_matches_its_canonical_path_exactly() {
         admission(
             &app.module,
             &owners,
-            Some((slash.as_path(), app.gid)),
+            Some((slash.as_path(), app.gid, app.uid)),
             &root.path
         )
         .unwrap(),
@@ -337,93 +368,95 @@ fn the_tolerated_directory_matches_its_canonical_path_exactly() {
     );
     // `Applications.x` is another directory and keeps the strict rule.
     assert_eq!(
+        admission(&dotted.module, &owners, app.tolerated(), &root.path),
+        Err(TokenError::UntrustedModule)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_tolerated_directory_is_compared_after_resolving_an_alias() {
+    use std::os::unix::fs::symlink;
+    let root = temporary_root();
+    let app = application_bundle(&root.path, "Applications");
+    let elsewhere = application_bundle(&root.path, "Elsewhere");
+    let owners = trusted_owners();
+    // The tolerated path may be an alias: canonicalizing it resolves the link
+    // to the directory the chain actually reaches.
+    let alias = root.path.join("applications-alias");
+    symlink(&app.applications, &alias).unwrap();
+    assert_eq!(
         admission(
-            &dotted.module,
+            &app.module,
             &owners,
-            Some((app.applications.as_path(), app.gid)),
+            Some((alias.as_path(), app.gid, app.uid)),
+            &root.path
+        )
+        .unwrap(),
+        std::fs::canonicalize(&app.module).unwrap()
+    );
+    // The comparison uses the resolved target, not the alias name: an alias
+    // that resolves to another directory does not tolerate this one.
+    let other = root.path.join("elsewhere-alias");
+    symlink(&elsewhere.applications, &other).unwrap();
+    assert_eq!(
+        admission(
+            &app.module,
+            &owners,
+            Some((other.as_path(), elsewhere.gid, elsewhere.uid)),
             &root.path
         ),
         Err(TokenError::UntrustedModule)
     );
 }
 
-/// A real module installed in an app bundle, when this machine has one: the
-/// chain below `/Applications` already meets the strict rule, so admission can
-/// only succeed through the `/Applications` exception.
-#[cfg(target_os = "macos")]
-fn an_installed_module(owners: &[u32]) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let strict = |path: &Path| {
-        std::fs::metadata(path).is_ok_and(|metadata| {
-            metadata.is_dir() && owners.contains(&metadata.uid()) && metadata.mode() & 0o022 == 0
-        })
-    };
-    std::fs::read_dir("/Applications")
-        .ok()?
-        .flatten()
-        .find_map(|app| {
-            let contents = app.path().join("Contents");
-            if !strict(&app.path()) || !strict(&contents) {
-                return None;
-            }
-            ["MacOS", "Frameworks"].iter().find_map(|name| {
-                let directory = contents.join(name);
-                if !strict(&directory) {
-                    return None;
-                }
-                std::fs::read_dir(directory)
-                    .ok()?
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .find(|path| {
-                        path.extension().is_some_and(|extension| extension == "so")
-                            && std::fs::metadata(path).is_ok_and(|metadata| {
-                                metadata.is_file()
-                                    && owners.contains(&metadata.uid())
-                                    && metadata.mode() & 0o022 == 0
-                            })
-                    })
-            })
-        })
-}
-
 #[cfg(target_os = "macos")]
 #[test]
 fn the_installed_applications_directory_is_accepted_with_the_production_defaults() {
     use std::os::unix::fs::MetadataExt;
-    assert_eq!(GROUP_WRITABLE, Some(("/Applications", 80)));
-    let applications =
-        std::fs::metadata("/Applications").expect("/Applications must exist on macOS");
-    assert!(applications.is_dir(), "/Applications must be a directory");
+    let Some((path, gid, uid)) = GROUP_WRITABLE else {
+        panic!("macOS must tolerate `/Applications` as the one directory");
+    };
+    let applications = std::fs::canonicalize(path)
+        .unwrap_or_else(|error| panic!("{path} must exist on macOS: {error}"));
     assert_eq!(
-        applications.uid(),
-        0,
-        "/Applications must be owned by root (uid 0), got uid {}",
-        applications.uid()
+        applications,
+        Path::new(path),
+        "{path} must be its own canonical path"
+    );
+    // The metadata is asserted first so a host that deviates says which field
+    // it deviates in, instead of only reporting the rule's `false`.
+    let metadata =
+        std::fs::metadata(&applications).unwrap_or_else(|error| panic!("{path} metadata: {error}"));
+    assert!(metadata.is_dir(), "{path} must be a directory");
+    assert_eq!(
+        metadata.uid(),
+        uid,
+        "{path} must be owned by uid {uid}, got uid {}",
+        metadata.uid()
     );
     assert_eq!(
-        applications.gid(),
-        80,
-        "/Applications must carry the admin group (gid 80), got gid {}",
-        applications.gid()
+        metadata.gid(),
+        gid,
+        "{path} must carry gid {gid}, got gid {}",
+        metadata.gid()
     );
     assert_eq!(
-        applications.mode() & 0o022,
+        metadata.mode() & 0o022,
         0o020,
-        "/Applications must be writable by its group alone, mode {:o}",
-        applications.mode() & 0o7777
+        "{path} must be writable by its group alone, mode {:o}",
+        metadata.mode() & 0o7777
     );
-    assert_eq!(
-        std::fs::canonicalize("/Applications").unwrap(),
-        Path::new("/Applications")
+    // The same predicate the ancestor walk applies, with the production
+    // defaults, must accept the real directory on every host.
+    assert!(
+        tolerates_group_write(
+            &applications,
+            &metadata,
+            Some((applications.as_path(), gid, uid))
+        ),
+        "{path} must be tolerated with the production defaults: uid {uid}, gid {gid}, no write for others"
     );
-    if let Some(module) = an_installed_module(&trusted_owners()) {
-        assert_eq!(
-            admit_module(module.to_str().unwrap()).unwrap(),
-            std::fs::canonicalize(&module).unwrap(),
-            "a module installed in an app bundle must be admitted"
-        );
-    }
 }
 
 #[test]

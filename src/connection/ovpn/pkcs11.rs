@@ -39,14 +39,14 @@ pub enum TokenError {
     Failed(RvError),
 }
 
-/// The one directory whose group write admission tolerates, with the gid it
-/// must carry. macOS ships `/Applications` as `root:admin 0775`, and a process
-/// in `admin` already holds the user's powers, while the module runs as the
-/// user, never as root. Every other target tolerates no directory.
+/// The one directory whose group write admission tolerates, with the gid and
+/// the uid it must carry. macOS ships `/Applications` as `root:admin 0775`,
+/// and a process in `admin` already holds the user's powers, while the module
+/// runs as the user, never as root. Every other target tolerates no directory.
 #[cfg(target_os = "macos")]
-const GROUP_WRITABLE: Option<(&str, u32)> = Some(("/Applications", 80));
+const GROUP_WRITABLE: Option<(&str, u32, u32)> = Some(("/Applications", 80, 0));
 #[cfg(not(target_os = "macos"))]
-const GROUP_WRITABLE: Option<(&str, u32)> = None;
+const GROUP_WRITABLE: Option<(&str, u32, u32)> = None;
 
 fn admit_module(path: &str) -> Result<PathBuf, TokenError> {
     admit_module_with(
@@ -58,7 +58,8 @@ fn admit_module(path: &str) -> Result<PathBuf, TokenError> {
 }
 
 /// `group_writable` names the one directory whose group write is tolerated and
-/// the gid it must carry; it is compared as a canonical path, like `resolved`.
+/// the gid and uid it must carry; it is compared as a canonical path, like
+/// `resolved`.
 fn admit_module_with(
     path: &str,
     owners: &[u32],
@@ -66,6 +67,7 @@ fn admit_module_with(
     // Only macOS compiles the exception below; other targets keep the strict rule.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] group_writable: Option<(
         &str,
+        u32,
         u32,
     )>,
 ) -> Result<PathBuf, TokenError> {
@@ -83,10 +85,10 @@ fn admit_module_with(
         return Err(TokenError::UntrustedModule);
     }
     #[cfg(target_os = "macos")]
-    let group_writable = group_writable.and_then(|(tolerated, gid)| {
+    let group_writable = group_writable.and_then(|(tolerated, gid, uid)| {
         std::fs::canonicalize(tolerated)
             .ok()
-            .map(|tolerated| (tolerated, gid))
+            .map(|tolerated| (tolerated, gid, uid))
     });
     let mut directory = resolved.parent().ok_or(TokenError::UntrustedModule)?;
     loop {
@@ -94,13 +96,14 @@ fn admit_module_with(
         if !metadata.is_dir() || !owners.contains(&metadata.uid()) {
             return Err(TokenError::UntrustedModule);
         }
-        // Group write is accepted on the tolerated directory alone, for its gid
-        // alone, and never together with write for others.
         #[cfg(target_os = "macos")]
-        let tolerated = metadata.mode() & 0o002 == 0
-            && group_writable
+        let tolerated = tolerates_group_write(
+            directory,
+            &metadata,
+            group_writable
                 .as_ref()
-                .is_some_and(|(tolerated, gid)| directory == tolerated && metadata.gid() == *gid);
+                .map(|(tolerated, gid, uid)| (tolerated.as_path(), *gid, *uid)),
+        );
         #[cfg(not(target_os = "macos"))]
         let tolerated = false;
         if metadata.mode() & 0o022 != 0 && !tolerated {
@@ -112,6 +115,23 @@ fn admit_module_with(
         directory = directory.parent().ok_or(TokenError::UntrustedModule)?;
     }
     Ok(resolved)
+}
+
+/// Whether `directory` is the one directory whose group write admission
+/// tolerates: the canonical path, the gid and the uid passed in, and never
+/// write for others. Any other directory keeps the strict rule.
+#[cfg(target_os = "macos")]
+fn tolerates_group_write(
+    directory: &Path,
+    metadata: &std::fs::Metadata,
+    tolerated: Option<(&Path, u32, u32)>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_dir()
+        && metadata.mode() & 0o002 == 0
+        && tolerated.is_some_and(|(path, gid, uid)| {
+            directory == path && metadata.gid() == gid && metadata.uid() == uid
+        })
 }
 
 impl From<Error> for TokenError {
