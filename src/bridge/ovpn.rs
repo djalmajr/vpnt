@@ -1,17 +1,17 @@
 //! OpenVPN bridge requests, separate from the snapshot dispatcher.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use super::CertificateView;
 #[cfg(unix)]
 use super::OvpnInspection;
 use super::{Command, Reply};
 #[cfg(unix)]
 use crate::connection::ovpn::profile::{ImportError, inspect};
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use crate::{
     connection::ovpn::pkcs11::{CertificateInfo, TokenError, list_certificates},
     model::valid_module_path,
 };
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 use std::{
     path::Path,
     sync::{
@@ -22,12 +22,12 @@ use std::{
     time::Duration,
 };
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 const CERTIFICATE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 /// At most one listing runs at a time. A module stuck in a native call keeps
 /// its thread alive after the reply times out; until that thread returns,
 /// further requests are answered at once instead of piling up threads.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 static LISTING: AtomicBool = AtomicBool::new(false);
 
 pub fn reply(id: &str, command: &Command) -> Option<Reply> {
@@ -38,7 +38,7 @@ pub fn reply(id: &str, command: &Command) -> Option<Reply> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn certificates_reply(id: &str, module: &str) -> Reply {
     certificates_reply_with(
         id,
@@ -49,12 +49,12 @@ fn certificates_reply(id: &str, module: &str) -> Reply {
     )
 }
 
-#[cfg(any(not(unix), target_os = "macos"))]
+#[cfg(not(unix))]
 fn certificates_reply(id: &str, _: &str) -> Reply {
     Reply::error(id.into(), "unsupported")
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 fn certificates_reply_with(
     id: &str,
     module: &str,
@@ -165,9 +165,22 @@ pub(crate) fn validate_config(content: &str) -> Result<(), &'static str> {
     }
 }
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_module_is_rejected_before_listing() {
+        static LIST: AtomicBool = AtomicBool::new(false);
+        let reply = certificates_reply_with(
+            "invalid",
+            "relative.dylib",
+            Duration::from_secs(1),
+            &LIST,
+            |_| panic!("invalid module reached provider"),
+        );
+        assert_eq!(reply.error.as_deref(), Some("invalid_module"));
+    }
 
     #[test]
     fn untrusted_module_has_a_distinct_bridge_error() {

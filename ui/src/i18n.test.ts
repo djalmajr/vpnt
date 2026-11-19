@@ -39,3 +39,11 @@ test("o prazo exibido é de 60 segundos nos dois idiomas", () => {
     "O gateway não respondeu em 60 segundos.",
   );
 });
+
+test("module guidance names both supported suffixes in each language", () => {
+  for (const locale of ["en-US", "pt-BR"] as const) {
+    const hint = translate(locale, "ovpnInvalidModule");
+    expect(hint).toContain(".so");
+    expect(hint).toContain(".dylib");
+  }
+});

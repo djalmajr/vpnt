@@ -47,7 +47,7 @@ pub struct ProfileStore {
 
 enum ConfigChange {
     None,
-    // Only the Linux admin path stores .ovpn files.
+    // The admin path stores .ovpn files.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Remove,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -327,7 +327,7 @@ impl ProfileStore {
         self.save_profile_with(profile, |_| Ok(ConfigChange::None), |data| self.write(data))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn save_admin_profile(
         &self,
         profile: Profile,
@@ -336,7 +336,7 @@ impl ProfileStore {
         self.save_admin_profile_with(profile, config, |data| self.write(data))
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn save_admin_profile_with(
         &self,
         profile: Profile,
@@ -434,7 +434,7 @@ impl ProfileStore {
         self.remove_profile(id, false)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn remove_admin_profile(&self, id: &str) -> Result<(), StoreError> {
         self.remove_profile(id, true)
     }

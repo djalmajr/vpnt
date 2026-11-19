@@ -48,7 +48,7 @@ pub(crate) fn valid_module_path(path: &str) -> bool {
     let module = Path::new(path);
     path.len() <= 4096
         && !path.chars().any(char::is_control)
-        && path.ends_with(".so")
+        && (path.ends_with(".so") || path.ends_with(".dylib"))
         && module.is_absolute()
         && !module.components().any(|part| part == Component::ParentDir)
 }
@@ -348,7 +348,7 @@ mod failure_tests {
         for invalid in [
             "opt/token.so".into(),
             "/opt/../token.so".into(),
-            "/opt/token.dylib".into(),
+            "/opt/token.dll".into(),
             "/opt/token\n.so".into(),
             format!("/{}.so", "é".repeat(2047)),
         ] {
@@ -473,5 +473,25 @@ mod failure_tests {
                 "health"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod module_path_tests {
+    use super::valid_module_path;
+    #[test]
+    fn accepts_only_absolute_module_paths_without_parent_components() {
+        for path in ["/opt/lib.so", "/opt/lib.dylib"] {
+            assert!(valid_module_path(path), "{path}");
+        }
+        for path in [
+            "opt/lib.so",
+            "/opt/lib",
+            "/opt/../lib.so",
+            "/opt/../lib.dylib",
+            "/opt/lib.so\n",
+        ] {
+            assert!(!valid_module_path(path), "{path}");
+        }
     }
 }

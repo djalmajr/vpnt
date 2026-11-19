@@ -68,6 +68,7 @@ afterEach(async () => {
     root = undefined;
     container?.remove();
     container = undefined;
+    delete document.documentElement.dataset.platform;
     localStorage.clear();
     globalThis.fetch = originalFetch;
   }
@@ -174,6 +175,7 @@ async function chooseFile(value: string | ArrayBuffer) {
 }
 
 async function createProfile() {
+  document.documentElement.dataset.platform = "linux";
   await mount();
   await click(button("Add VPN"));
   const option = [...document.querySelectorAll("button")].find((el) =>
@@ -362,5 +364,49 @@ for (const [locale, status, detail, cancel] of [
       id: existing.profile.id,
     });
     expect(document.querySelector("dialog")).toBeNull();
+  });
+}
+
+test("macOS starts with an empty module and accepts both library suffixes", async () => {
+  await mount();
+  await click(button("Add VPN"));
+  const option = [...document.querySelectorAll("button")].find((el) =>
+    el.textContent?.startsWith("OpenVPN"),
+  );
+  if (!option) throw new Error("Missing OpenVPN option");
+  await click(option);
+  expect(field("PKCS#11 module").value).toBe("");
+  for (const path of ["/fixture/token.so", "/fixture/token.dylib"]) {
+    await edit("PKCS#11 module", path);
+    await click(button("List certificates"));
+    expect(commands.at(-1)).toEqual({
+      type: "list_certificates",
+      module: path,
+    });
+  }
+  for (const path of [
+    "relative.so",
+    "/fixture/../token.dylib",
+    "/fixture/token",
+  ]) {
+    await edit("PKCS#11 module", path);
+    expect(button("List certificates").disabled).toBe(true);
+  }
+});
+
+for (const [locale, expected] of [
+  [
+    "en-US",
+    "The VPN client is unavailable or this profile type is not supported on this platform.",
+  ],
+  [
+    "pt-BR",
+    "O cliente de VPN está indisponível ou este tipo de perfil não é compatível com esta plataforma.",
+  ],
+] as const) {
+  test(`${locale}: unsupported OVPN is shown without claiming a tunnel`, async () => {
+    await mount([{ ...existing, state: "missing_program" }], locale);
+    expect(document.body.textContent).toContain(expected);
+    expect(commands.some((command) => command.type === "connect")).toBe(false);
   });
 }

@@ -82,6 +82,16 @@ jobs:
           cargo +1.99.0 clippy --locked --all-targets --no-default-features -- -D warnings
           cargo +1.99.0 test --locked --all-targets --all-features
           cargo +1.99.0 build --locked
+      - name: Exercise SoftHSM certificate listing
+        run: |
+          brew install softhsm
+          module=$(brew list --verbose softhsm | awk '/\/libsofthsm2\.(so|dylib)$/ { print; exit }')
+          test -n "$module" && test -f "$module"
+          output=$(mktemp)
+          VPNT_TEST_SOFTHSM="$module" cargo +1.99.0 test --locked --test ovpn_token -- --nocapture > "$output" 2>&1 || { cat "$output"; exit 1; }
+          cat "$output"
+          if grep -q 'skipped:' "$output"; then exit 1; fi
+          grep -q '1 passed' "$output"
       - name: Package unsigned development app
         run: python3 scripts/macos/package-app.py
       - name: Validate graphical askpass adapter without elevation
