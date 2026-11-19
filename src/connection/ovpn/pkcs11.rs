@@ -39,11 +39,36 @@ pub enum TokenError {
     Failed(RvError),
 }
 
+/// The one directory whose group write admission tolerates, with the gid it
+/// must carry. macOS ships `/Applications` as `root:admin 0775`, and a process
+/// in `admin` already holds the user's powers, while the module runs as the
+/// user, never as root. Every other target tolerates no directory.
+#[cfg(target_os = "macos")]
+const GROUP_WRITABLE: Option<(&str, u32)> = Some(("/Applications", 80));
+#[cfg(not(target_os = "macos"))]
+const GROUP_WRITABLE: Option<(&str, u32)> = None;
+
 fn admit_module(path: &str) -> Result<PathBuf, TokenError> {
-    admit_module_with(path, &[0, unsafe { libc::geteuid() }], Path::new("/"))
+    admit_module_with(
+        path,
+        &[0, unsafe { libc::geteuid() }],
+        Path::new("/"),
+        GROUP_WRITABLE,
+    )
 }
 
-fn admit_module_with(path: &str, owners: &[u32], stop_at: &Path) -> Result<PathBuf, TokenError> {
+/// `group_writable` names the one directory whose group write is tolerated and
+/// the gid it must carry; it is compared as a canonical path, like `resolved`.
+fn admit_module_with(
+    path: &str,
+    owners: &[u32],
+    stop_at: &Path,
+    // Only macOS compiles the exception below; other targets keep the strict rule.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] group_writable: Option<(
+        &str,
+        u32,
+    )>,
+) -> Result<PathBuf, TokenError> {
     use std::os::unix::fs::MetadataExt;
     if !crate::model::valid_module_path(path) {
         return Err(TokenError::UntrustedModule);
@@ -57,10 +82,28 @@ fn admit_module_with(path: &str, owners: &[u32], stop_at: &Path) -> Result<PathB
     if !metadata.is_file() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
         return Err(TokenError::UntrustedModule);
     }
+    #[cfg(target_os = "macos")]
+    let group_writable = group_writable.and_then(|(tolerated, gid)| {
+        std::fs::canonicalize(tolerated)
+            .ok()
+            .map(|tolerated| (tolerated, gid))
+    });
     let mut directory = resolved.parent().ok_or(TokenError::UntrustedModule)?;
     loop {
         let metadata = std::fs::metadata(directory).map_err(|_| TokenError::UntrustedModule)?;
-        if !metadata.is_dir() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+        if !metadata.is_dir() || !owners.contains(&metadata.uid()) {
+            return Err(TokenError::UntrustedModule);
+        }
+        // Group write is accepted on the tolerated directory alone, for its gid
+        // alone, and never together with write for others.
+        #[cfg(target_os = "macos")]
+        let tolerated = metadata.mode() & 0o002 == 0
+            && group_writable
+                .as_ref()
+                .is_some_and(|(tolerated, gid)| directory == tolerated && metadata.gid() == *gid);
+        #[cfg(not(target_os = "macos"))]
+        let tolerated = false;
+        if metadata.mode() & 0o022 != 0 && !tolerated {
             return Err(TokenError::UntrustedModule);
         }
         if directory == stop {
