@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { VpnView } from "../model";
 import type { Run } from "../navigation";
+import { isLinuxPlatform } from "../platform";
 import { Dialog, Icon, type T } from "./common";
 
 /* Pure body so SSR tests cover the saving paint without a renderer: while
@@ -17,9 +18,12 @@ export function RemoveDialogBody({
   close: () => void;
   t: T;
 }) {
+  const linux = isLinuxPlatform();
   return (
     <>
-      <p role="status">{t(saving ? "adminPending" : "removeHint")}</p>
+      <p role="status">
+        {t(saving ? (linux ? "removePending" : "adminPending") : "removeHint")}
+      </p>
       <div className="actions end">
         <button type="button" onClick={close} disabled={saving}>
           {t("cancel")}
