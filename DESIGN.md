@@ -296,6 +296,14 @@ O estado do interruptor vem do snapshot autoritativo, sem atualização otimista
 
 [Detalhes dos componentes](design/components.md)
 
+### Avisos fecháveis
+
+Os avisos de `dropped`, `credentials_rejected`, `gateway_timeout` e
+`missing_program`, e o erro de comando no topo, têm botão X. Após fechar, o
+estado continua no card e o log fica em Opções → Ver log. Avisos de
+`cleanup_unconfirmed`, `unresponsive`, helper, componente e diálogos
+permanecem visíveis.
+
 ## Do's and Don'ts
 
 Preservar o fluxo aprovado, os tokens e os catálogos de texto da interface.
