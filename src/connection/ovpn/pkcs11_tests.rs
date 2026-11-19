@@ -414,6 +414,9 @@ fn the_tolerated_directory_is_compared_after_resolving_an_alias() {
 #[test]
 fn the_installed_applications_directory_is_accepted_with_the_production_defaults() {
     use std::os::unix::fs::MetadataExt;
+    // The production values are pinned here, independently of the rule that
+    // reads them, so a constant moved to another directory cannot pass.
+    assert_eq!(GROUP_WRITABLE, Some(("/Applications", 80, 0)));
     let Some((path, gid, uid)) = GROUP_WRITABLE else {
         panic!("macOS must tolerate `/Applications` as the one directory");
     };
