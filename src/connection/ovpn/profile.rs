@@ -220,6 +220,8 @@ fn allowed(name: &str) -> bool {
             | "ping-exit"
             | "keepalive"
             | "hand-window"
+            | "tls-timeout"
+            | "tran-window"
             | "reneg-sec"
             | "remote-cert-tls"
             | "verify-x509-name"
