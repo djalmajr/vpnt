@@ -1,6 +1,17 @@
 const PRODUCT_NAME: &str = "VPN Tray";
 // DESIGN.md, Conflicting visual priorities: --panel-min-height: 480px.
 const DEFAULT_HEIGHT: u32 = 480;
+/// The Linux shell always identifies itself, with or without Omarchy. The UI
+/// uses this marker instead of navigator.platform or a user agent.
+const PLATFORM_SCRIPT: &str = "document.documentElement.dataset.platform='linux';";
+
+fn initialization_script(omarchy_script: Option<String>) -> String {
+    let mut script = PLATFORM_SCRIPT.to_owned();
+    if let Some(omarchy_script) = omarchy_script {
+        script.push_str(&omarchy_script);
+    }
+    script
+}
 /// StatusNotifierItem Id. Trays such as Omarchy's pin items by this Id, so it
 /// must not change between runs (tray-icon's default embeds the process id).
 const TRAY_ID: &str = "vpnt";
@@ -111,7 +122,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
         .with_rgba_visual(true)
         .build(&event_loop)?;
     let mut webview_builder = WebViewBuilder::new();
-    let initial_script = if detected {
+    let omarchy_script = if detected {
         Some(initial_theme.as_ref().map_or_else(
             || "document.documentElement.dataset.desktop='omarchy';".to_owned(),
             omarchy::script,
@@ -119,9 +130,8 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    if let Some(script) = initial_script.as_deref() {
-        webview_builder = webview_builder.with_initialization_script(script);
-    }
+    let script = initialization_script(omarchy_script);
+    webview_builder = webview_builder.with_initialization_script(script.as_str());
     let webview = webview_builder
         .with_transparent(true)
         .with_custom_protocol("vpnt".into(), |_id, request| {

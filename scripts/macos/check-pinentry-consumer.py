@@ -52,6 +52,7 @@ def main():
             subprocess.run(["rustc",source / "adapter.rs",*library,*flags,"-o",executable],check=True)
         subprocess.run(["/usr/bin/cc","-DHAVE_VDPRINTF",source / "consumer.c",directory / "userinput.c","-I",directory,"-o",consumer],check=True)
         subprocess.run(["rustc",source / "owner.rs",*library,"-o",owner],check=True)
+        # Guard against a hung fixture; each exchange already has its own bounded wait.
         result=subprocess.run([owner,consumer,adapter,wrong_peer,ROOT / "target/debug/vpnt-pinentry"],capture_output=True,timeout=30)
         if result.returncode:
             raise RuntimeError(f"Native pinentry consumer failed (exit {result.returncode}): {result.stderr.decode(errors='replace')}")

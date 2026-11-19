@@ -87,7 +87,7 @@ fn native_package_is_repeatable_audited_and_scripts_refuse_volume_or_unprivilege
     assert_eq!(result["installationPerformed"], false);
     assert_eq!(result["signed"], false);
     assert_eq!(result["uid"], f.repository.uid());
-    assert_eq!(result["payloadFiles"], 11);
+    assert_eq!(result["payloadFiles"], 12);
     let package = PathBuf::from(result["package"].as_str().unwrap());
     let inode = fs::metadata(&package).unwrap().ino();
     assert_eq!(f.build(), result);

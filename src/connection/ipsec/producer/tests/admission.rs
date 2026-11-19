@@ -1,6 +1,12 @@
 use super::*;
 use std::{os::unix::net::UnixListener, sync::atomic::Ordering};
 
+// Same 20 s open budget as the base test: a VICI lookup delayed past it is a
+// real regression, and the CI failure was Unavailable, not a deadline miss.
+fn open_until() -> Instant {
+    Instant::now() + Duration::from_secs(20)
+}
+
 // Mutation: allow the persistent phase to reenter a spent attempt.
 #[test]
 fn persistent_phase_transitions_never_reenter_a_spent_attempt() {
@@ -20,10 +26,50 @@ fn persistent_phase_transitions_never_reenter_a_spent_attempt() {
             .stage(record::Stage::Running, Some((&context.identity).into())),
         Err(Error::Changed)
     );
-    peer.open(reservation.owner(), until(), token())
-        .unwrap()
-        .command("version", Message::new(), &[])
-        .unwrap();
+    // One admission attempt only: production stops on the first open error.
+    // The guard bounds the fixture; it never permits a second open. On failure
+    // report the recorded phase and what the fixture left on disk so the next
+    // CI occurrence can name the step without changing production.
+    let expires = open_until();
+    let started = Instant::now();
+    let client = peer
+        .open(reservation.owner(), expires, token())
+        .unwrap_or_else(|error| {
+            let records = context.store.records().unwrap_or_default();
+            let mut producer = peer.producer.lock().unwrap();
+            let mut files = fs::read_dir(&producer.lease.directory.path)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            files.sort();
+            // child_exited() unwraps its own poll; keep the original failure
+            // message even when that secondary observation itself panics.
+            let child_probe = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(|| producer.child_exited()),
+            )
+            .map(|exited| exited.to_string())
+            .unwrap_or_else(|payload| {
+                let text = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_string()))
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                format!("child probe panicked: {text}")
+            });
+            panic!(
+                "open failed after {:?} ({} left on guard): {error:?}; recorded stage={:?} child={:?}; fixture files={files:?}; child_probe={child_probe} cached_fd={:?}",
+                started.elapsed(),
+                expires.saturating_duration_since(Instant::now()).as_secs(),
+                records.first().map(|record| record.stage),
+                records.first().and_then(|record| record.child.clone()),
+                producer.cached_fd()
+            );
+        });
+    client.command("version", Message::new(), &[]).unwrap();
     assert_eq!(
         peer.producer
             .lock()

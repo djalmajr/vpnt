@@ -21,6 +21,9 @@ if mode in ["ipsec","ipsec-denied"]:
 states={p["id"]:dict(id=p["id"],generation=0,state="off",failures=0) for p in profiles}
 waiting=[]
 s.settimeout(10)
+# Barrier for tests that must arm the broker's startup deadline only after
+# this peer is inside its read loop.
+open(marker+".started","w").close()
 while True:
     if mode=="restart" and os.path.exists(marker+".fault"):
         s.sendall(b'{"type":"accepted","id":"wrong","extra":"invalid"}\n')

@@ -2,9 +2,10 @@ use super::*;
 use crate::helper::client::tests::Peer;
 use std::{
     fs,
+    panic::Location,
     process::Command as Process,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -47,10 +48,17 @@ struct Harness {
     starts: Arc<AtomicUsize>,
     loads: Arc<AtomicUsize>,
     removes: Arc<AtomicUsize>,
+    connector_deadline: Arc<Mutex<Option<Instant>>>,
 }
 impl Harness {
     fn new(mode: &str) -> Self {
         let mut peer = Peer::new("flow");
+        // Arm the broker's 5 s startup deadline only after the Python peer has
+        // entered its read loop; the marker is written by the fixture itself.
+        let marker = peer.marker.clone();
+        wait("runtime fixture read loop", || {
+            marker.with_extension("started").exists()
+        });
         let loads = Arc::new(AtomicUsize::new(0));
         let removes = Arc::new(AtomicUsize::new(0));
         let mut broker = Broker::new(
@@ -61,7 +69,9 @@ impl Harness {
                 fail_removal: false,
             },
         );
-        wait(|| broker.snapshot().helper == "installed");
+        wait("initial installed snapshot", || {
+            broker.snapshot().helper == "installed"
+        });
         fs::write(
             peer.marker.with_extension("catalog"),
             serde_json::to_vec(
@@ -78,9 +88,12 @@ impl Harness {
         let marker = peer.marker.clone();
         let starts = Arc::new(AtomicUsize::new(0));
         let calls = starts.clone();
+        let connector_deadline = Arc::new(Mutex::new(None));
+        let observed_deadline = connector_deadline.clone();
         let mode = mode.to_string();
         broker.administration.connect = Box::new(move |request, locale, expires| {
             calls.fetch_add(1, Ordering::Relaxed);
+            *observed_deadline.lock().unwrap() = Some(expires);
             let mut command = Process::new("/usr/bin/python3");
             command
                 .arg(
@@ -98,28 +111,37 @@ impl Harness {
             starts,
             loads,
             removes,
+            connector_deadline,
         }
     }
     fn command(&mut self, command: Command) -> Snapshot {
         self.broker
-            .dispatch(command, Instant::now() + Duration::from_secs(20))
+            .dispatch(command, Instant::now() + Duration::from_secs(45))
             .unwrap()
     }
+    fn assert_connector_deadline(&self, expires: Instant) {
+        assert_eq!(
+            *self.connector_deadline.lock().unwrap(),
+            Some(expires),
+            "connector must receive exactly the operation deadline"
+        );
+    }
     fn begin(&mut self, command: Command) -> u64 {
-        self.broker
-            .begin_admin(
-                command,
-                Locale::PtBr,
-                Instant::now() + Duration::from_secs(20),
-            )
-            .unwrap()
+        let expires = Instant::now() + Duration::from_secs(45);
+        let token = self
+            .broker
+            .begin_admin(command, Locale::PtBr, expires)
+            .unwrap();
+        self.assert_connector_deadline(expires);
+        token
     }
     fn authorize(&self) {
         fs::write(self.peer.marker.with_extension("authorize"), b"").unwrap();
     }
+    #[track_caller]
     fn result(&mut self) -> (u64, Result<Snapshot, &'static str>) {
         let mut result = None;
-        wait(|| {
+        wait("admin result", || {
             self.broker.poll();
             result = self.broker.take_admin_result();
             result.is_some()
@@ -131,17 +153,31 @@ impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(op) = &mut self.broker.administration.current {
             op.client.close();
-            let until = Instant::now() + Duration::from_secs(20);
+            let started = Instant::now();
+            let until = started + Duration::from_secs(20);
             while !op.client.finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(5));
+            }
+            if !op.client.finished() {
+                eprintln!(
+                    "admin harness drop: client not finished after {:?}",
+                    started.elapsed()
+                );
             }
         }
     }
 }
-fn wait(mut predicate: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(20);
+#[track_caller]
+fn wait(stage: &str, mut predicate: impl FnMut() -> bool) {
+    let caller = Location::caller();
+    let started = Instant::now();
+    let until = started + Duration::from_secs(60);
     while !predicate() {
-        assert!(Instant::now() < until, "broker admin condition timed out");
+        assert!(
+            Instant::now() < until,
+            "{stage}: broker admin condition timed out after {:?} at {caller}",
+            started.elapsed()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -150,7 +186,9 @@ fn a_profile_change_waits_for_reap_and_fresh_metadata_while_another_profile_rema
     let mut h = Harness::new("save");
     h.command(Command::Toggle { id: "one".into() });
     h.peer.advance();
-    wait(|| h.broker.snapshot().vpns[0].state == State::Connected);
+    wait("connected after toggle", || {
+        h.broker.snapshot().vpns[0].state == State::Connected
+    });
     let mut edited = h.broker.snapshot().vpns[1].profile.clone();
     edited.name = "Edited by administrator".into();
     let token = h.begin(Command::SaveProfile {
@@ -158,7 +196,9 @@ fn a_profile_change_waits_for_reap_and_fresh_metadata_while_another_profile_rema
         ovpn_config: None,
     });
     h.command(Command::Probe { id: "one".into() });
-    wait(|| h.broker.snapshot().vpns[0].state == State::Unresponsive);
+    wait("unresponsive after probe", || {
+        h.broker.snapshot().vpns[0].state == State::Unresponsive
+    });
     assert!(h.broker.take_admin_result().is_none());
     assert_ne!(h.broker.snapshot().vpns[1].profile, edited);
     h.authorize();
@@ -170,14 +210,18 @@ fn a_profile_change_waits_for_reap_and_fresh_metadata_while_another_profile_rema
     assert_eq!(h.loads.load(Ordering::Relaxed), 1);
     assert_eq!(h.removes.load(Ordering::Relaxed), 0);
     h.command(Command::Toggle { id: "one".into() });
-    wait(|| h.broker.snapshot().vpns[0].state == State::Off);
+    wait("off after disconnect", || {
+        h.broker.snapshot().vpns[0].state == State::Off
+    });
 }
 #[test]
 fn active_profiles_do_not_prompt_and_secrets_are_removed_only_after_confirmed_removal() {
     let mut h = Harness::new("save");
     h.command(Command::Toggle { id: "one".into() });
     h.peer.advance();
-    wait(|| h.broker.snapshot().vpns[0].state == State::Connected);
+    wait("connected after toggle", || {
+        h.broker.snapshot().vpns[0].state == State::Connected
+    });
     assert_eq!(
         h.broker.begin_admin(
             Command::RemoveProfile { id: "one".into() },
@@ -228,6 +272,9 @@ fn acceptance_without_persistence_or_a_rejected_operation_never_deletes_credenti
 fn expired_administration_never_sends_a_document_or_replays_after_a_late_authorization() {
     let mut h = Harness::new("save");
     let p = h.broker.snapshot().vpns[0].profile.clone();
+    // Margem: 3 s de pausa suportada + partida Python < 8 s; a operação
+    // expira antes da autorização e o conector recebe este mesmo `expires`.
+    let expires = Instant::now() + Duration::from_secs(8);
     h.broker
         .begin_admin(
             Command::SaveProfile {
@@ -235,13 +282,13 @@ fn expired_administration_never_sends_a_document_or_replays_after_a_late_authori
                 ovpn_config: None,
             },
             Locale::PtBr,
-            // This deadline is the expiration being tested.
-            Instant::now() + Duration::from_millis(150),
+            expires,
         )
         .unwrap();
+    h.assert_connector_deadline(expires);
     assert!(matches!(h.result().1, Err("admin_expired")));
     h.authorize();
-    wait(|| {
+    wait("administration cleared after expiration", || {
         h.broker.poll();
         h.broker.administration.current.is_none()
     });
@@ -276,7 +323,8 @@ fn losing_the_runtime_during_authorization_never_replays_or_deletes_secrets() {
     h.command(Command::Quit {});
     assert!(matches!(h.result().1, Err("backend_unavailable")));
     h.authorize();
-    wait(|| {
+    wait("admin client finished after late authorization", || {
+        h.broker.poll();
         h.broker
             .administration
             .current

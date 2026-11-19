@@ -763,6 +763,29 @@ fn initial_height_matches_design_contract() {
     assert_eq!(super::DEFAULT_HEIGHT, 480);
 }
 
+#[test]
+fn initialization_script_marks_linux_with_and_without_omarchy() {
+    let plain = super::initialization_script(None);
+    assert_eq!(plain, super::PLATFORM_SCRIPT);
+    assert_eq!(plain, "document.documentElement.dataset.platform='linux';");
+
+    let detected_without_theme = super::initialization_script(Some(
+        "document.documentElement.dataset.desktop='omarchy';".to_owned(),
+    ));
+    assert!(detected_without_theme.contains("document.documentElement.dataset.platform='linux';"));
+    assert!(detected_without_theme.contains("document.documentElement.dataset.desktop='omarchy';"));
+
+    let theme_script =
+        "((t)=>{const e=document.documentElement;e.dataset.omarchyMode=t.mode;})(null);";
+    let detected_with_theme = super::initialization_script(Some(theme_script.to_owned()));
+    assert!(detected_with_theme.contains(super::PLATFORM_SCRIPT));
+    assert!(detected_with_theme.contains(theme_script));
+    assert!(
+        detected_with_theme.find(super::PLATFORM_SCRIPT) < detected_with_theme.find(theme_script),
+        "the platform marker must not overwrite the Omarchy theme script"
+    );
+}
+
 /// One log for the window's size calls and the positioner's sends, so each test
 /// asserts their order.
 #[derive(Debug, PartialEq)]

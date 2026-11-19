@@ -14,6 +14,7 @@ import tempfile
 import tomllib
 from urllib.request import urlopen
 from runtime_sources import build_fortinet, FORTI_VERSION, FORTI_URL, FORTI_SHA
+from runtime_sources import build_openvpn, OVPN_VERSION, OVPN_URL, OVPN_SHA
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
@@ -202,6 +203,8 @@ def verify_runtime(root):
         raise RuntimeError("Runtime does not include the exact strongSwan patch set")
     if manifest["openfortivpn"]["patches"] != {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]}:
         raise RuntimeError("Runtime does not include the expected Fortinet isolation patches")
+    if manifest.get("openvpn") != {"version": OVPN_VERSION, "source": OVPN_URL, "sha256": OVPN_SHA}:
+        raise RuntimeError("Runtime does not include the pinned OpenVPN source")
     if any(path.is_symlink() for path in root.rglob("*")):
         raise RuntimeError("Runtime may not contain symlinks")
     actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
@@ -213,8 +216,15 @@ def verify_runtime(root):
             raise RuntimeError("Non-canonical manifest path")
         if digest(root / name) != expected:
             raise RuntimeError(f"Runtime hash mismatch: {name}")
+    if "bin/openvpn" not in manifest["files"]:
+        raise RuntimeError("Runtime is missing bin/openvpn")
     machos = [path for path in root.rglob("*") if is_macho(path)]
-    minimum = ".".join(map(str, max(minimum_macos(path) for path in machos)))
+    # Every client must go through the Mach-O dependency, minimum-version and
+    # strict signature checks below before any of them is executed for --version.
+    not_macho = [f"bin/{program}" for program in ("charon", "openfortivpn", "openvpn") if root / "bin" / program not in machos]
+    if not_macho:
+        raise RuntimeError(f"Runtime clients are not Mach-O executables: {', '.join(not_macho)}")
+    minimum =".".join(map(str, max(minimum_macos(path) for path in machos)))
     if manifest["minimumMacOS"] != minimum:
         raise RuntimeError("Incorrect minimum macOS metadata")
     for path in machos:
@@ -246,14 +256,14 @@ def verify_runtime(root):
         configuration.chmod(0o600)
         env = {key: value for key, value in os.environ.items() if not key.startswith(("DYLD_", "LD_"))}
         env.update(DYLD_LIBRARY_PATH=str(root / "lib"), STRONGSWAN_CONF=str(configuration), OPENSSL_CONF="/dev/null", OPENSSL_MODULES=str(root / "lib/ossl-modules"))
-        for program, expected in [("charon", f"strongSwan {SWAN_VERSION}"), ("openfortivpn", FORTI_VERSION)]:
+        for program, expected in [("charon", f"strongSwan {SWAN_VERSION}"), ("openfortivpn", FORTI_VERSION), ("openvpn", f"OpenVPN {OVPN_VERSION}")]:
             arguments = [str(root / "bin" / program)]
             if program == "openfortivpn":
                 # Parse the driver's fixed options in the real client, then
                 # exit via --version before config, credentials or networking.
                 arguments += ["--config=/dev/null", "--no-routes", "--no-dns", "--pppd-no-peerdns", "--pppd-accept-remote=0", "--persistent=0", "--username=fixture", f"--pinentry={tool('pinentry')}", f"--ca-file={PREFIX}/certs/ca-bundle.pem", "--ifname=lo0", "--vpnt-ifindex=1", "--vpnt-gateway-ip=127.0.0.1", "--trusted-cert=" + "a1" * 32]
             result = subprocess.run(arguments + ["--version"], env=env, cwd=temporary, capture_output=True, text=True, timeout=10)
-            if result.returncode or result.stdout.strip() != expected:
+            if result.returncode or (not result.stdout.startswith(expected + " ") if program == "openvpn" else result.stdout.strip() != expected):
                 raise RuntimeError(f"Private {program} startup/version check failed")
         # Invalid metadata must fail during parsing, before --version can exit
         # successfully. No invocation proceeds to config loading or networking.
@@ -338,6 +348,7 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     pkgconf = local_pkgconf(cache, args.jobs)
     forti, forti_source = build_fortinet(ROOT, cache, openssl, pkgconf, args.jobs, run, PREFIX)
+    openvpn, openvpn_source, lzo_source, lz4_source = build_openvpn(ROOT, cache, openssl, pkgconf, args.jobs, run, PREFIX)
     archive = cache / f"strongswan-{SWAN_VERSION}.tar.bz2"
     if not archive.exists():
         print("Downloading verified strongSwan source", flush=True)
@@ -416,6 +427,7 @@ def main():
         (payload / "bin").mkdir(parents=True)
         shutil.copy2(installed / "libexec/ipsec/charon", payload / "bin/charon")
         shutil.copy2(forti, payload / "bin/openfortivpn")
+        shutil.copy2(openvpn, payload / "bin/openvpn")
         # Only public system roots, never the user's login/custom keychains or
         # a CA path under a user-writable package-manager prefix.
         certificates = payload / "certs/ca-bundle.pem"
@@ -442,6 +454,10 @@ def main():
         shutil.copy2(source / "COPYING", licenses / "strongswan.txt")
         shutil.copy2(forti_source / "LICENSE", licenses / "openfortivpn.txt")
         shutil.copy2(forti_source / "LICENSE.OpenSSL", licenses / "openfortivpn-openssl-exception.txt")
+        shutil.copy2(openvpn_source / "COPYING", licenses / "openvpn.txt")
+        shutil.copy2(openvpn_source / "COPYRIGHT.GPL", licenses / "openvpn-gpl.txt")
+        shutil.copy2(lzo_source / "COPYING", licenses / "lzo.txt")
+        shutil.copy2(lz4_source / "lib/LICENSE", licenses / "lz4.txt")
         openssl_license = openssl / "LICENSE.txt"
         if not openssl_license.is_file():
             raise RuntimeError("OpenSSL license missing")
@@ -466,6 +482,7 @@ def main():
                 "sha256": FORTI_SHA,
                 "patches": {patch.name: digest(patch) for patch in [FORTI_PATCH, TRANSPORT_PATCH, SUPERVISOR_PATCH, SPLIT_PATCH, DNS_PATCH]},
             },
+            "openvpn": {"version": OVPN_VERSION, "source": OVPN_URL, "sha256": OVPN_SHA},
             "files": files,
         }
         (payload / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
