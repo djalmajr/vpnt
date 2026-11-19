@@ -59,6 +59,11 @@ fn wait<S: SecretStore>(b: &mut Broker<S>, mut predicate: impl FnMut(&Snapshot) 
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+fn write_stale(peer: &Peer, contents: impl AsRef<[u8]>) {
+    let temporary = peer.marker.with_extension("stale.tmp");
+    std::fs::write(&temporary, contents).unwrap();
+    std::fs::rename(temporary, peer.marker.with_extension("stale")).unwrap();
+}
 fn dispatch(b: &mut Broker<Secrets>, c: Command) -> Snapshot {
     b.dispatch(c, Instant::now() + Duration::from_secs(2))
         .unwrap()
@@ -147,7 +152,7 @@ fn completed_attempts_request_diagnostics_and_publish_the_redacted_reply() {
             dispatch(&mut broker, Command::Disconnect { id: "one".into() });
         } else {
             let generation = broker.connections["one"].generation;
-            std::fs::write(peer.marker.with_extension("stale"), serde_json::to_vec(&serde_json::json!({"id":"one", "generation":generation, "state":case, "failures":0})).unwrap()).unwrap();
+            write_stale(&peer, serde_json::to_vec(&serde_json::json!({"id":"one", "generation":generation, "state":case, "failures":0})).unwrap());
         }
         let until = Instant::now() + Duration::from_secs(4);
         while saved.lock().unwrap().is_empty() {
