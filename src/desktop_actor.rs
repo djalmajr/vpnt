@@ -17,29 +17,46 @@ use std::{
 
 type ResultSnapshot = Result<Snapshot, &'static str>;
 
+/// Longest a listing may hold the single slot: a module stuck in a native call
+/// must not keep every later listing out forever.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Refuses a listing request that needs no provider, before the caller takes
+/// the single listing slot: a malformed module path is not a busy token.
+fn listing_refusal(id: &str, module: &str) -> Option<Reply> {
+    if crate::model::valid_module_path(module) {
+        None
+    } else {
+        Some(Reply::error(id.to_owned(), "invalid_module"))
+    }
+}
+
+/// One token certificate as the bridge view: the id in lowercase hex, and the
+/// optional metadata exactly as the module reported it.
+fn certificate_view(
+    certificate: crate::connection::ovpn::pkcs11::CertificateInfo,
+) -> crate::bridge::CertificateView {
+    crate::bridge::CertificateView {
+        id: certificate
+            .id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        subject: certificate.subject,
+        issuer: certificate.issuer,
+        not_before: certificate.not_before,
+        not_after: certificate.not_after,
+    }
+}
+
 fn list_certificates(id: String, module: String) -> Reply {
-    if !crate::model::valid_module_path(&module) {
-        return Reply::error(id, "invalid_module");
+    if let Some(refusal) = listing_refusal(&id, &module) {
+        return refusal;
     }
     match crate::connection::ovpn::pkcs11::list_certificates(std::path::Path::new(&module)) {
         Ok(certificates) => Reply {
             id,
-            certificates: Some(
-                certificates
-                    .into_iter()
-                    .map(|certificate| crate::bridge::CertificateView {
-                        id: certificate
-                            .id
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect(),
-                        subject: certificate.subject,
-                        issuer: certificate.issuer,
-                        not_before: certificate.not_before,
-                        not_after: certificate.not_after,
-                    })
-                    .collect(),
-            ),
+            certificates: Some(certificates.into_iter().map(certificate_view).collect()),
             ..Reply::default()
         },
         Err(crate::connection::ovpn::pkcs11::TokenError::UntrustedModule) => {
@@ -158,6 +175,17 @@ impl Actor {
         reply: impl Fn(Reply) + Send + 'static,
         list: impl Fn(String, String) -> Reply + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_listing_timeout(init, reply, list, LISTING_TIMEOUT)
+    }
+
+    /// `listing_timeout` is the production [`LISTING_TIMEOUT`]; a test names a
+    /// short one so the deadline is observable.
+    fn spawn_with_listing_timeout<B: Runtime + 'static>(
+        init: impl FnOnce() -> (Option<App>, Option<B>) + Send + 'static,
+        reply: impl Fn(Reply) + Send + 'static,
+        list: impl Fn(String, String) -> Reply + Send + Sync + 'static,
+        listing_timeout: Duration,
+    ) -> std::io::Result<Self> {
         let (input, requests) = mpsc::sync_channel::<Work>(32);
         let intent = Arc::new(AtomicU64::new(1));
         let actor_intent = intent.clone();
@@ -227,6 +255,13 @@ impl Actor {
                             #[cfg(any(target_os = "linux", target_os = "macos"))]
                             if let Command::ListCertificates { module } = &work.request.command {
                                 let id = work.request.id.clone();
+                                // Validation comes first, as the synchronous path
+                                // does: a bad module is refused even while
+                                // another listing holds the slot.
+                                if let Some(refusal) = listing_refusal(&id, module) {
+                                    reply(refusal);
+                                    continue;
+                                }
                                 if listing.is_some() {
                                     reply(Reply::error(id, "token_unavailable"));
                                     continue;
@@ -244,12 +279,8 @@ impl Actor {
                                 {
                                     reply(Reply::error(id, "token_unavailable"));
                                 } else {
-                                    listing = Some((
-                                        id,
-                                        recv,
-                                        Instant::now() + Duration::from_secs(30),
-                                        false,
-                                    ));
+                                    listing =
+                                        Some((id, recv, Instant::now() + listing_timeout, false));
                                 }
                                 continue;
                             }

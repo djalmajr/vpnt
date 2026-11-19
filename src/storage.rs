@@ -450,6 +450,26 @@ impl ProfileStore {
     }
 
     fn remove_profile(&self, id: &str, remove_config: bool) -> Result<(), StoreError> {
+        self.remove_profile_with(id, remove_config, ProfileStore::remove_ovpn_config)
+    }
+
+    /// Test seam: on a case-sensitive volume no fixture makes the unlink fail
+    /// after the admission checks, so the caller injects that one step.
+    #[cfg(test)]
+    fn remove_admin_profile_with(
+        &self,
+        id: &str,
+        unlink: impl FnOnce(&ProfileStore, &str) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.remove_profile_with(id, true, unlink)
+    }
+
+    fn remove_profile_with(
+        &self,
+        id: &str,
+        remove_config: bool,
+        unlink: impl FnOnce(&ProfileStore, &str) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         if !valid_profile_id(id) {
             return Err(StoreError::InvalidData);
         }
@@ -468,10 +488,46 @@ impl ProfileStore {
         // The config belongs to this entry: remove it first, so a failure
         // leaves the catalog unchanged and the profile visible for a retry.
         if remove_config {
-            self.remove_ovpn_config(id)?;
+            self.remove_config_of(id, &profiles, unlink)?;
         }
         self.write(&encode_profiles(profiles)?)?;
         Ok(())
+    }
+
+    /// Identity of the config a catalog entry resolves to: the device and
+    /// inode, so two names that converge on one file compare equal.
+    fn ovpn_config_identity(&self, id: &str) -> Result<Option<(u64, u64)>, StoreError> {
+        let name = ovpn_name(id)?;
+        let Some(dir) = self.ovpn_directory(false)? else {
+            return Ok(None);
+        };
+        let Some(file) = self.ovpn_file(&dir, &name)? else {
+            return Ok(None);
+        };
+        let metadata = file.metadata().map_err(|_| StoreError::Io)?;
+        Ok(Some((metadata.dev(), metadata.ino())))
+    }
+
+    /// Removes the config of the profile being removed unless a profile that
+    /// stays in the catalog resolves to the same file. On APFS `one.ovpn` and
+    /// `One.ovpn` are one file, so a legacy catalog holding both ids keeps the
+    /// config its remaining entry still uses. On a case-sensitive volume they
+    /// are two files and only the removed id's config goes.
+    fn remove_config_of(
+        &self,
+        id: &str,
+        remaining: &[Profile],
+        unlink: impl FnOnce(&ProfileStore, &str) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let Some(identity) = self.ovpn_config_identity(id)? else {
+            return Ok(());
+        };
+        for profile in remaining {
+            if self.ovpn_config_identity(&profile.id)? == Some(identity) {
+                return Ok(());
+            }
+        }
+        unlink(self, id)
     }
 
     fn check_directory(&self) -> Result<(), StoreError> {
@@ -1313,5 +1369,122 @@ mod admin_tests {
         store.remove_admin_profile("one").unwrap();
         assert!(!f.config_exists("one"));
         assert!(store.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_config_removal_after_admission_keeps_the_profile_and_a_retry_succeeds() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        let catalog = fs::read(f.0.join("profiles.json")).unwrap();
+        // The unlink is the step injected to fail: an unwritable `ovpn`
+        // directory is refused before admission, so it cannot reach this branch.
+        assert_eq!(
+            store.remove_admin_profile_with("one", |_, _| Err(StoreError::Io)),
+            Err(StoreError::Io)
+        );
+        assert!(f.config_exists("one"));
+        assert_eq!(fs::read(f.0.join("profiles.json")).unwrap(), catalog);
+        assert_eq!(store.load().unwrap().len(), 1);
+        store.remove_admin_profile("one").unwrap();
+        assert!(!f.config_exists("one"));
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn deny_catalog_write(f: &Fixture) -> Deny {
+        use std::os::unix::ffi::OsStrExt;
+        let path =
+            std::ffi::CString::new(f.0.join("profiles.json").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated owned path stays valid for this call.
+        assert_eq!(
+            unsafe { libc::chflags(path.as_ptr(), libc::UF_IMMUTABLE) },
+            0
+        );
+        Deny(path)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_catalog_write_failure_after_the_unlink_can_be_retried() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        let catalog = fs::read(f.0.join("profiles.json")).unwrap();
+        let deny = deny_catalog_write(&f);
+        // The config is unlinked first, then the immutable catalog refuses the
+        // write: the profile stays visible for a retry.
+        assert_eq!(store.remove_admin_profile("one"), Err(StoreError::Io));
+        assert!(!f.config_exists("one"));
+        assert_eq!(fs::read(f.0.join("profiles.json")).unwrap(), catalog);
+        assert_eq!(store.load().unwrap().len(), 1);
+        drop(deny);
+        store.remove_admin_profile("one").unwrap();
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn removing_a_case_alias_from_a_legacy_catalog_keeps_the_other_config() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        store
+            .write(&encode_profiles(vec![ovpn_profile("one"), ovpn_profile("One")]).unwrap())
+            .unwrap();
+        assert_eq!(store.load().unwrap().len(), 2);
+        // The fixture must be on a volume that ignores case, where both ids
+        // resolve to one file; otherwise this test cannot exercise the defect.
+        assert_eq!(fs::read(f.config("One")).unwrap(), CONFIG.as_bytes());
+        assert_eq!(store.remove_admin_profile("One"), Ok(()));
+        assert!(
+            f.config_exists("one"),
+            "the remaining entry must keep the config it still uses"
+        );
+        assert_eq!(fs::read(f.config("one")).unwrap(), CONFIG.as_bytes());
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>(),
+            ["one"]
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn removing_a_case_alias_on_a_case_sensitive_volume_deletes_only_its_config() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        store
+            .save_ovpn_bytes("One", OTHER_CONFIG.as_bytes())
+            .unwrap();
+        store
+            .write(&encode_profiles(vec![ovpn_profile("one"), ovpn_profile("One")]).unwrap())
+            .unwrap();
+        assert!(f.config_exists("one") && f.config_exists("One"));
+        assert_eq!(store.remove_admin_profile("One"), Ok(()));
+        assert_eq!(fs::read(f.config("one")).unwrap(), CONFIG.as_bytes());
+        assert!(!f.config_exists("One"));
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>(),
+            ["one"]
+        );
     }
 }
