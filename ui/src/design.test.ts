@@ -130,18 +130,21 @@ test("Linux recorta só a raiz e o placeholder não imita valor digitado", () =>
   expect(body).not.toMatch(/^\s*height\s*:/m);
   expect(body).not.toMatch(/^\s*overflow\s*:/m);
 
-  // The colour that wins the cascade is the last placeholder declaration.
-  const colours = rules
-    .filter(({ selectors }) =>
-      selectors.some((s) => s.endsWith("::placeholder")),
-    )
-    .flatMap(({ body }) => [
-      ...body.matchAll(/(?:^|;)\s*color\s*:\s*([^;]+)/gm),
-    ])
-    .map(([, value]) => value.trim());
-  expect(colours.at(-1)).toBe(
-    "color-mix(in srgb, var(--text) 70%, var(--field))",
-  );
+  // For each field type, the colour that wins the cascade is the last
+  // declaration of a rule that targets that type's placeholder.
+  const placeholderColour = (field: string) =>
+    rules
+      .filter(({ selectors }) => selectors.includes(`${field}::placeholder`))
+      .flatMap(({ body }) => [
+        ...body.matchAll(/(?:^|;)\s*color\s*:\s*([^;]+)/gm),
+      ])
+      .map(([, value]) => value.trim())
+      .at(-1);
+  for (const field of ["input", "textarea"]) {
+    expect(placeholderColour(field)).toBe(
+      "color-mix(in srgb, var(--text) 70%, var(--field))",
+    );
+  }
   const omarchy = readFileSync(
     new URL("./omarchy.css", import.meta.url),
     "utf8",
