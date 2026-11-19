@@ -142,8 +142,10 @@ test("Linux recorta só a raiz e o placeholder não imita valor digitado", () =>
     "input::placeholder",
     "textarea::placeholder",
   ]);
-  expect(placeholder?.body).toMatch(
-    /(?:^|;)\s*color\s*:\s*color-mix\(in srgb, var\(--text\) 70%, var\(--field\)\)\s*;/m,
+  // The block holds this one declaration and nothing else, so no later
+  // declaration in the same block can override it.
+  expect(placeholder?.body.replace(/\s+/g, " ").trim()).toBe(
+    "color: color-mix(in srgb, var(--text) 70%, var(--field));",
   );
   const omarchy = readFileSync(
     new URL("./omarchy.css", import.meta.url),
