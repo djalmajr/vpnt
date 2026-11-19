@@ -2,6 +2,7 @@ use super::*;
 use crate::{helper::client::tests::Peer, secrets::SecretError};
 use std::{
     fs,
+    panic::Location,
     process::Command as Process,
     sync::{
         Arc,
@@ -25,20 +26,63 @@ impl SecretStore for Secrets {
         Ok(())
     }
 }
-fn wait(mut check: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(15);
+#[track_caller]
+fn wait_stage(stage: &str, mut check: impl FnMut() -> bool) {
+    // Hang guard only. Every condition below is reachable: the fixture marks
+    // its read loop before the broker arms the 5 s startup deadline, the
+    // installer publishes `prepared` before waiting for `proceed`, and the
+    // test sets the busy state before polling.
+    let started = Instant::now();
+    let end = started + Duration::from_secs(60);
     while !check() {
-        assert!(Instant::now() < end, "component broker timed out");
+        assert!(
+            Instant::now() < end,
+            "{stage}: component broker condition timed out after {:?} at {}",
+            started.elapsed(),
+            Location::caller()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+/// Compatibility for the lifecycle submodule, whose waits are outside this
+/// slice; it still gets stage, elapsed time and caller through `wait_stage`.
+#[track_caller]
+fn wait(check: impl FnMut() -> bool) {
+    wait_stage("component lifecycle condition", check)
+}
+/// The fixture writes `.started` from inside its read loop; the broker's
+/// startup deadline is armed only after this returns.
+fn flow_peer() -> Peer {
+    let peer = Peer::new("flow");
+    let marker = peer.marker.with_extension("started");
+    wait_stage("runtime fixture read loop", || marker.exists());
+    peer
 }
 
 #[test]
 fn component_install_refuses_live_or_cleaning_connections_before_admission() {
-    let mut peer = Peer::new("flow");
+    let mut peer = flow_peer();
     let root = peer.root().to_owned();
     let mut broker = Broker::new(Some(peer.take()), Secrets(Arc::new(AtomicUsize::new(0))));
-    wait(|| broker.snapshot().helper == "installed");
+    wait_stage("initial installed snapshot", || {
+        broker.snapshot().helper == "installed"
+    });
+    // The installed snapshot triggers two capability queries. Their replies
+    // carry the fixture's `off` state and would overwrite the states this test
+    // forces below if they arrived during `begin_component`. The local
+    // fixture answers at once, so the wait keeps the 3.5 s bound the first
+    // admission used to impose on these polls: one 3 s pause fits, a slower
+    // `poll` does not.
+    let replies = Instant::now();
+    wait_stage("initial capability replies", || {
+        broker.poll();
+        broker.cleanup_probe.is_none() && broker.failure_probe.is_none()
+    });
+    assert!(
+        replies.elapsed() <= Duration::from_millis(3500),
+        "initial capability replies took {:?}, limit 3.5 s",
+        replies.elapsed()
+    );
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
     broker.component.connect = Box::new(move |_, _, _, _| {
@@ -58,7 +102,7 @@ fn component_install_refuses_live_or_cleaning_connections_before_admission() {
             broker.begin_component(
                 Command::InstallHelper {},
                 Locale::EnUs,
-                Instant::now() + Duration::from_secs(2)
+                Instant::now() + Duration::from_millis(3500)
             ),
             Err("component_busy"),
             "state: {state:?}"
@@ -73,7 +117,7 @@ fn component_install_refuses_live_or_cleaning_connections_before_admission() {
         broker.begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(2)
+            Instant::now() + Duration::from_millis(3500)
         ),
         Err("component_busy")
     );
@@ -83,22 +127,26 @@ fn component_install_refuses_live_or_cleaning_connections_before_admission() {
         broker.begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(2)
+            Instant::now() + Duration::from_millis(3500)
         ),
         Err("component_unconfirmed")
     );
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(!peer.retiring());
     drop(broker);
+    // `Peer::drop` waits only 3 s for the worker; observe cleanup first.
+    wait_stage("runtime worker cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists(), "fixture peer did not finish and clean up");
 }
 
 #[test]
 fn component_install_rechecks_activity_after_admission_before_runtime_handoff() {
-    let mut peer = Peer::new("flow");
+    let mut peer = flow_peer();
     let mut broker = Broker::new(Some(peer.take()), Secrets(Arc::new(AtomicUsize::new(0))));
-    wait(|| broker.snapshot().helper == "installed");
+    wait_stage("initial installed snapshot", || {
+        broker.snapshot().helper == "installed"
+    });
     let root = peer.root().to_owned();
     let script = root.join("must-not-start.py");
     fs::write(
@@ -116,41 +164,43 @@ fn component_install_rechecks_activity_after_admission_before_runtime_handoff() 
         .begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            // Generous: this test is about the activity recheck, and a loaded
-            // host can take seconds to prepare, which used to expire first.
-            Instant::now() + Duration::from_secs(30),
+            // Guard for fixture preparation, not the property under test: the
+            // installer stays prepared until the recheck calls `proceed`.
+            Instant::now() + Duration::from_secs(60),
         )
         .unwrap();
-    wait(|| broker.component.current.as_ref().unwrap().client.prepared());
-    broker.connections.get_mut("one").unwrap().view.state = State::Connecting;
-    let mut result = None;
-    wait(|| {
-        broker.poll_component();
-        result = broker.take_component_result();
-        result.is_some()
+    wait_stage("installer prepared", || {
+        broker.component.current.as_ref().unwrap().client.prepared()
     });
-    let (actual, result) = result.unwrap();
+    broker.connections.get_mut("one").unwrap().view.state = State::Connecting;
+    broker.poll_component();
+    let (actual, result) = broker
+        .take_component_result()
+        .expect("an already-prepared install must reject activity on this poll");
     assert_eq!(actual, token);
     assert_eq!(result.unwrap_err(), "component_busy");
     assert!(!peer.retiring());
     assert!(!root.join("must-not-start").exists());
-    wait(|| {
+    wait_stage("component operation cleared", || {
         broker.poll();
         !broker.component_busy()
     });
     assert_eq!(broker.snapshot().helper, "installed");
     drop(broker);
+    wait_stage("runtime worker cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists(), "fixture peer did not finish and clean up");
 }
 
 #[test]
 fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authenticated_snapshot() {
-    let mut old = Peer::new("flow");
-    let mut new = Peer::new("flow");
+    let mut old = flow_peer();
+    let mut new = flow_peer();
     let removes = Arc::new(AtomicUsize::new(0));
     let mut broker = Broker::new(Some(old.take()), Secrets(removes.clone()));
-    wait(|| broker.snapshot().helper == "installed");
+    wait_stage("initial installed snapshot", || {
+        broker.snapshot().helper == "installed"
+    });
     let calls = Arc::new(AtomicUsize::new(0));
     let attempts = calls.clone();
     let mut next = Some(new.take());
@@ -171,10 +221,11 @@ fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authent
         .begin_component(
             Command::InstallHelper {},
             Locale::EnUs,
-            Instant::now() + Duration::from_secs(3),
+            // Guard for cleanup + preparation + child spawn: 3 s pause < 15 s.
+            Instant::now() + Duration::from_secs(15),
         )
         .expect("install must start through the asynchronous component flow");
-    wait(|| {
+    wait_stage("installer child started", || {
         broker.poll();
         root.join("component_started").exists()
     });
@@ -184,7 +235,7 @@ fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authent
     let snapshot = broker
         .dispatch(
             Command::GetSnapshot {},
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_millis(3500),
         )
         .unwrap();
     assert_eq!(snapshot.helper, "missing");
@@ -203,7 +254,7 @@ fn installation_waits_for_runtime_cleanup_then_for_its_child_and_a_fresh_authent
     );
     fs::write(root.join("component_release"), b"").unwrap();
     let mut result = None;
-    wait(|| {
+    wait_stage("installer completion after release", || {
         broker.poll();
         result = broker.take_component_result();
         result.is_some()
@@ -225,10 +276,12 @@ fn installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_inst
         }
     }
 
-    let mut old = Peer::new("flow");
-    let mut new = Peer::new("flow");
+    let mut old = flow_peer();
+    let mut new = flow_peer();
     let mut broker = Broker::new(Some(old.take()), Secrets(Arc::new(AtomicUsize::new(0))));
-    wait(|| broker.snapshot().helper == "installed");
+    wait_stage("initial installed snapshot", || {
+        broker.snapshot().helper == "installed"
+    });
     let old_epoch = broker.epoch;
     assert!(broker.ready);
     let mut next = Some(new.take());
@@ -252,7 +305,7 @@ fn installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_inst
             Instant::now() + Duration::from_secs(8),
         )
         .unwrap();
-    wait(|| {
+    wait_stage("fresh installer started", || {
         broker.poll();
         root.join("started").exists()
     });
@@ -263,7 +316,7 @@ fn installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_inst
     broker.helper = "installed";
     broker.ready = true;
     fs::write(&release.0, b"").unwrap();
-    wait(|| {
+    wait_stage("installer verifying fresh snapshot", || {
         broker.poll_component();
         assert!(
             broker.take_component_result().is_none(),
@@ -278,7 +331,7 @@ fn installation_requires_a_fresh_installed_snapshot_even_if_old_session_was_inst
     assert_eq!(broker.epoch, old_epoch);
     assert_eq!(broker.component.current.as_ref().unwrap().epoch, old_epoch);
     let mut completion = None;
-    wait(|| {
+    wait_stage("fresh installer completion", || {
         broker.poll();
         completion = broker.take_component_result();
         completion.is_some()
