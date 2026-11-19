@@ -142,8 +142,9 @@ a partir de um terminal com o grupo novo: `newgrp vpnt` e, nele, `vpnt &`.
 
 ### Validação real manual
 
-Resultado: **parcial** (2026-11-19, Omarchy, pacote local `0.1.0-1`). Passos 1
-a 5 passaram; os cenários de rede do passo 6 seguem pendentes. Execute somente
+Resultado: **parcial** (2026-11-19, Omarchy, pacotes locais `0.1.0-1`). Passos 1
+a 5 passaram. No passo 6, a reconexão do `ping-restart` passou; a queda da
+interface física e suspender e retomar seguem pendentes. Execute somente
 no host autorizado, com servidor de VPN, domínio interno e host interno
 próprios. Guarde o estado de rede antes. O `resolvectl` lista os links em ordem
 variável, então a função ordena os blocos por link:
@@ -201,8 +202,27 @@ kill -9 "$pid"
 6. Cenários de rede, com a VPN conectada: queda da interface física com
    retorno, suspender e retomar, e a reconexão do `ping-restart`. Em cada um,
    anote se o app reconecta ou mostra o estado certo e compare o estado de rede
-   depois de desconectar.
-   **[NOT RUN]**
+   depois de desconectar. Para simular o `ping-restart`, mande `SIGUSR1` ao
+   `openvpn` da sessão (escolha o PID pela linha de comando com `--dev vpntN`,
+   nunca com `pkill -f`):
+
+```sh
+read -r -p "PID do openvpn da sessão: " pid
+kill -USR1 "$pid"
+```
+
+   Com um token em nuvem, a assinatura nova pode pedir outra aprovação no
+   celular. Durante a reconexão, o card mostra "reconectando" ou "aguardando
+   aprovação"; com `ip route show dev vpntN` dá para ver as rotas empurradas
+   saírem e voltarem.
+   - `ping-restart`: **[PASS]** o vpnt segurou o `hold release` por 800 ms
+     enquanto retirava rotas e DNS, a assinatura nova voltou em 671 ms, rotas e
+     DNS voltaram no `CONNECTED` e o host interno respondeu pelo túnel, sem
+     clique no app. Antes da correção, a sessão travava: o módulo do token
+     chamava o serviço do fornecedor por um endereço coberto pelas rotas
+     empurradas, e o pedido entrava no túnel parado.
+   - Queda da interface física com retorno: **[NOT RUN]**.
+   - Suspender e retomar: **[NOT RUN]**.
 
 IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
 fixture não substitui essa validação com VPN real.
