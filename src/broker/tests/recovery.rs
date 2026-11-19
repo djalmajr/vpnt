@@ -247,9 +247,17 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
         .modified()
         .unwrap()
         .duration_since(quit)
-        // A coarse file clock can stamp a cleanup that followed the quit
-        // within a tick slightly before it; that is no delay.
-        .unwrap_or(Duration::ZERO);
+        .unwrap_or_else(|early| {
+            // A coarse file clock can stamp a cleanup that followed the quit
+            // within a tick slightly before it; that is no delay. A larger
+            // gap means the clock stepped back, which would hide a delay.
+            assert!(
+                early.duration() <= Duration::from_millis(50),
+                "cleanup marker stamped {} ms before the quit",
+                early.duration().as_millis()
+            );
+            Duration::ZERO
+        });
     assert!(
         elapsed <= Duration::from_millis(3500),
         "cleanup after quit took {} ms",
