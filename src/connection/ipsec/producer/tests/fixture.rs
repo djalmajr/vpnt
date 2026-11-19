@@ -72,9 +72,15 @@ impl Fixture {
             String::from_utf8_lossy(&result.stderr)
         );
         fs::copy(path.join("bin/charon"), path.join("bin/openfortivpn")).unwrap();
+        fs::copy(path.join("bin/charon"), path.join("bin/openvpn")).unwrap();
         fs::write(path.join("certs/ca-bundle.pem"), b"fictional public CA").unwrap();
         let mut files = serde_json::Map::new();
-        for name in ["bin/charon", "bin/openfortivpn", "certs/ca-bundle.pem"] {
+        for name in [
+            "bin/charon",
+            "bin/openfortivpn",
+            "bin/openvpn",
+            "certs/ca-bundle.pem",
+        ] {
             fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o555)).unwrap();
             files.insert(
                 name.into(),
@@ -100,7 +106,7 @@ impl Fixture {
         };
         let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
             "strongswan":{"version":"6.1.0","source":"fixture","sha256":"fixture","backend":"kernel-libipsec","pidDirectory":paths::runtime_directory().join("run"),"patches":hashes(&["charon-private-pid.patch","strongswan-utun-framing.patch","strongswan-libipsec-no-routes.patch","charon-parent-eof.patch","strongswan-retain-utun.patch","strongswan-protected-udp.patch"])},
-            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":hashes(&["openfortivpn-no-routes.patch","openfortivpn-bound-transport.patch","openfortivpn-ppp-supervisor.patch","openfortivpn-split-routes.patch","openfortivpn-split-dns.patch"])},"files":files});
+            "openfortivpn":{"version":"1.24.1","source":"fixture","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":hashes(&["openfortivpn-no-routes.patch","openfortivpn-bound-transport.patch","openfortivpn-ppp-supervisor.patch","openfortivpn-split-routes.patch","openfortivpn-split-dns.patch"])},"openvpn":{"version":"2.7.9","source":"https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz","sha256":"c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1"},"files":files});
         fs::write(
             path.join("manifest.json"),
             serde_json::to_vec(&data).unwrap(),

@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 DEFAULT = HERE.parent / "build-runtime.py"
@@ -28,6 +29,61 @@ SIGNATURE = (
 CONFIGURE = ["/src/configure", "--enable-kernel-libipsec"]
 ENV = {"PATH": "/usr/bin:/bin"}
 LOG = "unused.log"
+
+
+class RuntimeInventoryTest(unittest.TestCase):
+    def test_missing_openvpn_file_and_inventory_entry_are_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="vpnt-runtime-inventory-") as temporary:
+            root = Path(temporary) / "target/vpnt-runtime"
+            root.mkdir(parents=True)
+            manifest = {
+                "format": 1, "appVersion": builder.VERSION, "prefix": str(builder.PREFIX),
+                "strongswan": {"backend": builder.SWAN_BACKEND, "patches": builder.expected_swan_patches()},
+                "openfortivpn": {"patches": {patch.name: builder.digest(patch) for patch in [builder.FORTI_PATCH, builder.TRANSPORT_PATCH, builder.SUPERVISOR_PATCH, builder.SPLIT_PATCH, builder.DNS_PATCH]}},
+                "openvpn": {"version": builder.OVPN_VERSION, "source": builder.OVPN_URL, "sha256": builder.OVPN_SHA},
+                "files": {},
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            with patch.object(builder, "ROOT", Path(temporary)), patch.object(sys, "argv", ["build-runtime.py", "--verify-only"]):
+                try:
+                    builder.main()
+                except Exception as error:
+                    self.assertIsInstance(error, RuntimeError)
+                    self.assertIn("missing bin/openvpn", str(error))
+                else:
+                    self.fail("missing OpenVPN was accepted")
+
+    def test_non_macho_openvpn_is_rejected_before_any_client_runs(self):
+        with tempfile.TemporaryDirectory(prefix="vpnt-runtime-format-") as temporary:
+            root = Path(temporary) / "target/vpnt-runtime"
+            (root / "bin").mkdir(parents=True)
+            # Real Mach-O stand-ins for the two existing clients, so only the
+            # OpenVPN entry has the wrong format.
+            for program in ("charon", "openfortivpn"):
+                (root / "bin" / program).write_bytes(Path("/usr/bin/true").read_bytes())
+            script = root / "bin/openvpn"
+            script.write_text("#!/bin/sh\necho 'OpenVPN 0.0.0 fake'\n")
+            script.chmod(0o755)
+            files = {f"bin/{name}": builder.digest(root / "bin" / name) for name in ("charon", "openfortivpn", "openvpn")}
+            manifest = {
+                "format": 1, "appVersion": builder.VERSION, "prefix": str(builder.PREFIX),
+                "strongswan": {"backend": builder.SWAN_BACKEND, "patches": builder.expected_swan_patches()},
+                "openfortivpn": {"patches": {patch.name: builder.digest(patch) for patch in [builder.FORTI_PATCH, builder.TRANSPORT_PATCH, builder.SUPERVISOR_PATCH, builder.SPLIT_PATCH, builder.DNS_PATCH]}},
+                "openvpn": {"version": builder.OVPN_VERSION, "source": builder.OVPN_URL, "sha256": builder.OVPN_SHA},
+                "files": files,
+                # Correct metadata for the stand-ins, so that without the format
+                # check the verifier proceeds to run a tool instead of stopping here.
+                "minimumMacOS": ".".join(map(str, max(builder.minimum_macos(root / "bin" / name) for name in ("charon", "openfortivpn")))),
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest))
+
+            def refuse(*args, **kwargs):
+                raise AssertionError(f"a subprocess ran before the format check: {args[0]}")
+
+            with patch.object(builder.subprocess, "run", side_effect=refuse):
+                with self.assertRaises(RuntimeError) as raised:
+                    builder.verify_runtime(root)
+            self.assertEqual(str(raised.exception), "Runtime clients are not Mach-O executables: bin/openvpn")
 
 
 class Run:
