@@ -11,6 +11,8 @@
  * and unmounting all release it, and the natural height returns.
  */
 
+import { isLinuxPlatform } from "./platform";
+
 /** Marks `<html>` while a menu holds a reservation; styles.css stretches the
  * panel to the window and pins the footer to the bottom. */
 export const RESERVE_ATTRIBUTE = "data-menu-reserve";
@@ -45,7 +47,9 @@ export function menuNeed({
 
 /**
  * Height to ask the host for: the content height, raised to the predefined
- * panel height and to the reservation, never above the panel limit. The host still clamps to the screen.
+ * panel height and to the reservation. Other hosts stop at the panel limit;
+ * Linux has no UI ceiling and the host clamps to the monitor. The host still
+ * clamps to the screen.
  */
 export function requestedHeight({
   natural,
@@ -124,11 +128,15 @@ export function observePanelHeight(
       : panelHeight;
     // max-height now combines viewport and token with min(); parse the token
     // directly, since parseFloat on the computed min() expression is NaN.
-    const max = panel
-      ? Number.parseFloat(
-          getComputedStyle(panel).getPropertyValue("--panel-max-height"),
-        )
-      : 0;
+    // Linux marks <html> before the UI loads and overrides the token with 100vh:
+    // there is no 720 px ceiling to cap the request, only the host's available
+    // monitor height. Other hosts keep the token ceiling.
+    const max =
+      panel && !isLinuxPlatform()
+        ? Number.parseFloat(
+            getComputedStyle(panel).getPropertyValue("--panel-max-height"),
+          )
+        : Number.POSITIVE_INFINITY;
     // The token, not the computed `min-height`: that one follows the current
     // window (`100vh`) and would keep a small window small.
     const min = Number.parseFloat(

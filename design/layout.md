@@ -34,9 +34,10 @@ mais bordas, mesmo quando o menu está limitado), mais `sideOffset`,
 `collisionPadding` e a distância do gatilho à borda inferior do painel, e o
 rodapé desce para essa borda; o Radix então coloca todas as ações acima do
 gatilho. Ao fechar, navegar ou desmontar, a reserva é liberada e a altura
-anterior volta, nunca abaixo de `panel-min-height`. A reserva é temporária, nunca vai além de `panel-max-height`
-(720 px) e o host ainda limita à tela; só quando a tela não comporta o menu ele
-rola. Não é aberta exceção de CSS para o menu: o dimensionamento fica em
+anterior volta, nunca abaixo de `panel-min-height`. A reserva é temporária: nos outros hosts não vai além de `panel-max-height`
+(720 px); no Linux o teto da UI não existe e o host limita o pedido à altura disponível do
+monitor; só quando a tela não comporta o menu ele rola. Não é aberta exceção de
+CSS para o menu: o dimensionamento fica em
 `ui/src/panelSizing.ts`. O `sideOffset` de 6 px
 da referência é uma exceção documentada: o deslocamento é calculado em JS, então
 o valor fica no componente e não vira token CSS. Por indicação do Djalma, o
@@ -57,8 +58,12 @@ Por correção do Djalma em 2026-11-14, o popover abre já na altura predefinida
 deslocamento de layout; o rodapé fica na borda inferior. A janela nativa nasce
 com a mesma medida. Enquanto o viewport estiver vazio, como no WebKitGTK antes
 da primeira exibição, a interface não mede: o texto quebraria numa coluna sem
-largura e o pedido iria ao teto. Conteúdo mais alto cresce até `panel-max-height`; tela mais
-baixa limita a janela e o painel rola.
+largura e o pedido iria ao teto. Conteúdo mais alto cresce até `panel-max-height`
+no macOS; por decisão do Djalma em 2026-11-19, no Linux cresce até a altura
+disponível do monitor e só então rola o miolo, entre o cabeçalho sticky e o
+rodapé (`--panel-max-height: 100vh` sob `data-platform="linux"` e pedido sem
+teto em `panelSizing.ts`). O macOS mantém o teto de 720 px. Tela mais baixa
+limita a janela e o painel rola.
 O pedido ao host soma a estrutura fixa ao `scrollHeight` de panel-content,
 independentemente do viewport atual; mudanças internas também são observadas.
 

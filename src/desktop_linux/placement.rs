@@ -270,7 +270,7 @@ pub(super) fn frame_with_gap(
     let extra = gap.map_or(0.0, |g| f64::from(g) * 2.0);
     let margin = gap.map_or(8.0, f64::from);
     let available = (height - top - bottom - 24.0 - extra).max(0.0) as u32;
-    let panel_height = requested.clamp(180, 720).min(available);
+    let panel_height = requested.max(180).min(available);
     let min_x = monitor.x + left + margin;
     let max_x = (monitor.x + width - right - margin - 320.0).max(min_x);
     let x = (anchor.x - 160.0).clamp(min_x, max_x);
@@ -502,10 +502,10 @@ pub(super) fn worker_loop(
         }
         let height = match process(request) {
             Ok(Some(height)) => height,
-            Ok(None) => request.requested.clamp(180, 720),
+            Ok(None) => request.requested.max(180),
             Err(error) => {
                 eprintln!("Could not place popover: {error}");
-                request.requested.clamp(180, 720)
+                request.requested.max(180)
             }
         };
         if is_current(generation, request.generation) {

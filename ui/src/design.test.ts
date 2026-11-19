@@ -95,6 +95,19 @@ test("rodapé reserva espaço fora da superfície rolável e usa texto pequeno",
   expect(block(".footer > small")).toContain("font-size: var(--font-control)");
 });
 
+// Sticky keeps the header in the accessibility and Tab order; only the middle
+// scrolls. The opaque surface and layer keep text from showing through it,
+// below the portalled menu and tooltip.
+test("cabeçalho fica fixo no topo da superfície rolável em todos os hosts", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const header = css.match(/\.header\s*\{([^}]*)\}/s)?.[1] ?? "";
+  expect(header).toContain("position: sticky");
+  expect(header).toContain("top: 0");
+  expect(header).toMatch(/background:\s*var\(--surface\)/);
+  expect(header).toMatch(/z-index:\s*1/);
+  expect(css).toMatch(/\.panel-content\s*\{[^}]*overflow:\s*auto/s);
+});
+
 // A body-level clip cuts the menu portal; a placeholder that matches the value
 // makes an empty field look filled (reported twice in the Omarchy app).
 test("Linux recorta só a raiz e o placeholder não imita valor digitado", () => {
@@ -115,7 +128,10 @@ test("Linux recorta só a raiz e o placeholder não imita valor digitado", () =>
   const root = linuxRules.filter(({ selectors }) =>
     selectors.includes(":root[data-platform=linux]"),
   );
-  expect(root.map(({ body }) => body).join("")).toContain("overflow: hidden");
+  const rootRules = root.map(({ body }) => body).join("");
+  expect(rootRules).toContain("overflow: hidden");
+  // 2026-11-19: no 720 px ceiling on Linux; the host limits the window.
+  expect(rootRules).toMatch(/--panel-max-height:\s*100vh\s*;/);
   for (const { selectors, body } of linuxRules) {
     // Only the root itself may be clipped, and never with a fixed height.
     expect(selectors.every((s) => s === ":root[data-platform=linux]")).toBe(

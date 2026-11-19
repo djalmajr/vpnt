@@ -500,7 +500,7 @@ fn geometry_corners_scaled_and_second_monitor() {
         placement::Frame {
             x: 1592,
             y: 30,
-            height: 720
+            height: 900
         }
     );
     let two = monitors(
@@ -524,8 +524,22 @@ fn geometry_corners_scaled_and_second_monitor() {
         900,
     )
     .unwrap();
-    assert_eq!(bottom.y, 720);
-    assert_eq!(bottom.height, 720);
+    assert_eq!(bottom.y, 540);
+    assert_eq!(bottom.height, 900);
+}
+
+#[test]
+fn frame_follows_the_request_between_the_floor_and_available_height() {
+    let anchor = placement::Anchor { x: 600.0, y: 10.0 };
+    // 1450 - 26 reserved - 24 kept above the bottom edge = 1400 available.
+    let tall =
+        monitors(r#"[{"x":0,"y":0,"width":1280,"height":1450,"scale":1,"reserved":[0,26,0,0]}]"#);
+    assert_eq!(placement::frame(anchor, &tall, 1000).unwrap().height, 1000);
+    // 650 - 26 reserved - 24 kept above the bottom edge = 600 available.
+    let short =
+        monitors(r#"[{"x":0,"y":0,"width":1280,"height":650,"scale":1,"reserved":[0,26,0,0]}]"#);
+    assert_eq!(placement::frame(anchor, &short, 1000).unwrap().height, 600);
+    assert_eq!(placement::frame(anchor, &short, 100).unwrap().height, 180);
 }
 
 #[test]
@@ -888,11 +902,11 @@ fn failed_placement_fixes_the_requested_height() {
         |_| Err("hyprctl failed".into()),
         |placed, height, _, opening| replies.borrow_mut().push((placed, height, opening)),
     );
-    assert_eq!(replies.take(), [(current, 720, false)]);
+    assert_eq!(replies.take(), [(current, 1000, false)]);
     let window = SizeRecorder::new(true, true);
     let mut anchor = None;
-    super::apply_placed(&window, current, current, 720, &mut anchor, None);
-    assert_eq!(window.take(), [SizeOp::SetHeight(720), SizeOp::Fix(720)]);
+    super::apply_placed(&window, current, current, 1000, &mut anchor, None);
+    assert_eq!(window.take(), [SizeOp::SetHeight(1000), SizeOp::Fix(1000)]);
 }
 
 #[test]
@@ -905,7 +919,7 @@ fn visible_resize_without_a_positioner_sizes_gtk_directly() {
     );
     assert_eq!(
         unsupported.take(),
-        [SizeOp::SetHeight(720), SizeOp::Fix(720)]
+        [SizeOp::SetHeight(1000), SizeOp::Fix(1000)]
     );
     let refused = SizeRecorder::new(true, false);
     super::resize_visible(
