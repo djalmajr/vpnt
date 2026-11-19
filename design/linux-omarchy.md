@@ -51,7 +51,7 @@ Sem `height: 100%` e sem regra no `body`: `html` e `body` permanecem em fluxo na
 
 ## Misturas
 
-Separador usa 25% do foreground sobre o fundo do popup; controles normais usam 4%, e hover de controles e menu 8%, para distinguir camadas mantendo a paleta. Aviso, erro e informação usam respectivamente 15% de amarelo, vermelho e azul sobre o fundo do popup, preservando a cor sem competir com o texto. O scrim usa 50% do fundo escuro com transparência. Essas misturas acompanham o tema; se uma propriedade faltar, suas cadeias usam o fallback da tabela. O `::placeholder` de `input` e `textarea` usa 65% de `--text` sobre `--field` em todos os temas: ele fica mais claro que o valor digitado sem trocar `--text` nem `--secondary`.
+Separador usa 25% do foreground sobre o fundo do popup; controles normais usam 4%, e hover de controles e menu 8%, para distinguir camadas mantendo a paleta. Aviso, erro e informação usam respectivamente 15% de amarelo, vermelho e azul sobre o fundo do popup, preservando a cor sem competir com o texto. O scrim usa 50% do fundo escuro com transparência. Essas misturas acompanham o tema; se uma propriedade faltar, suas cadeias usam o fallback da tabela. O `::placeholder` de `input` e `textarea` usa 70% de `--text` sobre `--field`: o exemplo tem contraste menor com o fundo do campo que o valor digitado (mais apagado, não necessariamente mais claro), e fica em 4,5:1 ou mais nas paletas padrão e na do Omarchy de referência, sem trocar `--text` nem `--secondary`. Essa mistura vive em `styles.css` e vale para todos os hosts, inclusive o macOS.
 
 ## Geometria e animação
 
@@ -77,4 +77,4 @@ Esses pares atingem 4,5:1 no tema atual. Outros temas e combinações não foram
 
 ## Contrato preservado
 
-Tipografia, espaçamento interno, dimensões, estados, acessibilidade, conteúdo e comportamento seguem `DESIGN.md`. A exceção específica Omarchy é o mapa de cores e a geometria descritos acima; o visual de macOS e outros Linux não é alterado.
+Tipografia, espaçamento interno, dimensões, estados, acessibilidade, conteúdo e comportamento seguem `DESIGN.md`. A exceção específica Omarchy é o mapa de cores e a geometria descritos acima. O recorte da raiz vale só com `data-platform="linux"`. A cor do `::placeholder` é a única regra compartilhada com o macOS e os outros Linux; fora isso, o visual deles não é alterado.

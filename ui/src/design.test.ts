@@ -99,11 +99,30 @@ test("rodapé reserva espaço fora da superfície rolável e usa texto pequeno",
 // makes an empty field look filled (reported twice in the Omarchy app).
 test("Linux recorta só a raiz e o placeholder não imita valor digitado", () => {
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
-  const linux =
-    css.match(/:root\[data-platform="linux"\]\s*\{([^}]*)\}/s)?.[1] ?? "";
-  expect(linux).toContain("overflow: hidden");
-  expect(linux).not.toMatch(/^\s*height\s*:/m);
-  expect(css).not.toMatch(/:root\[data-platform="linux"\]\s+body\s*\{/s);
+  // Every rule, with comments removed and the attribute quotes normalized so
+  // [data-platform=linux] and [data-platform="linux"] compare equal.
+  const rules = [
+    ...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g),
+  ].map(([, selector, body]) => ({
+    selectors: selector
+      .split(",")
+      .map((part) => part.trim().replace(/=(["'])([^"']*)\1\]/g, "=$2]")),
+    body,
+  }));
+  const linuxRules = rules.filter(({ selectors }) =>
+    selectors.some((selector) => selector.includes("[data-platform=linux]")),
+  );
+  const root = linuxRules.filter(({ selectors }) =>
+    selectors.includes(":root[data-platform=linux]"),
+  );
+  expect(root.map(({ body }) => body).join("")).toContain("overflow: hidden");
+  for (const { selectors, body } of linuxRules) {
+    // Only the root itself may be clipped, and never with a fixed height.
+    expect(selectors.every((s) => s === ":root[data-platform=linux]")).toBe(
+      true,
+    );
+    expect(body).not.toMatch(/(^|;)\s*height\s*:/m);
+  }
   const html = css.match(/^html\s*\{([^}]*)\}/ms)?.[1] ?? "";
   const body = css.match(/^body\s*\{([^}]*)\}/ms)?.[1] ?? "";
   expect(html).not.toMatch(/^\s*height\s*:/m);
@@ -111,12 +130,17 @@ test("Linux recorta só a raiz e o placeholder não imita valor digitado", () =>
   expect(body).not.toMatch(/^\s*height\s*:/m);
   expect(body).not.toMatch(/^\s*overflow\s*:/m);
 
-  const placeholder =
-    css.match(
-      /input::placeholder,\s*textarea::placeholder\s*\{([^}]*)\}/s,
-    )?.[1] ?? "";
-  expect(placeholder).toContain(
-    "color: color-mix(in srgb, var(--text) 65%, var(--field))",
+  // The colour that wins the cascade is the last placeholder declaration.
+  const colours = rules
+    .filter(({ selectors }) =>
+      selectors.some((s) => s.endsWith("::placeholder")),
+    )
+    .flatMap(({ body }) => [
+      ...body.matchAll(/(?:^|;)\s*color\s*:\s*([^;]+)/gm),
+    ])
+    .map(([, value]) => value.trim());
+  expect(colours.at(-1)).toBe(
+    "color-mix(in srgb, var(--text) 70%, var(--field))",
   );
   const omarchy = readFileSync(
     new URL("./omarchy.css", import.meta.url),

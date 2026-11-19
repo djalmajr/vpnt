@@ -216,11 +216,12 @@ input {
   padding: 0 var(--control-x);
   font-size: var(--font-control);
 }
-/* A placeholder is a hint, not a value: keep it visibly lighter than typed
-   text on every theme. */
+/* A placeholder is a hint, not a value: it has less contrast with the field
+   than typed text on every theme. 70% keeps it at 4.5:1 or more on the field
+   with the default and Omarchy palettes. Shared by every host. */
 input::placeholder,
 textarea::placeholder {
-  color: color-mix(in srgb, var(--text) 65%, var(--field));
+  color: color-mix(in srgb, var(--text) 70%, var(--field));
 }
 .panel {
   display: flex;
