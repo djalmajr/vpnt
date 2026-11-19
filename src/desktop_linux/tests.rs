@@ -902,7 +902,8 @@ fn failed_placement_fixes_the_requested_height() {
         |_| Err("hyprctl failed".into()),
         |placed, height, _, opening| replies.borrow_mut().push((placed, height, opening)),
     );
-    assert_eq!(replies.take(), [(current, 1000, false)]);
+    // Without a placed frame the monitor is unknown: the old ceiling holds.
+    assert_eq!(replies.take(), [(current, 720, false)]);
     let window = SizeRecorder::new(true, true);
     let mut anchor = None;
     super::apply_placed(&window, current, current, 1000, &mut anchor, None);
@@ -919,7 +920,7 @@ fn visible_resize_without_a_positioner_sizes_gtk_directly() {
     );
     assert_eq!(
         unsupported.take(),
-        [SizeOp::SetHeight(1000), SizeOp::Fix(1000)]
+        [SizeOp::SetHeight(720), SizeOp::Fix(720)]
     );
     let refused = SizeRecorder::new(true, false);
     super::resize_visible(

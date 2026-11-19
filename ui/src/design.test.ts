@@ -106,6 +106,13 @@ test("cabeçalho fica fixo no topo da superfície rolável em todos os hosts", (
   expect(header).toMatch(/background:\s*var\(--surface\)/);
   expect(header).toMatch(/z-index:\s*1/);
   expect(css).toMatch(/\.panel-content\s*\{[^}]*overflow:\s*auto/s);
+  // Keyboard focus scrolls a control below the sticky header, not under it.
+  const content =
+    css
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .match(/\.panel-content\s*\{([^}]*)\}/s)?.[1] ?? "";
+  expect(content).toMatch(/scroll-padding-top:\s*var\(--control-height\)\s*;/);
+  expect(header).toMatch(/(?:^|;)\s*height:\s*var\(--control-height\)\s*;/m);
 });
 
 // A body-level clip cuts the menu portal; a placeholder that matches the value

@@ -254,6 +254,15 @@ pub(super) fn frame(anchor: Anchor, monitors: &[Monitor], requested: u32) -> Opt
     frame_with_gap(anchor, monitors, requested, None)
 }
 
+/// Without monitor geometry the available height is unknown, so the panel
+/// keeps the ceiling it had before it could grow to the screen.
+pub(super) const UNPLACED_MAX_HEIGHT: u32 = 720;
+
+/// Height used when no placement bounds the request by the monitor.
+pub(super) fn unplaced_height(requested: u32) -> u32 {
+    requested.clamp(180, UNPLACED_MAX_HEIGHT)
+}
+
 pub(super) fn frame_with_gap(
     anchor: Anchor,
     monitors: &[Monitor],
@@ -502,10 +511,10 @@ pub(super) fn worker_loop(
         }
         let height = match process(request) {
             Ok(Some(height)) => height,
-            Ok(None) => request.requested.max(180),
+            Ok(None) => unplaced_height(request.requested),
             Err(error) => {
                 eprintln!("Could not place popover: {error}");
-                request.requested.max(180)
+                unplaced_height(request.requested)
             }
         };
         if is_current(generation, request.generation) {

@@ -20,8 +20,11 @@ com piso em `panel-min-height` (480 px) e sem teto de 720; o host limita só pel
 piso de 180 px e pela altura disponível calculada em `frame_with_gap` (altura do
 monitor menos áreas reservadas, margem e gap). A reserva temporária do menu
 continua valendo. Quando o conteúdo passa da altura disponível, só o miolo rola:
-o cabeçalho é sticky e o rodapé fica fora da superfície rolável em todos os
-hosts. No macOS nada muda: o teto de 720 px continua.
+o cabeçalho é sticky (com `scroll-padding-top` da altura do cabeçalho, para o
+foco por teclado não parar sob ele) e o rodapé fica fora da superfície rolável
+em todos os hosts. Sem geometria do monitor (posicionador ausente ou com falha),
+o host não sabe a altura disponível e mantém o teto de 720 px
+(`placement::unplaced_height`). No macOS nada muda: o teto de 720 px continua.
 
 ## Mapa de cores
 
