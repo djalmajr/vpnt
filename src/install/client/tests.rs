@@ -1,7 +1,7 @@
 use super::*;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -40,6 +40,61 @@ fn until(mut check: impl FnMut() -> bool) {
     let end = Instant::now() + Duration::from_secs(15);
     while !check() {
         assert!(Instant::now() < end, "condition timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+// Fixture-only guard: slow runners must not turn a setup wait into an
+// unbounded hang, and a failure must name the step that stalled.
+fn until_step(case: &str, label: &str, mut check: impl FnMut() -> bool) {
+    let started = Instant::now();
+    let end = started + Duration::from_secs(15);
+    while !check() {
+        assert!(
+            Instant::now() < end,
+            "condition timed out: {case}/{label} after {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+// After the child is reaped, publication has no fixture startup to wait for:
+// keep the 15 s limit of the base test so a hidden completion is still caught.
+fn until_finished(case: &str, mut check: impl FnMut() -> bool) {
+    let started = Instant::now();
+    let end = started + Duration::from_secs(15);
+    while !check() {
+        assert!(
+            Instant::now() < end,
+            "condition timed out: {case}/finished after {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+// The setup guard must explain itself: a stalled fixture is not evidence
+// about the product, so include everything the test can still observe.
+fn wait_for_marker(case: &str, path: &Path, op: &mut Operation, root: &Path) {
+    let started = Instant::now();
+    while !path.exists() {
+        if started.elapsed() >= Duration::from_secs(15) {
+            let result = op.poll();
+            let mut files = fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            files.sort();
+            let stderr = fs::read_to_string(root.join("child.stderr")).unwrap_or_default();
+            panic!(
+                "condition timed out: {case}/waiting after {:?}: result={result:?} finished={} prepared={} files={files:?} stderr={stderr:?}",
+                started.elapsed(),
+                op.finished(),
+                op.prepared()
+            );
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -284,14 +339,22 @@ fn component_launches_have_fixed_programs_arguments_and_no_shell_or_saved_state_
 #[test]
 fn removal_reply_wait_keeps_the_absolute_deadline_and_cancellation() {
     for cancel in [false, true] {
+        let case = if cancel { "cancel" } else { "deadline" };
         let f = Fixture::new();
         let mut command = f.command(
             r#"import json,pathlib,socket,sys,time
 p=pathlib.Path(sys.argv[1]);s=socket.socket(fileno=0)
+sys.stderr=open(p/'child.stderr','w')
 s.sendall((json.dumps(dict(type='ready',format=1,version=sys.argv[2]))+'\n').encode())
 r=json.loads(s.makefile('rb').read())
 (p/'waiting').touch()
-time.sleep(1)
+# The reply is owned by the fixture, not by the test's result: it is sent
+# as soon as the test writes 'done' after observing the result. A worker
+# that extends or ignores the deadline therefore still receives it and is
+# refused by the assertions below. The cap is only a fixture guard.
+deadline=time.monotonic()+60
+while not (p/'done').exists() and time.monotonic()<deadline:time.sleep(0.005)
+if not (p/'done').exists(): raise SystemExit(0)
 try:
  s.sendall((json.dumps(dict(type='removed',id=r['id'],component_present=False))+'\n').encode())
 except BrokenPipeError:
@@ -300,25 +363,52 @@ s.close()
 "#,
         );
         command.arg(env!("CARGO_PKG_VERSION"));
+        // Property: Expired must be published at 24 s, before the reply that
+        // is released just after the result is observed. 18 s lost a run here
+        // (child still starting when the worker closed its socket), so 24 s
+        // adds 6 s of setup margin. The 3.5 s ceiling is the shared readiness
+        // limit: correct with a supported 3 s pause publishes by 27 s, leaving
+        // 0.5 s; a 3 s drift is accepted, while 4 s or more is refused. A
+        // worker extended by 10 s or 600 s has no result inside the window;
+        // one that reads late publishes a Removed receipt, refused below.
+        // The 60 s cap is only a fixture guard.
+        let expires = Instant::now() + Duration::from_secs(24);
         let mut op = Operation::fixture(
             Kind::Remove,
             command,
             "bounded-removal".into(),
             Locale::EnUs,
-            Instant::now() + Duration::from_millis(700),
+            expires,
         )
         .unwrap();
-        until(|| op.prepared());
+        until_step(case, "prepared", || op.prepared());
         op.proceed();
-        until(|| f.root.join("waiting").exists());
+        wait_for_marker(case, &f.root.join("waiting"), &mut op, &f.root);
         if cancel {
             op.close();
         }
+        let floor = if cancel { Instant::now() } else { expires };
+        let ceiling = floor + Duration::from_millis(3500);
         let mut result = None;
-        until(|| {
-            result = op.poll();
-            result.is_some()
-        });
+        while result.is_none() {
+            if let Some(observed) = op.poll() {
+                assert!(
+                    Instant::now() >= floor,
+                    "{case}: deadline violated: {observed:?} published before the floor at {:?} (now {:?})",
+                    floor,
+                    Instant::now()
+                );
+                result = Some(observed);
+                break;
+            }
+            assert!(
+                Instant::now() < ceiling,
+                "{case}: deadline ignored: no result by {:?} (floor {:?})",
+                ceiling,
+                floor
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             result,
             Some(Err(if cancel {
@@ -331,7 +421,9 @@ s.close()
             !op.finished(),
             "a live child must retain exclusion after an error"
         );
-        until(|| op.finished());
+        // The child is no longer needed: release its reply and let it exit.
+        fs::write(f.root.join("done"), b"").unwrap();
+        until_finished(case, || op.finished());
         assert!(op.poll().is_none(), "a late reply cannot publish success");
     }
 }
