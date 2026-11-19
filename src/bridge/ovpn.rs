@@ -183,6 +183,31 @@ mod tests {
     }
 
     #[test]
+    fn a_dylib_module_reaches_the_provider() {
+        static LIST: AtomicBool = AtomicBool::new(false);
+        let reply = certificates_reply_with(
+            "dylib",
+            "/fixture/token.dylib",
+            Duration::from_secs(1),
+            &LIST,
+            |module| {
+                assert_eq!(module, Path::new("/fixture/token.dylib"));
+                Ok(vec![CertificateInfo {
+                    id: vec![0xd1],
+                    subject: None,
+                    issuer: None,
+                    not_before: None,
+                    not_after: None,
+                }])
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            serde_json::json!({"id":"dylib", "certificates":[{"id":"d1"}]})
+        );
+    }
+
+    #[test]
     fn untrusted_module_has_a_distinct_bridge_error() {
         static LISTING_TEST: AtomicBool = AtomicBool::new(false);
         let result = certificates_reply_with(

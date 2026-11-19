@@ -303,7 +303,8 @@ fn certificate_listing_validates_paths_and_reports_missing_module() {
     for module in [
         "relative/token.so",
         "/path/../token.so",
-        "/path/token.dylib",
+        "/path/token.dll",
+        "/path/token.so.1",
         "/path/token\n.so",
         &format!("/{}.so", "x".repeat(4093)),
     ] {
