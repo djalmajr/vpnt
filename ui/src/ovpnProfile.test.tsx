@@ -263,6 +263,8 @@ test("A new OVPN profile starts with an empty module and opens Advanced, and sta
   }
 
   await enterModule(tokenModule);
+  expect(advanced.hasAttribute("open")).toBe(true);
+  expect(field("PKCS#11 module").value).toBe(tokenModule);
   expect(button("List certificates").disabled).toBe(false);
   expect(button("Save").disabled).toBe(true);
   await click(button("List certificates"));

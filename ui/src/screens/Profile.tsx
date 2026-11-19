@@ -81,6 +81,9 @@ export function Profile({
   const isOvpn = value.kind === "ovpn";
   const ovpn = value.ovpn ?? blankOvpn();
   const moduleValid = validModule(ovpn.module);
+  // Open Advanced once when the module still needs to be entered; after that
+  // the person controls it, so completing a valid path does not hide the field.
+  const [advancedOpen, setAdvancedOpen] = useState(!moduleValid);
   const requiresImport = !vpn || initial.kind !== "ovpn";
   const domains =
     value.kind === "ssl" || isOvpn
@@ -439,7 +442,10 @@ export function Profile({
                 ))}
               </Group>
             )}
-            <details open={!moduleValid}>
+            <details
+              open={advancedOpen}
+              onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+            >
               <summary>{t("ovpnAdvanced")}</summary>
               <Group>
                 <label className="field">
