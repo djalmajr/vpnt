@@ -102,12 +102,12 @@ fn install_repeat_and_remove_preserve_profiles_and_the_controller_lock_inode() {
         .activate()
         .expect("a verified payload must be applied by the executor");
     assert_eq!(result.users, vec![601]);
-    assert_eq!(result.files, 9);
+    assert_eq!(result.files, 10);
     assert!(!result.cleanup_pending);
     let helper = f.executor.tree.resolve("adapters/helper").unwrap();
     let helper_inode = fs::metadata(&helper).unwrap().ino();
     let policy_inode = fs::metadata(f.policy(601)).unwrap().ino();
-    assert_eq!(f.activate().unwrap().files, 9);
+    assert_eq!(f.activate().unwrap().files, 10);
     assert_eq!(fs::metadata(&helper).unwrap().ino(), helper_inode);
     assert_eq!(fs::metadata(f.policy(601)).unwrap().ino(), policy_inode);
     let removed = f.executor.remove(601).unwrap();

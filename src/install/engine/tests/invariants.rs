@@ -294,7 +294,7 @@ fn a_sticky_public_tools_directory_traverses_install_update_rollback_and_remove_
     f.executor.fault = None;
 
     // Install through the real executor, not a mask check.
-    assert_eq!(f.activate().unwrap().files, 9);
+    assert_eq!(f.activate().unwrap().files, 10);
     assert_eq!(mode(), 0o1755);
     Receipt::load(&f.executor.tree)
         .unwrap()

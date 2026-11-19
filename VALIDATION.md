@@ -2054,7 +2054,19 @@ foi criado nesta máquina.
 ```bash
 python3 scripts/macos/build-runtime.py
 python3 scripts/macos/build-runtime.py --verify-only
+python3 scripts/macos/check-openvpn-runtime.py
 ```
+
+O runtime inclui OpenVPN 2.7.9, sem plugins, PKCS#11 e DCO, com management
+habilitado. O SHA-256 da fonte é `c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1`;
+foi comparado ao checksum publicado no release com
+`curl -fsSL https://api.github.com/repos/OpenVPN/openvpn/releases/tags/v2.7.9`
+e `shasum -a 256 target/runtime-sources/openvpn-2.7.9.tar.gz`. Inclui LZO
+2.10 e LZ4 1.11.1 estáticos: builds sem ambos recusaram `comp-lzo`,
+`comp-lzo no`, `compress` e `compress lz4-v2`, enquanto `compress stub-v2`
+chegou ao hold; com ambos, os cinco chegaram ao hold. O oráculo usa fixture
+genérica e socket Unix, verifica versão e recursos e termina antes de abrir
+um túnel ou usar rede real. Ele não prova uma conexão VPN.
 
 O build fica em `target/`, incluindo pkgconf/autoconf/automake locais e fontes verificadas por
 SHA-256. O strongSwan é compilado com os plugins necessários incorporados; seu

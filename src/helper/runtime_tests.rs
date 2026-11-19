@@ -144,3 +144,59 @@ fn cached_runtime_still_rejects_permissions_inventory_symlinks_and_missing_files
         assert!(fixture.0.verify_unchanged().is_err(), "{change}");
     }
 }
+
+#[test]
+fn inspect_rejects_openvpn_identity_and_binary_mutations() {
+    let fixture = Fixture::new();
+    let directory = &fixture.0.directory;
+    let binary = directory.join("bin/openvpn");
+    fs::copy(directory.join("bin/charon"), &binary).unwrap();
+    let mut files = serde_json::Map::new();
+    for name in [
+        "bin/charon",
+        "bin/openfortivpn",
+        "bin/openvpn",
+        "certs/ca-bundle.pem",
+    ] {
+        files.insert(
+            name.into(),
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(directory.join(name)).unwrap())
+            )
+            .into(),
+        );
+    }
+    let data = serde_json::json!({"format":1,"appVersion":env!("CARGO_PKG_VERSION"),"prefix":paths::runtime_directory(),"minimumMacOS":"13.0",
+            "strongswan":{"version":"6.1.0","source":"https://download.strongswan.org/strongswan-6.1.0.tar.bz2","sha256":"fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4","backend":"kernel-libipsec","pidDirectory":paths::runtime_directory().join("run"),"patches":{"charon-private-pid.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/charon-private-pid.patch"))),"strongswan-utun-framing.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-utun-framing.patch"))),"strongswan-libipsec-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-libipsec-no-routes.patch"))),"charon-parent-eof.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/charon-parent-eof.patch"))),"strongswan-retain-utun.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-retain-utun.patch"))),"strongswan-protected-udp.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/strongswan-protected-udp.patch")))}},
+            "openfortivpn":{"version":"1.24.1","source":"https://github.com/adrienverge/openfortivpn/archive/refs/tags/v1.24.1.tar.gz","sha256":"c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465","patches":{"openfortivpn-no-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-no-routes.patch"))),"openfortivpn-bound-transport.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-bound-transport.patch"))),"openfortivpn-ppp-supervisor.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-ppp-supervisor.patch"))),"openfortivpn-split-routes.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-split-routes.patch"))),"openfortivpn-split-dns.patch":format!("{:x}",Sha256::digest(include_bytes!("../../scripts/macos/patches/openfortivpn-split-dns.patch")))}},
+            "openvpn":{"version":"2.7.9","source":"https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz","sha256":"c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1"},"files":files});
+    let path = directory.join("manifest.json");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(Runtime::inspect(directory, fixture.0.owner).is_ok());
+    for key in ["version", "source", "sha256", "file"] {
+        let mut altered = data.clone();
+        if key == "file" {
+            altered["files"]["bin/openvpn"] = "0".repeat(64).into();
+        } else {
+            altered["openvpn"][key] = "wrong".into();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            Runtime::inspect(directory, fixture.0.owner).is_err(),
+            "{key}"
+        );
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(Runtime::inspect(directory, fixture.0.owner).is_ok());
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&binary, b"replaced").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(Runtime::inspect(directory, fixture.0.owner).is_err());
+}

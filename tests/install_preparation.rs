@@ -21,7 +21,7 @@ fn preparation_is_repeatable_parses_its_own_policy_and_refuses_to_replace_a_corr
     assert_eq!(result["uid"], repository.uid());
     assert_eq!(result["activationAvailable"], true);
     assert_eq!(result["visudoParsed"], true);
-    assert_eq!(result["files"], 10);
+    assert_eq!(result["files"], 11);
     let second = repository.run();
     assert!(
         second.status.success(),

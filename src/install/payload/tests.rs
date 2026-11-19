@@ -83,7 +83,7 @@ fn admitted_payload_identifies_the_recipient_and_the_entire_verified_build() {
     assert_eq!(summary.uid, 601);
     assert_eq!(summary.app_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(summary.minimum_macos, "13.0");
-    assert_eq!(summary.files, 10);
+    assert_eq!(summary.files, 11);
     assert!(valid_hash(&summary.id));
     assert_eq!(
         summary.id,

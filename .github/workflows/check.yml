@@ -222,8 +222,10 @@ jobs:
           persist-credentials: false
       - name: Install runtime fixture prerequisites
         run: brew install openssl@4 m4
-      - name: Build the pinned strongSwan and openfortivpn runtime without elevation
+      - name: Build the pinned strongSwan, openfortivpn and OpenVPN runtime without elevation
         run: python3 scripts/macos/build-runtime.py --jobs 2
+      - name: Verify the OpenVPN management boundary without a tunnel
+        run: python3 scripts/macos/check-openvpn-runtime.py
       - name: Verify permanent original-TU handoff fixture
         run: python3 scripts/macos/check-utun-handoff.py
       - name: Verify permanent original-TU protected UDP fixture

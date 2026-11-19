@@ -42,7 +42,47 @@ struct Manifest {
     minimum_macos: String,
     strongswan: Swan,
     openfortivpn: Forti,
+    openvpn: Option<Openvpn>,
     files: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Openvpn {
+    version: String,
+    source: String,
+    sha256: String,
+}
+
+fn valid_openvpn(value: Option<&Openvpn>) -> bool {
+    value.is_some_and(|value| {
+        value.version == "2.7.9"
+            && value.source == "https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz"
+            && value.sha256 == "c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1"
+    })
+}
+
+#[cfg(test)]
+mod openvpn_identity_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_missing_and_altered_identity() {
+        let mut value = Openvpn {
+            version: "2.7.9".into(),
+            source:
+                "https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz"
+                    .into(),
+            sha256: "c42a6ed892ddfe2d6e3317a5040f19bec5827564affb2fe3f2b3904a94daacb1".into(),
+        };
+        assert!(valid_openvpn(Some(&value)));
+        assert!(!valid_openvpn(None));
+        value.version = "2.7.8".into();
+        assert!(!valid_openvpn(Some(&value)));
+        value.version = "2.7.9".into();
+        value.sha256 = "0".repeat(64);
+        assert!(!valid_openvpn(Some(&value)));
+    }
 }
 
 #[derive(Deserialize)]
@@ -165,6 +205,7 @@ impl Runtime {
             || manifest.strongswan.backend != "kernel-libipsec"
             || manifest.strongswan.patches != swan_patches()
             || manifest.openfortivpn.version != "1.24.1"
+            || !valid_openvpn(manifest.openvpn.as_ref())
             || manifest.openfortivpn.sha256
                 != "c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465"
             || manifest.openfortivpn.patches
@@ -219,6 +260,7 @@ impl Runtime {
             || !valid_version(&manifest.minimum_macos)
             || !manifest.files.contains_key("bin/charon")
             || !manifest.files.contains_key("bin/openfortivpn")
+            || !manifest.files.contains_key("bin/openvpn")
             || !manifest.files.contains_key("certs/ca-bundle.pem")
         {
             return Err(RuntimeError::InvalidManifest);
@@ -306,7 +348,10 @@ impl Runtime {
             {
                 return Err(RuntimeError::InvalidManifest);
             }
-            let executable = matches!(name.as_str(), "bin/charon" | "bin/openfortivpn");
+            let executable = matches!(
+                name.as_str(),
+                "bin/charon" | "bin/openfortivpn" | "bin/openvpn"
+            );
             let bytes = read_file(&self.directory.join(name), self.owner, executable, MAX_FILE)?;
             if format!("{:x}", Sha256::digest(&bytes)) != *hash {
                 return Err(RuntimeError::Integrity);
@@ -354,7 +399,10 @@ impl Runtime {
         actual
             .into_iter()
             .map(|name| {
-                let executable = matches!(name.as_str(), "bin/charon" | "bin/openfortivpn");
+                let executable = matches!(
+                    name.as_str(),
+                    "bin/charon" | "bin/openfortivpn" | "bin/openvpn"
+                );
                 let path = self.directory.join(&name);
                 let (_, meta) = open_file(&path, self.owner, executable, MAX_FILE)?;
                 let named = fs::symlink_metadata(&path).map_err(map_io)?;
@@ -381,7 +429,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
         })
         && (matches!(
             name,
-            "bin/charon" | "bin/openfortivpn" | "certs/ca-bundle.pem"
+            "bin/charon" | "bin/openfortivpn" | "bin/openvpn" | "certs/ca-bundle.pem"
         ) || (name.starts_with("lib/") && name.ends_with(".dylib"))
             || (name.starts_with("licenses/") && name.ends_with(".txt")))
 }
