@@ -34,14 +34,32 @@ def no_resume(source):
     start=source.index("    pub fn poll(")
     return source[:start]+replace(source[start:],"            self.resume();\n","")
 
+def diagnostics(log,limit=80):
+    """The failing tests and their panics, for the CI log: the full log stays
+    in REPORTS, which a hosted runner discards when the job ends."""
+    lines=log.decode("utf-8","replace").splitlines()
+    keep=[]
+    covered=0
+    for index,line in enumerate(lines):
+        if " ... FAILED" in line or "panicked at" in line or "(fail)" in line or line.startswith(("error:","error[")):
+            # Each marker brings its next lines; overlapping windows are not repeated.
+            keep.extend(lines[max(index,covered):index+6])
+            covered=max(covered,index+6)
+    return "\n".join((keep or lines[-30:])[:limit])
+
+def report_unexpected(label,log):
+    print(f"{label}: unexpected result; failing tests and panics:\n{diagnostics(log)}",file=sys.stderr,flush=True)
+
 def run_ui(copy,label,failed=None):
     command=["bun","test","src/commandFlow.test.ts"]
     result=subprocess.run(command,cwd=copy/"ui",capture_output=True,timeout=30)
     log=result.stdout+result.stderr
     (REPORTS/(label+".log")).write_bytes(log)
     if result.returncode!=(1 if failed else 0):
+        report_unexpected(label,log)
         raise RuntimeError(f"{label}: unexpected exit {result.returncode}")
     if failed and (f"(fail) {failed}".encode() not in log or b"error: expect" not in log):
+        report_unexpected(label,log)
         raise RuntimeError(f"{label}: expected executed UI assertion, not build/timeout failure")
     print(f"{label}: exit {result.returncode}",flush=True)
     return {"exit":result.returncode,"command":command,"assertion":failed}
@@ -53,8 +71,10 @@ def run(copy,label,filter,failed=None,desktop=False):
     (REPORTS/(label+".log")).write_bytes(log)
     expected=101 if failed else 0
     if result.returncode!=expected:
+        report_unexpected(label,log)
         raise RuntimeError(f"{label}: expected {expected}, got {result.returncode}")
     if failed and (f"test {failed} ... FAILED".encode() not in log or b"panicked at" not in log or b"test result: FAILED." not in log):
+        report_unexpected(label,log)
         raise RuntimeError(f"{label}: expected executed assertion, not compilation/unrelated failure")
     print(f"{label}: exit {result.returncode}",flush=True)
     return {"exit":result.returncode,"command":command,"assertion":failed}
