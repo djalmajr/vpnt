@@ -111,7 +111,9 @@ test("cabeçalho fica fixo no topo da superfície rolável em todos os hosts", (
     css
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .match(/\.panel-content\s*\{([^}]*)\}/s)?.[1] ?? "";
-  expect(content).toMatch(/scroll-padding-top:\s*var\(--control-height\)\s*;/);
+  expect(content).toMatch(
+    /scroll-padding-top:\s*calc\(var\(--control-height\) \+ var\(--space-sm\)\)\s*;/,
+  );
   expect(header).toMatch(/(?:^|;)\s*height:\s*var\(--control-height\)\s*;/m);
 });
 

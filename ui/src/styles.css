@@ -253,8 +253,9 @@ textarea::placeholder {
   min-height: 0;
   overflow: auto;
   /* The sticky header covers the top of the scroll area; keyboard focus must
-     scroll a control below it, not under it. */
-  scroll-padding-top: var(--control-height);
+     scroll a control below it, not under it. WebKit's focus path stops a few
+     pixels short of the padding, so the layout gap is added on top. */
+  scroll-padding-top: calc(var(--control-height) + var(--space-sm));
 }
 .panel-content > * {
   flex-shrink: 0;
