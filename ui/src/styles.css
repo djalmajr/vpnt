@@ -121,6 +121,11 @@ html {
 body {
   margin: 0;
 }
+/* On Linux only .panel-content scrolls, and the root shows no scrollbar of its
+   own. The window bounds the panel; html and body stay in natural flow. */
+:root[data-platform="linux"] {
+  overflow: hidden;
+}
 button,
 input,
 select,
@@ -210,6 +215,13 @@ input {
   height: var(--control-height);
   padding: 0 var(--control-x);
   font-size: var(--font-control);
+}
+/* A placeholder is a hint, not a value: it has less contrast with the field
+   than typed text on every theme. 70% keeps it at 4.5:1 or more on the field
+   with the default and Omarchy palettes. Shared by every host. */
+input::placeholder,
+textarea::placeholder {
+  color: color-mix(in srgb, var(--text) 70%, var(--field));
 }
 .panel {
   display: flex;

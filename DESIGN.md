@@ -279,9 +279,13 @@ Raios de 4, 6, 10, 12 e 13 px, conforme os tokens. O popover externo usa 13 px
 referência ai-usagebar; cartões e menus usam 10 px; o diálogo continua em 12 px
 (`rounded.panel`); controles e linhas de menu, 6 px. O recorte externo é do host
 nativo: a janela é transparente e a camada AppKit é recortada em 13 pt contínuos,
-então no CSS basta o raio do próprio painel sobre a raiz transparente — não há
-`height: 100%`/`overflow: hidden` em `html`/`body`, que cortaria o portal do menu
-no `body`. Por indicação do Djalma em 2026-11-13, os interruptores são mais
+então no CSS basta o raio do próprio painel sobre a raiz transparente.
+No macOS não há `height: 100%`/`overflow: hidden` em `html`/`body`, que
+cortaria o portal do menu no `body`. No Linux, a raiz aplica `overflow: hidden`
+como única exceção de layout, registrada em
+[design/linux-omarchy.md](design/linux-omarchy.md#exceção-de-layout-no-linux);
+o macOS mantém a regra original. Por indicação do Djalma em 2026-11-13, os
+interruptores são mais
 retangulares: usam borda de 1 px com `separator`, como os inputs, mas raio
 externo de 3 px, calculado como `rounded.sm` menos a espessura da borda.
 O botão interno acompanha o contorno com raio de 1 px, calculado descontando

@@ -94,3 +94,62 @@ test("rodapé reserva espaço fora da superfície rolável e usa texto pequeno",
   expect(block(".footer")).toContain("flex-shrink: 0");
   expect(block(".footer > small")).toContain("font-size: var(--font-control)");
 });
+
+// A body-level clip cuts the menu portal; a placeholder that matches the value
+// makes an empty field look filled (reported twice in the Omarchy app).
+test("Linux recorta só a raiz e o placeholder não imita valor digitado", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  // Every rule, with comments removed and the attribute quotes normalized so
+  // [data-platform=linux] and [data-platform="linux"] compare equal.
+  const rules = [
+    ...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g),
+  ].map(([, selector, body]) => ({
+    selectors: selector
+      .split(",")
+      .map((part) => part.trim().replace(/=(["'])([^"']*)\1\]/g, "=$2]")),
+    body,
+  }));
+  const linuxRules = rules.filter(({ selectors }) =>
+    selectors.some((selector) => selector.includes("[data-platform=linux]")),
+  );
+  const root = linuxRules.filter(({ selectors }) =>
+    selectors.includes(":root[data-platform=linux]"),
+  );
+  expect(root.map(({ body }) => body).join("")).toContain("overflow: hidden");
+  for (const { selectors, body } of linuxRules) {
+    // Only the root itself may be clipped, and never with a fixed height.
+    expect(selectors.every((s) => s === ":root[data-platform=linux]")).toBe(
+      true,
+    );
+    expect(body).not.toMatch(/(^|;)\s*height\s*:/m);
+  }
+  const html = css.match(/^html\s*\{([^}]*)\}/ms)?.[1] ?? "";
+  const body = css.match(/^body\s*\{([^}]*)\}/ms)?.[1] ?? "";
+  expect(html).not.toMatch(/^\s*height\s*:/m);
+  expect(html).not.toMatch(/^\s*overflow\s*:/m);
+  expect(body).not.toMatch(/^\s*height\s*:/m);
+  expect(body).not.toMatch(/^\s*overflow\s*:/m);
+
+  // The placeholder colour lives in exactly one rule: any other rule that
+  // styles a placeholder (qualified, per field or later in the cascade) could
+  // make an empty field look filled again.
+  const placeholderRules = rules.filter(({ selectors }) =>
+    selectors.some((s) => s.includes("::placeholder")),
+  );
+  expect(placeholderRules).toHaveLength(1);
+  const [placeholder] = placeholderRules;
+  expect(placeholder?.selectors).toEqual([
+    "input::placeholder",
+    "textarea::placeholder",
+  ]);
+  // The block holds this one declaration and nothing else, so no later
+  // declaration in the same block can override it.
+  expect(placeholder?.body.replace(/\s+/g, " ").trim()).toBe(
+    "color: color-mix(in srgb, var(--text) 70%, var(--field));",
+  );
+  const omarchy = readFileSync(
+    new URL("./omarchy.css", import.meta.url),
+    "utf8",
+  );
+  expect(omarchy).not.toMatch(/::placeholder/);
+});

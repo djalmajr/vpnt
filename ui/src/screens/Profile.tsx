@@ -29,6 +29,7 @@ import {
   type RegisterNavigationGuard,
   type Run,
 } from "../navigation";
+import { isLinuxPlatform } from "../platform";
 import { blankOvpn, blankProfile } from "../profileDefaults";
 import { hasShellExpression } from "../shellExpression";
 
@@ -55,6 +56,7 @@ export function Profile({
   secrets: () => void;
   remove: () => void;
 }) {
+  const linux = isLinuxPlatform();
   const [initial] = useState(
     () => vpn?.profile ?? blankProfile(kind ?? "ipsec"),
   );
@@ -548,9 +550,20 @@ export function Profile({
             </Group>
           </>
         )}
-        <p className="hint" role="status">
-          {t(saving ? "adminPending" : "saveRequiresAdmin")}
-        </p>
+        {/* Only macOS asks for an administrator password; Linux writes the
+            profile as the logged-in user. Linux is silent while idle and
+            shows the plain pending text only while saving. */}
+        {(!linux || saving) && (
+          <p className="hint" role="status">
+            {t(
+              linux
+                ? "savePending"
+                : saving
+                  ? "adminPending"
+                  : "saveRequiresAdmin",
+            )}
+          </p>
+        )}
         <div className="spread">
           {vpn ? (
             <button

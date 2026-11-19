@@ -1,6 +1,16 @@
 # Variante Linux Omarchy
 
-Aplica-se somente quando o shell define `data-desktop="omarchy"` em `<html>`; `data-omarchy-mode` escolhe os fallbacks claro ou escuro e o esquema nativo. As propriedades do shell são consumidas por `var()`, portanto alterações ao vivo propagam sem recarga. Outros desktops conservam o contrato existente.
+O tema aplica-se somente quando o shell define `data-desktop="omarchy"` em `<html>`; `data-omarchy-mode` escolhe os fallbacks claro ou escuro e o esquema nativo. As propriedades do shell são consumidas por `var()`, portanto alterações ao vivo propagam sem recarga. Outros desktops conservam o contrato existente. A exceção de layout abaixo é independente do tema.
+
+## Exceção de layout no Linux
+
+Vale para **todo** shell com `data-platform="linux"`, com ou sem `data-desktop="omarchy"`; este último continua regendo só as cores e a geometria do tema. Em 2026-11-19, o app real no Omarchy mostrou uma segunda barra de rolagem na janela, além da rolagem de navegação em `.panel-content`. O recorte adotado é só:
+
+```css
+:root[data-platform="linux"] { overflow: hidden; }
+```
+
+Sem `height: 100%` e sem regra no `body`: `html` e `body` permanecem em fluxo natural. A navegação rola em `.panel-content`, acima do rodapé, que não faz parte da superfície rolável. Os portais do menu Options e da dica acessível moram no `body` e usam `position: fixed` (Radix Popper com `strategy: "fixed"` e `help-tooltip`), então não dependem de um contexto de rolagem na raiz; o limite final é o recorte físico da janela do host. Ao abrir o menu, a janela recebe uma reserva temporária de altura, liberada ao fechar; se faltar altura física, o conteúdo rola em `.panel-content` e o rodapé continua visível. Nenhum token novo entra nesta exceção. A prova nativa com o app instalado continua pendente; veja os passos manuais no relatório da rodada.
 
 ## Mapa de cores
 
@@ -41,7 +51,7 @@ Aplica-se somente quando o shell define `data-desktop="omarchy"` em `<html>`; `d
 
 ## Misturas
 
-Separador usa 25% do foreground sobre o fundo do popup; controles normais usam 4%, e hover de controles e menu 8%, para distinguir camadas mantendo a paleta. Aviso, erro e informação usam respectivamente 15% de amarelo, vermelho e azul sobre o fundo do popup, preservando a cor sem competir com o texto. O scrim usa 50% do fundo escuro com transparência. Essas misturas acompanham o tema; se uma propriedade faltar, suas cadeias usam o fallback da tabela.
+Separador usa 25% do foreground sobre o fundo do popup; controles normais usam 4%, e hover de controles e menu 8%, para distinguir camadas mantendo a paleta. Aviso, erro e informação usam respectivamente 15% de amarelo, vermelho e azul sobre o fundo do popup, preservando a cor sem competir com o texto. O scrim usa 50% do fundo escuro com transparência. Essas misturas acompanham o tema; se uma propriedade faltar, suas cadeias usam o fallback da tabela. O `::placeholder` de `input` e `textarea` usa 70% de `--text` sobre `--field`: o exemplo tem contraste menor com o fundo do campo que o valor digitado (mais apagado, não necessariamente mais claro), e fica em 4,5:1 ou mais nas paletas padrão e na do Omarchy de referência, sem trocar `--text` nem `--secondary`. Essa mistura vive em `styles.css` e vale para todos os hosts, inclusive o macOS.
 
 ## Geometria e animação
 
@@ -67,4 +77,4 @@ Esses pares atingem 4,5:1 no tema atual. Outros temas e combinações não foram
 
 ## Contrato preservado
 
-Tipografia, espaçamento interno, dimensões, estados, acessibilidade, conteúdo e comportamento seguem `DESIGN.md`. A exceção específica Omarchy é o mapa de cores e a geometria descritos acima; o visual de macOS e outros Linux não é alterado.
+Tipografia, espaçamento interno, dimensões, estados, acessibilidade, conteúdo e comportamento seguem `DESIGN.md`. A exceção específica Omarchy é o mapa de cores e a geometria descritos acima. O recorte da raiz vale só com `data-platform="linux"`. A cor do `::placeholder` é a única regra compartilhada com o macOS e os outros Linux; fora isso, o visual deles não é alterado.
