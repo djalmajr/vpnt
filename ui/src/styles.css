@@ -121,15 +121,9 @@ html {
 body {
   margin: 0;
 }
-/* The Linux window is fixed and only .panel-content scrolls. WebKitGTK can
-   report a viewport a few pixels taller than the native client area, so the
-   document would otherwise get a second, window-level scrollbar. */
+/* On Linux only .panel-content scrolls, and the root shows no scrollbar of its
+   own. The window bounds the panel; html and body stay in natural flow. */
 :root[data-platform="linux"] {
-  height: 100%;
-  overflow: hidden;
-}
-:root[data-platform="linux"] body {
-  height: 100%;
   overflow: hidden;
 }
 button,
@@ -221,6 +215,12 @@ input {
   height: var(--control-height);
   padding: 0 var(--control-x);
   font-size: var(--font-control);
+}
+/* A placeholder is a hint, not a value: keep it visibly lighter than typed
+   text on every theme. */
+input::placeholder,
+textarea::placeholder {
+  color: color-mix(in srgb, var(--text) 65%, var(--field));
 }
 .panel {
   display: flex;

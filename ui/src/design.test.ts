@@ -94,3 +94,33 @@ test("rodapé reserva espaço fora da superfície rolável e usa texto pequeno",
   expect(block(".footer")).toContain("flex-shrink: 0");
   expect(block(".footer > small")).toContain("font-size: var(--font-control)");
 });
+
+// A body-level clip cuts the menu portal; a placeholder that matches the value
+// makes an empty field look filled (reported twice in the Omarchy app).
+test("Linux recorta só a raiz e o placeholder não imita valor digitado", () => {
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const linux =
+    css.match(/:root\[data-platform="linux"\]\s*\{([^}]*)\}/s)?.[1] ?? "";
+  expect(linux).toContain("overflow: hidden");
+  expect(linux).not.toMatch(/^\s*height\s*:/m);
+  expect(css).not.toMatch(/:root\[data-platform="linux"\]\s+body\s*\{/s);
+  const html = css.match(/^html\s*\{([^}]*)\}/ms)?.[1] ?? "";
+  const body = css.match(/^body\s*\{([^}]*)\}/ms)?.[1] ?? "";
+  expect(html).not.toMatch(/^\s*height\s*:/m);
+  expect(html).not.toMatch(/^\s*overflow\s*:/m);
+  expect(body).not.toMatch(/^\s*height\s*:/m);
+  expect(body).not.toMatch(/^\s*overflow\s*:/m);
+
+  const placeholder =
+    css.match(
+      /input::placeholder,\s*textarea::placeholder\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+  expect(placeholder).toContain(
+    "color: color-mix(in srgb, var(--text) 65%, var(--field))",
+  );
+  const omarchy = readFileSync(
+    new URL("./omarchy.css", import.meta.url),
+    "utf8",
+  );
+  expect(omarchy).not.toMatch(/::placeholder/);
+});

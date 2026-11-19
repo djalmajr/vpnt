@@ -15,9 +15,11 @@
   a posição do menu: só o tamanho da janela é dimensionado, e a reserva é
   liberada ao fechar, navegar ou desmontar. A altura predefinida
   `panel-min-height` é o piso aprovado do painel e não é essa reserva.
-- Não recortar a página inteira (`height: 100%` + `overflow: hidden` em
-  `html`/`body`): o portal do menu vive no `body`, e o recorte final do popover é
-  do host nativo, não do CSS.
+- Não recortar a página inteira no macOS (`height: 100%` + `overflow: hidden`
+  em `html`/`body`): o portal do menu vive no `body`, e o recorte final do
+  popover é do host nativo, não do CSS. No Linux, a única exceção é
+  `:root[data-platform="linux"] { overflow: hidden; }`, registrada em
+  [design/linux-omarchy.md](linux-omarchy.md#exceção-de-layout-no-linux).
 - Não trocar o `select` nativo por dropdown próprio, nem fixar a altura de
   cartões e linhas para igualar controles: só os controles de linha única usam os
   24 px de `control-height`.
