@@ -109,7 +109,9 @@ pub fn list_certificates(module: &Path) -> Result<Vec<CertificateInfo>, TokenErr
     let mut certificates = Vec::new();
     let mut seen = HashSet::new();
     for slot in pkcs11.get_slots_with_token()? {
-        let session = pkcs11.open_ro_session(slot)?;
+        let Some(session) = open_session(&pkcs11, slot)? else {
+            continue;
+        };
         // Finish the find before looking for private keys on the same session.
         let objects = session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])?;
         for object in objects {
@@ -157,6 +159,15 @@ pub fn list_certificates(module: &Path) -> Result<Vec<CertificateInfo>, TokenErr
     Ok(certificates)
 }
 
+fn open_session(pkcs11: &Pkcs11, slot: Slot) -> Result<Option<Session>, TokenError> {
+    match pkcs11.open_ro_session(slot) {
+        Ok(session) => Ok(Some(session)),
+        // A token may be uninitialized or removed between discovery and opening.
+        Err(Error::Pkcs11(RvError::TokenNotRecognized | RvError::TokenNotPresent, _)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn object_result<T>(result: Result<T, Error>) -> Result<Option<T>, TokenError> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -183,7 +194,9 @@ impl TokenKey {
     pub fn open(module: &Path, id: &[u8]) -> Result<Self, TokenError> {
         let pkcs11 = context(module)?;
         for slot in pkcs11.get_slots_with_token()? {
-            let session = pkcs11.open_ro_session(slot)?;
+            let Some(session) = open_session(&pkcs11, slot)? else {
+                continue;
+            };
             if find(&session, ObjectClass::CERTIFICATE, id)?.is_some() {
                 return Ok(Self {
                     pkcs11,
