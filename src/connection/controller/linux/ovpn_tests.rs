@@ -613,7 +613,9 @@ fn sealed_profile_survives_rename_and_link_after_session_start() {
         }
     }
     let scratch = Scratch::new();
-    let original = valid_profile().replace('\n', "\r\n");
+    // Serpro profiles carry the control-channel timers; the child must get them.
+    let profile = format!("{}tls-timeout 2\ntran-window 3600\n", valid_profile());
+    let original = profile.replace('\n', "\r\n");
     let path = scratch.profile(original.as_bytes());
     let config = read_profile(&path, unsafe { libc::geteuid() }).unwrap();
     let program = scratch.0.join("openvpn");
@@ -644,7 +646,7 @@ fn sealed_profile_survives_rename_and_link_after_session_start() {
     session.wait().unwrap();
     assert_eq!(
         fs::read_to_string(observed).unwrap(),
-        format!("/dev/fd/3\n{}", valid_profile())
+        format!("/dev/fd/3\n{profile}")
     );
 }
 
