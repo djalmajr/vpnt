@@ -150,7 +150,10 @@ fn timeout_retains_exclusion_while_the_child_lives_and_never_replays_or_sends_la
         .clone();
     assert_eq!(
         h.broker.begin_admin(
-            Command::SaveProfile { profile },
+            Command::SaveProfile {
+                profile,
+                ovpn_config: None
+            },
             Locale::EnUs,
             Instant::now() + Duration::from_secs(1)
         ),

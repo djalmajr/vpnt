@@ -1,16 +1,20 @@
+#[cfg(test)]
+use crate::bridge::Request;
+pub(super) use crate::desktop_actor::Actor as Worker;
 use crate::{
     app::App,
-    bridge::{Reply, Request},
+    bridge::Reply,
     broker::Broker,
     keychain::MacKeychain,
     model::VpnKind,
     secrets::{Credentials, SecretError, SecretStore},
 };
+#[cfg(test)]
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -34,16 +38,6 @@ impl SecretStore for Keychain {
     fn remove(&self, id: &str, kind: VpnKind) -> Result<(), SecretError> {
         self.store()?.remove(id, kind)
     }
-}
-struct Work {
-    request: Request,
-    expires: Instant,
-}
-pub(super) struct Worker {
-    input: SyncSender<Work>,
-    intent: Arc<AtomicU64>,
-    #[cfg(test)]
-    idle_cycles: Arc<AtomicU64>,
 }
 impl Worker {
     pub fn new(demo: bool, reply: impl Fn(Reply) + Send + 'static) -> Result<Self, std::io::Error> {
@@ -73,183 +67,6 @@ impl Worker {
             },
             reply,
         )
-    }
-    fn spawn<S: SecretStore + 'static>(
-        init: impl FnOnce() -> (Option<App>, Option<Broker<S>>) + Send + 'static,
-        reply: impl Fn(Reply) + Send + 'static,
-    ) -> Result<Self, std::io::Error> {
-        let (input, requests) = mpsc::sync_channel::<Work>(32);
-        let intent = Arc::new(AtomicU64::new(1));
-        let actor_intent = intent.clone();
-        #[cfg(test)]
-        let idle_cycles = Arc::new(AtomicU64::new(0));
-        #[cfg(test)]
-        let actor_idle_cycles = idle_cycles.clone();
-        std::thread::Builder::new()
-            .name("vpnt-application".into())
-            .spawn(move || {
-                let (mut demo, mut normal) = init();
-                let mut administrative = std::collections::BTreeMap::new();
-                loop {
-                    if let Some(normal) = &mut normal {
-                        normal.poll();
-                        if let Some((token, result)) = normal.take_admin_result()
-                            && let Some(id) = administrative.remove(&token)
-                        {
-                            reply(response(id, result));
-                        }
-                        if let Some((token, result)) = normal.take_component_result()
-                            && let Some(id) = administrative.remove(&token)
-                        {
-                            reply(response(id, result));
-                        }
-                    }
-                    let observed_intent = actor_intent.load(Ordering::Acquire);
-                    match requests.recv_timeout(Duration::from_millis(20)) {
-                        Ok(work) => {
-                            if let Some(normal) = &mut normal {
-                                normal.interrupt_automatic(&work.request.command);
-                                if let Some(locale) = work.request.locale {
-                                    normal.set_locale(locale);
-                                }
-                            }
-                            if matches!(
-                                work.request.command,
-                                crate::bridge::Command::GetSnapshot {}
-                            ) && let Some(normal) = &mut normal
-                            {
-                                while normal.starting() && Instant::now() < work.expires {
-                                    normal.poll();
-                                    std::thread::sleep(Duration::from_millis(5));
-                                }
-                            }
-                            let result = if Instant::now() >= work.expires {
-                                Err("backend_unavailable")
-                            } else if let Some(demo) = &mut demo {
-                                demo.dispatch(work.request.command)
-                            } else {
-                                if matches!(
-                                    work.request.command,
-                                    crate::bridge::Command::SaveProfile { .. }
-                                        | crate::bridge::Command::RemoveProfile { .. }
-                                        | crate::bridge::Command::InstallHelper {}
-                                        | crate::bridge::Command::RemoveHelper {}
-                                ) {
-                                    let component = matches!(
-                                        &work.request.command,
-                                        crate::bridge::Command::InstallHelper {}
-                                            | crate::bridge::Command::RemoveHelper {}
-                                    );
-                                    let normal = normal.as_mut().unwrap();
-                                    let locale = work.request.locale.unwrap_or_default();
-                                    let started = if component {
-                                        normal.begin_component(
-                                            work.request.command,
-                                            locale,
-                                            work.expires,
-                                        )
-                                    } else {
-                                        normal.begin_admin(
-                                            work.request.command,
-                                            locale,
-                                            work.expires,
-                                        )
-                                    };
-                                    match started {
-                                        Ok(token) => {
-                                            administrative.insert(token, work.request.id);
-                                        }
-                                        Err(error) => reply(response(work.request.id, Err(error))),
-                                    }
-                                    continue;
-                                }
-                                normal
-                                    .as_mut()
-                                    .unwrap()
-                                    .dispatch(work.request.command, work.expires)
-                            };
-                            reply(response(work.request.id, result));
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some(normal) = &mut normal {
-                                normal.perform_automatic(|| {
-                                    actor_intent.load(Ordering::Acquire) == observed_intent
-                                });
-                            }
-                            #[cfg(test)]
-                            actor_idle_cycles.fetch_add(1, Ordering::Release);
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-            })?;
-        Ok(Self {
-            input,
-            intent,
-            #[cfg(test)]
-            idle_cycles,
-        })
-    }
-    pub fn send(&self, request: Request, received: Instant) -> Result<(), ()> {
-        // A queued manual action interrupts background reconnect before it can
-        // submit credentials after a blocking keychain read. The actor processes
-        // that action before retrying any still-current background work.
-        if matches!(
-            &request.command,
-            crate::bridge::Command::Connect { .. }
-                | crate::bridge::Command::Disconnect { .. }
-                | crate::bridge::Command::Toggle { .. }
-                | crate::bridge::Command::Reconnect { .. }
-                | crate::bridge::Command::DisconnectAll {}
-                | crate::bridge::Command::SaveProfile { .. }
-                | crate::bridge::Command::RemoveProfile { .. }
-                | crate::bridge::Command::SaveSecrets { .. }
-                | crate::bridge::Command::InstallHelper {}
-                | crate::bridge::Command::RemoveHelper {}
-                | crate::bridge::Command::Quit {}
-        ) || matches!(&request.command, crate::bridge::Command::SetPreferences { preferences } if !preferences.reconnect)
-        {
-            self.intent.fetch_add(1, Ordering::AcqRel);
-        }
-        let seconds = if matches!(
-            request.command,
-            crate::bridge::Command::InstallHelper {} | crate::bridge::Command::RemoveHelper {}
-        ) {
-            599
-        } else if matches!(
-            request.command,
-            crate::bridge::Command::Connect { .. }
-                | crate::bridge::Command::Disconnect { .. }
-                | crate::bridge::Command::Toggle { .. }
-                | crate::bridge::Command::Reconnect { .. }
-                | crate::bridge::Command::SaveSecrets { .. }
-                | crate::bridge::Command::SaveProfile { .. }
-                | crate::bridge::Command::RemoveProfile { .. }
-        ) {
-            119
-        } else {
-            9
-        };
-        self.input
-            .try_send(Work {
-                request,
-                expires: received + Duration::from_secs(seconds),
-            })
-            .map_err(|_| ())
-    }
-}
-fn response(id: String, result: Result<crate::model::Snapshot, &'static str>) -> Reply {
-    match result {
-        Ok(snapshot) => Reply {
-            id,
-            snapshot: Some(snapshot),
-            error: None,
-        },
-        Err(error) => Reply {
-            id,
-            snapshot: None,
-            error: Some(error.into()),
-        },
     }
 }
 
@@ -340,12 +157,15 @@ mod tests {
             work.expires.duration_since(received),
             Duration::from_secs(119)
         );
-        let crate::bridge::Command::SaveProfile { profile } = work.request.command else {
+        let crate::bridge::Command::SaveProfile { profile, .. } = work.request.command else {
             panic!("wrong command");
         };
         let request = AdminRequest {
             id: "fixture".into(),
-            command: AdminCommand::SaveProfile { profile },
+            command: AdminCommand::SaveProfile {
+                profile,
+                ovpn_config: None,
+            },
         };
         struct Marker(std::path::PathBuf);
         impl Drop for Marker {

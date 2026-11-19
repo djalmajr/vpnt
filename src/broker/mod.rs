@@ -1,11 +1,28 @@
 //! Normal application state. Only the authenticated helper's current generation
 //! may report a connected tunnel; demo schedules never enter this model.
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "the component flow using the admin busy state is macOS-only"
+    ),
+    allow(
+        clippy::large_enum_variant,
+        reason = "keep the existing shared admin command representation"
+    )
+)]
 mod admin;
 mod automatic;
 mod behavior;
 mod commands;
+#[cfg(target_os = "macos")]
 mod component;
+#[cfg(target_os = "macos")]
 mod diagnostics;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::component;
 mod retry;
 mod snapshot;
 use crate::{
@@ -42,6 +59,11 @@ struct Connection {
     failures: u32,
     policy: behavior::Policy,
 }
+
+fn needs_credentials(kind: VpnKind) -> bool {
+    !cfg!(target_os = "linux") || kind != VpnKind::Ovpn
+}
+
 pub struct Broker<S: SecretStore> {
     client: Option<Client>,
     retry: Option<retry::Retry>,
@@ -56,11 +78,21 @@ pub struct Broker<S: SecretStore> {
     waiting_previous: bool,
     administration: admin::Flow,
     component: component::Flow,
+    #[cfg(target_os = "linux")]
+    netd: Option<linux::NetdProbe>,
+    #[cfg(target_os = "macos")]
     diagnostics: diagnostics::Flow,
     epoch: u64,
     preferences: Preferences,
     notifier: Box<dyn crate::notifications::Notifier>,
     #[cfg(any(test, feature = "desktop"))]
+    #[cfg_attr(
+        target_os = "linux",
+        allow(
+            dead_code,
+            reason = "the Linux desktop actor will consume automatic actions"
+        )
+    )]
     locale: crate::localization::Locale,
     automatic: std::collections::VecDeque<automatic::Action>,
     sent_interval: Option<crate::preferences::ProbeInterval>,
@@ -73,7 +105,7 @@ pub struct Broker<S: SecretStore> {
     preferences_host: Box<dyn crate::preferences::host::Host>,
 }
 impl<S: SecretStore> Broker<S> {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn fixture(client: Client, secrets: S) -> Self {
         Self::new(Some(client), secrets)
     }
@@ -93,18 +125,21 @@ impl<S: SecretStore> Broker<S> {
         result
     }
     fn new(client: Option<Client>, secrets: S) -> Self {
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "macos"))]
         let fixture_build = client
             .as_ref()
             .and_then(Client::fixture_build)
             .map(str::to_owned);
-        #[cfg(not(test))]
+        #[cfg(all(not(test), target_os = "macos"))]
         let fixture_build: Option<String> = None;
+        #[cfg(target_os = "macos")]
         let expected_build = fixture_build.or_else(|| {
             crate::install::bundle::Component::current()
                 .ok()
                 .map(|component| component.metadata().build.clone())
         });
+        #[cfg(target_os = "linux")]
+        let expected_build = crate::helper::client::linux_build_identity();
         let mut result = Self {
             client,
             retry: None,
@@ -119,6 +154,13 @@ impl<S: SecretStore> Broker<S> {
             waiting_previous: false,
             administration: admin::Flow::new(),
             component: component::Flow::new(),
+            #[cfg(all(target_os = "linux", not(test)))]
+            netd: Some(linux::NetdProbe::new(
+                crate::netd::client::SOCKET_PATH.into(),
+            )),
+            #[cfg(all(target_os = "linux", test))]
+            netd: None,
+            #[cfg(target_os = "macos")]
             diagnostics: diagnostics::Flow::new(),
             epoch: 1,
             preferences: Preferences::default(),
@@ -155,7 +197,7 @@ impl<S: SecretStore> Broker<S> {
             .and_then(|r| r.attempt(self.client.as_ref()));
         match attempt {
             Some(Ok(client)) => {
-                #[cfg(test)]
+                #[cfg(all(test, target_os = "macos"))]
                 if self.expected_build.is_none() {
                     self.expected_build = client.fixture_build().map(str::to_owned);
                 }
@@ -189,8 +231,11 @@ impl<S: SecretStore> Broker<S> {
         self.failure_capable = false;
         self.failure_probe = None;
         self.automatic.clear();
-        self.diagnostics.pending = None;
-        self.diagnostics.dirty = false;
+        #[cfg(target_os = "macos")]
+        {
+            self.diagnostics.pending = None;
+            self.diagnostics.dirty = false;
+        }
         self.helper = if outdated {
             "outdated"
         } else if self.waiting_previous {
@@ -215,12 +260,18 @@ impl<S: SecretStore> Broker<S> {
             && self.client.is_some()
     }
     pub fn poll(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(probe) = self.netd.as_mut() {
+            probe.poll(Instant::now());
+        }
+        #[cfg(target_os = "macos")]
         self.diagnostics.tick();
         if (self.dead || self.client.is_none()) && !self.component.blocks_retry() {
             self.resume();
         }
         if self.dead {
             self.poll_admin();
+            #[cfg(target_os = "macos")]
             self.poll_component();
             return;
         }
@@ -249,6 +300,7 @@ impl<S: SecretStore> Broker<S> {
             self.lost(self.helper == "outdated");
         }
         self.poll_admin();
+        #[cfg(target_os = "macos")]
         self.poll_component();
         self.reconcile_interval();
     }
@@ -300,11 +352,13 @@ impl<S: SecretStore> Broker<S> {
                 if generation != c.generation {
                     return Err(());
                 }
+                #[cfg(target_os = "macos")]
                 let ended = diagnostics::ended(c.view.state, c.view.cleaning, state, cleaning);
                 transition(c, state, failure.map(FailureView::from));
                 c.failures = failures;
                 c.view.cleaning = cleaning;
                 self.refresh_actions();
+                #[cfg(target_os = "macos")]
                 if ended {
                     self.request_diagnostics();
                 }
@@ -343,6 +397,7 @@ impl<S: SecretStore> Broker<S> {
                     self.cleanup_verify = None;
                     return Ok(());
                 }
+                #[cfg(target_os = "macos")]
                 if self.diagnostics.pending.as_deref() == Some(id.as_str()) {
                     self.diagnostics.pending = None;
                     if std::mem::take(&mut self.diagnostics.dirty) {
@@ -368,6 +423,7 @@ impl<S: SecretStore> Broker<S> {
                     self.request_cleanup_snapshot();
                 }
             }
+            #[cfg(target_os = "macos")]
             Message::Diagnostics { id, status, logs } => {
                 if self.diagnostics.pending.as_deref() != Some(id.as_str()) {
                     return Err(());
@@ -378,6 +434,8 @@ impl<S: SecretStore> Broker<S> {
                     self.request_diagnostics();
                 }
             }
+            #[cfg(target_os = "linux")]
+            Message::Diagnostics { .. } => return Err(()),
             Message::Fatal { .. } => {
                 self.waiting_previous = false;
                 self.lost(false);
@@ -395,7 +453,13 @@ impl<S: SecretStore> Broker<S> {
         Snapshot {
             version: env!("CARGO_PKG_VERSION"),
             demo: false,
+            #[cfg(target_os = "macos")]
             helper: self.helper,
+            #[cfg(target_os = "linux")]
+            helper: self
+                .netd
+                .as_ref()
+                .map_or(self.helper, linux::NetdProbe::status),
             component_operation: self.component.status(),
             preferences: self.preferences,
             vpns: self
@@ -444,10 +508,10 @@ fn transition(c: &mut Connection, state: State, failure: Option<FailureView>) {
 
 #[cfg(test)]
 mod preferences_tests;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;
 
-#[cfg(all(test, feature = "desktop"))]
+#[cfg(all(test, feature = "desktop", target_os = "macos"))]
 impl<S: SecretStore> Broker<S> {
     /// Test-only composition seam with a real transport and injected secrets.
     pub(crate) fn transport_fixture(client: Client, secrets: S) -> Self {

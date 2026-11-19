@@ -2,8 +2,9 @@
 //! The socket's kernel peer UID, not IPC or sudo environment, selects storage.
 pub(crate) mod caller;
 mod io;
+#[cfg(target_os = "macos")]
+use super::controller_lock::ControllerLock;
 use super::{
-    controller_lock::ControllerLock,
     ppp_supervisor::signals,
     protocol::{self, AdminCommand, ErrorCode, Message, Request},
 };
@@ -46,10 +47,10 @@ impl Mode {
 fn interrupted() -> bool {
     signals::INTERRUPTED.load(Ordering::Acquire)
 }
-fn mode_lock(
+fn mode_lock<L>(
     mode: Mode,
-    acquire: impl FnOnce() -> Result<ControllerLock, super::controller_lock::LockError>,
-) -> Result<Option<ControllerLock>, ErrorCode> {
+    acquire: impl FnOnce() -> Result<L, super::controller_lock::LockError>,
+) -> Result<Option<L>, ErrorCode> {
     if mode == Mode::Admin {
         return Ok(None);
     }
@@ -104,13 +105,13 @@ fn supports_wait_notice(stream: &UnixStream, deadline: Instant) -> bool {
     }
 }
 
-fn wait_for_mode_lock(
+fn wait_for_mode_lock<L>(
     mode: Mode,
     stream: &mut UnixStream,
     budget: Duration,
     announced: &mut bool,
-    mut acquire: impl FnMut() -> Result<ControllerLock, super::controller_lock::LockError>,
-) -> Result<Option<ControllerLock>, ErrorCode> {
+    mut acquire: impl FnMut() -> Result<L, super::controller_lock::LockError>,
+) -> Result<Option<L>, ErrorCode> {
     let deadline = Instant::now() + budget;
     loop {
         if interrupted() {
@@ -208,6 +209,110 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     }
 }
 
+/// Runs the Linux helper using its inherited protocol socket.
+///
+/// # Safety
+/// FD 0 must not have a Rust owner or aliases; this consumes it as the sole
+/// duplex protocol channel and never uses stdout/stderr for protocol data.
+#[cfg(target_os = "linux")]
+pub unsafe fn linux_run(mode: Mode) -> Result<(), ErrorCode> {
+    let uid = unsafe { libc::getuid() };
+    let effective = unsafe { libc::geteuid() };
+    check_process_uid(uid, effective)?;
+    if unsafe { libc::fcntl(0, libc::F_GETFD) } < 0 {
+        return Err(ErrorCode::PermissionDenied);
+    }
+    let mut caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
+        .map_err(|_| ErrorCode::PermissionDenied)?;
+    check_peer_uid(caller.uid, effective)?;
+    let _signals = signals::Guard::install().map_err(|_| ErrorCode::Unavailable)?;
+    let mut announced = false;
+    let admitted = (|| {
+        let store = ProfileStore::for_current_user().map_err(store_error)?;
+        store.load().map_err(store_error)?;
+        let lock = wait_for_mode_lock(
+            mode,
+            &mut caller.stream,
+            PREVIOUS_SESSION_WAIT,
+            &mut announced,
+            || super::user_lock::UserLock::acquire(&store, effective),
+        )?;
+        let build = build_identity()?;
+        Ok((store, lock, build))
+    })();
+    let (store, _lock, build) = match admitted {
+        Ok(value) => value,
+        Err(error) => {
+            send_admission_error(&mut caller.stream, announced, error);
+            return Err(error);
+        }
+    };
+    match mode {
+        Mode::Runtime => runtime_with_diagnostics(
+            caller,
+            Some(build),
+            Arc::new(|_| (protocol::DiagnosticsStatus::Unavailable, vec![])),
+            crate::connection::controller::run_linux,
+        ),
+        Mode::Admin => admin(caller, |_, request| apply_admin(&store, request)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn check_process_uid(uid: u32, effective: u32) -> Result<(), ErrorCode> {
+    if uid == 0 || effective == 0 {
+        Err(ErrorCode::PermissionDenied)
+    } else {
+        Ok(())
+    }
+}
+#[cfg(target_os = "linux")]
+fn check_peer_uid(peer: u32, effective: u32) -> Result<(), ErrorCode> {
+    if peer != effective {
+        Err(ErrorCode::PermissionDenied)
+    } else {
+        Ok(())
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+mod linux_uid_tests {
+    use super::*;
+    #[test]
+    fn rejects_root_and_foreign_peer() {
+        assert_eq!(check_process_uid(0, 1000), Err(ErrorCode::PermissionDenied));
+        assert_eq!(check_process_uid(1000, 0), Err(ErrorCode::PermissionDenied));
+        assert_eq!(check_process_uid(1000, 1000), Ok(()));
+        assert_eq!(check_peer_uid(1001, 1000), Err(ErrorCode::PermissionDenied));
+        assert_eq!(check_peer_uid(1000, 1000), Ok(()));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_identity() -> Result<String, ErrorCode> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    const LIMIT: u64 = 256 * 1024 * 1024;
+    let file = std::fs::File::open("/proc/self/exe").map_err(|_| ErrorCode::Unavailable)?;
+    let mut reader = file.take(LIMIT + 1);
+    let mut hash = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 16384];
+    loop {
+        let n = reader
+            .read(&mut buffer)
+            .map_err(|_| ErrorCode::Unavailable)?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        if size > LIMIT {
+            return Err(ErrorCode::Unavailable);
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 fn store_error(error: StoreError) -> ErrorCode {
     match error {
         StoreError::NotFound => ErrorCode::ProfileNotFound,
@@ -222,10 +327,50 @@ fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message
             return Err(ErrorCode::Unavailable);
         }
         match request.command {
-            AdminCommand::SaveProfile { profile } => store.save(profile),
-            AdminCommand::RemoveProfile { id } => store.remove(&id),
+            AdminCommand::SaveProfile {
+                profile,
+                ovpn_config,
+            } => {
+                #[cfg(target_os = "linux")]
+                {
+                    let normalized = if let Some(text) = ovpn_config {
+                        if profile.kind != crate::model::VpnKind::Ovpn {
+                            return Err(ErrorCode::InvalidRequest);
+                        }
+                        Some(
+                            crate::connection::ovpn::profile::inspect(text.as_bytes())
+                                .map_err(|_| ErrorCode::InvalidRequest)?
+                                .normalized,
+                        )
+                    } else {
+                        None
+                    };
+                    store
+                        .save_admin_profile(profile, normalized.as_deref())
+                        .map_err(|error| {
+                            if error == StoreError::InvalidData {
+                                ErrorCode::InvalidRequest
+                            } else {
+                                store_error(error)
+                            }
+                        })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if ovpn_config.is_some() {
+                        return Err(ErrorCode::InvalidRequest);
+                    }
+                    store.save(profile).map_err(store_error)
+                }
+            }
+            AdminCommand::RemoveProfile { id } => {
+                #[cfg(target_os = "linux")]
+                let result = store.remove_admin_profile(&id);
+                #[cfg(not(target_os = "linux"))]
+                let result = store.remove(&id);
+                result.map_err(store_error)
+            }
         }
-        .map_err(store_error)
     })();
     match result {
         Ok(()) => Message::Accepted { id: request.id },
@@ -271,7 +416,7 @@ fn admin(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn runtime(
     caller: Caller,
     run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
@@ -279,6 +424,7 @@ fn runtime(
     runtime_with_build(caller, None, run)
 }
 
+#[cfg(target_os = "macos")]
 fn runtime_with_build(
     caller: Caller,
     build: Option<String>,
@@ -289,12 +435,14 @@ fn runtime_with_build(
 
 type Diagnostics =
     Arc<dyn Fn(u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) + Send + Sync>;
+#[cfg(target_os = "macos")]
 fn system_diagnostics(uid: u32) -> (protocol::DiagnosticsStatus, Vec<super::diagnostics::Log>) {
     gated_diagnostics(
         || crate::install::engine::admit_uid(uid).map(|(_, sole)| sole),
         || super::diagnostics::collect(std::path::Path::new(super::paths::STATE), 0, || true),
     )
 }
+#[cfg(target_os = "macos")]
 pub(crate) fn gated_diagnostics(
     admit: impl FnOnce() -> Result<bool, crate::install::Error>,
     read: impl FnOnce() -> Option<Vec<super::diagnostics::Log>>,
@@ -433,7 +581,7 @@ fn read_requests(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn runtime_fixture(
     stream: UnixStream,
     run: impl FnOnce(u32, Receiver<Request>, SyncSender<Message>) -> Result<(), ErrorCode>,
@@ -442,5 +590,5 @@ pub(crate) fn runtime_fixture(
     runtime(caller, run)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) mod tests;

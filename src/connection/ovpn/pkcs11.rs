@@ -1,7 +1,10 @@
 //! An RSA key held by a PKCS#11 token and addressed by CKA_ID. Objects are
 //! found by class and id only: some modules (SerproID) reject label searches
 //! and refuse attribute queries that generic helpers make before signing.
-use super::signing::{Hash, Padding};
+use super::{
+    der,
+    signing::{Hash, Padding},
+};
 use cryptoki::{
     context::{CInitializeArgs, CInitializeFlags, Pkcs11},
     error::{Error, RvError},
@@ -15,12 +18,16 @@ use cryptoki::{
     types::Ulong,
 };
 use std::{
+    collections::HashSet,
+    fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenError {
+    /// The module or its directory chain is not trusted.
+    UntrustedModule,
     /// The module could not be loaded or initialized.
     Module,
     /// No token holds a certificate and private key with this id.
@@ -32,6 +39,38 @@ pub enum TokenError {
     Failed(RvError),
 }
 
+fn admit_module(path: &str) -> Result<PathBuf, TokenError> {
+    admit_module_with(path, &[0, unsafe { libc::geteuid() }], Path::new("/"))
+}
+
+fn admit_module_with(path: &str, owners: &[u32], stop_at: &Path) -> Result<PathBuf, TokenError> {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::model::valid_module_path(path) {
+        return Err(TokenError::UntrustedModule);
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|_| TokenError::Module)?;
+    let stop = std::fs::canonicalize(stop_at).map_err(|_| TokenError::UntrustedModule)?;
+    if !resolved.starts_with(&stop) || resolved == stop {
+        return Err(TokenError::UntrustedModule);
+    }
+    let metadata = std::fs::metadata(&resolved).map_err(|_| TokenError::UntrustedModule)?;
+    if !metadata.is_file() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+        return Err(TokenError::UntrustedModule);
+    }
+    let mut directory = resolved.parent().ok_or(TokenError::UntrustedModule)?;
+    loop {
+        let metadata = std::fs::metadata(directory).map_err(|_| TokenError::UntrustedModule)?;
+        if !metadata.is_dir() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+            return Err(TokenError::UntrustedModule);
+        }
+        if directory == stop {
+            break;
+        }
+        directory = directory.parent().ok_or(TokenError::UntrustedModule)?;
+    }
+    Ok(resolved)
+}
+
 impl From<Error> for TokenError {
     fn from(error: Error) -> Self {
         match error {
@@ -39,6 +78,95 @@ impl From<Error> for TokenError {
             Error::Pkcs11(code, _) => Self::Failed(code),
             _ => Self::Module,
         }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct CertificateInfo {
+    pub id: Vec<u8>,
+    pub subject: Option<String>,
+    pub issuer: Option<String>,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+}
+
+impl fmt::Debug for CertificateInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let id: String = self.id.iter().map(|byte| format!("{byte:02x}")).collect();
+        f.debug_struct("CertificateInfo")
+            .field("id", &id)
+            .field("subject", &self.subject)
+            .field("issuer", &self.issuer)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .finish()
+    }
+}
+
+/// List certificates whose key object is visible without authenticating.
+pub fn list_certificates(module: &Path) -> Result<Vec<CertificateInfo>, TokenError> {
+    let pkcs11 = context(module)?;
+    let mut certificates = Vec::new();
+    let mut seen = HashSet::new();
+    for slot in pkcs11.get_slots_with_token()? {
+        let session = pkcs11.open_ro_session(slot)?;
+        // Finish the find before looking for private keys on the same session.
+        let objects = session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])?;
+        for object in objects {
+            let Some(attributes) = object_result(
+                session.get_attributes(object, &[AttributeType::Id, AttributeType::Value]),
+            )?
+            else {
+                continue;
+            };
+            let mut id = None;
+            let mut value = None;
+            for attribute in attributes {
+                match attribute {
+                    Attribute::Id(bytes) => id = Some(bytes),
+                    Attribute::Value(bytes) => value = Some(bytes),
+                    _ => {}
+                }
+            }
+            let (Some(id), Some(value)) = (id, value) else {
+                continue;
+            };
+            if id.is_empty() || seen.contains(&id) {
+                continue;
+            }
+            if !matches!(
+                object_result(find(&session, ObjectClass::PRIVATE_KEY, &id))?,
+                Some(Some(_))
+            ) {
+                continue;
+            }
+            let fields = der::read_certificate(&value);
+            seen.insert(id.clone());
+            certificates.push(CertificateInfo {
+                id,
+                subject: fields.subject,
+                issuer: fields.issuer,
+                not_before: fields.not_before,
+                not_after: fields.not_after,
+            });
+            if certificates.len() == 32 {
+                return Ok(certificates);
+            }
+        }
+    }
+    Ok(certificates)
+}
+
+fn object_result<T>(result: Result<T, Error>) -> Result<Option<T>, TokenError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(
+            error @ Error::Pkcs11(
+                RvError::SessionHandleInvalid | RvError::SessionClosed | RvError::DeviceRemoved,
+                _,
+            ),
+        ) => Err(error.into()),
+        Err(_) => Ok(None),
     }
 }
 
@@ -146,19 +274,30 @@ impl TokenKey {
 /// never finalizes on drop, and unloading a module that runs its own threads
 /// (cloud tokens do) can crash; initializing it again would fail instead.
 fn context(module: &Path) -> Result<Arc<Pkcs11>, TokenError> {
-    static CONTEXTS: Mutex<Vec<(PathBuf, Arc<Pkcs11>)>> = Mutex::new(Vec::new());
-    let mut contexts = CONTEXTS.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some((_, pkcs11)) = contexts.iter().find(|(path, _)| path == module) {
-        return Ok(Arc::clone(pkcs11));
-    }
-    let pkcs11 = Pkcs11::new(module).map_err(|_| TokenError::Module)?;
-    match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
-        Ok(()) | Err(Error::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
-        Err(_) => return Err(TokenError::Module),
-    }
-    let pkcs11 = Arc::new(pkcs11);
-    contexts.push((module.to_path_buf(), Arc::clone(&pkcs11)));
-    Ok(pkcs11)
+    with_admitted_module(module, admit_module, |module| {
+        static CONTEXTS: Mutex<Vec<(PathBuf, Arc<Pkcs11>)>> = Mutex::new(Vec::new());
+        let mut contexts = CONTEXTS.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, pkcs11)) = contexts.iter().find(|(path, _)| path == module) {
+            return Ok(Arc::clone(pkcs11));
+        }
+        let pkcs11 = Pkcs11::new(module).map_err(|_| TokenError::Module)?;
+        match pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK)) {
+            Ok(()) | Err(Error::Pkcs11(RvError::CryptokiAlreadyInitialized, _)) => {}
+            Err(_) => return Err(TokenError::Module),
+        }
+        let pkcs11 = Arc::new(pkcs11);
+        contexts.push((module.to_path_buf(), Arc::clone(&pkcs11)));
+        Ok(pkcs11)
+    })
+}
+
+fn with_admitted_module<T>(
+    module: &Path,
+    admit: impl FnOnce(&str) -> Result<PathBuf, TokenError>,
+    load: impl FnOnce(&Path) -> Result<T, TokenError>,
+) -> Result<T, TokenError> {
+    let canonical = admit(module.to_str().ok_or(TokenError::UntrustedModule)?)?;
+    load(&canonical)
 }
 
 fn session<'a>(

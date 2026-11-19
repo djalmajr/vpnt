@@ -52,7 +52,7 @@ impl<S: SecretStore> Broker<S> {
             | Command::Reconnect { id }
             | Command::RemoveProfile { id }
             | Command::SaveSecrets { id, .. } => Some(id.as_str()),
-            Command::SaveProfile { profile } => Some(profile.id.as_str()),
+            Command::SaveProfile { profile, .. } => Some(profile.id.as_str()),
             Command::DisconnectAll {}
             | Command::Quit {}
             | Command::InstallHelper {}

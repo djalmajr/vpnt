@@ -12,6 +12,8 @@ pub mod desktop;
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 #[path = "desktop_linux/mod.rs"]
 pub mod desktop;
+#[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "desktop"))]
+mod desktop_actor;
 #[cfg(unix)]
 mod fs_permissions;
 pub mod helper;
@@ -35,5 +37,5 @@ pub mod session;
 #[cfg(unix)]
 pub mod storage;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod broker;

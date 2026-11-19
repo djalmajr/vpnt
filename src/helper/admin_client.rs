@@ -1,11 +1,9 @@
 //! One authenticated administrative transaction. It never shares the runtime
 //! channel and never kills a helper to make an incomplete operation look done.
 mod worker;
-use super::{
-    paths,
-    protocol::{AdminRequest, ErrorCode},
-    runtime::Runtime,
-};
+use super::protocol::{AdminRequest, ErrorCode};
+#[cfg(target_os = "macos")]
+use super::{paths, runtime::Runtime};
 use crate::localization::Locale;
 use std::{
     process::Command,
@@ -15,6 +13,7 @@ use std::{
     },
     time::Instant,
 };
+#[cfg(target_os = "macos")]
 pub(crate) use worker::monotonic_ns;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,11 +36,28 @@ pub struct Admin {
     reported: bool,
 }
 impl Admin {
+    #[cfg(target_os = "macos")]
     pub fn start(request: AdminRequest, locale: Locale, expires: Instant) -> Result<Self, Error> {
         Runtime::verify_helper()
             .and_then(|_| Runtime::verify_askpass())
             .map_err(|_| Error::Untrusted)?;
         Self::spawn(command(), request, locale, expires)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn start(request: AdminRequest, locale: Locale, expires: Instant) -> Result<Self, Error> {
+        let path = super::client::linux_executable().map_err(|_| Error::Untrusted)?;
+        Self::linux_for_executable(&path, request, locale, expires)
+    }
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn linux_for_executable(
+        path: &std::path::Path,
+        request: AdminRequest,
+        locale: Locale,
+        expires: Instant,
+    ) -> Result<Self, Error> {
+        let command = super::client::linux_command(path, "admin").map_err(|_| Error::Untrusted)?;
+        Self::spawn(command, request, locale, expires)
     }
     fn spawn(
         command: Command,
@@ -70,7 +86,7 @@ impl Admin {
             reported: false,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn fixture(
         command: Command,
         request: AdminRequest,
@@ -101,10 +117,11 @@ impl Drop for Admin {
         self.close();
     }
 }
+#[cfg(target_os = "macos")]
 fn command() -> Command {
     let mut command = Command::new("/usr/bin/sudo");
     command.args(["-A", "-k", "--", paths::HELPER, "admin"]);
     command
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;

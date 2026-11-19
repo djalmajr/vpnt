@@ -245,6 +245,7 @@ fn launch(openvpn: &Path) -> Launch {
     Launch {
         openvpn: openvpn.to_path_buf(),
         config: PathBuf::from("/dev/null"),
+        dev: None,
         signatures: Signatures::Any,
         extra: Vec::new(),
         env: Vec::new(),
@@ -263,6 +264,7 @@ fn scripted_openvpn(directory: &Path, lines: &str, linger: f32) -> PathBuf {
     let path = directory.join("openvpn");
     let script = format!(
         "#!/usr/bin/env python3\nimport socket, sys, time\n\
+         if '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\n\
          path = sys.argv[sys.argv.index('--management') + 1]\n\
          s = socket.socket(socket.AF_UNIX)\ns.connect(path)\n\
          s.sendall({lines:?}.encode())\ntime.sleep({linger})\n"
@@ -294,7 +296,7 @@ fn an_openvpn_that_exits_early_fails_the_start_promptly() {
         .err()
         .expect("start must fail");
     assert!(
-        error.to_string().contains("exited before connecting"),
+        error.to_string().contains("version check failed"),
         "{error}"
     );
     assert!(started.elapsed() < CONNECT_TIMEOUT);
@@ -333,5 +335,305 @@ fn a_signature_pending_approval_does_not_hold_up_wait() {
         started.elapsed() < Duration::from_secs(3),
         "{:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn up_down_and_block_boundaries() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n>UPDOWN:ENV,END\n>UPDOWN:DOWN\n>UPDOWN:ENV,ignored=value\n>UPDOWN:ENV,END\n");
+    let (_, progress) = vpn.hang_up();
+    assert!(
+        matches!(&progress[..], [Progress::Up(c), Progress::Down] if c.prefix == 24 && c.address == std::net::Ipv4Addr::new(10,81,0,2))
+    );
+}
+
+#[test]
+fn invalid_network_stops_and_reports() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n>UPDOWN:ENV,END\n");
+    assert_eq!(vpn.hear(), management::TERMINATE);
+    let (_, progress) = vpn.hang_up();
+    assert_eq!(
+        progress,
+        [Progress::BadNetwork(NetworkError::MissingAddress)]
+    );
+}
+
+#[test]
+fn oversized_network_stops_and_reports() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(">UPDOWN:UP\n");
+    for _ in 0..1025 {
+        vpn.say(">UPDOWN:ENV,k=v\n");
+    }
+    assert_eq!(vpn.hear(), management::TERMINATE);
+    let (_, progress) = vpn.hang_up();
+    assert_eq!(progress, [Progress::BadNetwork(NetworkError::TooLarge)]);
+}
+
+#[test]
+fn launch_passes_device_and_management_up_down() {
+    let directory = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = directory.path.join("openvpn");
+    fs::write(&executable, "#!/usr/bin/env python3\nimport socket,sys,time\na=sys.argv\nif '--version' in a: print('OpenVPN 2.6.19'); sys.exit(0)\ni=a.index('--dev')\nassert a[i:i+5] == ['--dev','vpnt0','--dev-type','tun','--disable-dco']\nassert '--management-up-down' in a\nc=a.index('--config')\nr=a.index('--remote-cert-tls')\nassert r > c+1 and a[r+1] == 'server'\ns=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\ntime.sleep(.2)\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = launch(&executable);
+    settings.dev = Some("vpnt0".into());
+    let session = Session::start(settings, FakeToken::default()).unwrap();
+    session.wait().unwrap();
+}
+
+#[test]
+fn up_block_without_end_is_rejected_and_the_line_still_handled() {
+    // Every line other than ENV records and END inside an open UP block
+    // rejects it, even well-formed ones; the line is then processed as usual.
+    for (line, reply) in [
+        (">HOLD:waiting\n", Some(management::HOLD_RELEASE)),
+        (">STATE:1,CONNECTED,SUCCESS,10.81.0.2,,,,\n", None),
+        (
+            ">PK_SIGN:%%%,RSA_PKCS1_PADDING\n",
+            Some(management::TERMINATE),
+        ),
+        (">UPDOWN:UP\n", None),
+        (">UPDOWN:DOWN\n", None),
+    ] {
+        let mut vpn = Openvpn::connect(FakeToken::default());
+        vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n");
+        vpn.say(line);
+        assert_eq!(vpn.hear(), management::TERMINATE, "{line}");
+        if let Some(reply) = reply {
+            assert_eq!(vpn.hear(), reply, "{line}");
+        }
+        let (_, progress) = vpn.hang_up();
+        assert!(
+            !progress.iter().any(|p| matches!(p, Progress::Up(_))),
+            "{line}: {progress:?}"
+        );
+        assert!(
+            progress.contains(&Progress::BadNetwork(NetworkError::Malformed)),
+            "{line}: {progress:?}"
+        );
+    }
+}
+
+#[test]
+fn openvpn_version_parsing() {
+    assert_eq!(
+        parse_version(b"OpenVPN 2.7.8 [git:example]\n"),
+        Some((2, 7))
+    );
+    assert_eq!(parse_version(b"OpenVPN 2.6.19 x86_64\n"), Some((2, 6)));
+    assert_eq!(parse_version(b"OpenVPN 3.0.0\n"), Some((3, 0)));
+    assert_eq!(parse_version(b"garbage\n"), None);
+    assert_eq!(parse_version(b"OpenVPN bad\n"), None);
+    assert_eq!(parse_version(b"\xff"), None);
+}
+
+#[test]
+fn dns_updown_follows_extra_options_only_for_supported_versions() {
+    for (version, expected) in [
+        (
+            Some((2, 7)),
+            vec!["--dns-updown", "other", "--dns-updown", "disable"],
+        ),
+        (
+            Some((3, 0)),
+            vec!["--dns-updown", "other", "--dns-updown", "disable"],
+        ),
+        (Some((2, 6)), vec!["--dns-updown", "other"]),
+        (None, vec!["--dns-updown", "other"]),
+    ] {
+        let mut command = Command::new("openvpn");
+        add_extra_options(
+            &mut command,
+            &["--dns-updown".into(), "other".into()],
+            version,
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn version_detection_caches_and_times_out() {
+    let dir = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = dir.path.join("version");
+    let marker = dir.path.join("calls");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf 'OpenVPN 2.7.8 test\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(version_for(&executable).unwrap(), Some((2, 7)));
+    assert_eq!(version_for(&executable).unwrap(), Some((2, 7)));
+    assert_eq!(fs::read(&marker).unwrap(), b"x");
+    let slow = dir.path.join("slow");
+    fs::write(&slow, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        version_for(&slow).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(start.elapsed() < Duration::from_secs(7));
+}
+
+#[test]
+fn malformed_up_environment_rejects_block_and_terminates() {
+    for invalid in [
+        ">UPDOWN:ENV,broken\n",
+        ">UPDOWN:ENV,=value\n",
+        ">UPDOWN:ENV,key=\u{fffd}\n",
+        ">UPDOWN:ENV\n",
+        ">UPDOWN:UNKNOWN\n",
+        ">STATE:not-a-number\n",
+    ] {
+        let mut vpn = Openvpn::connect(FakeToken::default());
+        vpn.say(">UPDOWN:UP\n>UPDOWN:ENV,ifconfig_local=10.81.0.2\n>UPDOWN:ENV,ifconfig_netmask=255.255.255.0\n");
+        if invalid.contains('\u{fffd}') {
+            vpn.writer.write_all(b">UPDOWN:ENV,key=\xff\n").unwrap();
+        } else {
+            vpn.say(invalid);
+        }
+        vpn.say(">UPDOWN:ENV,END\n");
+        assert_eq!(vpn.hear(), management::TERMINATE);
+        let (_, progress) = vpn.hang_up();
+        assert_eq!(progress, [Progress::BadNetwork(NetworkError::Malformed)]);
+    }
+}
+
+#[test]
+fn malformed_environment_outside_up_and_in_down_is_ignored() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(
+        ">UPDOWN:ENV,broken\n>UPDOWN:DOWN\n>UPDOWN:ENV,=invalid\n>UPDOWN:ENV,END\n>HOLD:waiting\n",
+    );
+    assert_eq!(vpn.hear(), management::HOLD_RELEASE);
+    let (_, progress) = vpn.hang_up();
+    assert_eq!(progress, [Progress::Down]);
+}
+
+#[test]
+fn stop_times_out_when_management_does_not_read() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scratch.path.join("openvpn");
+    fs::write(&executable, "#!/usr/bin/python3\nimport socket,sys,time\nif '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[sys.argv.index('--management')+1])\nb=b''\nwhile b.count(b'\\n') < 2: b+=s.recv(1024)\ns.sendall(b'>STATE:1,CONNECTING,,,,,,,\\n')\ntime.sleep(20)\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let session = start_scripted(&executable, FakeToken::default());
+    assert!(matches!(
+        session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Progress::State(_)
+    ));
+    assert_eq!(
+        session.control.lock().unwrap().write_timeout().unwrap(),
+        Some(Duration::from_secs(2))
+    );
+    let mut fill = session.control.lock().unwrap().try_clone().unwrap();
+    fill.set_nonblocking(true).unwrap();
+    loop {
+        match fill.write(&[0u8; 8192]) {
+            Ok(0) => panic!("management socket closed while filling"),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling management socket: {e}"),
+        }
+    }
+    fill.set_nonblocking(false).unwrap();
+    let control = Arc::clone(&session.control);
+    let held = control.lock().unwrap();
+    let (send, recv) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let start = Instant::now();
+        let result = session.stop();
+        let _ = send.send((result, start.elapsed()));
+    });
+    thread::sleep(Duration::from_millis(1300));
+    drop(held);
+    let outcome = recv.recv_timeout(Duration::from_millis(1600));
+    let _ = fill.shutdown(Shutdown::Both);
+    worker.join().unwrap();
+    let (result, elapsed) = outcome.expect("stop blocked for more than 3 seconds");
+    assert!(result.is_err(), "full socket should time out");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[test]
+fn stop_times_out_waiting_for_control_lock() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 20.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let control = Arc::clone(&session.control);
+    let held = control.lock().unwrap();
+    let (send, recv) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let started = Instant::now();
+        let result = session.stop();
+        let _ = send.send((result, started.elapsed()));
+    });
+    let observed = recv.recv_timeout(Duration::from_secs(3));
+    drop(held);
+    worker.join().unwrap();
+    let (result, elapsed) = observed.expect("stop waited over 3 seconds for control lock");
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_exit_has_a_total_management_drain_budget() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, &pss_request(32), 0.0);
+    let (release, gate) = mpsc::channel();
+    let session = start_scripted(
+        &executable,
+        FakeToken {
+            gate: Some(Arc::new(Mutex::new(gate))),
+            ..FakeToken::default()
+        },
+    );
+    assert_eq!(
+        session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Progress::AwaitingApproval
+    );
+    let start = Instant::now();
+    let mut observed = None;
+    while start.elapsed() < Duration::from_millis(1500) {
+        observed = session.exited();
+        if observed.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = start.elapsed();
+    let again_at = Instant::now();
+    let again = session.exited();
+    let again_elapsed = again_at.elapsed();
+    let _ = release.send(());
+    session.wait().unwrap();
+    assert!(
+        observed.is_some(),
+        "dead child remained running after {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert!(again.is_some());
+    assert!(
+        again_elapsed < Duration::from_millis(100),
+        "drain budget restarted: {again_elapsed:?}"
     );
 }

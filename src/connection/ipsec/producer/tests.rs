@@ -34,6 +34,7 @@ fn owner(id: &str, generation: u64) -> Owner {
 }
 fn config<N: Observer>(registry: &Registry<N>, reservation: &Reservation) -> Config {
     let p = Profile {
+        ovpn: None,
         dns_domains: Vec::new(),
         id: reservation.owner().profile.clone(),
         name: "Fixture".into(),

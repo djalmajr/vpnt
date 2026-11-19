@@ -36,6 +36,8 @@ pub(super) fn run(
             .stdin(Stdio::from(OwnedFd::from(capability)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "linux")]
+        super::linux_inherit_session(&mut command);
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }

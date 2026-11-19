@@ -33,6 +33,7 @@ impl Factory for CapabilityFactory {
         match kind {
             VpnKind::Ssl => self.ssl.load(Ordering::Acquire),
             VpnKind::Ipsec => self.ipsec.load(Ordering::Acquire),
+            VpnKind::Ovpn => false,
         }
     }
     fn create(

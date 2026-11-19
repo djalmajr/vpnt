@@ -2,9 +2,13 @@
 //! root helper supplies its own profiles/UID; requests contain no executable,
 //! interface, route or configuration paths. Shutdown retains pending cleanup.
 mod engine;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::run_linux;
 #[cfg(target_os = "macos")]
 mod native;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profiles;
 mod worker;
 use crate::{
@@ -52,6 +56,9 @@ trait Attempt {
     fn start(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure>;
     /// true only after owned interface discovery and complete route leases.
     fn ready(&mut self) -> Result<bool, Failure>;
+    fn phase(&self) -> Option<ConnectionState> {
+        None
+    }
     fn healthy(&mut self) -> Result<(), Failure>;
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure>;
     /// Stop only owned children; return true only after observed cleanup.

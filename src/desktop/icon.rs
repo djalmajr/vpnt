@@ -111,12 +111,14 @@ pub(crate) fn icon_for(snapshot: Option<&Snapshot>, error: bool) -> Icon {
                 kinds |= match view.profile.kind {
                     VpnKind::Ipsec => IPSEC,
                     VpnKind::Ssl => SSL,
+                    VpnKind::Ovpn => return Icon::Warning,
                 };
             }
             // Work in progress proves no tunnel and is not a problem either: it
             // reads like Off, so the triangle is kept for what needs attention.
             ConnectionState::Off
             | ConnectionState::Connecting
+            | ConnectionState::AwaitingApproval
             | ConnectionState::Verifying
             | ConnectionState::Reconnecting
             | ConnectionState::Disconnecting => {}

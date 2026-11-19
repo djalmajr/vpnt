@@ -1,0 +1,16 @@
+post_install() {
+    cat <<'MESSAGE'
+Add your user to the vpnt group, then sign out and sign in again:
+  sudo usermod -aG vpnt "$USER"
+Enable and start the helper socket:
+  sudo systemctl enable --now vpnt-helper.socket
+MESSAGE
+}
+
+post_upgrade() {
+    systemctl try-restart vpnt-helper.service
+}
+
+pre_remove() {
+    systemctl disable --now vpnt-helper.socket vpnt-helper.service || true
+}

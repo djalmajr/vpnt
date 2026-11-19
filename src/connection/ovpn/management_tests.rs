@@ -154,3 +154,31 @@ fn certificate_is_a_pem_block_inside_the_certificate_command() {
         "certificate\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\nEND\n"
     );
 }
+
+#[test]
+fn updown_events() {
+    assert_eq!(parse(b">UPDOWN:UP\n"), Event::Up);
+    assert_eq!(parse(b">UPDOWN:DOWN\n"), Event::Down);
+    assert_eq!(
+        parse(b">UPDOWN:ENV,dev=vpnt0\n"),
+        Event::Env {
+            key: "dev".into(),
+            value: "vpnt0".into()
+        }
+    );
+    assert_eq!(parse(b">UPDOWN:ENV,END\n"), Event::EnvEnd);
+    assert_eq!(parse(b">UPDOWN:ENV,=x\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:ENV,broken\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:ENV\n"), Event::MalformedEnv);
+    assert_eq!(parse(b">UPDOWN:SOMETHING\n"), Event::MalformedEnv);
+}
+
+#[test]
+fn environment_debug_redacts_value() {
+    let event = parse(b">UPDOWN:ENV,probe_key=synthetic_private_value\n");
+    let debug = format!("{event:?}");
+    assert!(debug.contains("probe_key"));
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("synthetic_private_value"));
+    assert_eq!(parse(b">UPDOWN:ENV,foo=\xff\n"), Event::MalformedEnv);
+}

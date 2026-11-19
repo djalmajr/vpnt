@@ -82,7 +82,7 @@ def main():
         ("owned-helper-killed-during-cleanup",worker,lambda s:replace(s,"let waited = child.wait()","let _ = child.kill(); let waited = child.wait()"),cleanup,False),
         ("channel-fault-delayed-until-child-exit",worker,early_fault,"helper::client::tests::malformed_and_incompatible_replies_fail_the_channel_instead_of_becoming_snapshots",False),
         ("inherited-environment-reaches-helper",worker,lambda s:replace(s,"            .env_clear()\n",""),cleanup,False),
-        ("expired-native-job-executed","src/desktop/worker.rs",lambda s:replace(s,"if Instant::now() >= work.expires {","if false {"),actor,True),
+        ("expired-native-job-executed","src/desktop_actor.rs",lambda s:replace(s,"if Instant::now() >= work.expires {","if false {"),actor,True),
         ("runtime-never-resumes",model,no_resume,recovery,False),
         ("runtime-replaced-before-reap","src/broker/retry.rs",lambda s:replace(s," || previous.is_some_and(|c| !c.finished())",""),recovery,False),
         ("runtime-retry-unpaced","src/broker/retry.rs",lambda s:replace(s,"Instant::now() < self.next || ",""),pacing,False),

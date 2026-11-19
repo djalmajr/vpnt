@@ -67,14 +67,18 @@ fn administrative_wire_can_edit_another_profile_while_runtime_and_target_reserva
     let active = store.reserve("one").unwrap();
     assert!(matches!(
         f.request(AdminCommand::SaveProfile {
-            profile: profile("two")
+            profile: profile("two"),
+            ovpn_config: None,
         }),
         Message::Accepted { .. }
     ));
     let mut changed = profile("one");
     changed.gateway = "changed.example.test".into();
     for command in [
-        AdminCommand::SaveProfile { profile: changed },
+        AdminCommand::SaveProfile {
+            profile: changed,
+            ovpn_config: None,
+        },
         AdminCommand::RemoveProfile { id: "one".into() },
     ] {
         assert!(matches!(

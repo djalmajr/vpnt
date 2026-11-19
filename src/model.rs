@@ -2,13 +2,55 @@ use crate::helper::protocol::{ErrorCode, FailureNote, Step};
 use crate::preferences::Preferences;
 use crate::session::ConnectionState;
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::{
+    net::IpAddr,
+    path::{Component, Path},
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VpnKind {
     Ipsec,
     Ssl,
+    Ovpn,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OvpnTls {
+    #[default]
+    Pkcs1Only,
+    Any,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OvpnSettings {
+    pub certificate_id: String,
+    pub module: String,
+    #[serde(default)]
+    pub tls: OvpnTls,
+}
+
+impl OvpnSettings {
+    fn is_valid(&self) -> bool {
+        (2..=128).contains(&self.certificate_id.len())
+            && self.certificate_id.len().is_multiple_of(2)
+            && self
+                .certificate_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && valid_module_path(&self.module)
+    }
+}
+
+pub(crate) fn valid_module_path(path: &str) -> bool {
+    let module = Path::new(path);
+    path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && path.ends_with(".so")
+        && module.is_absolute()
+        && !module.components().any(|part| part == Component::ParentDir)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,6 +73,8 @@ pub struct Profile {
     pub probe_host: String,
     pub probe_port: u16,
     pub probe_method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ovpn: Option<OvpnSettings>,
 }
 
 impl Profile {
@@ -47,6 +91,20 @@ impl Profile {
         if !valid_host(&self.gateway) || self.port == 0 {
             return Err("invalid_gateway");
         }
+        match (self.kind, &self.ovpn) {
+            (VpnKind::Ovpn, None) => return Err("invalid_profile"),
+            (VpnKind::Ovpn, Some(settings)) => {
+                if !settings.is_valid()
+                    || !self.username.is_empty()
+                    || !self.networks.is_empty()
+                    || !self.certificate.is_empty()
+                {
+                    return Err("invalid_profile");
+                }
+            }
+            (_, Some(_)) => return Err("invalid_profile"),
+            (_, None) => {}
+        }
         let username_limit = if self.kind == VpnKind::Ssl { 64 } else { 200 };
         if self.username.len() > username_limit || self.username.chars().any(char::is_control) {
             return Err("invalid_profile");
@@ -54,12 +112,11 @@ impl Profile {
         if self.networks.len() > 64 || self.networks.iter().any(|network| !valid_network(network)) {
             return Err("invalid_network");
         }
-        if (self.kind != VpnKind::Ssl && !self.dns_domains.is_empty())
+        if (!matches!(self.kind, VpnKind::Ssl | VpnKind::Ovpn) && !self.dns_domains.is_empty())
             || self.dns_domains.len() > 8
-            || self
-                .dns_domains
-                .iter()
-                .any(|domain| !valid_dns_domain(domain))
+            || self.dns_domains.iter().any(|domain| {
+                !valid_dns_domain(domain) || (self.kind == VpnKind::Ssl && !domain.contains('.'))
+            })
             || self
                 .dns_domains
                 .iter()
@@ -102,8 +159,7 @@ fn deserialize_dns_domains<'de, D: serde::Deserializer<'de>>(
 }
 
 fn valid_dns_domain(domain: &str) -> bool {
-    domain.contains('.')
-        && domain.len() <= 253
+    domain.len() <= 253
         && domain.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
@@ -210,6 +266,145 @@ mod failure_tests {
     fn profile() -> Profile {
         serde_json::from_value(serde_json::json!({"id":"one","name":"Example","kind":"ssl","gateway":"vpn.example.com","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap()
     }
+    fn ovpn_profile() -> Profile {
+        serde_json::from_str(concat!(
+            r#"{"id":"one","name":"Example","kind":"ovpn","gateway":"vpn.example.com","username":"","networks":[],"dnsDomains":["serpro"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp","#,
+            r#""ovpn":{"certificateId":"01ab","module":"/opt/pkcs11/token.so","tls":"any"}}"#
+        )).unwrap()
+    }
+
+    #[test]
+    fn ovpn_round_trip_and_tls_wire_defaults() {
+        let profile = ovpn_profile();
+        assert_eq!(profile.validate(), Ok(()));
+        assert_eq!(profile.kind, VpnKind::Ovpn);
+        assert_eq!(profile.ovpn.as_ref().unwrap().tls, OvpnTls::Any);
+        let wire = serde_json::to_string(&profile).unwrap();
+        assert_eq!(serde_json::from_str::<Profile>(&wire).unwrap(), profile);
+        let mut value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(value["kind"], "ovpn");
+        assert_eq!(value["ovpn"]["certificateId"], "01ab");
+        assert_eq!(value["ovpn"]["module"], "/opt/pkcs11/token.so");
+        assert_eq!(value["ovpn"]["tls"], "any");
+        value["ovpn"].as_object_mut().unwrap().remove("tls");
+        let defaulted: Profile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(defaulted.ovpn.as_ref().unwrap().tls, OvpnTls::Pkcs1Only);
+        assert_eq!(
+            serde_json::to_value(defaulted).unwrap()["ovpn"]["tls"],
+            "pkcs1_only"
+        );
+        value["ovpn"]["unknown"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<Profile>(value).is_err());
+    }
+
+    #[test]
+    fn legacy_profile_serialization_bytes_are_unchanged() {
+        for wire in [
+            r#"{"id":"one","name":"Example","kind":"ipsec","gateway":"vpn.example.com","username":"fictional","networks":["10.20.0.0/24"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"}"#,
+            r#"{"id":"one","name":"Example","kind":"ssl","gateway":"vpn.example.com","username":"fictional","networks":[],"dnsDomains":["example.com"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"}"#,
+        ] {
+            let profile: Profile = serde_json::from_str(wire).unwrap();
+            assert_eq!(profile.validate(), Ok(()));
+            assert!(profile.ovpn.is_none());
+            assert_eq!(serde_json::to_vec(&profile).unwrap(), wire.as_bytes());
+        }
+    }
+
+    #[test]
+    fn ovpn_requires_settings_and_legacy_kinds_reject_them() {
+        let mut missing = ovpn_profile();
+        missing.ovpn = None;
+        assert_eq!(missing.validate(), Err("invalid_profile"));
+
+        let settings = ovpn_profile().ovpn;
+        let mut legacy = profile();
+        for kind in [VpnKind::Ssl, VpnKind::Ipsec] {
+            legacy.kind = kind;
+            assert_eq!(legacy.validate(), Ok(()));
+            legacy.ovpn.clone_from(&settings);
+            assert_eq!(legacy.validate(), Err("invalid_profile"));
+            legacy.ovpn = None;
+        }
+    }
+
+    #[test]
+    fn ovpn_certificate_id_and_module_validation() {
+        for invalid in [
+            "123".into(),
+            "AF".into(),
+            "0g".into(),
+            "".into(),
+            "a".repeat(130),
+        ] {
+            let mut profile = ovpn_profile();
+            profile.ovpn.as_mut().unwrap().certificate_id = invalid;
+            assert_eq!(profile.validate(), Err("invalid_profile"));
+        }
+        for valid in ["01".into(), "a".repeat(128)] {
+            let mut profile = ovpn_profile();
+            profile.ovpn.as_mut().unwrap().certificate_id = valid;
+            assert_eq!(profile.validate(), Ok(()));
+        }
+        for invalid in [
+            "opt/token.so".into(),
+            "/opt/../token.so".into(),
+            "/opt/token.dylib".into(),
+            "/opt/token\n.so".into(),
+            format!("/{}.so", "é".repeat(2047)),
+        ] {
+            let mut profile = ovpn_profile();
+            profile.ovpn.as_mut().unwrap().module = invalid;
+            assert_eq!(profile.validate(), Err("invalid_profile"));
+        }
+        let mut boundary = ovpn_profile();
+        boundary.ovpn.as_mut().unwrap().module = format!("/{}.so", "x".repeat(4092));
+        assert_eq!(boundary.validate(), Ok(()));
+    }
+
+    #[test]
+    fn ovpn_rejects_legacy_fields_without_relaxing_gateway_or_probe() {
+        for (field, value) in [
+            ("username", serde_json::json!("unused")),
+            ("networks", serde_json::json!(["not-a-network"])),
+            ("certificate", serde_json::json!("unused")),
+        ] {
+            let mut wire = serde_json::to_value(ovpn_profile()).unwrap();
+            wire[field] = value;
+            let profile: Profile = serde_json::from_value(wire).unwrap();
+            assert_eq!(profile.validate(), Err("invalid_profile"));
+        }
+        let mut profile = ovpn_profile();
+        profile.gateway = "not a host".into();
+        assert_eq!(profile.validate(), Err("invalid_gateway"));
+        let mut profile = ovpn_profile();
+        profile.probe_port = 22;
+        assert_eq!(profile.validate(), Err("invalid_probe"));
+    }
+
+    #[test]
+    fn ovpn_dns_accepts_a_single_label_but_ssl_requires_a_dot() {
+        assert_eq!(ovpn_profile().validate(), Ok(()));
+        let mut ssl = profile();
+        ssl.dns_domains = vec!["serpro".into()];
+        assert_eq!(ssl.validate(), Err("invalid_profile"));
+        ssl.dns_domains = vec!["serpro.example".into()];
+        assert_eq!(ssl.validate(), Ok(()));
+
+        for domains in [
+            vec!["serpro".into(), "serpro".into()],
+            vec!["-serpro".into()],
+            vec!["serpro.".into()],
+            (0..9).map(|i| format!("domain{i}")).collect(),
+        ] {
+            let mut profile = ovpn_profile();
+            profile.dns_domains = domains;
+            assert_eq!(profile.validate(), Err("invalid_profile"));
+        }
+        let mut boundary = ovpn_profile();
+        boundary.dns_domains = (0..8).map(|i| format!("domain{i}")).collect();
+        assert_eq!(boundary.validate(), Ok(()));
+    }
+
     fn view(failure: Option<FailureView>) -> VpnView {
         VpnView {
             cleaning: false,

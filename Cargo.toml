@@ -116,6 +116,12 @@ cc = "=1.11.1"
 lto = "thin"
 strip = true
 
+# The Linux runtime and admin children hash their own executable at start
+# (build identity). Unoptimized sha2 takes seconds over a debug binary of
+# about 200 MiB, enough to time out tests on a busy CI runner.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [[bin]]
 name = "vpnt"
 path = "src/main.rs"

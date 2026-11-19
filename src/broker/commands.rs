@@ -5,6 +5,13 @@ impl<S: SecretStore> Broker<S> {
         command: Command,
         expires: Instant,
     ) -> Result<Snapshot, &'static str> {
+        #[cfg(target_os = "linux")]
+        if matches!(
+            &command,
+            Command::InstallHelper {} | Command::RemoveHelper {}
+        ) {
+            return Err("unsupported");
+        }
         self.poll();
         // Direct Broker callers carry the same manual intent as the actor.
         // Interrupt after poll so newly observed reconnect work is covered too.
@@ -117,13 +124,15 @@ impl<S: SecretStore> Broker<S> {
                 credentials
                     .validate(c.view.profile.kind)
                     .map_err(|_| "invalid_secret")?;
-                self.secrets
-                    .save(&id, c.view.profile.kind, &credentials)
-                    .map_err(|_| "backend_unavailable")?;
-                c.view.has_password = true;
-                c.view.has_psk = c.view.profile.kind == VpnKind::Ipsec;
-                if c.view.state == State::MissingSecret {
-                    set_state(c, State::Off);
+                if needs_credentials(c.view.profile.kind) {
+                    self.secrets
+                        .save(&id, c.view.profile.kind, &credentials)
+                        .map_err(|_| "backend_unavailable")?;
+                    c.view.has_password = true;
+                    c.view.has_psk = c.view.profile.kind == VpnKind::Ipsec;
+                    if c.view.state == State::MissingSecret {
+                        set_state(c, State::Off);
+                    }
                 }
             }
             Command::SetPreferences { preferences } => {
@@ -137,6 +146,9 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Command::SetDemoState { .. } => return Err("invalid_request"),
+            Command::InspectOvpn { .. } | Command::ListCertificates { .. } => {
+                return Err("unsupported");
+            }
             Command::SaveProfile { .. }
             | Command::RemoveProfile { .. }
             | Command::InstallHelper {}
@@ -201,15 +213,22 @@ impl<S: SecretStore> Broker<S> {
         if c.view.state == State::CleanupUnconfirmed {
             return Err("profile_busy");
         }
-        let credentials = match self.secrets.load(id, c.view.profile.kind) {
-            Ok(credentials) => credentials,
-            Err(crate::secrets::SecretError::Missing) => {
-                c.view.has_password = false;
-                c.view.has_psk = false;
-                set_state(c, State::MissingSecret);
-                return Ok(());
+        let credentials = if needs_credentials(c.view.profile.kind) {
+            match self.secrets.load(id, c.view.profile.kind) {
+                Ok(credentials) => credentials,
+                Err(crate::secrets::SecretError::Missing) => {
+                    c.view.has_password = false;
+                    c.view.has_psk = false;
+                    set_state(c, State::MissingSecret);
+                    return Ok(());
+                }
+                Err(_) => return Err("backend_unavailable"),
             }
-            Err(_) => return Err("backend_unavailable"),
+        } else {
+            Credentials {
+                password: "".into(),
+                psk: "".into(),
+            }
         };
         if !current() {
             return Err("operation_canceled");

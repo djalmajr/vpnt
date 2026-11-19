@@ -1,9 +1,12 @@
 //! OVPN: OpenVPN with a certificate whose private key stays in a PKCS#11
 //! token. openvpn requests every TLS signature over the management channel
 //! and the token produces it, so no pkcs11-helper sits in between.
+mod der;
 pub mod management;
+pub mod network;
 pub mod pkcs11;
 mod private_dir;
+pub mod profile;
 pub mod session;
 pub mod signing;
 

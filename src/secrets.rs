@@ -46,6 +46,9 @@ pub struct Credentials {
 impl Credentials {
     /// The pipe parser does not know the root-owned profile type yet.
     pub fn validate_shape(&self) -> Result<(), SecretError> {
+        if self.password.expose().is_empty() && self.psk.expose().is_empty() {
+            return Ok(());
+        }
         if !self.password.valid(true) || !self.psk.valid(false) {
             return Err(SecretError::InvalidData);
         }
@@ -53,10 +56,18 @@ impl Credentials {
     }
 
     pub fn validate(&self, kind: VpnKind) -> Result<(), SecretError> {
+        if kind == VpnKind::Ovpn {
+            return if self.password.expose().is_empty() && self.psk.expose().is_empty() {
+                Ok(())
+            } else {
+                Err(SecretError::InvalidData)
+            };
+        }
         self.validate_shape()?;
         // openfortivpn 1.24.1 stores at most PASSWORD_SIZE=256 bytes. Reject
         // excess before sending to pinentry instead of silently truncating.
-        if (kind == VpnKind::Ssl && self.password.expose().len() > 256)
+        if self.password.expose().is_empty()
+            || (kind == VpnKind::Ssl && self.password.expose().len() > 256)
             || (kind == VpnKind::Ipsec && self.psk.expose().is_empty())
         {
             return Err(SecretError::InvalidData);
@@ -79,4 +90,78 @@ pub trait SecretStore: Send {
     fn load(&self, id: &str, kind: VpnKind) -> Result<Credentials, SecretError>;
     fn save(&self, id: &str, kind: VpnKind, credentials: &Credentials) -> Result<(), SecretError>;
     fn remove(&self, id: &str, kind: VpnKind) -> Result<(), SecretError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ovpn_credentials_must_both_be_empty() {
+        for (password, psk, expected) in [
+            ("", "", Ok(())),
+            ("placeholder", "", Err(SecretError::InvalidData)),
+            ("", "placeholder", Err(SecretError::InvalidData)),
+            ("placeholder", "placeholder", Err(SecretError::InvalidData)),
+        ] {
+            let credentials = Credentials {
+                password: password.into(),
+                psk: psk.into(),
+            };
+            assert_eq!(credentials.validate(VpnKind::Ovpn), expected);
+        }
+    }
+    #[test]
+    fn empty_credentials_cross_wire_but_remain_type_checked() {
+        let empty = || Credentials {
+            password: "".into(),
+            psk: "".into(),
+        };
+        assert_eq!(empty().validate_shape(), Ok(()));
+        assert_eq!(
+            empty().validate(VpnKind::Ssl),
+            Err(SecretError::InvalidData)
+        );
+        assert_eq!(
+            empty().validate(VpnKind::Ipsec),
+            Err(SecretError::InvalidData)
+        );
+        assert_eq!(empty().validate(VpnKind::Ovpn), Ok(()));
+        let request = crate::helper::protocol::Request {
+            id: "request".into(),
+            command: crate::helper::protocol::Command::Connect {
+                id: "profile".into(),
+                generation: 1,
+                interval: crate::preferences::ProbeInterval::TEN,
+                credentials: empty(),
+            },
+        };
+        let wire = serde_json::to_vec(&request).unwrap();
+        assert!(crate::helper::protocol::parse_request(&wire).is_ok());
+        let password_only = Credentials {
+            password: "fixture".into(),
+            psk: "".into(),
+        };
+        assert_eq!(password_only.validate(VpnKind::Ssl), Ok(()));
+        assert_eq!(
+            password_only.validate(VpnKind::Ipsec),
+            Err(SecretError::InvalidData)
+        );
+        assert_eq!(
+            password_only.validate(VpnKind::Ovpn),
+            Err(SecretError::InvalidData)
+        );
+        let psk_only = Credentials {
+            password: "".into(),
+            psk: "fixture".into(),
+        };
+        assert_eq!(
+            psk_only.validate(VpnKind::Ovpn),
+            Err(SecretError::InvalidData)
+        );
+        assert_eq!(
+            psk_only.validate(VpnKind::Ipsec),
+            Err(SecretError::InvalidData)
+        );
+    }
 }

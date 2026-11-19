@@ -6,6 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod ovpn;
 mod preferences;
 
 #[derive(Deserialize)]
@@ -17,6 +18,9 @@ pub struct Request {
     pub locale: Option<crate::localization::Locale>,
 }
 
+// One command is decoded per bridge request; boxing the profile would only
+// move the allocation and touch every constructor.
+#[allow(clippy::large_enum_variant)]
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
@@ -40,6 +44,14 @@ pub enum Command {
     },
     SaveProfile {
         profile: Profile,
+        #[serde(default)]
+        ovpn_config: Option<String>,
+    },
+    InspectOvpn {
+        content: String,
+    },
+    ListCertificates {
+        module: String,
     },
     RemoveProfile {
         id: String,
@@ -67,17 +79,65 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct Reply {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ovpn: Option<OvpnInspection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificates: Option<Vec<CertificateView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OvpnInspection {
+    pub name: Option<String>,
+    pub gateway: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateView {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+}
+
+impl Reply {
+    pub fn error(id: String, code: &str) -> Self {
+        Self {
+            id,
+            error: Some(code.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn from_result(id: String, result: Result<Snapshot, &'static str>) -> Self {
+        match result {
+            Ok(snapshot) => Self {
+                id,
+                snapshot: Some(snapshot),
+                ..Self::default()
+            },
+            Err(error) => Self::error(id, error),
+        }
+    }
 }
 
 pub fn parse_request(body: &str) -> Result<Request, &'static str> {
-    if body.len() > 65536 {
+    if body.len() > 128 * 1024 {
         return Err("invalid_request");
     }
     let request: Request = serde_json::from_str(body).map_err(|_| "invalid_request")?;

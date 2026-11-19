@@ -6,11 +6,12 @@ const DEFAULT_HEIGHT: u32 = 480;
 const TRAY_ID: &str = "vpnt";
 
 mod backend;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use backend::Backend as TestBackend;
 mod icon;
 mod omarchy;
 mod placement;
-// Wired into the desktop backend in the subsequent integration slice.
-#[allow(dead_code)]
 mod preferences;
 #[cfg(test)]
 mod tests;
@@ -281,14 +282,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let id = request.id.clone();
                     if backend.send(request, received).is_err() {
-                        send_reply(
-                            &webview,
-                            &Reply {
-                                id,
-                                snapshot: None,
-                                error: Some("backend_unavailable".into()),
-                            },
-                        );
+                        send_reply(&webview, &Reply::error(id, "backend_unavailable"));
                     }
                 }
             }

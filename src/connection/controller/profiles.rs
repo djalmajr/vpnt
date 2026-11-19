@@ -9,12 +9,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux has no driver that reserves profiles yet.
 struct Reservation {
     profile: ProfileReservation,
     live: bool,
     identity: Arc<()>,
 }
 type Reservations = Arc<Mutex<BTreeMap<(String, u64), Reservation>>>;
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Reservations are used by native drivers.
 pub(super) struct Profiles {
     store: ProfileStore,
     reservations: Reservations,
@@ -24,10 +26,15 @@ pub(super) struct ProfileUse {
     reservations: Reservations,
     identity: Arc<()>,
 }
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux currently only loads profiles.
 impl Profiles {
     #[cfg(test)]
     pub(super) fn fixture(store: ProfileStore) -> Self {
         Self::new(store)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn for_current_user() -> Result<Self, StoreError> {
+        Ok(Self::new(ProfileStore::for_current_user()?))
     }
     #[cfg(target_os = "macos")]
     pub(super) fn for_user(uid: u32) -> Result<Self, StoreError> {
@@ -97,6 +104,7 @@ impl Profiles {
         Ok(action(&live))
     }
 }
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux currently starts no attempts.
 impl ProfileUse {
     /// Hold the reservation through the durable write and release only after
     /// the action commits successfully. `busy` is the error when the

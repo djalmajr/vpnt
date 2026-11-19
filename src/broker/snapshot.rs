@@ -111,6 +111,7 @@ impl<S: SecretStore> Broker<S> {
             self.connections.clear();
         }
         for profile in profiles {
+            let requires_credentials = needs_credentials(profile.kind);
             let status = statuses.remove(&profile.id).ok_or(())?;
             let previous = self.connections.remove(&profile.id);
             if let Some(mut c) = previous {
@@ -128,10 +129,11 @@ impl<S: SecretStore> Broker<S> {
                 }
                 let changed_kind = c.view.profile.kind != profile.kind;
                 if changed_kind {
-                    let present = self
-                        .secrets
-                        .contains(&profile.id, profile.kind)
-                        .unwrap_or(false);
+                    let present = requires_credentials
+                        && self
+                            .secrets
+                            .contains(&profile.id, profile.kind)
+                            .unwrap_or(false);
                     c.view.has_password = present;
                     c.view.has_psk = present && profile.kind == VpnKind::Ipsec;
                 }
@@ -140,20 +142,22 @@ impl<S: SecretStore> Broker<S> {
                     c.pending = None;
                 }
                 c.generation = status.generation;
-                let state = if status.state == State::Off && !c.view.has_password {
-                    State::MissingSecret
-                } else {
-                    status.state
-                };
+                let state =
+                    if requires_credentials && status.state == State::Off && !c.view.has_password {
+                        State::MissingSecret
+                    } else {
+                        status.state
+                    };
                 transition(&mut c, state, status.failure.map(FailureView::from));
                 c.failures = status.failures;
                 c.view.cleaning = status.cleaning;
                 current.insert(c.view.profile.id.clone(), c);
             } else {
-                let present = self
-                    .secrets
-                    .contains(&profile.id, profile.kind)
-                    .unwrap_or(false);
+                let present = requires_credentials
+                    && self
+                        .secrets
+                        .contains(&profile.id, profile.kind)
+                        .unwrap_or(false);
                 current.insert(
                     profile.id.clone(),
                     Connection {
@@ -163,7 +167,8 @@ impl<S: SecretStore> Broker<S> {
                             has_password: present,
                             has_psk: present && profile.kind == VpnKind::Ipsec,
                             profile,
-                            state: if status.state == State::Off && !present {
+                            state: if requires_credentials && status.state == State::Off && !present
+                            {
                                 State::MissingSecret
                             } else {
                                 status.state

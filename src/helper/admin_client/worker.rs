@@ -29,6 +29,7 @@ pub(super) fn run(
         if remaining.is_zero() || remaining > Duration::from_secs(120) {
             return Err(Error::Expired);
         }
+        #[cfg(target_os = "macos")]
         let until = monotonic_ns()?
             .checked_add(u64::try_from(remaining.as_nanos()).map_err(|_| Error::Expired)?)
             .ok_or(Error::Expired)?;
@@ -37,13 +38,20 @@ pub(super) fn run(
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("LANG", "C")
             .env("LC_ALL", "C")
-            .env("SUDO_ASKPASS", paths::ASKPASS)
-            .env("VPNT_AUTH_LOCALE", locale.code())
-            .env("VPNT_AUTH_UNTIL_NS", until.to_string())
             .current_dir("/")
             .stdin(Stdio::from(OwnedFd::from(capability)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "macos")]
+        command
+            .env("SUDO_ASKPASS", paths::ASKPASS)
+            .env("VPNT_AUTH_LOCALE", locale.code())
+            .env("VPNT_AUTH_UNTIL_NS", until.to_string());
+        #[cfg(target_os = "linux")]
+        {
+            let _ = locale;
+            super::super::client::linux_inherit_session(&mut command);
+        }
         check(&state, expires)?;
         let mut child = command.spawn().map_err(|_| Error::Unavailable)?;
         drop(command);
@@ -176,6 +184,7 @@ fn read(
         }
     }
 }
+#[cfg(target_os = "macos")]
 pub(crate) fn monotonic_ns() -> Result<u64, Error> {
     let mut time = libc::timespec {
         tv_sec: 0,

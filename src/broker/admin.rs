@@ -30,6 +30,9 @@ pub(super) struct Query {
     pub epoch: u64,
     pub observed: BTreeMap<String, u64>,
 }
+// One change at a time is pending per broker, so the size of Save (a whole
+// profile, OVPN settings included) costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 enum Change {
     Save(Profile),
     Remove { id: String, kind: VpnKind },
@@ -55,7 +58,7 @@ impl Flow {
     }
 }
 impl<S: SecretStore> Broker<S> {
-    #[cfg(all(test, feature = "desktop"))]
+    #[cfg(all(test, feature = "desktop", target_os = "macos"))]
     pub(crate) fn administrative_fixture(
         client: Client,
         secrets: S,
@@ -82,12 +85,12 @@ impl<S: SecretStore> Broker<S> {
             return Err("admin_busy");
         }
         let (change, command) = match command {
-            Command::SaveProfile { profile } => {
-                profile.validate()?;
-                (
-                    Change::Save(profile.clone()),
-                    AdminCommand::SaveProfile { profile },
-                )
+            Command::SaveProfile {
+                profile,
+                ovpn_config,
+            } => {
+                let change = Change::Save(profile.clone());
+                (change, AdminCommand::for_save(profile, ovpn_config)?)
             }
             Command::RemoveProfile { id } => {
                 let kind = self
@@ -275,5 +278,5 @@ fn map_error(error: AdminError) -> &'static str {
         _ => "admin_unconfirmed",
     }
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests;
