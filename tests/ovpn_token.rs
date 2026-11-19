@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
 };
-use vpnt::connection::ovpn::pkcs11::list_certificates;
+use vpnt::connection::ovpn::pkcs11::{TokenError, TokenKey, list_certificates};
 
 const LABEL: &str = "vpnt-fixture";
 const PIN: &str = "18273645";
@@ -152,7 +152,10 @@ fn exercise(module: &Path, root: &Path, utility: bool) {
         run(Command::new("softhsm2-util")
             .arg("--import")
             .arg(&key)
-            .args(["--token", LABEL, "--id", "01", "--pin", PIN]));
+            // SoftHSM 2.7 refuses an import without an object label.
+            .args([
+                "--token", LABEL, "--label", "matched", "--id", "01", "--pin", PIN,
+            ]));
     } else {
         let der_key = root.join("matched-key.der");
         fs::write(&der_key, &rsa.stdout).unwrap();
@@ -254,6 +257,13 @@ fn exercise(module: &Path, root: &Path, utility: bool) {
         certificate.not_after.as_deref(),
         Some(date("notAfter=").as_str())
     );
+
+    assert_eq!(
+        TokenKey::open(module, &[9]).err(),
+        Some(TokenError::NotFound)
+    );
+    let mut key = TokenKey::open(module, &[1]).unwrap();
+    assert_eq!(key.certificate().unwrap(), fs::read(&cert).unwrap());
 }
 
 fn import_visible_key(session: &Session, mut der: &[u8]) {
