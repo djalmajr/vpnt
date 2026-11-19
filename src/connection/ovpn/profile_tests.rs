@@ -20,7 +20,7 @@ fn remote_cert_tls_requires_exact_server_role() {
 
 #[test]
 fn control_channel_timers_are_accepted() {
-    // Serpro profiles tune TLS retransmission and key transition windows.
+    // Provider profiles tune TLS retransmission and key transition windows.
     for line in ["tls-timeout 2", "tran-window 3600", "hand-window 60"] {
         let inspected = inspect(append(line).as_bytes()).unwrap();
         assert!(
@@ -31,7 +31,7 @@ fn control_channel_timers_are_accepted() {
 }
 
 #[test]
-fn serpro_shape_normalizes_and_extracts_metadata() {
+fn provider_shape_normalizes_and_extracts_metadata() {
     let input = concat!(
         "  # Name: Rede de teste \r\n",
         "# Description: synthetic\r# Servers: synthetic\r\n",

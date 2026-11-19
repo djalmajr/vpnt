@@ -367,7 +367,7 @@ export function Profile({
                 <input
                   value={dnsDomains}
                   disabled={saving}
-                  placeholder={isOvpn ? "serpro" : "corp.example.com"}
+                  placeholder={isOvpn ? "corp.example" : "corp.example.com"}
                   onChange={(event) => setDnsDomains(event.target.value)}
                   spellCheck={false}
                   autoComplete="off"
@@ -439,7 +439,7 @@ export function Profile({
                 ))}
               </Group>
             )}
-            <details>
+            <details open={!moduleValid}>
               <summary>{t("ovpnAdvanced")}</summary>
               <Group>
                 <label className="field">
@@ -448,6 +448,7 @@ export function Profile({
                     value={ovpn.module}
                     disabled={saving || listing}
                     aria-invalid={!moduleValid}
+                    placeholder="/usr/lib/libpkcs11-module.so"
                     onChange={(event) => {
                       set("ovpn", {
                         ...ovpn,
