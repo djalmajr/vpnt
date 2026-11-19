@@ -513,6 +513,11 @@ impl ProfileStore {
     /// `One.ovpn` are one file, so a legacy catalog holding both ids keeps the
     /// config its remaining entry still uses. On a case-sensitive volume they
     /// are two files and only the removed id's config goes.
+    ///
+    /// Only an id equal to the removed one ignoring ASCII case can name the
+    /// same file, so an unrelated entry is never inspected: its config being
+    /// unreadable or badly permissioned cannot block this removal. A reachable
+    /// alias that cannot be inspected still refuses it.
     fn remove_config_of(
         &self,
         id: &str,
@@ -523,6 +528,9 @@ impl ProfileStore {
             return Ok(());
         };
         for profile in remaining {
+            if !profile.id.eq_ignore_ascii_case(id) {
+                continue;
+            }
             if self.ovpn_config_identity(&profile.id)? == Some(identity) {
                 return Ok(());
             }
@@ -1425,6 +1433,35 @@ mod admin_tests {
         drop(deny);
         store.remove_admin_profile("one").unwrap();
         assert!(store.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_profile_ignores_an_unrelated_config_it_cannot_inspect() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        store
+            .save_admin_profile(ovpn_profile("two"), Some(OTHER_CONFIG))
+            .unwrap();
+        let unrelated = fs::read(f.config("two")).unwrap();
+        // `two` cannot converge with `one` by name, so its config is not an
+        // alias candidate and its mode may never be inspected.
+        fs::set_permissions(f.config("two"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.remove_admin_profile("one"), Ok(()));
+        assert!(!f.config_exists("one"));
+        assert_eq!(fs::read(f.config("two")).unwrap(), unrelated);
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>(),
+            ["two"]
+        );
     }
 
     #[cfg(target_os = "macos")]

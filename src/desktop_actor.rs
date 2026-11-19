@@ -50,10 +50,29 @@ fn certificate_view(
 }
 
 fn list_certificates(id: String, module: String) -> Reply {
+    list_certificates_with(
+        id,
+        module,
+        crate::connection::ovpn::pkcs11::list_certificates,
+    )
+}
+
+/// The production reply built from an injected provider, so a test can assert
+/// the certificates this reply carries without a native PKCS#11 module.
+fn list_certificates_with(
+    id: String,
+    module: String,
+    provider: impl Fn(
+        &std::path::Path,
+    ) -> Result<
+        Vec<crate::connection::ovpn::pkcs11::CertificateInfo>,
+        crate::connection::ovpn::pkcs11::TokenError,
+    >,
+) -> Reply {
     if let Some(refusal) = listing_refusal(&id, &module) {
         return refusal;
     }
-    match crate::connection::ovpn::pkcs11::list_certificates(std::path::Path::new(&module)) {
+    match provider(std::path::Path::new(&module)) {
         Ok(certificates) => Reply {
             id,
             certificates: Some(certificates.into_iter().map(certificate_view).collect()),

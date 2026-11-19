@@ -206,6 +206,35 @@ fn ovpn_admin_identity_keeps_each_config_through_rename_and_removal() {
 }
 
 #[test]
+fn ovpn_admin_removal_ignores_an_unrelated_config_it_cannot_inspect() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let input = "remote vpn.example.test 1194\n<ca>\nfixture\n</ca>\n";
+    for id in ["one", "two"] {
+        assert!(matches!(
+            f.request(AdminCommand::SaveProfile {
+                profile: ovpn_profile(id),
+                ovpn_config: Some(input.into())
+            }),
+            Message::Accepted { .. }
+        ));
+    }
+    let target = f.0.join("ovpn/one.ovpn");
+    let unrelated = f.0.join("ovpn/two.ovpn");
+    let unrelated_data = fs::read(&unrelated).unwrap();
+    // `two` is no case alias of `one`: its config is never inspected, so an
+    // invalid mode on it must not block removing `one`.
+    fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(matches!(
+        f.request(AdminCommand::RemoveProfile { id: "one".into() }),
+        Message::Accepted { .. }
+    ));
+    assert!(!target.exists());
+    assert_eq!(fs::read(&unrelated).unwrap(), unrelated_data);
+    assert_eq!(f.store().load().unwrap(), vec![ovpn_profile("two")]);
+}
+
+#[test]
 fn ovpn_admin_rejects_forbidden_directives_before_writing() {
     let f = Fixture::new();
     let profile: crate::model::Profile = serde_json::from_value(serde_json::json!({
