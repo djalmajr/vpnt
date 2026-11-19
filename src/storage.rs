@@ -389,6 +389,16 @@ impl ProfileStore {
         let _lock = self.lock()?;
         let mut profiles = self.load()?;
         let original = profiles.clone();
+        // Two ids that differ only in case stay separate in the catalog but
+        // converge on a case-insensitive volume (APFS), where one config would
+        // replace the other. Refuse the new write; a catalog that already holds
+        // both keeps loading until it is edited.
+        if profiles
+            .iter()
+            .any(|existing| existing.id != id && existing.id.eq_ignore_ascii_case(&id))
+        {
+            return Err(StoreError::InvalidData);
+        }
         let previous =
             if let Some(existing) = profiles.iter_mut().find(|existing| existing.id == id) {
                 let kind = existing.kind;
@@ -448,25 +458,20 @@ impl ProfileStore {
         let mut profiles = self.load()?;
         let count = profiles.len();
         profiles.retain(|profile| profile.id != id);
-        let found = count != profiles.len();
-        if !found && !remove_config {
+        if count == profiles.len() {
+            // Nothing in the catalog means this id was never saved here. Its
+            // config path may still converge with another profile's on a
+            // case-insensitive volume, so nothing is removed.
             return Err(StoreError::NotFound);
         }
         reservation.validate()?;
+        // The config belongs to this entry: remove it first, so a failure
+        // leaves the catalog unchanged and the profile visible for a retry.
         if remove_config {
-            self.ovpn_config_exists(id)?;
+            self.remove_ovpn_config(id)?;
         }
-        if found {
-            self.write(&encode_profiles(profiles)?)?;
-        }
-        if remove_config && self.remove_ovpn_config(id).is_err() {
-            eprintln!("ovpn_orphan");
-        }
-        if found {
-            Ok(())
-        } else {
-            Err(StoreError::NotFound)
-        }
+        self.write(&encode_profiles(profiles)?)?;
+        Ok(())
     }
 
     fn check_directory(&self) -> Result<(), StoreError> {
@@ -1147,5 +1152,166 @@ mod linux_tests {
             store.ovpn_config_exists("test"),
             Err(StoreError::UntrustedPath)
         );
+    }
+}
+
+// Portable administrative-store cases: identity of an id and its config.
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+    use std::{fs, os::unix::fs::MetadataExt, path::PathBuf, sync::atomic::AtomicU64};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("output/fixtures")
+                .join(format!(
+                    "storage-admin-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+        fn store(&self) -> ProfileStore {
+            ProfileStore::open(&self.0, fs::metadata(&self.0).unwrap().uid()).unwrap()
+        }
+        fn config(&self, id: &str) -> PathBuf {
+            self.0.join("ovpn").join(format!("{id}.ovpn"))
+        }
+        fn config_exists(&self, id: &str) -> bool {
+            fs::symlink_metadata(self.config(id)).is_ok()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const CONFIG: &str = "remote vpn.example.test 1194\r\n<ca>\r\nfixture\r\n</ca>\r\n";
+    const OTHER_CONFIG: &str = "remote vpn.example.test 1194\n<ca>\nother\n</ca>\n";
+
+    fn ovpn_profile(id: &str) -> Profile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "kind": "ovpn", "gateway": "vpn.example.test",
+            "username": "", "networks": [], "port": 1194, "certificate": "",
+            "probeHost": "192.0.2.1", "probePort": 8443, "probeMethod": "tcp",
+            "ovpn": {"module": "/fixture/token.dylib", "certificateId": "01", "tls": "pkcs1_only"}
+        }))
+        .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    struct Deny(std::ffi::CString);
+    #[cfg(target_os = "macos")]
+    impl Drop for Deny {
+        fn drop(&mut self) {
+            // SAFETY: the NUL-terminated owned path stays valid for this call.
+            assert_eq!(unsafe { libc::chflags(self.0.as_ptr(), 0) }, 0);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn deny_config_removal(f: &Fixture) -> Deny {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(f.config("one").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated owned path stays valid for this call.
+        assert_eq!(
+            unsafe { libc::chflags(path.as_ptr(), libc::UF_IMMUTABLE) },
+            0
+        );
+        Deny(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    struct Deny(PathBuf);
+    #[cfg(not(target_os = "macos"))]
+    impl Drop for Deny {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn deny_config_removal(f: &Fixture) -> Deny {
+        // The unlink needs a writable directory; this fixture makes it read-only.
+        let directory = f.0.join("ovpn");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+        Deny(directory)
+    }
+
+    #[test]
+    fn saving_an_id_that_differs_only_in_case_is_refused() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        let catalog = fs::read(f.0.join("profiles.json")).unwrap();
+        let config = fs::read(f.config("one")).unwrap();
+        assert_eq!(
+            store.save_admin_profile(ovpn_profile("One"), Some(OTHER_CONFIG)),
+            Err(StoreError::InvalidData)
+        );
+        assert_eq!(fs::read(f.0.join("profiles.json")).unwrap(), catalog);
+        assert_eq!(fs::read(f.config("one")).unwrap(), config);
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>(),
+            ["one"]
+        );
+    }
+
+    #[test]
+    fn editing_the_stored_id_keeps_its_config() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        let mut edited = ovpn_profile("one");
+        edited.name = "Edited fixture".into();
+        store.save_admin_profile(edited.clone(), None).unwrap();
+        assert_eq!(store.load().unwrap(), vec![edited]);
+        assert_eq!(fs::read(f.config("one")).unwrap(), CONFIG.as_bytes());
+    }
+
+    #[test]
+    fn removing_an_absent_case_alias_keeps_the_stored_profile_config() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        assert_eq!(store.remove_admin_profile("One"), Err(StoreError::NotFound));
+        assert!(f.config_exists("one"));
+        assert_eq!(fs::read(f.config("one")).unwrap(), CONFIG.as_bytes());
+        assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_config_removal_keeps_the_profile_and_a_retry_succeeds() {
+        let f = Fixture::new();
+        let store = f.store();
+        store
+            .save_admin_profile(ovpn_profile("one"), Some(CONFIG))
+            .unwrap();
+        let catalog = fs::read(f.0.join("profiles.json")).unwrap();
+        let deny = deny_config_removal(&f);
+        assert!(store.remove_admin_profile("one").is_err());
+        assert!(f.config_exists("one"));
+        assert_eq!(fs::read(f.0.join("profiles.json")).unwrap(), catalog);
+        assert_eq!(store.load().unwrap().len(), 1);
+        drop(deny);
+        store.remove_admin_profile("one").unwrap();
+        assert!(!f.config_exists("one"));
+        assert!(store.load().unwrap().is_empty());
     }
 }

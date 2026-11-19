@@ -17,7 +17,6 @@ use std::{
 
 type ResultSnapshot = Result<Snapshot, &'static str>;
 
-#[cfg(target_os = "linux")]
 fn list_certificates(id: String, module: String) -> Reply {
     if !crate::model::valid_module_path(&module) {
         return Reply::error(id, "invalid_module");
@@ -150,12 +149,8 @@ impl Actor {
         init: impl FnOnce() -> (Option<App>, Option<B>) + Send + 'static,
         reply: impl Fn(Reply) + Send + 'static,
     ) -> std::io::Result<Self> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         return Self::spawn_with_listing(init, reply, list_certificates);
-        #[cfg(not(target_os = "linux"))]
-        Self::spawn_with_listing(init, reply, |id, module| {
-            crate::bridge::ovpn::reply(&id, &Command::ListCertificates { module }).unwrap()
-        })
     }
 
     fn spawn_with_listing<B: Runtime + 'static>(
@@ -170,16 +165,16 @@ impl Actor {
         let idle_cycles = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let actor_idle_cycles = idle_cycles.clone();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let list = Arc::new(list);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = list;
         std::thread::Builder::new()
             .name("vpnt-application".into())
             .spawn(move || {
                 let (mut demo, mut normal) = init();
                 let mut administrative = std::collections::BTreeMap::new();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let mut listing: Option<(
                     String,
                     mpsc::Receiver<Reply>,
@@ -187,7 +182,9 @@ impl Actor {
                     bool,
                 )> = None;
                 loop {
-                    #[cfg(target_os = "linux")]
+                    // A token module may wait on a native call: the listing
+                    // runs on its own thread so this loop keeps answering.
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     if let Some((id, receiver, expires, reported)) = &mut listing {
                         match receiver.try_recv() {
                             Ok(value) => {
@@ -227,7 +224,7 @@ impl Actor {
                     let observed_intent = actor_intent.load(Ordering::Acquire);
                     match requests.recv_timeout(Duration::from_millis(20)) {
                         Ok(work) => {
-                            #[cfg(target_os = "linux")]
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
                             if let Command::ListCertificates { module } = &work.request.command {
                                 let id = work.request.id.clone();
                                 if listing.is_some() {

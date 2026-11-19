@@ -138,7 +138,8 @@ impl<S: SecretStore> Broker<S> {
                     c.view.has_psk = present && profile.kind == VpnKind::Ipsec;
                 }
                 c.view.profile = profile;
-                if c.generation != status.generation {
+                let same_generation = c.generation == status.generation;
+                if !same_generation {
                     c.pending = None;
                 }
                 c.generation = status.generation;
@@ -148,6 +149,19 @@ impl<S: SecretStore> Broker<S> {
                     } else {
                         status.state
                     };
+                // The macOS app records a local warning when it has no OVPN
+                // program. The same generation reporting `Off` carries no new
+                // information and must not erase the warning the user can close.
+                #[cfg(target_os = "macos")]
+                let state = if same_generation
+                    && state == State::Off
+                    && c.view.state == State::MissingProgram
+                    && c.view.profile.kind == VpnKind::Ovpn
+                {
+                    State::MissingProgram
+                } else {
+                    state
+                };
                 transition(&mut c, state, status.failure.map(FailureView::from));
                 c.failures = status.failures;
                 c.view.cleaning = status.cleaning;

@@ -141,7 +141,10 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                     if let (Some(menu), Some(locale)) = (native_edit.as_mut(), request.locale) {
                         menu.set_locale(locale);
                     }
-                    if let Some(reply) = crate::bridge::ovpn::reply(&request.id, &request.command) {
+                    if synchronous_metadata(&request.command)
+                        && let Some(reply) =
+                            crate::bridge::ovpn::reply(&request.id, &request.command)
+                    {
                         if let Ok(json) = serde_json::to_string(&reply) {
                             let _ =
                                 webview.evaluate_script(&format!("window.__vpntReply?.({json})"));
@@ -201,6 +204,12 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
     });
 }
 
+/// Certificate listing can wait on the token module, so it runs in the actor;
+/// this callback answers only metadata that cannot block.
+fn synchronous_metadata(command: &Command) -> bool {
+    !matches!(command, Command::ListCertificates { .. })
+}
+
 /// Places the panel under `anchor` on its screen; without an anchor, or when
 /// AppKit placement fails, only the size follows the request.
 fn reposition(window: &Window, anchor: Option<placement::Anchor>, height: u32) {
@@ -236,5 +245,20 @@ fn show_icon(icons: &mut Option<icon::Controller>, snapshot: Option<&Snapshot>, 
     };
     if let Err(error) = controller.show(snapshot, error) {
         eprintln!("Could not update tray icon: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_callback_answers_only_metadata_that_cannot_block() {
+        assert!(!synchronous_metadata(&Command::ListCertificates {
+            module: "/fixture/token.dylib".into()
+        }));
+        assert!(synchronous_metadata(&Command::InspectOvpn {
+            content: "<ca>fixture</ca>".into()
+        }));
     }
 }

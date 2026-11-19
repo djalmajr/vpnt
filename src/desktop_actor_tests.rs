@@ -194,7 +194,6 @@ fn actor_correlates_administrative_replies_by_token_out_of_order() {
     assert!(first.snapshot.is_some());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn blocked_certificate_listing_does_not_block_actor() {
     let (started, _begins) = mpsc::channel();
@@ -272,7 +271,6 @@ fn blocked_certificate_listing_does_not_block_actor() {
     assert_eq!(listing.unwrap().id, "listing");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn actor_listing_reports_an_untrusted_module_distinctly() {
     use std::os::unix::fs::PermissionsExt;
