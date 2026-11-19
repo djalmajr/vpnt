@@ -112,14 +112,23 @@ fn duplicate_and_old_generation_failure_events_cannot_queue_another_attempt() {
     // A late event for the replaced generation is ignored by the broker. The
     // Probe below is the ordered wire barrier: its request/answer follows the
     // stale frame on the same Client stream.
-    std::fs::write(
-        peer.marker.with_extension("stale"),
+    write_stale(
+        &peer,
         br#"{"id":"one","generation":1,"state":"unresponsive","failures":3}"#,
-    )
-    .unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
+    );
+    let until = Instant::now() + Duration::from_secs(15);
     while !peer.marker.with_extension("stale.sent").exists() {
-        assert!(Instant::now() < until, "late event was not consumed");
+        let c = &broker.connections["one"];
+        assert!(
+            Instant::now() < until,
+            "duplicate late event receipt timed out: helper={}, state={:?}, generation={}, pending={}, accepted={:?}, stale.sent={}",
+            broker.helper,
+            c.view.state,
+            c.generation,
+            c.pending.is_some(),
+            c.pending.as_ref().map(|p| p.accepted),
+            peer.marker.with_extension("stale.sent").exists()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     consume_stale_with_probe(&mut broker, &peer);
@@ -202,14 +211,23 @@ fn late_old_generation_failure_does_not_reactivate() {
     wait(&mut broker, |s| state(s, "one") == State::Connected);
     assert_eq!(broker.connections["one"].generation, 2);
     assert_eq!(command_count(&peer, "connect"), 2);
-    std::fs::write(
-        peer.marker.with_extension("stale"),
+    write_stale(
+        &peer,
         br#"{"id":"one","generation":1,"state":"unresponsive","failures":3}"#,
-    )
-    .unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
+    );
+    let until = Instant::now() + Duration::from_secs(15);
     while !peer.marker.with_extension("stale.sent").exists() {
-        assert!(Instant::now() < until, "late event was not consumed");
+        let c = &broker.connections["one"];
+        assert!(
+            Instant::now() < until,
+            "old generation receipt timed out: helper={}, state={:?}, generation={}, pending={}, accepted={:?}, stale.sent={}",
+            broker.helper,
+            c.view.state,
+            c.generation,
+            c.pending.is_some(),
+            c.pending.as_ref().map(|p| p.accepted),
+            peer.marker.with_extension("stale.sent").exists()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     consume_stale_with_probe(&mut broker, &peer);

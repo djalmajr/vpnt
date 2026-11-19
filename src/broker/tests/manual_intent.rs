@@ -26,14 +26,58 @@ fn until(mut ready: impl FnMut() -> bool) {
     }
 }
 
+// Synchronization guards, not latency requirements: allow a 3 s pause plus
+// peer startup and scheduling, while still failing a stalled stage.
+fn stale_until(
+    broker: &mut Broker<Secrets>,
+    peer: &Peer,
+    stage: &str,
+    mut ready: impl FnMut(&mut Broker<Secrets>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if ready(broker) {
+            return;
+        }
+        let c = broker.connections.get("one");
+        assert!(
+            Instant::now() < deadline,
+            "{stage} timed out: pending={}, accepted={:?}, state={:?}, generation={:?}, stale.sent={}",
+            c.is_some_and(|c| c.pending.is_some()),
+            c.and_then(|c| c.pending.as_ref().map(|p| p.accepted)),
+            c.map(|c| c.view.state),
+            c.map(|c| c.generation),
+            peer.marker.with_extension("stale.sent").exists(),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn stale_dispatch(broker: &mut Broker<Secrets>, command: Command) -> Snapshot {
+    broker
+        .dispatch(command, Instant::now() + Duration::from_secs(15))
+        .unwrap()
+}
+
 fn stale_stop(rendered: State, prior_stop: bool) {
     let mut peer = Peer::new("flow");
+    // Start the broker's own startup deadline only once its fixture can read.
+    let startup_deadline = Instant::now() + Duration::from_secs(15);
+    while !peer.marker.with_extension("started").exists() {
+        assert!(
+            Instant::now() < startup_deadline,
+            "fixture startup timed out: started=false"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
     let mut broker = Broker::new(Some(peer.take()), secrets);
-    wait(&mut broker, |s| s.helper == "installed");
-    dispatch(&mut broker, Command::Toggle { id: "one".into() });
-    until(|| {
+    stale_until(&mut broker, &peer, "helper setup", |b| {
+        b.snapshot().helper == "installed"
+    });
+    stale_dispatch(&mut broker, Command::Toggle { id: "one".into() });
+    stale_until(&mut broker, &peer, "connecting setup", |broker| {
         broker.poll();
         broker.connections["one"]
             .pending
@@ -43,7 +87,9 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     });
     if rendered == State::Connected {
         peer.advance();
-        wait(&mut broker, |s| s.vpns[0].state == State::Connected);
+        stale_until(&mut broker, &peer, "connected setup", |b| {
+            b.snapshot().vpns[0].state == State::Connected
+        });
     }
     let caller_snapshot = broker.snapshot();
     assert!(!caller_snapshot.demo);
@@ -54,21 +100,20 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     if prior_stop {
         // A prior stop is already in flight; its reply is not delivered to this
         // caller. The peer generates Off through its normal Disconnect branch.
-        dispatch(&mut broker, Command::Toggle { id: "one".into() });
+        stale_dispatch(&mut broker, Command::Toggle { id: "one".into() });
         generation += 1;
     } else {
         // Existing marker sends a current-generation frame on the real stream.
         // This proves protocol consumption, not spontaneous native Off provenance.
-        std::fs::write(
-            peer.marker.with_extension("stale"),
+        write_stale(
+            &peer,
             serde_json::to_vec(&serde_json::json!({
                 "id": "one", "generation": generation, "state": "off", "failures": 0
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
     }
-    until(|| {
+    stale_until(&mut broker, &peer, "stale stop receipt", |broker| {
         broker.poll(); // actor work only: no new snapshot delivered to caller
         let c = &broker.connections["one"];
         (prior_stop || peer.marker.with_extension("stale.sent").exists())
@@ -80,13 +125,13 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     assert_eq!(caller_snapshot.vpns[0].state, rendered);
     assert_eq!(loads.load(Ordering::Relaxed), 1);
     // Explicit stop preserves the intent of the retained active render.
-    let result = dispatch(
+    let result = stale_dispatch(
         &mut broker,
         Command::Disconnect {
             id: caller_snapshot.vpns[0].profile.id.clone(),
         },
     );
-    until(|| {
+    stale_until(&mut broker, &peer, "explicit stop receipt", |broker| {
         broker.poll();
         let c = &broker.connections["one"];
         c.generation == generation + 1 && c.pending.as_ref().is_some_and(|p| p.accepted)
@@ -96,7 +141,7 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     let disconnects = commands.lines().filter(|c| *c == "disconnect").count();
     let load_count = loads.load(Ordering::Relaxed);
     if connects == 1 {
-        until(|| {
+        stale_until(&mut broker, &peer, "explicit stop off", |broker| {
             broker.poll();
             broker.connections["one"].view.state == State::Off
         });
