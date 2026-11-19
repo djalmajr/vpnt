@@ -7,7 +7,7 @@ fn one_notice_per_episode_uses_the_shared_catalog_and_profile_name() {
     let mut peer = Peer::new("flow");
     let (secrets, _, _) = RecordingSecrets::new();
     let fake = FakeNotifier::default();
-    let mut broker = Broker::new(Some(peer.take()), secrets).with_notifier(Box::new(fake.clone()));
+    let mut broker = broker_with(&mut peer, secrets).with_notifier(Box::new(fake.clone()));
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, true, false));
     connect(&mut broker, &peer, "one");
@@ -64,7 +64,7 @@ fn notify_off_never_delivers_and_revokes_the_live_episode_token() {
     let mut peer = Peer::new("flow");
     let (secrets, _, _) = RecordingSecrets::new();
     let fake = FakeNotifier::default();
-    let mut broker = Broker::new(Some(peer.take()), secrets).with_notifier(Box::new(fake.clone()));
+    let mut broker = broker_with(&mut peer, secrets).with_notifier(Box::new(fake.clone()));
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, true, false));
     connect(&mut broker, &peer, "one");
@@ -94,7 +94,7 @@ fn generation_change_and_channel_loss_revoke_the_live_token() {
     let mut peer = Peer::new("flow");
     let (secrets, _, _) = RecordingSecrets::new();
     let fake = FakeNotifier::default();
-    let mut broker = Broker::new(Some(peer.take()), secrets).with_notifier(Box::new(fake.clone()));
+    let mut broker = broker_with(&mut peer, secrets).with_notifier(Box::new(fake.clone()));
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, true, false));
     connect(&mut broker, &peer, "one");
@@ -123,7 +123,7 @@ fn dropping_the_broker_revokes_the_live_notice_token() {
     let mut peer = Peer::new("flow");
     let (secrets, _, _) = RecordingSecrets::new();
     let fake = FakeNotifier::default();
-    let mut broker = Broker::new(Some(peer.take()), secrets).with_notifier(Box::new(fake.clone()));
+    let mut broker = broker_with(&mut peer, secrets).with_notifier(Box::new(fake.clone()));
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, true, false));
     connect(&mut broker, &peer, "one");

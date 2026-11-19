@@ -97,12 +97,17 @@ pub(super) fn connect<S: SecretStore>(broker: &mut Broker<S>, peer: &Peer, id: &
 
 pub(super) fn probe<S: SecretStore>(broker: &mut Broker<S>, id: &str, failures: u32) {
     run(broker, Command::Probe { id: id.into() }).unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    // Synchronization guard, not a latency requirement: the peer may take a
+    // 3 s pause, while a stalled poll still fails with the state it observed.
+    let until = Instant::now() + Duration::from_secs(15);
     while broker.connections[id].failures != failures {
         broker.poll();
         assert!(
             Instant::now() < until,
-            "the helper failure counter did not reach {failures}"
+            "the helper failure counter did not reach {failures} for {id}: helper={}, states={:?}, generations={:?}",
+            broker.helper,
+            super::states(broker),
+            super::generations(broker),
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -113,11 +118,11 @@ pub(super) fn automatic<S: SecretStore>(broker: &mut Broker<S>) {
     broker.perform_automatic(|| true);
 }
 
-/// The peer sends the injected stale frame before it answers this diagnostics
-/// request; the correlated reply is the FIFO barrier that proves the Broker
-/// consumed the stale frame on the ordered Client stream. The reply carries no
-/// tunnel state (`src/broker/mod.rs` Message::Diagnostics), so it cannot restore
-/// the state the caller asserts after it returns. The peer stays fake/in-process.
+/// Any frame the peer sent before it answers this diagnostics request is
+/// already on the ordered Client stream, so the correlated reply is the FIFO
+/// barrier that proves the Broker consumed it. The reply carries no tunnel
+/// state (`src/broker/mod.rs` Message::Diagnostics), so it cannot restore the
+/// state the caller asserts after it returns. The peer stays fake/in-process.
 pub(super) fn consume_stale_with_diagnostics<S: SecretStore>(broker: &mut Broker<S>) {
     // An earlier request would make the barrier prove nothing about the stale
     // frame, so the request that clears must be the one made here.
