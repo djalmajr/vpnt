@@ -13,6 +13,7 @@ struct FakeToken {
     delay: Duration,
     /// When set, `sign` waits for the test to open the gate.
     gate: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    signing: Option<mpsc::Sender<()>>,
     requests: Arc<Mutex<Vec<(Padding, usize)>>>,
 }
 
@@ -25,6 +26,9 @@ impl Signer for FakeToken {
     }
 
     fn sign(&mut self, padding: Padding, data: &[u8]) -> Result<Vec<u8>, SignError> {
+        if let Some(signing) = &self.signing {
+            let _ = signing.send(());
+        }
         if let Some(gate) = &self.gate {
             let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(5));
         }
@@ -114,6 +118,15 @@ fn certificate_request_is_answered_with_the_token_certificate() {
         openvpn.hear_block(),
         "certificate\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\nEND\n"
     );
+}
+
+#[test]
+fn hold_is_released_after_down() {
+    let mut vpn = Openvpn::connect(FakeToken::default());
+    vpn.say(">UPDOWN:DOWN\n>UPDOWN:ENV,END\n>HOLD:Waiting for hold release:0\n");
+    assert_eq!(vpn.hear(), management::HOLD_RELEASE);
+    let (_, progress) = vpn.hang_up();
+    assert_eq!(progress, [Progress::Down]);
 }
 
 #[test]
@@ -336,6 +349,45 @@ fn a_signature_pending_approval_does_not_hold_up_wait() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn session_approval_pending_tracks_a_blocked_signature_until_success_or_refusal() {
+    for refusal in [None, Some(SignError::Canceled)] {
+        let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+        let lines = format!("{}>UPDOWN:DOWN\n>UPDOWN:ENV,END\n", pss_request(32));
+        let openvpn = scripted_openvpn(&scratch.path, &lines, 1.0);
+        let (entered, signing) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let token = FakeToken {
+            refusal,
+            signing: Some(entered),
+            gate: Some(Arc::new(Mutex::new(gate))),
+            ..FakeToken::default()
+        };
+        let session = start_scripted(&openvpn, token);
+        let timeout = Duration::from_secs(3);
+        let started = signing.recv_timeout(timeout);
+        let pending_during = session.approval_pending();
+        drop(release);
+        let mut expected = vec![Progress::AwaitingApproval];
+        if let Some(refusal) = refusal {
+            expected.push(Progress::Refused(refusal));
+        }
+        expected.push(Progress::Down);
+        let progress: Vec<_> = expected
+            .iter()
+            .map(|_| session.progress().recv_timeout(timeout))
+            .collect();
+        let pending_after = session.approval_pending();
+        let outcome = session.wait().unwrap();
+
+        assert_eq!(started, Ok(()), "{refusal:?}");
+        assert!(pending_during, "approval missing during sign: {refusal:?}");
+        assert_eq!(progress, expected.into_iter().map(Ok).collect::<Vec<_>>());
+        assert!(!pending_after, "approval remained after sign: {refusal:?}");
+        assert!(outcome.status.success());
+    }
 }
 
 #[test]
@@ -636,4 +688,228 @@ fn observed_exit_has_a_total_management_drain_budget() {
         again_elapsed < Duration::from_millis(100),
         "drain budget restarted: {again_elapsed:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+struct RestartPeer {
+    session: Session,
+    wire: BufReader<UnixStream>,
+    _scratch: PrivateDir,
+}
+
+#[cfg(target_os = "linux")]
+impl RestartPeer {
+    const RECONNECTING: &'static str = ">STATE:2,RECONNECTING,ping-restart,,,,,\n";
+    const HOLD: &'static str = ">HOLD:Waiting for hold release:0\n";
+    const CONNECTED: &'static str = ">STATE:3,CONNECTED,SUCCESS,192.0.2.2\n";
+
+    fn start() -> Self {
+        let scratch = PrivateDir::create(Path::new("/tmp")).unwrap();
+        let relay = scratch.path.join("relay");
+        let listener = UnixListener::bind(&relay).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let executable = scratch.path.join("openvpn");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import select, socket, sys
+if "--version" in sys.argv:
+    print("OpenVPN 2.6.19")
+    sys.exit(0)
+with socket.socket(socket.AF_UNIX) as management, socket.socket(socket.AF_UNIX) as test:
+    management.connect(sys.argv[sys.argv.index("--management") + 1])
+    test.connect(sys.argv[0].rsplit("/", 1)[0] + "/relay")
+    peers = {management: test, test: management}
+    while True:
+        ready, _, _ = select.select(list(peers), [], [], 15)
+        assert ready, "relay idle"
+        for source in ready:
+            data = source.recv(4096)
+            if not data:
+                sys.exit(0)
+            peers[source].sendall(data)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let session = start_scripted(&executable, FakeToken::default());
+        let until = Instant::now() + Duration::from_secs(2);
+        let wire = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break BufReader::new(stream),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < until, "relay did not connect");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let mut peer = Self {
+            session,
+            wire,
+            _scratch: scratch,
+        };
+        let timeout = Duration::from_secs(2);
+        assert_eq!(peer.reply(timeout).unwrap(), management::VERSION);
+        assert_eq!(peer.reply(timeout).unwrap(), management::STATE_ON);
+        peer.say(Self::HOLD);
+        assert_eq!(peer.reply(timeout).unwrap(), management::HOLD_RELEASE);
+        peer
+    }
+
+    fn say(&mut self, lines: &str) {
+        self.wire.get_mut().write_all(lines.as_bytes()).unwrap();
+    }
+
+    fn reply(&mut self, timeout: Duration) -> io::Result<String> {
+        self.wire.get_ref().set_read_timeout(Some(timeout))?;
+        let mut line = String::new();
+        self.wire.read_line(&mut line)?;
+        Ok(line)
+    }
+
+    fn reconnect(&mut self) -> u64 {
+        self.say(Self::RECONNECTING);
+        let event = self
+            .session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let Progress::Restarting { state, epoch } = event else {
+            panic!("expected restarting, got {event:?}");
+        };
+        assert_eq!(state.phase, management::Phase::Reconnecting);
+        epoch
+    }
+
+    fn expect_held(&mut self) {
+        let reply = self.reply(Duration::from_millis(150));
+        assert!(
+            matches!(&reply, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "restart hold released before acknowledgement: {reply:?}"
+        );
+    }
+
+    fn finish(self) -> Outcome {
+        self.wire.get_ref().shutdown(Shutdown::Both).unwrap();
+        self.session.wait().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_hold_rejects_the_acknowledgement_of_an_older_epoch() {
+    let mut peer = RestartPeer::start();
+    let timeout = Duration::from_secs(2);
+    let first_epoch = peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    peer.session.release_restart_hold(first_epoch);
+    assert_eq!(peer.reply(timeout).unwrap(), management::HOLD_RELEASE);
+    peer.say(RestartPeer::CONNECTED);
+    assert!(matches!(
+        peer.session.progress().recv_timeout(timeout),
+        Ok(Progress::State(s)) if s.phase == management::Phase::Connected
+    ));
+
+    let second_epoch = peer.reconnect();
+    // An out-of-order CONNECTED must not acknowledge the new restart.
+    peer.say(RestartPeer::CONNECTED);
+    peer.say(RestartPeer::HOLD);
+    assert!(matches!(
+        peer.session.progress().recv_timeout(timeout),
+        Ok(Progress::State(s)) if s.phase == management::Phase::Connected
+    ));
+    peer.expect_held();
+    assert_ne!(first_epoch, second_epoch);
+    peer.session.release_restart_hold(first_epoch);
+    peer.say(RestartPeer::HOLD);
+    peer.expect_held();
+    peer.session.release_restart_hold(second_epoch);
+    // Both HOLD records share the second restart's acknowledgement.
+    assert_eq!(peer.reply(timeout).unwrap(), management::HOLD_RELEASE);
+    assert_eq!(peer.reply(timeout).unwrap(), management::HOLD_RELEASE);
+    assert!(peer.finish().status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_hold_stop_wakes_the_management_thread() {
+    let mut peer = RestartPeer::start();
+    peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    peer.expect_held();
+    peer.session.stop().unwrap();
+    assert_eq!(
+        peer.reply(Duration::from_secs(1)).unwrap(),
+        management::TERMINATE
+    );
+    peer.say(">STATE:5,EXITING,auth-failure,,,,,\n");
+    // Prove the reader advanced past HOLD before Session::wait can wake it.
+    let event = peer.session.progress().recv_timeout(Duration::from_secs(1));
+    assert!(matches!(event, Ok(Progress::State(s)) if s.reason == Some(Reason::AuthFailure)));
+    assert_eq!(peer.finish().reason, Some(Reason::AuthFailure));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_hold_timeout_releases_the_hold() {
+    let mut peer = RestartPeer::start();
+    let start = Instant::now();
+    peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(Duration::from_secs(12)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "hold timed out early: {elapsed:?}"
+    );
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(Duration::from_secs(1)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    assert!(peer.finish().status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_hold_acknowledgement_is_unique_to_the_session() {
+    let mut old = RestartPeer::start();
+    let old_epoch = old.reconnect();
+    let mut current = RestartPeer::start();
+    let current_epoch = current.reconnect();
+    current.say(RestartPeer::HOLD);
+    current.session.release_restart_hold(old_epoch);
+    current.expect_held();
+    current.session.release_restart_hold(current_epoch);
+    assert_eq!(
+        current.reply(Duration::from_secs(2)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    assert!(current.finish().status.success());
+    assert!(old.finish().status.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn invalid_signature_is_refused_while_a_restart_waits() {
+    // Validation comes before the wait for the withdrawal: an invalid request
+    // is refused at once even while the restart is unacknowledged.
+    let mut peer = RestartPeer::start();
+    peer.reconnect();
+    peer.say(">PK_SIGN:AAEC,unknown-algorithm\n");
+    let result = peer.reply(Duration::from_secs(2));
+    assert_eq!(
+        result.ok().as_deref(),
+        Some(management::TERMINATE),
+        "the invalid request must be refused while the restart is unacknowledged"
+    );
+    assert!(matches!(
+        peer.session.progress().recv_timeout(Duration::from_secs(1)),
+        Ok(Progress::Refused(SignError::Unsupported))
+    ));
+    assert!(peer.finish().status.success());
 }

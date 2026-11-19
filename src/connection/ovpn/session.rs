@@ -12,6 +12,8 @@ use super::{
     private_dir::PrivateDir,
     signing::Padding,
 };
+#[cfg(target_os = "linux")]
+use std::sync::{Condvar, atomic::AtomicU64};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -23,6 +25,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
@@ -202,7 +205,7 @@ pub enum Signatures {
     /// PKCS#1 v1.5 or RSA-PSS, so TLS 1.3 can be negotiated.
     Any,
     /// PKCS#1 v1.5 only, which caps TLS at 1.2: for tokens whose PSS
-    /// signatures servers do not accept (seen with the SerproID cloud token).
+    /// signatures servers do not accept (seen with a cloud PKCS#11 token).
     Pkcs1Only,
 }
 
@@ -224,7 +227,102 @@ pub enum Progress {
     BadNetwork(NetworkError),
     AwaitingApproval,
     State(State),
+    #[cfg(target_os = "linux")]
+    Restarting {
+        state: State,
+        epoch: u64,
+    },
     Refused(SignError),
+}
+
+#[cfg(target_os = "linux")]
+const RESTART_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct RestartHold {
+    state: Mutex<RestartHoldState>,
+    changed: Condvar,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct RestartHoldState {
+    pending: Option<u64>,
+    stopped: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl RestartHold {
+    fn progress(&self, state: State) -> Progress {
+        match state.phase {
+            management::Phase::Reconnecting => Progress::Restarting {
+                state,
+                epoch: self.begin(),
+            },
+            _ => Progress::State(state),
+        }
+    }
+
+    fn begin(&self) -> u64 {
+        // A notification from a retired session must not match a new session's hold.
+        static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+        let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        lock(&self.state).pending = Some(epoch);
+        epoch
+    }
+
+    fn release(&self, epoch: u64) {
+        let mut state = lock(&self.state);
+        if state.pending == Some(epoch) {
+            state.pending = None;
+            self.changed.notify_one();
+        }
+    }
+
+    fn stop(&self) {
+        lock(&self.state).stopped = true;
+        self.changed.notify_one();
+    }
+
+    /// Waits until the pending restart, if any, has its routes withdrawn.
+    /// Returns false when the session is stopping.
+    fn await_withdrawal(&self) -> bool {
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(lock(&self.state), RESTART_HOLD_TIMEOUT, |state| {
+                !state.stopped && state.pending.is_some()
+            })
+            .unwrap_or_else(|error| error.into_inner());
+        if state.stopped {
+            return false;
+        }
+        // Duplicate HOLD records for this epoch share its result, including timeout.
+        state.pending = None;
+        true
+    }
+
+    fn send_release(&self, control: &Mutex<UnixStream>) {
+        if !self.await_withdrawal() {
+            return;
+        }
+        let mut writer = lock(control);
+        // Order the write with TERMINATE without holding the gate during I/O.
+        let stopped = lock(&self.state).stopped;
+        if !stopped {
+            let _ = writer.write_all(management::HOLD_RELEASE.as_bytes());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct RestartHoldOwner(Arc<RestartHold>);
+
+#[cfg(target_os = "linux")]
+impl Drop for RestartHoldOwner {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 #[derive(Debug)]
@@ -242,6 +340,9 @@ pub struct Session {
     /// Disconnects when the management thread ends.
     finished: mpsc::Receiver<()>,
     progress: mpsc::Receiver<Progress>,
+    approval_pending: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    restart_hold: RestartHoldOwner,
     _directory: PrivateDir,
     #[cfg(target_os = "linux")]
     exit_observed: Mutex<Option<Instant>>,
@@ -362,11 +463,26 @@ impl Session {
         let (sender, progress) = mpsc::channel();
         let (writer, last_reason) = (Arc::clone(&control), Arc::clone(&reason));
         let (done, finished) = mpsc::channel();
+        let approval_pending = Arc::new(AtomicBool::new(false));
+        let approval = Arc::clone(&approval_pending);
+        #[cfg(target_os = "linux")]
+        let restart_hold = RestartHoldOwner(Arc::default());
+        #[cfg(target_os = "linux")]
+        let management_hold = Arc::clone(&restart_hold.0);
         let worker = thread::Builder::new()
             .name("vpnt-ovpn-management".into())
             .spawn(move || {
                 let _done = done;
-                drive(stream, &writer, signer, &sender, &last_reason);
+                drive_with_approval(
+                    stream,
+                    &writer,
+                    signer,
+                    &sender,
+                    &last_reason,
+                    &approval,
+                    #[cfg(target_os = "linux")]
+                    Some(&management_hold),
+                );
             })?;
         Ok(Self {
             openvpn,
@@ -375,6 +491,9 @@ impl Session {
             worker,
             finished,
             progress,
+            approval_pending,
+            #[cfg(target_os = "linux")]
+            restart_hold,
             _directory: directory,
             #[cfg(target_os = "linux")]
             exit_observed: Mutex::new(None),
@@ -395,6 +514,7 @@ impl Session {
         };
         if result == 0 && unsafe { info.si_pid() } != 0 {
             let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
+            self.restart_hold.0.stop();
             let remaining = (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now());
             let _ = self.finished.recv_timeout(remaining);
             Some(*lock(&self.reason))
@@ -407,9 +527,21 @@ impl Session {
         &self.progress
     }
 
+    pub fn approval_pending(&self) -> bool {
+        self.approval_pending.load(Ordering::Acquire)
+    }
+
+    /// Acknowledges the withdrawal for one management restart notification.
+    #[cfg(target_os = "linux")]
+    pub fn release_restart_hold(&self, epoch: u64) {
+        self.restart_hold.0.release(epoch);
+    }
+
     /// Asks openvpn to leave, notifying the server.
     pub fn stop(&self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(2);
+        #[cfg(target_os = "linux")]
+        self.restart_hold.0.stop();
         loop {
             let mut control = match self.control.try_lock() {
                 Ok(control) => control,
@@ -432,7 +564,9 @@ impl Session {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             control.set_write_timeout(Some(remaining))?;
-            return control.write_all(management::TERMINATE.as_bytes());
+            let result = control.write_all(management::TERMINATE.as_bytes());
+            drop(control);
+            return result;
         }
     }
 
@@ -449,6 +583,7 @@ impl Session {
         #[cfg(target_os = "linux")]
         let drain = {
             let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
+            self.restart_hold.0.stop();
             (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now())
         };
         #[cfg(not(target_os = "linux"))]
@@ -506,12 +641,34 @@ fn accept(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> 
     }
 }
 
+#[cfg(test)]
 fn drive(
+    stream: UnixStream,
+    control: &Mutex<UnixStream>,
+    signer: impl Signer,
+    progress: &mpsc::Sender<Progress>,
+    reason: &Mutex<Option<Reason>>,
+) {
+    drive_with_approval(
+        stream,
+        control,
+        signer,
+        progress,
+        reason,
+        &AtomicBool::new(false),
+        #[cfg(target_os = "linux")]
+        None,
+    );
+}
+
+fn drive_with_approval(
     stream: UnixStream,
     control: &Mutex<UnixStream>,
     mut signer: impl Signer,
     progress: &mpsc::Sender<Progress>,
     reason: &Mutex<Option<Reason>>,
+    approval_pending: &AtomicBool,
+    #[cfg(target_os = "linux")] restart_hold: Option<&RestartHold>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
@@ -519,7 +676,12 @@ fn drive(
     // reading, so writes never end the loop, only the end of the stream does.
     let _ = send(control, management::VERSION).and_then(|()| send(control, management::STATE_ON));
     let mut block: Option<Option<Vec<(String, String)>>> = None;
-    while let Ok(true) = management::read_line(&mut reader, &mut line) {
+    loop {
+        match management::read_line(&mut reader, &mut line) {
+            Ok(true) => {}
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => break,
+            _ => break,
+        }
         let event = management::parse(&line);
         if let Event::Env { key, value } = event {
             if let Some(Some(pairs)) = &mut block {
@@ -574,15 +736,33 @@ fn drive(
             }
             Event::EnvEnd => None,
             Event::Env { .. } | Event::MalformedEnv | Event::Malformed => unreachable!(),
-            Event::Hold => Some(management::HOLD_RELEASE.to_owned()),
+            Event::Hold => {
+                #[cfg(target_os = "linux")]
+                if let Some(hold) = restart_hold {
+                    hold.send_release(control);
+                    continue;
+                }
+                Some(management::HOLD_RELEASE.to_owned())
+            }
             Event::NeedCertificate => Some(match signer.certificate() {
                 Ok(der) => management::certificate(&der),
                 Err(error) => refuse(progress, error),
             }),
             Event::Sign { data, algorithm } => Some(match request(algorithm.as_deref(), &data) {
                 Ok(padding) => {
+                    // A HOLD may arrive before the restart state. The token is
+                    // still called only after that restart's routes are withdrawn.
+                    #[cfg(target_os = "linux")]
+                    if let Some(hold) = restart_hold
+                        && !hold.await_withdrawal()
+                    {
+                        continue;
+                    }
+                    approval_pending.store(true, Ordering::Release);
                     let _ = progress.send(Progress::AwaitingApproval);
-                    match signer.sign(padding, &data) {
+                    let signature = signer.sign(padding, &data);
+                    approval_pending.store(false, Ordering::Release);
+                    match signature {
                         Ok(signature) => management::signature(&signature),
                         Err(error) => refuse(progress, error),
                     }
@@ -594,7 +774,14 @@ fn drive(
                 if state.reason.is_some() {
                     *lock(reason) = state.reason;
                 }
-                let _ = progress.send(Progress::State(state));
+                #[cfg(not(target_os = "linux"))]
+                let update = Progress::State(state);
+                #[cfg(target_os = "linux")]
+                let update = match restart_hold {
+                    Some(hold) => hold.progress(state),
+                    None => Progress::State(state),
+                };
+                let _ = progress.send(update);
                 None
             }
             Event::Fatal => {
