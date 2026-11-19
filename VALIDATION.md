@@ -96,7 +96,14 @@ VPNT_TEST_SOFTHSM=/caminho/absoluto/do/modulo.so cargo test --locked --test ovpn
   `/usr/bin/dbus-send` e `/usr/bin/secret-tool`.
 - `ovpn_token` exercita um token SoftHSM de fixture; substitua o caminho pelo
   módulo SoftHSM instalado. Exige `openssl` e `softhsm2-util` ou `pkcs11-tool`.
-  O valor da variável é o caminho do módulo, não `1`.
+  O valor da variável é o caminho do módulo, não `1`. Sem instalar o pacote, é
+  possível extrair os pacotes oficiais `softhsm` e `botan` (com a assinatura
+  conferida por `pacman-key --verify`) num diretório do usuário, apontar
+  `LD_LIBRARY_PATH` para o `usr/lib` extraído e pôr no `PATH` um wrapper de
+  `softhsm2-util` que acrescente `--module <módulo extraído>`, porque o binário
+  procura o módulo em `/usr/lib/pkcs11`. Em 19/11/2026, com o SoftHSM 2.7.0, o
+  teste passou depois do #16. O SoftHSM sempre expõe um slot com token não
+  inicializado, e a listagem e a abertura da chave pulam esse slot.
 
 Essas fixtures não demonstram conexão com servidor ou token reais.
 
