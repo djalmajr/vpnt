@@ -514,6 +514,16 @@ h2 {
   gap: var(--space-sm);
   align-items: flex-start;
 }
+.notice.dismissible {
+  position: relative;
+  padding-right: calc(var(--control-height) + var(--space-sm));
+}
+.notice .notice-dismiss {
+  position: absolute;
+  top: var(--space-xs);
+  right: var(--space-xs);
+  color: inherit;
+}
 .notice.info {
   background: var(--info-bg);
   color: var(--info-fg);

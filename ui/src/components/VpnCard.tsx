@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { active, type VpnView } from "../model";
 import type { Navigate, Run } from "../navigation";
 import { Icon, Notice, type T } from "./common";
@@ -50,16 +51,26 @@ export function VpnCard({
   run,
   navigate,
   secrets,
+  dismissed = false,
+  dismiss,
 }: {
   vpn: VpnView;
   t: T;
   run: Run;
   navigate: Navigate;
   secrets: () => void;
+  dismissed?: boolean;
+  dismiss?: () => void;
 }) {
   const { profile, cleaning } = vpn;
   const isOvpn = profile.kind === "ovpn";
   const state = isOvpn && vpn.state === "missing_secret" ? "off" : vpn.state;
+  const dismissible = [
+    "dropped",
+    "credentials_rejected",
+    "gateway_timeout",
+    "missing_program",
+  ].includes(state);
   const cleanupId = `cleanup-${profile.id}`;
   // While cleaning, the Notice action stays focusable (aria-disabled, inert
   // click) so the keyboard reaches it and hears why it is unavailable.
@@ -154,7 +165,12 @@ export function VpnCard({
             <button
               type="button"
               onClick={toggle}
-              disabled={!!disabled || cancelable}
+              disabled={
+                (!!disabled || cancelable) && !(dismissed && dismissible)
+              }
+              aria-disabled={
+                dismissed && dismissible && disabled ? true : undefined
+              }
               aria-label={`${profile.name}: ${t(`state.${state}`)}`}
               aria-pressed={on}
               className={`switch ${on ? "on" : ""} ${busy || disabled ? "dim" : ""}`}
@@ -174,7 +190,7 @@ export function VpnCard({
             </button>
           </span>
         </span>
-        {!hint && (
+        {(!hint || (dismissible && dismissed)) && (
           <span className="card-state">
             <span className="status-line">
               <span className={color}>
@@ -199,8 +215,20 @@ export function VpnCard({
           <small>{t("ovpnApprovalHint")}</small>
         )}
       </div>
-      {hint && (
-        <Notice tone={danger ? "error" : "warn"}>
+      {hint && !(dismissible && dismissed) && (
+        <Notice
+          tone={danger ? "error" : "warn"}
+          t={t}
+          onDismiss={
+            dismissible && dismiss
+              ? (event) => {
+                  const card = event.currentTarget.closest(".vpn-card");
+                  flushSync(dismiss);
+                  card?.querySelector<HTMLButtonElement>(".switch")?.focus();
+                }
+              : undefined
+          }
+        >
           {state === "cleanup_unconfirmed" && (
             <strong>{t("state.cleanup_unconfirmed")}</strong>
           )}

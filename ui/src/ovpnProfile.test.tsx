@@ -2,7 +2,6 @@ import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { act, createElement } from "react";
 import type { Root } from "react-dom/client";
-import { App } from "./App";
 import type { Command, Reply, Snapshot, VpnView } from "./model";
 import { blankProfile } from "./profileDefaults";
 import { defaultPreferences } from "./settings";
@@ -45,6 +44,10 @@ const globals = new Map(
   ]),
 );
 let createRoot: typeof import("react-dom/client").createRoot;
+// Imported after the DOM is registered: the module graph is shared by every
+// test file in the process, so a static import here would evaluate the app
+// (and the libraries it pulls in) before any document exists.
+let App: typeof import("./App").App;
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 let commands: Command[];
@@ -52,9 +55,10 @@ let replyFor: (command: Command) => Omit<Reply, "id"> | undefined;
 const originalFetch = globalThis.fetch;
 
 beforeAll(async () => {
-  GlobalRegistrator.register();
+  GlobalRegistrator.register({ url: "http://localhost/" });
   scope.IS_REACT_ACT_ENVIRONMENT = true;
   ({ createRoot } = await import("react-dom/client"));
+  ({ App } = await import("./App"));
 });
 
 afterEach(async () => {

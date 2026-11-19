@@ -1258,3 +1258,185 @@ test("sessão anterior reconcilia onboarding durante instalação pendente", asy
   expect(actions()).toEqual([{ type: "install_helper" }]);
   await act(async () => pendingInstall?.(false));
 });
+
+for (const locale of ["pt-BR", "en-US"] as const) {
+  for (const state of [
+    "dropped",
+    "credentials_rejected",
+    "gateway_timeout",
+    "missing_program",
+  ] as const) {
+    test(`${locale} ${state}: dismiss preserves state and focus across navigation`, async () => {
+      await mountComponentScenario(
+        componentSnapshot("installed", [
+          { ...vpn, state, log: [{ state, timestamp: 1 }] },
+        ]),
+        false,
+        locale,
+      );
+      const close = byLabel(t(locale, "dismissNotice"));
+      expect(close.title).toBe(t(locale, "dismissNotice"));
+      close.focus();
+      await click(close);
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+      expect(document.querySelector(".card-state")?.textContent).toContain(
+        t(locale, `state.${state}`),
+      );
+      expect(document.activeElement).toBe(
+        document.querySelector(".vpn-card .switch"),
+      );
+      await click(
+        byLabel(t(locale, "profileDetails", { name: vpn.profile.name })),
+      );
+      await click(byLabel(t(locale, "back")));
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+      snapshot = {
+        ...snapshot,
+        vpns: [{ ...vpn, state, log: [{ state, timestamp: 2 }] }],
+      };
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 650));
+      });
+      expect(
+        document.querySelector(".vpn-card .notice-dismiss"),
+      ).not.toBeNull();
+    });
+  }
+  for (const state of ["cleanup_unconfirmed", "unresponsive"] as const) {
+    test(`${locale} ${state}: notice cannot be dismissed`, async () => {
+      await mountComponentScenario(
+        componentSnapshot("installed", [{ ...vpn, state }]),
+        false,
+        locale,
+      );
+      expect(document.querySelector(".vpn-card .notice")).not.toBeNull();
+      expect(document.querySelector(".notice-dismiss")).toBeNull();
+    });
+  }
+  test(`${locale}: command error dismisses with icon and restores focus`, async () => {
+    await mount(locale);
+    globalThis.fetch = (async () =>
+      new Response("error", { status: 500 })) as unknown as typeof fetch;
+    const toggle =
+      document.querySelector<HTMLButtonElement>(".vpn-card .switch");
+    if (!toggle) throw new Error("switch missing");
+    await click(toggle);
+    const close = byLabel(t(locale, "dismissNotice"));
+    expect(document.querySelector('[role="alert"]')).not.toBeNull();
+    expect(
+      [...document.querySelectorAll("button")].some(
+        (button) => button.textContent?.trim() === t(locale, "close"),
+      ),
+    ).toBe(false);
+    close.focus();
+    await click(close);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(document.activeElement === byLabel(t(locale, "preferences"))).toBe(
+      true,
+    );
+  });
+}
+
+async function receiveVpns(vpns: VpnView[]) {
+  snapshot = { ...snapshot, vpns };
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 650));
+  });
+}
+
+for (const state of ["missing_program", "gateway_timeout"] as const) {
+  test(`${state}: observed off invalidates dismissal even with same second or empty log`, async () => {
+    const log = state === "missing_program" ? [{ state, timestamp: 12 }] : [];
+    const initial = { ...vpn, state, log };
+    await mountComponentScenario(componentSnapshot("installed", [initial]));
+    await click(byLabel(t("en-US", "dismissNotice")));
+    expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+    await receiveVpns([{ ...initial, state: "off" }]);
+    expect(document.querySelector(".card-state")?.textContent).toContain(
+      t("en-US", "state.off"),
+    );
+    const returnedLog =
+      state === "missing_program"
+        ? [
+            ...log,
+            { state: "off" as const, timestamp: 12 },
+            { state, timestamp: 12 },
+          ]
+        : [];
+    await receiveVpns([{ ...initial, log: returnedLog }]);
+    expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+  });
+}
+
+test("same second with additional log entry reopens without observed off", async () => {
+  const initial: VpnView = {
+    ...vpn,
+    state: "missing_program",
+    log: [{ state: "missing_program", timestamp: 12 }],
+  };
+  await mountComponentScenario(componentSnapshot("installed", [initial]));
+  await click(byLabel(t("en-US", "dismissNotice")));
+  expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+  await receiveVpns([
+    {
+      ...initial,
+      log: [...initial.log, { state: "missing_program", timestamp: 12 }],
+    },
+  ]);
+  expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+});
+
+test("removed profile forgets dismissal when it returns", async () => {
+  const initial: VpnView = { ...vpn, state: "missing_program" };
+  await mountComponentScenario(componentSnapshot("installed", [initial]));
+  await click(byLabel(t("en-US", "dismissNotice")));
+  expect(document.querySelector(".vpn-card .notice-dismiss")).toBeNull();
+  await receiveVpns([]);
+  expect(document.querySelector(".vpn-card")).toBeNull();
+  await receiveVpns([initial]);
+  expect(document.querySelector(".vpn-card .notice-dismiss")).not.toBeNull();
+});
+
+for (const [state, cleaning] of [
+  ["missing_program", false],
+  ["dropped", true],
+] as const) {
+  test(`${state} cleaning=${cleaning}: dismissed disabled switch is inert to pointer and keyboard`, async () => {
+    await mountComponentScenario(
+      componentSnapshot("installed", [{ ...vpn, state, cleaning }]),
+    );
+    await click(byLabel(t("en-US", "dismissNotice")));
+    const toggle =
+      document.querySelector<HTMLButtonElement>(".vpn-card .switch");
+    if (!toggle) throw new Error("switch missing");
+    expect(toggle.getAttribute("aria-disabled")).toBe("true");
+    commands.length = 0;
+    const tunnelCommands = () =>
+      commands
+        .filter((command) =>
+          ["connect", "disconnect", "reconnect"].includes(command.type),
+        )
+        .map((command) => command.type);
+    await click(toggle);
+    expect(tunnelCommands()).toEqual([]);
+    for (const key of ["Enter", " "]) {
+      await act(async () => {
+        const down = new KeyboardEvent("keydown", {
+          key,
+          bubbles: true,
+          cancelable: true,
+        });
+        const up = new KeyboardEvent("keyup", {
+          key,
+          bubbles: true,
+          cancelable: true,
+        });
+        const allowed = toggle.dispatchEvent(down);
+        toggle.dispatchEvent(up);
+        // happy-dom does not implement native button keyboard activation.
+        if (allowed) toggle.click();
+      });
+      expect(tunnelCommands()).toEqual([]);
+    }
+  });
+}

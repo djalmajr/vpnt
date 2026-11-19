@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(target_os = "linux")]
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -119,6 +120,9 @@ fn control_names_are_rejected_and_long_names_are_capped_by_characters() {
     assert_eq!(parsed.subject.unwrap().chars().count(), 200);
 }
 
+// The oracle prints dates with `-dateopt`, an OpenSSL 3 option. macOS ships
+// LibreSSL as `openssl`, and OVPN profiles only connect on Linux.
+#[cfg(target_os = "linux")]
 #[test]
 fn openssl_generated_certificates_match_displayed_names_and_dates() {
     match Command::new("openssl").arg("version").output() {

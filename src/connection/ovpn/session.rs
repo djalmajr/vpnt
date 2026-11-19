@@ -349,7 +349,14 @@ impl Session {
         drop(listener);
         let _ = fs::remove_file(&socket);
         let control_stream = stream.try_clone()?;
-        control_stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // macOS refuses SO_SNDTIMEO with EINVAL once openvpn has already
+        // closed its end; writes to such a peer fail at once, so the session
+        // goes on and reports the exit. Any other error still aborts.
+        if let Err(error) = control_stream.set_write_timeout(Some(Duration::from_secs(2)))
+            && error.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(error);
+        }
         let control = Arc::new(Mutex::new(control_stream));
         let reason = Arc::default();
         let (sender, progress) = mpsc::channel();

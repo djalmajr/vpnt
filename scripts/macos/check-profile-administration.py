@@ -28,6 +28,8 @@ def without_reservation(source, start, end):
     finish=part.index('\n',begin)
     part=part[:begin]+part[finish+1:]
     part=replace(part,'        reservation.validate()?;\n','')
+    # The save path checks the reservation again right before writing.
+    part=part.replace('reservation.validate().and_then(|()| write_profile(&data))','write_profile(&data)')
     return source[:at]+part+source[stop:]
 
 def no_validation(source):
