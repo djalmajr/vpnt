@@ -130,21 +130,21 @@ test("Linux recorta só a raiz e o placeholder não imita valor digitado", () =>
   expect(body).not.toMatch(/^\s*height\s*:/m);
   expect(body).not.toMatch(/^\s*overflow\s*:/m);
 
-  // For each field type, the colour that wins the cascade is the last
-  // declaration of a rule that targets that type's placeholder.
-  const placeholderColour = (field: string) =>
-    rules
-      .filter(({ selectors }) => selectors.includes(`${field}::placeholder`))
-      .flatMap(({ body }) => [
-        ...body.matchAll(/(?:^|;)\s*color\s*:\s*([^;]+)/gm),
-      ])
-      .map(([, value]) => value.trim())
-      .at(-1);
-  for (const field of ["input", "textarea"]) {
-    expect(placeholderColour(field)).toBe(
-      "color-mix(in srgb, var(--text) 70%, var(--field))",
-    );
-  }
+  // The placeholder colour lives in exactly one rule: any other rule that
+  // styles a placeholder (qualified, per field or later in the cascade) could
+  // make an empty field look filled again.
+  const placeholderRules = rules.filter(({ selectors }) =>
+    selectors.some((s) => s.includes("::placeholder")),
+  );
+  expect(placeholderRules).toHaveLength(1);
+  const [placeholder] = placeholderRules;
+  expect(placeholder?.selectors).toEqual([
+    "input::placeholder",
+    "textarea::placeholder",
+  ]);
+  expect(placeholder?.body).toMatch(
+    /(?:^|;)\s*color\s*:\s*color-mix\(in srgb, var\(--text\) 70%, var\(--field\)\)\s*;/m,
+  );
   const omarchy = readFileSync(
     new URL("./omarchy.css", import.meta.url),
     "utf8",
