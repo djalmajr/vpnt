@@ -1,5 +1,7 @@
 #include "userinput.h"
 #include "log.h"
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,14 +18,58 @@ int main(int argc, char **argv) {
         uint32_t pid = htonl((uint32_t)getpid() + (fixture == 3));
         memcpy(request+4,&pid,4);memcpy(request+8,request,8);
         if (fixture == 6) request[0]='X';
-        if (write(3,request,fixture == 4 ? 16 : 8)<0 || shutdown(3,SHUT_WR)) return 2;
+        if (fixture == 4) {
+            /* Report which step rejected this 16-byte extra-data request. */
+            ssize_t written = write(3,request,16);
+            if (written != 16) {
+                int saved = errno;
+                fprintf(stderr,"case 4 write: ret=%zd errno=%d\n",written,saved);
+                return 2;
+            }
+            int shut = shutdown(3,SHUT_WR);
+            /* A peer that already rejected the extra byte may be gone before
+             * this call; EOF below still has to prove the channel is closed. */
+            if (shut != 0 && errno != ENOTCONN) {
+                int saved = errno;
+                fprintf(stderr,"case 4 shutdown: ret=%d errno=%d\n",shut,saved);
+                return 2;
+            }
+            unsigned char response[260];
+            ssize_t got = read(3,response,sizeof(response));
+            if (got != 0) {
+                int saved = errno;
+                fprintf(stderr,"case 4 read: ret=%zd errno=%d bytes=",got,saved);
+                for (ssize_t i=0;i<got && i<8;i++) fprintf(stderr,"%02x",response[i]);
+                fputc('\n',stderr);
+                return 1;
+            }
+            return 0;
+        }
+        /* Same peer-close race as case 4: a rejected request may already
+         * have closed the server side before shutdown(3, SHUT_WR). */
+        ssize_t sent = write(3,request,8);
+        if (sent != 8) {
+            fprintf(stderr,"case %d write: ret=%zd errno=%d\n",fixture,sent,errno);
+            return 2;
+        }
+        int shut = shutdown(3,SHUT_WR);
+        if (shut != 0 && errno != ENOTCONN) {
+            fprintf(stderr,"case %d shutdown: ret=%d errno=%d\n",fixture,shut,errno);
+            return 2;
+        }
         unsigned char response[260];
         return read(3,response,sizeof(response)) == 0 ? 0 : 1;
     }
     if (fixture == 5 || fixture == 9) {
         if (write(1,"ready\n",6)!=6) return 2;
         unsigned char response[260];
-        return read(3,response,sizeof(response)) == 0 ? 0 : 1;
+        if (fixture == 5) fprintf(stderr,"READING\n");
+        ssize_t got = read(3,response,sizeof(response));
+        if (fixture == 5) {
+            if (got == 0) fprintf(stderr,"REVOKED\n");
+            else fprintf(stderr,"REVOKE-FAILED ret=%zd errno=%d\n",got,errno);
+        }
+        return got == 0 ? 0 : 1;
     }
     if (fixture == 0) strcpy(expected, " %fixture+\xc3\xa9 ");
     else if (fixture == 1) memset(expected, 'x', 256);

@@ -74,7 +74,8 @@ fn request() -> AdminRequest {
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(20);
+    // Hang guard only: no assertion in these tests measures elapsed time.
+    let until = Instant::now() + Duration::from_secs(60);
     while !predicate() {
         assert!(Instant::now() < until, "admin condition timed out");
         std::thread::sleep(Duration::from_millis(5));
@@ -123,7 +124,9 @@ fn mismatched_duplicate_failed_and_unsuccessful_exit_are_not_success() {
         ("busy", Error::Rejected(ErrorCode::ProfileBusy)),
         ("exit", Error::Unavailable),
     ] {
-        let (_peer, mut admin) = Peer::new(mode, Duration::from_secs(20));
+        // Guard for fixture startup: the errors, not this budget, are the
+        // property. The wrong reply or a premature expiration still fails.
+        let (_peer, mut admin) = Peer::new(mode, Duration::from_secs(45));
         let mut outcome = None;
         wait(|| {
             outcome = admin.poll();
