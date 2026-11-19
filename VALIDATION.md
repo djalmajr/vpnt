@@ -142,23 +142,38 @@ a partir de um terminal com o grupo novo: `newgrp vpnt` e, nele, `vpnt &`.
 
 ### Validação real manual
 
-Resultado: **pendente**. Execute somente no host autorizado, com servidor de VPN,
-domínio interno e host interno próprios. Guarde o estado de rede antes:
+Resultado: **parcial** (2026-11-19, Omarchy, pacote local `0.1.0-1`). Passos 1
+a 5 passaram; os cenários de rede do passo 6 seguem pendentes. Execute somente
+no host autorizado, com servidor de VPN, domínio interno e host interno
+próprios. Guarde o estado de rede antes. O `resolvectl` lista os links em ordem
+variável, então a função ordena os blocos por link:
 
 ```sh
 estado_rede() {
-  ip -br link
-  ip route
+  ip -br link | grep -v '^vpnt'
+  ip route | sort
+  ip -6 route | sort
   ip -4 rule
-  resolvectl status
+  resolvectl status --no-pager | grep -vE 'Current DNS Server|^\s*$' |
+    awk '/^(Global|Link [0-9]+ )/ { if (b) print b; b = $0; next }
+         { b = b "\n" $0 } END { if (b) print b }' | sort
 }
 estado_rede > rede-antes.txt
 ```
 
-1. Importe o `.ovpn` e escolha o certificado do token. Conecte pelo ícone e
-   aprove no celular.
-2. Confira a interface `vpntN` e o endereço e as rotas recebidos, o DNS por
-   domínio e o acesso ao host interno pelo túnel.
+1. Importe o `.ovpn` e escolha o certificado do token. Preencha o domínio
+   interno e o endereço de teste do túnel: os exemplos cinza nos campos não são
+   valores. Sem domínio, e sem DOMAIN enviado pelo servidor, o DNS da VPN vira o
+   padrão do sistema. Conecte pelo ícone e aprove no celular.
+   **[PASS]** perfil importado, certificado escolhido no app, aprovação no
+   celular.
+2. Confira a interface `vpntN`, o endereço e as rotas recebidos, o DNS por
+   domínio (`resolvectl status vpntN` com `~<domínio>` e `Default Route: no`) e
+   o acesso ao host interno pelo túnel (`resolvectl query`, `ip route get` e um
+   pedido HTTPS com a AC do provedor). Um nome de fora do domínio interno
+   continua resolvendo pela interface física.
+   **[PASS]** rotas só pela tun, rota padrão intacta, DNS restrito ao domínio,
+   HTTP 302 do host interno pelo túnel, `openvpn` sem root.
 3. Desconecte e compare o estado; o diff esperado é vazio:
 
 ```sh
@@ -166,16 +181,28 @@ estado_rede > rede-depois.txt
 diff -u rede-antes.txt rede-depois.txt
 ```
 
-4. Repita a conexão, mate apenas o processo do app escolhido pelo dono e
-   confira que o helper limpa a tun. Compare novamente o estado de rede.
+   **[PASS]** diff vazio, nenhuma tun `vpnt*`.
+4. Repita a conexão e mate o `openvpn`; depois repita e mate o processo do app
+   escolhido pelo dono. Em cada caso, confira que o helper limpa a tun e
+   compare novamente o estado de rede.
 
 ```sh
-read -r -p "PID do vpnt: " pid_vpnt
-kill -9 "$pid_vpnt"
+read -r -p "PID do openvpn ou do vpnt: " pid
+kill -9 "$pid"
 ```
 
-5. Confira que não há regra sudoers do vpnt, inclusive nos arquivos incluídos;
-   revise os arquivos de sudoers conforme a configuração do host.
+   **[PASS]** nos dois casos a tun sumiu em até 2 s e o diff ficou vazio; ao
+   matar o app, o runtime e o `openvpn` morreram junto e só o helper root
+   continuou ativo.
+5. Confira que não há regra sudoers do vpnt (`pacman -Ql vpnt | grep -i
+   sudoers`), inclusive nos arquivos incluídos; revise os arquivos de sudoers
+   conforme a configuração do host.
+   **[PASS]** o pacote não instala sudoers.
+6. Cenários de rede, com a VPN conectada: queda da interface física com
+   retorno, suspender e retomar, e a reconexão do `ping-restart`. Em cada um,
+   anote se o app reconecta ou mostra o estado certo e compare o estado de rede
+   depois de desconectar.
+   **[NOT RUN]**
 
 IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
 fixture não substitui essa validação com VPN real.
