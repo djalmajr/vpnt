@@ -205,6 +205,7 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
     second.advance();
     wait(&mut broker, |s| s.vpns[0].state == State::Connected);
     assert_eq!(loads.load(Ordering::Relaxed), 2);
+    let quit = std::time::SystemTime::now();
     dispatch(&mut broker, Command::Quit {});
     let until = Instant::now() + Duration::from_millis(400);
     while Instant::now() < until {
@@ -212,16 +213,48 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
         assert_eq!(attempts.load(Ordering::Relaxed), 1, "quit cannot relaunch");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Readiness limit for the fixture's own cleanup marker, measured from the
-    // quit: 3.5 s, per the project's temporal test contract.
-    let cleaned = Instant::now() + Duration::from_millis(3500);
-    while !second.cleaned() {
+    // A quit must not relaunch after the old child has actually exited.
+    let reaped = Instant::now() + Duration::from_secs(15);
+    while !broker.client.as_ref().unwrap().finished() {
         assert!(
-            Instant::now() < cleaned,
-            "the replacement fixture did not clean up after quit"
+            Instant::now() < reaped,
+            "fixture child exit guard timed out: helper={}, states={:?}",
+            broker.helper,
+            states(&broker),
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    broker.poll();
+    assert_eq!(broker.snapshot().helper, "missing");
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        1,
+        "quit cannot relaunch after the previous child exits"
+    );
+    // Synchronization guard only; the 3.5 s readiness limit is checked below
+    // against the marker mtime written by the fixture at the source.
+    let cleaned = Instant::now() + Duration::from_secs(15);
+    while !second.cleaned() {
+        assert!(
+            Instant::now() < cleaned,
+            "fixture cleanup guard timed out: marker={:?}",
+            second.marker.with_extension("cleaned"),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = std::fs::metadata(second.marker.with_extension("cleaned"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(quit)
+        // A coarse file clock can stamp a cleanup that followed the quit
+        // within a tick slightly before it; that is no delay.
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        elapsed <= Duration::from_millis(3500),
+        "cleanup after quit took {} ms",
+        elapsed.as_millis()
+    );
     drop(broker);
     drop(second);
 }
