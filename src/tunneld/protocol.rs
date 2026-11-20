@@ -76,31 +76,81 @@ impl From<ErrorCode> for FrameError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Request {
-    Hello { version: u32 },
-    PrepareIpsec(IpsecRequest),
-    PrepareFortinet(FortinetRequest),
-    Status {},
-    Stop {},
+// Serde's derived struct and tagged enum visitors also accept positional
+// sequences. Require a map first, then use the derived field validation.
+macro_rules! named_object {
+    (
+        $(#[$outer:meta])*
+        serde($($serde:tt)*)
+        $visibility:vis $kind:ident $name:ident $body:tt
+    ) => {
+        $(#[$outer])*
+        $visibility $kind $name $body
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                type Target = $name;
+
+                #[derive(Deserialize)]
+                #[serde(remote = "Target", $($serde)*)]
+                $kind Wire $body
+
+                struct NamedObjectVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for NamedObjectVisitor {
+                    type Value = Target;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("an object with named fields")
+                    }
+
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        Wire::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    }
+                }
+
+                deserializer.deserialize_map(NamedObjectVisitor)
+            }
+        }
+    };
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Response {
-    Version { version: u32 },
-    Prepared {},
-    Status { state: State },
-    Error { code: ErrorCode },
+named_object! {
+    #[derive(Debug, Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)
+    pub enum Request {
+        Hello { version: u32 },
+        PrepareIpsec(IpsecRequest),
+        PrepareFortinet(FortinetRequest),
+        Status {},
+        Stop {},
+    }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Endpoint {
-    #[serde(deserialize_with = "deserialize_host")]
-    host: String,
-    port: std::num::NonZeroU16,
+named_object! {
+    #[derive(Debug, Serialize)]
+    #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+    serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)
+    pub enum Response {
+        Version { version: u32 },
+        Prepared {},
+        Status { state: State },
+        Error { code: ErrorCode },
+    }
+}
+
+named_object! {
+    #[derive(Debug, PartialEq, Eq, Serialize)]
+    serde(deny_unknown_fields)
+    pub struct Endpoint {
+        #[serde(deserialize_with = "deserialize_host")]
+        host: String,
+        port: std::num::NonZeroU16,
+    }
 }
 impl Endpoint {
     pub fn new(host: String, port: u16) -> Result<Self, ErrorCode> {
@@ -126,11 +176,12 @@ pub struct CidrV4 {
     network: Ipv4Addr,
     prefix: u8,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireCidr {
-    network: Ipv4Addr,
-    prefix: u8,
+named_object! {
+    serde(deny_unknown_fields)
+    struct WireCidr {
+        network: Ipv4Addr,
+        prefix: u8,
+    }
 }
 impl TryFrom<WireCidr> for CidrV4 {
     type Error = FrameError;
@@ -162,14 +213,16 @@ impl CidrV4 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IpsecRequest {
-    endpoint: Endpoint,
-    #[serde(deserialize_with = "deserialize_username::<_, 200>")]
-    username: String,
-    #[serde(deserialize_with = "deserialize_networks")]
-    networks: Vec<CidrV4>,
+named_object! {
+    #[derive(Debug, Serialize)]
+    serde(deny_unknown_fields)
+    pub struct IpsecRequest {
+        endpoint: Endpoint,
+        #[serde(deserialize_with = "deserialize_username::<_, 200>")]
+        username: String,
+        #[serde(deserialize_with = "deserialize_networks")]
+        networks: Vec<CidrV4>,
+    }
 }
 impl IpsecRequest {
     pub fn new(
@@ -200,14 +253,16 @@ impl IpsecRequest {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FortinetRequest {
-    endpoint: Endpoint,
-    #[serde(deserialize_with = "deserialize_username::<_, 64>")]
-    username: String,
-    #[serde(with = "pin")]
-    certificate_sha256: [u8; 32],
+named_object! {
+    #[derive(Debug, Serialize)]
+    serde(deny_unknown_fields)
+    pub struct FortinetRequest {
+        endpoint: Endpoint,
+        #[serde(deserialize_with = "deserialize_username::<_, 64>")]
+        username: String,
+        #[serde(with = "pin")]
+        certificate_sha256: [u8; 32],
+    }
 }
 impl FortinetRequest {
     pub fn new(
@@ -567,11 +622,7 @@ pub(super) fn timed(stream: &UnixStream, deadline: Instant) -> Result<TimedStrea
 
 // Linux's UnixStream::peek is unstable. Peek into zeroizing storage so an
 // out-of-phase byte is never copied into a regular userspace buffer.
-fn peek_matches(
-    stream: &UnixStream,
-    deadline: Instant,
-    matches: impl Fn(u8) -> bool,
-) -> Result<Option<bool>, FrameError> {
+fn has_queued_byte(stream: &UnixStream, deadline: Instant) -> Result<bool, FrameError> {
     let budget = Budget::until(deadline, None)?;
     let mut byte = Zeroizing::new([0]);
     loop {
@@ -586,11 +637,11 @@ fn peek_matches(
             )
         };
         match count {
-            1 => return Ok(Some(matches(byte[0]))),
+            1 => return Ok(true),
             0 => return Err(FrameError::Io(io::ErrorKind::UnexpectedEof)),
             _ => match io::Error::last_os_error().kind() {
                 io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => return Ok(None),
+                io::ErrorKind::WouldBlock => return Ok(false),
                 kind => return Err(FrameError::Io(kind)),
             },
         }
@@ -677,7 +728,9 @@ impl ServerDecoder {
             return Err(ErrorCode::BadRequest.into());
         };
         self.in_phase(Phase::Admission(backend), deadline, |stream, io| {
-            if peek_matches(stream, deadline, |_| true)?.is_some() {
+            // Reject pipelining already visible in the socket. This check
+            // cannot establish whether the client has received the ACK.
+            if has_queued_byte(stream, deadline)? {
                 return Err(ErrorCode::BadRequest.into());
             }
             write_control(io, &Response::Prepared {})?;
@@ -690,17 +743,8 @@ impl ServerDecoder {
             self.stream.take();
             return Err(ErrorCode::BadRequest.into());
         };
-        self.in_phase(Phase::Credentials(backend), deadline, |stream, io| {
+        self.in_phase(Phase::Credentials(backend), deadline, |_, io| {
             let credentials = Credentials::read(io, backend)?;
-            // A queued non-JSON prefix cannot be the next control frame. Bytes
-            // arriving later are validated by command(), since a stream carries
-            // no message boundary beyond the lengths and the control delimiter.
-            if peek_matches(stream, deadline, |byte| {
-                matches!(byte, b'{' | b' ' | b'\t' | b'\r' | b'\n')
-            })? == Some(false)
-            {
-                return Err(ErrorCode::BadRequest.into());
-            }
             Ok((credentials, Phase::Active))
         })
     }

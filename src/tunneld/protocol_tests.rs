@@ -196,6 +196,104 @@ fn json_frames_are_closed_and_bounded() {
     ));
 }
 
+fn assert_named_object<T: serde::de::DeserializeOwned>(
+    fields: &str,
+    sequence: &str,
+    duplicate: &str,
+) {
+    assert!(serde_json::from_str::<T>(&format!("{{{fields}}}")).is_ok());
+    for invalid in [
+        sequence.to_owned(),
+        format!("{{{fields},{duplicate}}}"),
+        format!(r#"{{{fields},"extra":1}}"#),
+    ] {
+        assert!(serde_json::from_str::<T>(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn endpoint_requires_named_fields() {
+    assert_named_object::<Endpoint>(
+        r#""host":"vpn.example","port":443"#,
+        r#"["vpn.example",443]"#,
+        r#""port":443"#,
+    );
+}
+
+#[test]
+fn cidr_requires_named_fields() {
+    assert_named_object::<CidrV4>(
+        r#""network":"10.0.0.0","prefix":8"#,
+        r#"["10.0.0.0",8]"#,
+        r#""prefix":8"#,
+    );
+}
+
+#[test]
+fn ipsec_preparation_requires_named_fields() {
+    let endpoint = r#"{"host":"vpn.example","port":500}"#;
+    let routes = r#"[{"network":"10.0.0.0","prefix":8}]"#;
+    assert_named_object::<IpsecRequest>(
+        &format!(r#""endpoint":{endpoint},"username":"u","networks":{routes}"#),
+        &format!(r#"[{endpoint},"u",{routes}]"#),
+        r#""username":"u""#,
+    );
+}
+
+#[test]
+fn fortinet_preparation_requires_named_fields() {
+    let endpoint = r#"{"host":"vpn.example","port":443}"#;
+    assert_named_object::<FortinetRequest>(
+        &format!(r#""endpoint":{endpoint},"username":"u","certificate_sha256":"{PIN}""#),
+        &format!(r#"[{endpoint},"u","{PIN}"]"#),
+        r#""username":"u""#,
+    );
+}
+
+#[test]
+fn request_rejects_sequences_in_nested_objects() {
+    let routes = networks(&[("10.0.0.0", 8), ("192.0.2.1", 32)]);
+    let request = ipsec("vpn.example", 500, "u", routes.clone());
+    assert!(decode_request(&request).is_ok());
+    for index in 0..2 {
+        let mut routes = routes.clone();
+        routes[index] = serde_json::json!([routes[index]["network"], routes[index]["prefix"]]);
+        let request = ipsec("vpn.example", 500, "u", routes);
+        assert_eq!(decode_request(&request).unwrap_err(), ErrorCode::BadRequest);
+    }
+    for request in [request, fortinet("u", PIN)] {
+        assert!(decode_request(&request).is_ok());
+        let mut request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+        request["endpoint"] = serde_json::json!(["vpn.example", request["endpoint"]["port"]]);
+        assert_eq!(
+            decode_request(format!("{request}\n").as_bytes()).unwrap_err(),
+            ErrorCode::BadRequest
+        );
+    }
+}
+
+#[test]
+fn control_requests_require_named_fields() {
+    assert_named_object::<Request>(
+        r#""op":"hello","version":1"#,
+        r#"["hello",1]"#,
+        r#""version":1"#,
+    );
+    assert!(decode_request(STATUS).is_ok());
+    assert!(decode_request(b"[\"status\"]\n").is_err());
+}
+
+#[test]
+fn control_responses_require_named_fields() {
+    assert_named_object::<Response>(
+        r#""op":"version","version":1"#,
+        r#"["version",1]"#,
+        r#""version":1"#,
+    );
+    assert!(decode_response(b"{\"op\":\"prepared\"}\n").is_ok());
+    assert!(decode_response(b"[\"prepared\"]\n").is_err());
+}
+
 fn begin(request: &[u8]) -> (UnixStream, ServerDecoder) {
     let (mut writer, reader) = UnixStream::pair().unwrap();
     let mut decoder = ServerDecoder::new(reader);
@@ -245,7 +343,7 @@ fn rejects_frames_outside_the_current_phase() {
 }
 
 #[test]
-fn rejects_malformed_credentials_and_followup_bytes() {
+fn rejects_malformed_credentials() {
     let request = fortinet("u", PIN);
     for frame in [
         b"".as_slice(),
@@ -273,15 +371,39 @@ fn rejects_malformed_credentials_and_followup_bytes() {
         writer.shutdown(std::net::Shutdown::Write).unwrap();
         assert!(decoder.credentials(deadline()).is_err(), "{frame:?}");
     }
+}
+
+#[test]
+fn rejects_followup_bytes_at_command_for_both_write_patterns() {
+    let request = fortinet("u", PIN);
+    let frame = b"\0\x01p";
     for extra in [b"!".as_slice(), b"\0\x01q"] {
-        let (mut writer, mut decoder) = begin(&request);
-        decoder.prepared(deadline()).unwrap();
-        writer
-            .write_all(&[b"\0\x01p".as_slice(), extra, STATUS].concat())
-            .unwrap();
-        let rejected =
-            decoder.credentials(deadline()).is_err() || decoder.command(deadline()).is_err();
-        assert!(rejected, "{extra:?}");
+        let invalid_command = [extra, STATUS].concat();
+        for coalesced in [false, true] {
+            let (mut writer, mut decoder) = begin(&request);
+            decoder.prepared(deadline()).unwrap();
+            if coalesced {
+                writer
+                    .write_all(&[frame, &invalid_command[..]].concat())
+                    .unwrap();
+            } else {
+                for byte in frame {
+                    writer.write_all(&[*byte]).unwrap();
+                }
+            }
+            let credentials = decoder.credentials(deadline()).unwrap();
+            assert_eq!(credentials.password(), "p");
+            assert_eq!(credentials.psk(), None);
+            if !coalesced {
+                for byte in &invalid_command {
+                    writer.write_all(&[*byte]).unwrap();
+                }
+            }
+            assert_eq!(
+                decoder.command(deadline()).unwrap_err(),
+                FrameError::Protocol(ErrorCode::BadRequest)
+            );
+        }
     }
 }
 
