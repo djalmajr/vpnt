@@ -26,6 +26,8 @@ pub mod localization;
 pub mod model;
 #[cfg(target_os = "linux")]
 pub mod netd;
+#[cfg(target_os = "linux")]
+pub mod netlease;
 pub mod notifications;
 pub mod preferences;
 #[cfg(feature = "desktop")]
