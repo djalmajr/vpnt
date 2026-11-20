@@ -13,16 +13,13 @@ fn denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unsafe ovpn session base")
 }
 
-/// Pure decision over the metadata of an existing entry. `symlink_metadata`
-/// reports the link itself, so a link is never mistaken for a directory.
+/// Pure decision over the metadata of an entry. `symlink_metadata` reports
+/// the link itself, so a link is never mistaken for a directory. The base is
+/// made only by this helper with mkdir 0700, so an existing one is held to the
+/// same exact mode: setuid, setgid and sticky bits are refused too, and a
+/// restrictive umask cannot get a base accepted on a later start.
 pub(crate) fn acceptable(metadata: &Metadata, expected_uid: u32) -> bool {
-    metadata.is_dir() && metadata.uid() == expected_uid && metadata.mode() & 0o077 == 0
-}
-
-/// A directory made here must be exactly 0700: a restrictive umask or an
-/// injected chmod must not change what this function guarantees.
-fn acceptable_new(metadata: &Metadata, expected_uid: u32) -> bool {
-    acceptable(metadata, expected_uid) && metadata.mode() & 0o7777 == 0o700
+    metadata.is_dir() && metadata.uid() == expected_uid && metadata.mode() & 0o7777 == 0o700
 }
 
 fn check_existing(path: &Path, expected_uid: u32) -> io::Result<()> {
@@ -52,7 +49,7 @@ fn ensure_base_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => match create(path) {
             Ok(()) => {
                 let metadata = fs::symlink_metadata(path)?;
-                if !acceptable_new(&metadata, expected_uid) {
+                if !acceptable(&metadata, expected_uid) {
                     return Err(denied());
                 }
                 Ok(())
@@ -152,7 +149,9 @@ mod tests {
     fn refuses_wide_mode_symlink_file_and_foreign_owner_without_repair() {
         // SAFETY: UID query has no memory preconditions.
         let uid = unsafe { libc::geteuid() };
-        for case in ["wide", "symlink", "file", "foreign"] {
+        for case in [
+            "wide", "setuid", "setgid", "sticky", "symlink", "file", "foreign",
+        ] {
             let root = Root::new();
             let base = root.base();
             let target = root.0.join("target");
@@ -162,9 +161,20 @@ mod tests {
                 uid
             };
             match case {
-                "wide" => {
+                "wide" | "setuid" | "setgid" | "sticky" => {
+                    let mode = match case {
+                        "wide" => 0o755,
+                        "setuid" => 0o4700,
+                        "setgid" => 0o2700,
+                        _ => 0o1700,
+                    };
                     fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
-                    fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::set_permissions(&base, fs::Permissions::from_mode(mode)).unwrap();
+                    assert_eq!(
+                        fs::symlink_metadata(&base).unwrap().mode() & 0o7777,
+                        mode,
+                        "the fixture could not set {mode:o}"
+                    );
                 }
                 "symlink" => {
                     fs::DirBuilder::new().mode(0o700).create(&target).unwrap();
