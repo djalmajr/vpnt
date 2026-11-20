@@ -61,7 +61,6 @@ trait Attempt {
     }
     /// Changes when a transport restart begins, even if it completes before
     /// the next poll.
-    #[cfg(target_os = "linux")]
     fn restart_epoch(&self) -> u64 {
         0
     }

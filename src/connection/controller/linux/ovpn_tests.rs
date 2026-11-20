@@ -130,6 +130,7 @@ fn network() -> NetworkConfig {
         dns_servers: vec![],
         dns_domains: vec!["pushed.test".into()],
         server: None,
+        device: None,
     }
 }
 fn attempt(

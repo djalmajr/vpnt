@@ -10,10 +10,15 @@ pub struct NetworkConfig {
     pub dns_servers: Vec<Ipv4Addr>,
     pub dns_domains: Vec<String>,
     pub server: Option<Ipv4Addr>,
+    /// Device name from the UP environment; absent on profiles that do not
+    /// push one. Identity only: this module never configures the interface.
+    pub device: Option<String>,
 }
 impl fmt::Debug for NetworkConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("NetworkConfig([redacted])")
+        f.debug_struct("NetworkConfig")
+            .field("device", &self.device)
+            .finish_non_exhaustive()
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +85,19 @@ fn domain(s: &str) -> Option<String> {
         Some(s)
     }
 }
+/// OpenVPN's `dev` is a short interface name, not a path: the macOS
+/// controller uses it as identity for the interface it will own.
+fn device(value: &str) -> Result<String, NetworkError> {
+    if value.is_empty()
+        || value.len() > 15
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Err(NetworkError::Malformed);
+    }
+    Ok(value.to_owned())
+}
 fn index(s: &str) -> Result<Option<usize>, NetworkError> {
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
         return Ok(None);
@@ -120,6 +138,9 @@ pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkErro
     let server = vars
         .get("trusted_ip")
         .and_then(|v| v.parse::<Ipv4Addr>().ok());
+    // A missing `dev` is normal and must never reject the UP block; a present
+    // but invalid one is as malformed as any other bad field here.
+    let device = vars.get("dev").map(|value| device(value)).transpose()?;
     let mut indexed = BTreeMap::<usize, (&str, Option<&str>)>::new();
     for (&key, &value) in &vars {
         if let Some(n) = key
@@ -207,6 +228,7 @@ pub fn from_env(pairs: &[(String, String)]) -> Result<NetworkConfig, NetworkErro
         dns_servers,
         dns_domains,
         server,
+        device,
     })
 }
 #[cfg(test)]
