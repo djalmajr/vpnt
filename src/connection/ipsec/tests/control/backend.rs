@@ -121,7 +121,9 @@ fn linux_accepts_the_tested_6_1_patch_range() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_rejects_untested_versions_with_a_positive_control_alongside() {
-    for version in ["6.0.3", "6.2.0", "6.1", "6.1.0rc1", "6.1.0-2", "empty"] {
+    for version in [
+        "6.0.3", "6.2.0", "6.1", "6.1.0rc1", "6.1.0-2", "6.1.0.1", "empty",
+    ] {
         let mode = format!("version-{version}");
         let (mut control, harness, observation, registry) = setup(&mode, false);
         let result = control.start(creds(), until(), token());
@@ -153,11 +155,16 @@ fn macos_keeps_the_patched_runtime_admission() {
     complete_exchange(&harness.audit(), "6.1.0");
     settle(&mut control, &harness, &observation, &registry);
 
-    for mode in ["version-6.1.7", "stats-foreign-kernel-netlink"] {
+    // A refused version stops before `stats`; a foreign backend is only
+    // visible in the `stats` reply.
+    for (mode, audit) in [
+        ("version-6.1.7", &["version"][..]),
+        ("stats-foreign-kernel-netlink", &["version", "stats"][..]),
+    ] {
         let (mut control, harness, observation, registry) = setup(mode, false);
         let result = control.start(creds(), until(), token());
         assert_eq!(result, Err(Error::Incompatible), "{mode}");
-        assert_eq!(harness.audit(), ["version", "stats"], "{mode}");
+        assert_eq!(harness.audit(), audit, "{mode}");
         assert_eq!(control.cleanup(until()), Ok(false), "{mode}");
         settle(&mut control, &harness, &observation, &registry);
     }
