@@ -10,7 +10,7 @@ fn main() -> Result<(), String> {
     use std::{
         ffi::OsString,
         path::PathBuf,
-        thread,
+        sync::mpsc,
         time::{Duration, Instant},
     };
     use vpnt::connection::ovpn::{
@@ -90,12 +90,31 @@ fn main() -> Result<(), String> {
                     break;
                 }
             }
+            #[cfg(target_os = "linux")]
+            Ok(Progress::Restarting { state, epoch }) => {
+                // dev null: there is no network configuration to withdraw.
+                session.release_restart_hold(epoch);
+                println!(
+                    "state: {:?} reason={:?} (restart)",
+                    state.phase, state.reason
+                );
+            }
             Ok(progress) => println!("progress: {progress:?}"),
             Err(_) => break,
         }
     }
     if connected {
-        thread::sleep(hold);
+        // Keep acknowledging restarts while the connection is observed.
+        let until = Instant::now() + hold;
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            match session.progress().recv_timeout(left) {
+                #[cfg(target_os = "linux")]
+                Ok(Progress::Restarting { epoch, .. }) => session.release_restart_hold(epoch),
+                Ok(progress) => println!("progress: {progress:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
     let _ = session.stop();
     let outcome = session.wait().map_err(|error| format!("wait: {error}"))?;

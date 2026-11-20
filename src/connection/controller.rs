@@ -59,8 +59,19 @@ trait Attempt {
     fn phase(&self) -> Option<ConnectionState> {
         None
     }
+    /// Changes when a transport restart begins, even if it completes before
+    /// the next poll.
+    #[cfg(target_os = "linux")]
+    fn restart_epoch(&self) -> u64 {
+        0
+    }
     fn healthy(&mut self) -> Result<(), Failure>;
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure>;
+    /// Whether the last call to `probe` returned without starting a sample.
+    #[cfg(target_os = "linux")]
+    fn probe_busy(&self) -> bool {
+        false
+    }
     /// Stop only owned children; return true only after observed cleanup.
     /// Repeated calls must retain all uncertain resources.
     fn cleanup(&mut self) -> bool;
