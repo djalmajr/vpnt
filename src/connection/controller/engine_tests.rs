@@ -63,6 +63,121 @@ mod recovery {
             self.0.verify(profile)
         }
     }
+
+    #[test]
+    fn native_ovpn_waits_for_the_connect_ack_when_the_output_is_full() {
+        struct Admission {
+            snapshots: std::sync::atomic::AtomicUsize,
+            read_snapshot: SyncSender<()>,
+            created: SyncSender<()>,
+        }
+        impl Factory for Admission {
+            type Attempt = RecoveryAttempt;
+
+            fn supports(&self, kind: VpnKind) -> bool {
+                kind == VpnKind::Ovpn
+            }
+
+            fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
+                if self.snapshots.fetch_add(1, Ordering::Relaxed) == 63 {
+                    self.read_snapshot.try_send(()).ok();
+                }
+                Ok(None)
+            }
+
+            fn create(
+                &self,
+                _: Profile,
+                _: u32,
+                _: u64,
+                _: Credentials,
+                _: Arc<AtomicBool>,
+            ) -> Self::Attempt {
+                self.created.try_send(()).ok();
+                RecoveryAttempt
+            }
+
+            fn idle(&self) -> bool {
+                true
+            }
+        }
+
+        let profile = serde_json::from_value(serde_json::json!({
+            "id": "ovpn", "name": "OVPN", "kind": "ovpn", "gateway": "vpn.example.test",
+            "username": "", "networks": [], "port": 1194, "certificate": "",
+            "probeHost": "10.0.0.42", "probePort": 443, "probeMethod": "tcp",
+            "ovpn": {"module": "/example/libtoken.dylib", "certificateId": "00"}
+        }))
+        .unwrap();
+        let (output, wire) = mpsc::sync_channel(1);
+        output
+            .send(Message::Accepted {
+                id: "occupied".into(),
+            })
+            .unwrap();
+        let (read_snapshot, snapshot_read) = mpsc::sync_channel(1);
+        let (created, creation) = mpsc::sync_channel(1);
+        let factory = Admission {
+            snapshots: Default::default(),
+            read_snapshot,
+            created,
+        };
+        let sign_replies = Arc::new(RemoteSigners::new(output.clone()));
+        let bound = Duration::from_secs(2);
+        thread::scope(|scope| {
+            let (input, requests) = mpsc::sync_channel(65);
+            input
+                .send(Request {
+                    id: "connect".into(),
+                    command: Command::Connect {
+                        id: "ovpn".into(),
+                        generation: 1,
+                        interval: ProbeInterval::TEN,
+                        credentials: Credentials {
+                            password: "".into(),
+                            psk: "".into(),
+                        },
+                    },
+                })
+                .unwrap();
+            // The engine reads at most 64 commands per pass. The final
+            // snapshot handshake puts it beyond the first launch site.
+            for n in 0..64 {
+                input
+                    .send(Request {
+                        id: format!("snapshot-{n}"),
+                        command: Command::Snapshot {},
+                    })
+                    .unwrap();
+            }
+            let engine = scope.spawn(move || {
+                super::super::run_native(
+                    factory,
+                    501,
+                    vec![profile],
+                    requests,
+                    output,
+                    Timing::default(),
+                    sign_replies,
+                )
+            });
+            snapshot_read.recv_timeout(bound).unwrap();
+            assert_eq!(
+                creation.recv_timeout(Duration::from_millis(250)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            assert!(
+                matches!(wire.recv_timeout(bound).unwrap(), Message::Accepted { id } if id == "occupied")
+            );
+            assert!(
+                matches!(wire.recv_timeout(bound).unwrap(), Message::Accepted { id } if id == "connect")
+            );
+            creation.recv_timeout(bound).unwrap();
+            drop(input);
+            engine.join().unwrap().unwrap();
+        });
+    }
+
     struct EngineGuard(Option<JoinHandle<Result<(), ErrorCode>>>);
     impl Drop for EngineGuard {
         fn drop(&mut self) {
@@ -1633,14 +1748,18 @@ fn in_flight_engine(budget: Duration, margin: Duration) -> InFlightEngine {
             vec![profile("one")],
             requests,
             output,
-            Timing {
-                connect: Duration::from_secs(5),
-                probe: Duration::from_secs(1),
-                interval: Duration::from_secs(60),
-                health: Duration::from_millis(2),
-                poll: Duration::from_millis(2),
+            RunOptions {
+                timing: Timing {
+                    connect: Duration::from_secs(5),
+                    probe: Duration::from_secs(1),
+                    interval: Duration::from_secs(60),
+                    health: Duration::from_millis(2),
+                    poll: Duration::from_millis(2),
+                },
+                deadline,
+                #[cfg(target_os = "macos")]
+                sign_replies: None,
             },
-            deadline,
         );
         let _ = drain.join();
         result
@@ -1856,14 +1975,17 @@ fn stuck_helper_process_fixture() {
             vec![profile("one")],
             requests,
             output,
-            Timing {
-                connect: Duration::from_secs(5),
-                probe: Duration::from_secs(1),
-                interval: Duration::from_secs(60),
-                health: Duration::from_millis(2),
-                poll: Duration::from_millis(2),
+            RunOptions {
+                timing: Timing {
+                    connect: Duration::from_secs(5),
+                    probe: Duration::from_secs(1),
+                    interval: Duration::from_secs(60),
+                    health: Duration::from_millis(2),
+                    poll: Duration::from_millis(2),
+                },
+                deadline,
+                sign_replies: None,
             },
-            deadline,
         )
     });
     assert!(result.is_ok(), "stuck helper fixture failed: {result:?}");

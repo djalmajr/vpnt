@@ -1,5 +1,7 @@
 mod dispatch;
 mod metadata;
+#[cfg(target_os = "macos")]
+use super::native::remote_signer::RemoteSigners;
 use super::{
     worker::{self, ExitRequested, Finished, Signals},
     *,
@@ -194,6 +196,7 @@ fn launch<'scope, 'env: 'scope, F: Factory>(
     });
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub(super) fn run<F: Factory>(
     factory: F,
     uid: u32,
@@ -208,19 +211,65 @@ pub(super) fn run<F: Factory>(
         profiles,
         requests,
         output,
-        timing,
-        Deadline::process(Arc::new(ExitRequested::new(worker::CLEANUP_BUDGET))),
+        RunOptions::new(timing),
     )
 }
-fn run_with_exit<F: Factory>(
+
+#[cfg(target_os = "macos")]
+pub(super) fn run_native<F: Factory>(
     factory: F,
     uid: u32,
     profiles: Vec<Profile>,
     requests: Receiver<Request>,
     output: SyncSender<Message>,
     timing: Timing,
-    deadline: Deadline,
+    sign_replies: Arc<RemoteSigners>,
 ) -> Result<(), ErrorCode> {
+    run_with_exit(
+        factory,
+        uid,
+        profiles,
+        requests,
+        output,
+        RunOptions {
+            sign_replies: Some(sign_replies),
+            ..RunOptions::new(timing)
+        },
+    )
+}
+
+struct RunOptions {
+    timing: Timing,
+    deadline: Deadline,
+    #[cfg(target_os = "macos")]
+    sign_replies: Option<Arc<RemoteSigners>>,
+}
+
+impl RunOptions {
+    fn new(timing: Timing) -> Self {
+        Self {
+            timing,
+            deadline: Deadline::process(Arc::new(ExitRequested::new(worker::CLEANUP_BUDGET))),
+            #[cfg(target_os = "macos")]
+            sign_replies: None,
+        }
+    }
+}
+
+fn run_with_exit<F: Factory>(
+    factory: F,
+    uid: u32,
+    profiles: Vec<Profile>,
+    requests: Receiver<Request>,
+    output: SyncSender<Message>,
+    options: RunOptions,
+) -> Result<(), ErrorCode> {
+    let RunOptions {
+        timing,
+        deadline,
+        #[cfg(target_os = "macos")]
+        sign_replies,
+    } = options;
     let exit = &deadline.exit;
     if uid == 0 {
         return Err(ErrorCode::UntrustedConfiguration);
@@ -268,7 +317,16 @@ fn run_with_exit<F: Factory>(
                     break;
                 }
                 match requests.try_recv() {
-                    Ok(mut request) => {
+                    Ok(request) => {
+                        #[cfg(target_os = "macos")]
+                        let Some(request) = dispatch::dispatch_sign_reply(
+                            request,
+                            sign_replies.as_deref(),
+                            &mut outgoing,
+                        ) else {
+                            continue;
+                        };
+                        let mut request = request;
                         if matches!(request.command, Command::Snapshot {})
                             && request.id == crate::helper::protocol::CLEANUP_PROBE_SNAPSHOT_ID
                         {
@@ -398,6 +456,18 @@ fn run_with_exit<F: Factory>(
                     }
                 }
                 if !closing && slot.worker.is_none() && slot.pending.is_some() {
+                    #[cfg(target_os = "macos")]
+                    if sign_replies.is_some()
+                        && slot.profile.kind == VpnKind::Ovpn
+                        && let Some(pending) = &slot.pending
+                        && outgoing.iter().any(
+                            |message| matches!(message, Message::Accepted { id } if id == &pending.request),
+                        )
+                    {
+                        // The app admits signing only after it sees this
+                        // acknowledgement. A signer sends directly to output.
+                        continue;
+                    }
                     launch(scope, &factory, uid, slot, timing, exit);
                 }
             }
