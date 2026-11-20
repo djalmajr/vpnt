@@ -2,7 +2,6 @@ use super::*;
 use crate::netd::protocol::{Request, parse_request};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -123,8 +122,7 @@ impl Fixture {
     }
     fn script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.0.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
 }
