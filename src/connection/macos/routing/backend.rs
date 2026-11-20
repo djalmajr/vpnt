@@ -1,5 +1,5 @@
-//! Native routes for owned PPP and retained IPsec UTUN scopes, including
-//! the scoped default used by a full tunnel’s physical transport.
+//! Native routes for owned PPP, retained IPsec and observed OpenVPN scopes,
+//! including the scoped default used by a full tunnel’s physical transport.
 mod ppp;
 mod registry;
 mod retained;
@@ -10,14 +10,14 @@ use super::{AddWriter, Error, Key, Record, Route, Snapshot, TransportDefault, Tu
 use crate::{
     connection::{
         macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink},
-        routes::{Backend, NextHop, Owner, Presence},
+        routes::{Backend, Coordinator, NextHop, Owner, Presence},
     },
     helper::controller_lock::ControllerLock,
 };
 use ppp::NativeScope;
 use registry::{Attempt, Registry, Scope, Table};
 pub use registry::{InterfaceToken, NativeReceipt};
-use retained::{UtunQueue, UtunScope};
+use retained::UtunQueue;
 use retirement::Guard;
 use std::{
     sync::{
@@ -43,6 +43,7 @@ impl<'a> NativeBackend<'a> {
             registry: Registry::new(NativeTable {
                 controller,
                 writer: None,
+                observe_cleanup_only: false,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -81,6 +82,7 @@ impl<'a> NativeBackend<'a> {
             registry: Registry::new(NativeTable {
                 controller,
                 writer: None,
+                observe_cleanup_only: false,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -97,6 +99,22 @@ impl<'a> NativeBackend<'a> {
     pub fn finish_cleanup(&mut self, token: &InterfaceToken) -> Result<(), Error> {
         self.registry.finish_cleanup(token)
     }
+    /// Observe stale receipts without delegating any scoped-default DELETE to
+    /// this retry. The coordinator can also hold claims from SSL attempts.
+    pub(crate) fn retry_observed_cleanup(routes: &mut Coordinator<Self>) {
+        routes
+            .backend_mut()
+            .registry
+            .table_mut()
+            .observe_cleanup_only = true;
+        routes.retry_cleanup();
+        routes
+            .backend_mut()
+            .registry
+            .table_mut()
+            .observe_cleanup_only = false;
+    }
+
     pub fn has_resources(&self) -> bool {
         !self.registry.is_empty()
             || self.retired.lock().map_or(true, |queue| !queue.is_empty())
@@ -141,13 +159,24 @@ impl Backend for NativeBackend<'_> {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep the PPP registry representation unchanged"
+)]
 enum RegisteredScope<'a> {
     Ppp(NativeScope<'a>),
-    Utun(UtunScope<'a>),
+    Utun(Box<dyn Scope + Send + 'a>),
     #[cfg(test)]
     Fixture(u16),
 }
 impl Scope for RegisteredScope<'_> {
+    fn bind_work(&mut self, owner: &Owner) -> Result<(), Error> {
+        match self {
+            Self::Utun(scope) => scope.bind_work(owner),
+            _ => Ok(()),
+        }
+    }
+
     fn index(&self) -> u16 {
         match self {
             Self::Ppp(scope) => scope.index(),
@@ -209,8 +238,16 @@ impl Scope for RegisteredScope<'_> {
 struct NativeTable<'a> {
     controller: &'a ControllerLock,
     writer: Option<AddWriter<'a>>,
+    observe_cleanup_only: bool,
 }
 impl<'a> NativeTable<'a> {
+    fn cleanup_writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
+        if self.observe_cleanup_only {
+            return Err(Error::Busy);
+        }
+        self.writer()
+    }
+
     fn writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
         if self.writer.is_none() {
             self.writer = Some(AddWriter::open(self.controller)?);
@@ -236,10 +273,10 @@ impl Table for NativeTable<'_> {
             .map(|confirmation| Attempt { confirmation })
     }
     fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error> {
-        self.writer()?.get_transport_default(route)
+        self.cleanup_writer()?.get_transport_default(route)
     }
     fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error> {
-        self.writer()?
+        self.cleanup_writer()?
             .delete_transport_default(route)
             .map(|confirmation| Attempt { confirmation })
     }

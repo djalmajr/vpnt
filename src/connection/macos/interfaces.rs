@@ -28,6 +28,10 @@ pub struct Interfaces {
     pub(super) entries: BTreeMap<String, Interface>,
 }
 impl Interfaces {
+    pub(crate) fn index(&self, name: &str) -> Option<u32> {
+        self.entries.get(name).map(|interface| interface.index)
+    }
+
     pub fn read() -> io::Result<Self> {
         let mut list = ptr::null_mut();
         // SAFETY: getifaddrs initializes a linked list owned until freeifaddrs.

@@ -86,6 +86,28 @@ impl Profiles {
             identity,
         })
     }
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn read_ovpn_config(
+        &self,
+        profile: &str,
+        usage: &ProfileUse,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        if usage.key.0 != profile || !Arc::ptr_eq(&self.reservations, &usage.reservations) {
+            return Err(StoreError::InvalidData);
+        }
+        // Keep the reservation live through the read, even if cleanup or
+        // abandonment is requested concurrently.
+        let reservations = self.reservations.lock().map_err(|_| StoreError::Io)?;
+        let reservation = reservations
+            .get(&usage.key)
+            .filter(|reservation| {
+                reservation.live && Arc::ptr_eq(&reservation.identity, &usage.identity)
+            })
+            .ok_or(StoreError::InvalidData)?;
+        reservation.profile.validate()?;
+        self.store.read_ovpn_config(profile)
+    }
+
     pub(super) fn idle(&self) -> bool {
         self.reservations.try_lock().is_ok_and(|r| r.is_empty())
     }
@@ -261,4 +283,89 @@ mod abandon_tests {
         store.remove("first").unwrap();
         store.remove("second").unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn ovpn_text_requires_the_original_live_reservation_for_the_requested_profile() {
+    use std::{
+        fs,
+        os::unix::fs::DirBuilderExt,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let path = std::env::current_dir().unwrap().join(format!(
+        "vpnt-reserved-ovpn-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let root = Root(path);
+    // SAFETY: UID query has no memory preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let open = || ProfileStore::open(&root.0, uid).unwrap();
+    let store = open();
+    let profile = |id| -> Profile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": "Fixture", "kind": "ovpn", "gateway": "vpn.example.test",
+            "username": "", "networks": [], "port": 1194, "certificate": "",
+            "probeHost": "10.0.0.42", "probePort": 443, "probeMethod": "tcp",
+            "ovpn": {"module": "/example/libtoken.dylib", "certificateId": "00"}
+        }))
+        .unwrap()
+    };
+    let first = profile("first");
+    let other = profile("other");
+    store.save(first.clone()).unwrap();
+    store.save(other.clone()).unwrap();
+    store.save_ovpn_config(&first.id, "first fixture").unwrap();
+    store.save_ovpn_config(&other.id, "other fixture").unwrap();
+
+    let profiles = Profiles::fixture(store);
+    let first_use = profiles.begin(&first, 1).unwrap();
+    let other_use = profiles.begin(&other, 1).unwrap();
+    assert_eq!(
+        profiles
+            .read_ovpn_config(&first.id, &first_use)
+            .unwrap()
+            .as_deref(),
+        Some(b"first fixture".as_slice())
+    );
+    assert_eq!(
+        profiles.read_ovpn_config(&first.id, &other_use),
+        Err(StoreError::InvalidData)
+    );
+    let foreign = Profiles::fixture(open());
+    assert_eq!(
+        foreign.read_ovpn_config(&first.id, &first_use),
+        Err(StoreError::InvalidData)
+    );
+
+    first_use.complete().unwrap();
+    assert_eq!(
+        profiles.read_ovpn_config(&first.id, &first_use),
+        Err(StoreError::InvalidData)
+    );
+    let replacement = profiles.begin(&first, 1).unwrap();
+    assert_eq!(
+        profiles.read_ovpn_config(&first.id, &first_use),
+        Err(StoreError::InvalidData)
+    );
+    assert_eq!(
+        profiles
+            .read_ovpn_config(&first.id, &replacement)
+            .unwrap()
+            .as_deref(),
+        Some(b"first fixture".as_slice())
+    );
+    replacement.complete().unwrap();
+    other_use.complete().unwrap();
 }

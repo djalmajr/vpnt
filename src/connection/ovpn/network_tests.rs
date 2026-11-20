@@ -47,9 +47,24 @@ fn absent_device_never_rejects_the_up_block() {
 }
 #[test]
 fn device_is_read_validated_and_shown_in_debug() {
-    let c = from_env(&pairs(&[("dev", "vpn-0_1.t")])).unwrap();
+    let c = from_env(&pairs(&[
+        ("dev", "vpn-0_1.t"),
+        ("route_network_1", "10.23.5.0"),
+        ("route_netmask_1", "255.255.255.0"),
+        ("foreign_option_1", "dhcp-option DNS 10.81.0.53"),
+        (
+            "foreign_option_2",
+            "dhcp-option DOMAIN private.example.test",
+        ),
+    ]))
+    .unwrap();
     assert_eq!(c.device.as_deref(), Some("vpn-0_1.t"));
-    assert!(format!("{c:?}").contains("vpn-0_1.t"));
+    let debug = format!("{c:?}");
+    assert!(debug.contains("vpn-0_1.t"));
+    assert!(!debug.contains("10.81.0.2"), "address leaked");
+    assert!(!debug.contains("10.23.5.0"), "route leaked");
+    assert!(!debug.contains("10.81.0.53"), "DNS server leaked");
+    assert!(!debug.contains("private.example.test"), "DNS domain leaked");
     for bad in [
         "",
         &"a".repeat(16),
