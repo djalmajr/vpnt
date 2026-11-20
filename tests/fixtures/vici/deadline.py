@@ -5,7 +5,7 @@ import sys
 wire = socket.socket(fileno=0)
 control = socket.socket(fileno=2)
 wire.settimeout(5)
-control.settimeout(5)
+control.settimeout(20)
 mode = sys.argv[1]
 
 

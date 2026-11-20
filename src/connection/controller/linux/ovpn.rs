@@ -3,7 +3,7 @@
 use super::super::{Attempt, Failure};
 use crate::{
     connection::ovpn::{
-        management::Reason,
+        management::{Phase, Reason},
         network::NetworkConfig,
         pkcs11::TokenKey,
         session::{ConfigSource, Launch, Progress, Session, SignError, Signatures},
@@ -51,6 +51,10 @@ trait Tunnel {
     fn exited(&self) -> Option<Option<Reason>>;
     fn stop(&mut self);
     fn wait(&mut self, timeout: Duration) -> bool;
+    fn release_restart_hold(&self, epoch: u64);
+    fn approval_pending(&self) -> Option<bool> {
+        None
+    }
 }
 pub(super) struct RealNetwork(Client);
 fn net_error(e: ClientError) -> NetFailure {
@@ -85,6 +89,14 @@ impl Tunnel for RealTunnel {
     }
     fn exited(&self) -> Option<Option<Reason>> {
         self.session.as_ref()?.exited()
+    }
+    fn approval_pending(&self) -> Option<bool> {
+        self.session.as_ref().map(Session::approval_pending)
+    }
+    fn release_restart_hold(&self, epoch: u64) {
+        if let Some(session) = &self.session {
+            session.release_restart_hold(epoch);
+        }
     }
     fn stop(&mut self) {
         if let Some(s) = &self.session
@@ -155,7 +167,13 @@ fn read_profile(path: &Path, uid: u32) -> Result<ConfigSource, Failure> {
 trait Starter<N, T> {
     type Key;
     fn connect(&mut self) -> Result<N, Failure>;
-    fn token(&mut self, settings: &OvpnSettings, id: &[u8]) -> Result<Self::Key, Failure>;
+    fn token(
+        &mut self,
+        settings: &OvpnSettings,
+        id: &[u8],
+        canceled: &AtomicBool,
+        expires: Instant,
+    ) -> Result<Self::Key, Failure>;
     fn session(
         &mut self,
         config: ConfigSource,
@@ -178,8 +196,22 @@ impl Starter<RealNetwork, RealTunnel> for RealStart {
                 )
             })
     }
-    fn token(&mut self, settings: &OvpnSettings, id: &[u8]) -> Result<TokenKey, Failure> {
-        TokenKey::open(Path::new(&settings.module), id).map_err(|_| Failure::at(Step::Profile))
+    fn token(
+        &mut self,
+        settings: &OvpnSettings,
+        id: &[u8],
+        canceled: &AtomicBool,
+        expires: Instant,
+    ) -> Result<TokenKey, Failure> {
+        TokenKey::open_until(Path::new(&settings.module), id, canceled, expires)
+            .map_err(|_| Failure::at(Step::Profile))?
+            .ok_or_else(|| {
+                state_failure(
+                    ConnectionState::GatewayTimeout,
+                    ErrorCode::BackendFailure,
+                    Step::Tunnel,
+                )
+            })
     }
     fn session(
         &mut self,
@@ -247,17 +279,24 @@ fn state_failure(state: ConnectionState, error: ErrorCode, step: Step) -> Failur
     Failure { state, error, step }
 }
 
+const RECONNECT_GRACE: Duration = Duration::from_secs(120);
+
 pub(super) struct OvpnAttempt<N, T, S = RealStart> {
     profile: Profile,
     uid: u32,
     network: Option<N>,
     tunnel: Option<T>,
     name: Option<String>,
+    last_config: Option<Config>,
+    config_withdrawn: bool,
     phase: Option<ConnectionState>,
+    reconnect_started: Option<Instant>,
+    restart_epoch: u64,
     down: bool,
     stopped: bool,
     probe_job: Arc<dyn Fn(String, u16, Instant) -> bool + Send + Sync>,
     probe_inflight: Option<(mpsc::Receiver<bool>, thread::JoinHandle<()>)>,
+    probe_busy: bool,
     starter: S,
     config_path: Option<PathBuf>,
 }
@@ -284,11 +323,16 @@ impl<N, T, S> OvpnAttempt<N, T, S> {
             network: None,
             tunnel: None,
             name: None,
+            last_config: None,
+            config_withdrawn: false,
             phase: None,
+            reconnect_started: None,
+            restart_epoch: 0,
             down: false,
             stopped: false,
             probe_job: Arc::new(probe_connection),
             probe_inflight: None,
+            probe_busy: false,
             starter,
             config_path,
         }
@@ -301,7 +345,7 @@ impl OvpnAttempt<RealNetwork, RealTunnel> {
 }
 #[allow(private_bounds)]
 impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
-    fn open(&mut self) -> Result<(), Failure> {
+    fn open(&mut self, canceled: &AtomicBool, expires: Instant) -> Result<(), Failure> {
         if self.profile.kind != VpnKind::Ovpn || self.profile.validate().is_err() {
             return Err(Failure::at(Step::Profile));
         }
@@ -335,7 +379,10 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
             .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap_or(""), 16))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| Failure::at(Step::Profile))?;
-        let key = self.starter.token(settings, &bytes)?;
+        let key = self.starter.token(settings, &bytes, canceled, expires)?;
+        if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
+            return Err(Failure::at(Step::Tunnel));
+        }
         self.tunnel = Some(self.starter.session(config, settings, name, key)?);
         Ok(())
     }
@@ -369,10 +416,16 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
                 domains,
             },
         };
-        self.network
+        Self::apply_config(&mut self.network, &config)?;
+        self.last_config = Some(config);
+        self.config_withdrawn = false;
+        Ok(())
+    }
+    fn apply_config(network: &mut Option<N>, config: &Config) -> Result<(), Failure> {
+        network
             .as_mut()
             .ok_or_else(|| Failure::at(Step::Routes))?
-            .configure(&config)
+            .configure(config)
             .map_err(|e| {
                 Failure::at(if matches!(e, NetFailure::Dns) {
                     Step::Dns
@@ -381,13 +434,36 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
                 })
             })
     }
+    fn withdraw_config(&mut self) -> Result<(), Failure> {
+        let Some(config) = &self.last_config else {
+            return Ok(());
+        };
+        // A persisted TUN may still route the token's traffic into the stalled VPN.
+        let withdrawn = Config {
+            name: config.name.clone(),
+            address: config.address,
+            prefix: config.prefix,
+            mtu: config.mtu,
+            routes: Vec::new(),
+            dns: Dns {
+                servers: Vec::new(),
+                domains: Vec::new(),
+            },
+        };
+        Self::apply_config(&mut self.network, &withdrawn).map_err(|_| Failure::at(Step::Routes))?;
+        self.config_withdrawn = true;
+        Ok(())
+    }
     fn process(&mut self, ready: bool) -> Result<bool, Failure> {
         while let Some(event) = self.tunnel.as_mut().and_then(Tunnel::next) {
             match event {
-                Progress::AwaitingApproval => self.phase = Some(ConnectionState::AwaitingApproval),
+                Progress::AwaitingApproval if ready || self.reconnect_started.is_some() => {
+                    self.phase = Some(ConnectionState::AwaitingApproval);
+                }
+                Progress::AwaitingApproval => {}
                 Progress::Up(net) => {
                     self.phase = None;
-                    if ready || self.down {
+                    if ready || self.down || self.config_withdrawn {
                         self.configure(net)?;
                         self.down = false;
                         if ready {
@@ -401,6 +477,33 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> OvpnAttempt<N, T, S> {
                 Progress::Refused(_) => return Err(Failure::at(Step::Tunnel)),
                 Progress::State(s) if s.reason == Some(Reason::AuthFailure) => {
                     return Err(rejected(Step::Tunnel));
+                }
+                Progress::Restarting { state, epoch } => {
+                    if state.reason == Some(Reason::AuthFailure) {
+                        return Err(rejected(Step::Tunnel));
+                    }
+                    if self.reconnect_started.is_none() {
+                        self.reconnect_started = Some(Instant::now());
+                        self.restart_epoch = self.restart_epoch.wrapping_add(1);
+                    }
+                    // An intervening UP can have reapplied the network without
+                    // a CONNECTED state closing the recovery window.
+                    if !self.config_withdrawn {
+                        self.withdraw_config()?;
+                    }
+                    if let Some(tunnel) = &self.tunnel {
+                        tunnel.release_restart_hold(epoch);
+                    }
+                }
+                Progress::State(s) if s.phase == Phase::Connected => {
+                    if self.config_withdrawn
+                        && let Some(config) = &self.last_config
+                    {
+                        Self::apply_config(&mut self.network, config)?;
+                        self.config_withdrawn = false;
+                    }
+                    self.reconnect_started = None;
+                    self.phase = None;
                 }
                 Progress::State(_) => {}
             }
@@ -427,19 +530,41 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> Attempt for OvpnAttempt<N, T, S> {
         if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
             return Err(Failure::at(Step::Tunnel));
         }
-        self.open()
+        self.open(canceled, expires)
     }
     fn ready(&mut self) -> Result<bool, Failure> {
         self.process(true)
     }
     fn phase(&self) -> Option<ConnectionState> {
-        self.phase
+        let Some(started) = self.reconnect_started else {
+            return self.phase;
+        };
+        if started.elapsed() >= RECONNECT_GRACE {
+            return None;
+        }
+        let approval = self
+            .tunnel
+            .as_ref()
+            .and_then(Tunnel::approval_pending)
+            .unwrap_or(self.phase == Some(ConnectionState::AwaitingApproval));
+        Some(if approval {
+            ConnectionState::AwaitingApproval
+        } else {
+            ConnectionState::Reconnecting
+        })
     }
     fn healthy(&mut self) -> Result<(), Failure> {
         self.process(false).map(|_| ())
     }
+    fn restart_epoch(&self) -> u64 {
+        self.restart_epoch
+    }
+    fn probe_busy(&self) -> bool {
+        self.probe_busy
+    }
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
-        if canceled.load(Ordering::Acquire) || timeout.is_zero() {
+        self.probe_busy = true;
+        if self.config_withdrawn || canceled.load(Ordering::Acquire) || timeout.is_zero() {
             return Ok(false);
         }
         if let Some((_, worker)) = self.probe_inflight.as_ref() {
@@ -464,6 +589,7 @@ impl<N: Network, T: Tunnel, S: Starter<N, T>> Attempt for OvpnAttempt<N, T, S> {
                 let _ = send.send(job(host, port, deadline));
             })
             .map_err(|_| Failure::at(Step::Verify))?;
+        self.probe_busy = false;
         self.probe_inflight = Some((recv, worker));
         let (recv, _) = self.probe_inflight.as_ref().unwrap();
         loop {

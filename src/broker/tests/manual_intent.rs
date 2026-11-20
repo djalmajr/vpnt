@@ -15,25 +15,61 @@ fn stale_connected_off_after_prior_stop_must_not_start_a_second_connect() {
     stale_stop(State::Connected, true);
 }
 
-fn until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(4);
+// Synchronization guard, not a latency requirement: a 3 s pause anywhere in
+// the fixture must pass, and a stalled stage still names itself.
+fn until(stage: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !ready() {
-        assert!(
-            Instant::now() < deadline,
-            "stale-stop setup/receipt barrier timed out"
-        );
+        assert!(Instant::now() < deadline, "{stage} barrier timed out");
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+// Synchronization guards, not latency requirements: allow a 3 s pause plus
+// peer startup and scheduling, while still failing a stalled stage.
+fn stale_until(
+    broker: &mut Broker<Secrets>,
+    peer: &Peer,
+    stage: &str,
+    mut ready: impl FnMut(&mut Broker<Secrets>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if ready(broker) {
+            return;
+        }
+        let c = broker.connections.get("one");
+        assert!(
+            Instant::now() < deadline,
+            "{stage} timed out: pending={}, accepted={:?}, state={:?}, generation={:?}, stale.sent={}",
+            c.is_some_and(|c| c.pending.is_some()),
+            c.and_then(|c| c.pending.as_ref().map(|p| p.accepted)),
+            c.map(|c| c.view.state),
+            c.map(|c| c.generation),
+            peer.marker.with_extension("stale.sent").exists(),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn stale_dispatch(broker: &mut Broker<Secrets>, command: Command) -> Snapshot {
+    broker
+        .dispatch(command, Instant::now() + Duration::from_secs(15))
+        .unwrap()
 }
 
 fn stale_stop(rendered: State, prior_stop: bool) {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
-    wait(&mut broker, |s| s.helper == "installed");
-    dispatch(&mut broker, Command::Toggle { id: "one".into() });
-    until(|| {
+    // `broker_with` waits for the fixture's read loop before arming the
+    // broker's own startup deadline.
+    let mut broker = broker_with(&mut peer, secrets);
+    stale_until(&mut broker, &peer, "helper setup", |b| {
+        b.snapshot().helper == "installed"
+    });
+    stale_dispatch(&mut broker, Command::Toggle { id: "one".into() });
+    stale_until(&mut broker, &peer, "connecting setup", |broker| {
         broker.poll();
         broker.connections["one"]
             .pending
@@ -43,7 +79,9 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     });
     if rendered == State::Connected {
         peer.advance();
-        wait(&mut broker, |s| s.vpns[0].state == State::Connected);
+        stale_until(&mut broker, &peer, "connected setup", |b| {
+            b.snapshot().vpns[0].state == State::Connected
+        });
     }
     let caller_snapshot = broker.snapshot();
     assert!(!caller_snapshot.demo);
@@ -54,21 +92,20 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     if prior_stop {
         // A prior stop is already in flight; its reply is not delivered to this
         // caller. The peer generates Off through its normal Disconnect branch.
-        dispatch(&mut broker, Command::Toggle { id: "one".into() });
+        stale_dispatch(&mut broker, Command::Toggle { id: "one".into() });
         generation += 1;
     } else {
         // Existing marker sends a current-generation frame on the real stream.
         // This proves protocol consumption, not spontaneous native Off provenance.
-        std::fs::write(
-            peer.marker.with_extension("stale"),
+        write_stale(
+            &peer,
             serde_json::to_vec(&serde_json::json!({
                 "id": "one", "generation": generation, "state": "off", "failures": 0
             }))
             .unwrap(),
-        )
-        .unwrap();
+        );
     }
-    until(|| {
+    stale_until(&mut broker, &peer, "stale stop receipt", |broker| {
         broker.poll(); // actor work only: no new snapshot delivered to caller
         let c = &broker.connections["one"];
         (prior_stop || peer.marker.with_extension("stale.sent").exists())
@@ -80,13 +117,13 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     assert_eq!(caller_snapshot.vpns[0].state, rendered);
     assert_eq!(loads.load(Ordering::Relaxed), 1);
     // Explicit stop preserves the intent of the retained active render.
-    let result = dispatch(
+    let result = stale_dispatch(
         &mut broker,
         Command::Disconnect {
             id: caller_snapshot.vpns[0].profile.id.clone(),
         },
     );
-    until(|| {
+    stale_until(&mut broker, &peer, "explicit stop receipt", |broker| {
         broker.poll();
         let c = &broker.connections["one"];
         c.generation == generation + 1 && c.pending.as_ref().is_some_and(|p| p.accepted)
@@ -96,7 +133,7 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     let disconnects = commands.lines().filter(|c| *c == "disconnect").count();
     let load_count = loads.load(Ordering::Relaxed);
     if connects == 1 {
-        until(|| {
+        stale_until(&mut broker, &peer, "explicit stop off", |broker| {
             broker.poll();
             broker.connections["one"].view.state == State::Off
         });
@@ -108,7 +145,7 @@ fn stale_stop(rendered: State, prior_stop: bool) {
     // Complete our own fixture lifecycle before the intentional negative oracle.
     let fixture_root = peer.root().to_path_buf();
     drop(broker);
-    until(|| peer.cleaned());
+    until("fixture cleanup", || peer.cleaned());
     drop(peer); // waits Client.finished; reaps child and removes owned fixture dir
     assert!(
         !fixture_root.exists(),
@@ -132,7 +169,7 @@ fn explicit_connect_from_stale_off_view_preserves_actual_active_connection() {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     let caller_snapshot = broker.snapshot();
     assert_eq!(caller_snapshot.vpns[0].state, State::Off);
@@ -152,7 +189,7 @@ fn explicit_connect_from_stale_off_view_preserves_actual_active_connection() {
         &mut broker,
         automatic_support::preferences(crate::preferences::ProbeInterval::THIRTY, false, false),
     );
-    until(|| {
+    until("set_probe_interval receipt", || {
         broker.poll();
         automatic_support::intervals(&peer)
             .iter()
@@ -168,7 +205,7 @@ fn explicit_connect_from_stale_off_view_preserves_actual_active_connection() {
     );
     let root = peer.root().to_path_buf();
     drop(broker);
-    until(|| peer.cleaned());
+    until("fixture cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists());
     assert_eq!(
@@ -186,7 +223,7 @@ fn explicit_disconnect_direct_broker_cancels_queued_auto_without_secret_load() {
     use automatic_support as auto;
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = auto::RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     auto::set_preferences(
         &mut broker,
@@ -207,7 +244,7 @@ fn explicit_disconnect_direct_broker_cancels_queued_auto_without_secret_load() {
     assert_eq!(result.vpns[0].state, State::Disconnecting);
     assert!(!broker.automatic.iter().any(|a| matches!(a,
         automatic::Action::Reconnect { id, .. } if id == "one")));
-    until(|| {
+    until("explicit disconnect receipt", || {
         broker.poll();
         let c = &broker.connections["one"];
         c.view.state == State::Off && c.pending.as_ref().is_some_and(|p| p.accepted)
@@ -218,7 +255,7 @@ fn explicit_disconnect_direct_broker_cancels_queued_auto_without_secret_load() {
     assert_eq!(auto::command_count(&peer, "disconnect"), 1);
     let root = peer.root().to_path_buf();
     drop(broker);
-    until(|| peer.cleaned());
+    until("fixture cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists());
 }
@@ -228,7 +265,7 @@ fn explicit_intent_unknown_and_expired_commands_do_not_load_credentials() {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     for command in [
         Command::Connect {
@@ -259,7 +296,7 @@ fn explicit_intent_unknown_and_expired_commands_do_not_load_credentials() {
     assert_eq!(automatic_support::command_count(&peer, "disconnect"), 0);
     let root = peer.root().to_path_buf();
     drop(broker);
-    until(|| peer.cleaned());
+    until("fixture cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists());
 }
@@ -269,10 +306,10 @@ fn explicit_intent_after_helper_loss_neither_loads_nor_fakes_off() {
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     std::fs::write(peer.marker.with_extension("close"), b"").unwrap();
-    until(|| {
+    until("helper loss", || {
         broker.poll();
         broker.helper == "missing"
     });
@@ -293,7 +330,7 @@ fn explicit_intent_after_helper_loss_neither_loads_nor_fakes_off() {
     assert_eq!(automatic_support::command_count(&peer, "disconnect"), 0);
     let root = peer.root().to_path_buf();
     drop(broker);
-    until(|| peer.cleaned());
+    until("fixture cleanup", || peer.cleaned());
     drop(peer);
     assert!(!root.exists());
 }

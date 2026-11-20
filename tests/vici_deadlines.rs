@@ -61,7 +61,9 @@ fn cancellation_interrupts_response_header_subscription_and_blocked_write_before
             );
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        let expires = Instant::now() + Duration::from_secs(5);
+        // Longer than the 3.5 s readiness limit plus the result guard's margin:
+        // the mutant must fail the readiness assertion, not a test timeout.
+        let expires = Instant::now() + Duration::from_secs(15);
         let client = Client::from_stream_until(stream, uid(), expires, cancel.clone()).unwrap();
         let mut message = Message::new();
         if mode == "write" {
@@ -81,12 +83,35 @@ fn cancellation_interrupts_response_header_subscription_and_blocked_write_before
             )
         });
         assert_eq!(peer.line(), "waiting");
+        if let Err(reason) = operation.wait_until_blocked(mode) {
+            // Release both sides before unwinding without letting cleanup
+            // replace the synchronization diagnosis.
+            cancel.store(true, Ordering::Release);
+            let result = operation.receive("cleanup");
+            let received = match &result {
+                Ok(Ok(_)) => "ok",
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+            let finish = peer.try_finish();
+            let join = operation.try_join();
+            panic!("{reason}; cleanup: receive={received}, finish={finish:?}, join={join:?}");
+        }
+        let cancel_at = Instant::now();
         cancel.store(true, Ordering::Release);
-        let result = operation.receive();
+        let result = operation.receive(mode);
+        let finished = operation
+            .finished_at()
+            .expect("operation did not record its return instant");
         let alive = peer.alive();
         let before_deadline = Instant::now() < expires;
         peer.finish();
         operation.join();
+        let elapsed = finished.saturating_duration_since(cancel_at);
+        assert!(
+            elapsed <= Duration::from_millis(3500),
+            "cancel took {elapsed:?} after store: {mode}"
+        );
         assert!(
             matches!(result, Ok(Err(vici::Error::Canceled))),
             "cancel did not finish promptly: {mode}"
@@ -123,7 +148,7 @@ fn preflight_denies_canceled_expired_and_foreign_peers_without_sending_bytes() {
             + if expired {
                 Duration::ZERO
             } else {
-                Duration::from_secs(1)
+                Duration::from_secs(15)
             };
         let result = Client::from_stream_until(
             stream,
@@ -149,21 +174,41 @@ fn preflight_denies_canceled_expired_and_foreign_peers_without_sending_bytes() {
 fn an_independent_peer_cannot_extend_the_callers_deadline_and_a_reply_still_succeeds() {
     for mode in ["request", "reply"] {
         let (mut peer, stream) = peer::Peer::new(mode);
-        let expires = Instant::now() + Duration::from_millis(150);
+        // Both arms need room for a 3 s setup pause before the request is
+        // sent. The readiness limit is the 3.5 s measured from `expires` to
+        // the worker's recorded return, not the length of the setup.
+        let expires = Instant::now()
+            + if mode == "reply" {
+                Duration::from_secs(15)
+            } else {
+                Duration::from_secs(4)
+            };
         let client =
             Client::from_stream_until(stream, uid(), expires, Arc::new(AtomicBool::new(false)))
                 .unwrap();
         let mut operation =
             peer::Operation::new(move || client.command("version", Message::new(), &[]));
         assert_eq!(peer.line(), "waiting");
-        let result = operation.receive();
+        let result = operation.receive(mode);
+        let finished = operation
+            .finished_at()
+            .expect("operation did not record its return instant");
         let alive = peer.alive();
         peer.finish();
         operation.join();
         assert!(alive, "peer exited before the consumer result");
         if mode == "reply" {
+            assert!(
+                finished < expires,
+                "reply arrived after the caller deadline"
+            );
             assert!(matches!(result, Ok(Ok(_))));
         } else {
+            let elapsed = finished.saturating_duration_since(expires);
+            assert!(
+                elapsed <= Duration::from_millis(3500),
+                "timeout took {elapsed:?} after expires"
+            );
             assert!(
                 matches!(result, Ok(Err(vici::Error::Timeout))),
                 "caller deadline was extended"
@@ -190,7 +235,7 @@ fn path_connection_keeps_the_callers_budget_and_rejects_unadmitted_peers() {
             + if expired {
                 Duration::ZERO
             } else {
-                Duration::from_secs(1)
+                Duration::from_secs(15)
             };
         let result = Client::connect_until(
             &path,
@@ -215,7 +260,7 @@ fn path_connection_keeps_the_callers_budget_and_rejects_unadmitted_peers() {
     let client = Client::connect_until(
         &path,
         uid(),
-        Instant::now() + Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(15),
         cancel.clone(),
     )
     .unwrap();
@@ -229,10 +274,21 @@ fn path_connection_keeps_the_callers_budget_and_rejects_unadmitted_peers() {
     let _ = stream.read_to_end(&mut bytes);
     assert!(bytes.is_empty());
 
-    let client = Client::connect(&path, uid(), Duration::from_millis(30)).unwrap();
+    // The budget given to the public `Client::connect` is the one under test:
+    // it must reach the later command. Four seconds tolerate a 3 s setup pause;
+    // after it has actually expired, the command must still reject without
+    // sending the preloaded reply request.
+    // The budget starts inside `connect`, so anchor the wait at its return:
+    // that instant is never earlier than the budget's own start.
+    let connect_budget = Duration::from_secs(4);
+    let client = Client::connect(&path, uid(), connect_budget).unwrap();
+    let connected_at = Instant::now();
     let (mut stream, _) = listener.accept().unwrap();
     stream.write_all(b"\0\0\0\x01\x01").unwrap();
-    thread::sleep(Duration::from_millis(60));
+    let expired_at = connected_at + connect_budget + Duration::from_millis(50);
+    while Instant::now() < expired_at {
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(matches!(
         client.command("version", Message::new(), &[]),
         Err(vici::Error::Timeout)
@@ -244,7 +300,7 @@ fn path_connection_keeps_the_callers_budget_and_rejects_unadmitted_peers() {
         Client::connect_until(
             std::path::Path::new("relative.sock"),
             uid(),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(15),
             Arc::new(AtomicBool::new(false))
         ),
         Err(vici::Error::InvalidMessage)

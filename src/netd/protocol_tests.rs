@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 fn valid() -> Value {
     json!({"op":"configure","ifname":"vpnt0","address":"10.1.2.3","prefix":18,
         "mtu":1500,"routes":[{"network":"10.0.0.0","prefix":8}],
-        "dns":{"servers":["10.200.0.1"],"domains":["serpro"]}})
+        "dns":{"servers":["10.200.0.1"],"domains":["corp"]}})
 }
 fn parse(value: &Value) -> Result<Request, ErrorCode> {
     parse_request(format!("{value}\n").as_bytes())
@@ -175,7 +175,7 @@ fn route_rules() {
 #[test]
 fn dns_rules() {
     for domain in [
-        "~serpro", "Serpro", "-serpro", "serpro-", ".serpro", "serpro.", "a..b", "", "a_b", "é",
+        "~corp", "Corp", "-corp", "corp-", ".corp", "corp.", "a..b", "", "a_b", "é",
     ] {
         let mut v = valid();
         v["dns"]["domains"] = json!([domain]);

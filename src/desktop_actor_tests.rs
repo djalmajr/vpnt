@@ -194,7 +194,6 @@ fn actor_correlates_administrative_replies_by_token_out_of_order() {
     assert!(first.snapshot.is_some());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn blocked_certificate_listing_does_not_block_actor() {
     let (started, _begins) = mpsc::channel();
@@ -272,7 +271,6 @@ fn blocked_certificate_listing_does_not_block_actor() {
     assert_eq!(listing.unwrap().id, "listing");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn actor_listing_reports_an_untrusted_module_distinctly() {
     use std::os::unix::fs::PermissionsExt;
@@ -286,4 +284,276 @@ fn actor_listing_reports_an_untrusted_module_distinctly() {
     assert_eq!(reply.id, "one");
     assert_eq!(reply.error.as_deref(), Some("untrusted_module"));
     assert!(reply.certificates.is_none());
+}
+
+#[test]
+fn the_production_listing_deadline_is_thirty_seconds() {
+    // The injectable deadline is a test seam: production keeps 30 s.
+    assert_eq!(LISTING_TIMEOUT, Duration::from_secs(30));
+}
+
+#[test]
+fn a_listing_that_misses_its_deadline_reports_once_and_discards_the_late_answer() {
+    let (reply, replies) = mpsc::channel();
+    let (started, begins) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = calls.clone();
+    let actor = Actor::spawn_with_listing_timeout::<FixtureRuntime>(
+        || (None, None),
+        move |r| {
+            let _ = reply.send(r);
+        },
+        move |id, _| {
+            if provider_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = started.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                Reply::error(id, "late_answer")
+            } else {
+                Reply {
+                    id,
+                    ..Reply::default()
+                }
+            }
+        },
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    let list = |id: &str| {
+        actor
+            .send(
+                Request {
+                    id: id.into(),
+                    locale: None,
+                    command: Command::ListCertificates {
+                        module: "/fixture.so".into(),
+                    },
+                },
+                Instant::now(),
+            )
+            .unwrap()
+    };
+    list("listing");
+    begins.recv_timeout(Duration::from_secs(2)).unwrap();
+    let timed_out = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(timed_out.id, "listing");
+    assert_eq!(timed_out.error.as_deref(), Some("token_unavailable"));
+    // The exclusion holds until the provider returns.
+    list("busy");
+    let busy = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(busy.id, "busy");
+    assert_eq!(busy.error.as_deref(), Some("token_unavailable"));
+    release.send(()).unwrap();
+    let mut accepted = None;
+    for attempt in 0..100 {
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            replies.try_recv().is_err(),
+            "the late answer must never reach the webview"
+        );
+        list(&format!("after-{attempt}"));
+        let response = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        if response.error.is_none() {
+            accepted = Some(response);
+            break;
+        }
+        assert_eq!(response.error.as_deref(), Some("token_unavailable"));
+    }
+    let accepted = accepted.expect("the slot must be free once the provider returns");
+    assert!(accepted.id.starts_with("after-"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    drop(actor);
+}
+
+#[test]
+fn a_listing_reply_carries_hex_ids_and_optional_metadata() {
+    use crate::connection::ovpn::pkcs11::CertificateInfo;
+    let view = certificate_view(CertificateInfo {
+        id: vec![0x00, 0x0a, 0xff],
+        subject: Some("subject".into()),
+        issuer: None,
+        not_before: Some("Oct  1 00:00:00 2026 GMT".into()),
+        not_after: None,
+    });
+    assert_eq!(view.id, "000aff");
+    assert_eq!(view.subject.as_deref(), Some("subject"));
+    assert_eq!(view.issuer, None);
+    assert_eq!(view.not_before.as_deref(), Some("Oct  1 00:00:00 2026 GMT"));
+    assert_eq!(view.not_after, None);
+
+    let other = certificate_view(CertificateInfo {
+        id: vec![0x01, 0x10],
+        subject: None,
+        issuer: Some("issuer".into()),
+        not_before: None,
+        not_after: Some("Nov  1 00:00:00 2026 GMT".into()),
+    });
+    assert_eq!(other.id, "0110");
+    assert_eq!(other.subject, None);
+    assert_eq!(other.issuer.as_deref(), Some("issuer"));
+    assert_eq!(other.not_before, None);
+    assert_eq!(other.not_after.as_deref(), Some("Nov  1 00:00:00 2026 GMT"));
+}
+
+#[test]
+fn a_listing_reply_carries_every_certificate_the_provider_returns() {
+    use crate::connection::ovpn::pkcs11::CertificateInfo;
+    let reply = list_certificates_with("listing".into(), "/fixture/token.so".into(), |module| {
+        assert_eq!(module, std::path::Path::new("/fixture/token.so"));
+        Ok(vec![
+            CertificateInfo {
+                id: vec![0x01, 0x0a],
+                subject: Some("first subject".into()),
+                issuer: None,
+                not_before: None,
+                not_after: Some("Nov  1 00:00:00 2026 GMT".into()),
+            },
+            CertificateInfo {
+                id: vec![0xff, 0x00],
+                subject: None,
+                issuer: Some("second issuer".into()),
+                not_before: Some("Oct  1 00:00:00 2026 GMT".into()),
+                not_after: None,
+            },
+        ])
+    });
+    assert_eq!(reply.id, "listing");
+    assert_eq!(reply.error, None);
+    let certificates = reply
+        .certificates
+        .expect("the reply must carry every certificate the provider returned");
+    assert_eq!(certificates.len(), 2);
+    let first = &certificates[0];
+    assert_eq!(first.id, "010a");
+    assert_eq!(first.subject.as_deref(), Some("first subject"));
+    assert_eq!(first.issuer, None);
+    assert_eq!(first.not_before, None);
+    assert_eq!(first.not_after.as_deref(), Some("Nov  1 00:00:00 2026 GMT"));
+    let second = &certificates[1];
+    assert_eq!(second.id, "ff00");
+    assert_eq!(second.subject, None);
+    assert_eq!(second.issuer.as_deref(), Some("second issuer"));
+    assert_eq!(
+        second.not_before.as_deref(),
+        Some("Oct  1 00:00:00 2026 GMT")
+    );
+    assert_eq!(second.not_after, None);
+}
+
+#[test]
+fn the_actor_delivers_the_certificates_the_provider_returns() {
+    use crate::connection::ovpn::pkcs11::CertificateInfo;
+    let (reply, replies) = mpsc::channel();
+    let actor = Actor::spawn_with_listing::<FixtureRuntime>(
+        || (None, None),
+        move |r| {
+            let _ = reply.send(r);
+        },
+        |id, module| {
+            list_certificates_with(id, module, |_| {
+                Ok(vec![
+                    CertificateInfo {
+                        id: vec![0x02],
+                        subject: Some("tunnel".into()),
+                        issuer: None,
+                        not_before: None,
+                        not_after: None,
+                    },
+                    CertificateInfo {
+                        id: vec![0x03, 0x04],
+                        subject: None,
+                        issuer: Some("authority".into()),
+                        not_before: Some("Oct  1 00:00:00 2026 GMT".into()),
+                        not_after: None,
+                    },
+                ])
+            })
+        },
+    )
+    .unwrap();
+    actor
+        .send(
+            Request {
+                id: "listing".into(),
+                locale: None,
+                command: Command::ListCertificates {
+                    module: "/fixture.so".into(),
+                },
+            },
+            Instant::now(),
+        )
+        .unwrap();
+    let delivered = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(delivered.id, "listing");
+    assert_eq!(delivered.error, None);
+    let certificates = delivered
+        .certificates
+        .expect("the reply the actor hands out must carry the provider's certificates");
+    assert_eq!(
+        certificates
+            .iter()
+            .map(|view| view.id.as_str())
+            .collect::<Vec<_>>(),
+        ["02", "0304"]
+    );
+    assert_eq!(certificates[0].subject.as_deref(), Some("tunnel"));
+    assert_eq!(certificates[1].issuer.as_deref(), Some("authority"));
+    assert_eq!(
+        certificates[1].not_before.as_deref(),
+        Some("Oct  1 00:00:00 2026 GMT")
+    );
+    drop(actor);
+}
+
+#[test]
+fn an_invalid_module_is_refused_while_another_listing_holds_the_slot() {
+    let (reply, replies) = mpsc::channel();
+    let (started, begins) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let actor = Actor::spawn_with_listing::<FixtureRuntime>(
+        || (None, None),
+        move |r| {
+            let _ = reply.send(r);
+        },
+        move |id, _| {
+            let _ = started.send(());
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            Reply::error(id, "token_unavailable")
+        },
+    )
+    .unwrap();
+    let list = |id: &str, module: &str| {
+        actor
+            .send(
+                Request {
+                    id: id.into(),
+                    locale: None,
+                    command: Command::ListCertificates {
+                        module: module.into(),
+                    },
+                },
+                Instant::now(),
+            )
+            .unwrap()
+    };
+    list("busy", "/fixture.so");
+    begins.recv_timeout(Duration::from_secs(2)).unwrap();
+    list("invalid", "relative.so");
+    let refused = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(refused.id, "invalid");
+    assert_eq!(refused.error.as_deref(), Some("invalid_module"));
+    // The busy listing still owns the slot and answers only after the release.
+    release.send(()).unwrap();
+    let busy = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(busy.id, "busy");
+    assert_eq!(busy.error.as_deref(), Some("token_unavailable"));
+    drop(actor);
 }

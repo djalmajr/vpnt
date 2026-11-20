@@ -48,7 +48,7 @@ pub(crate) fn valid_module_path(path: &str) -> bool {
     let module = Path::new(path);
     path.len() <= 4096
         && !path.chars().any(char::is_control)
-        && path.ends_with(".so")
+        && (path.ends_with(".so") || path.ends_with(".dylib"))
         && module.is_absolute()
         && !module.components().any(|part| part == Component::ParentDir)
 }
@@ -268,7 +268,7 @@ mod failure_tests {
     }
     fn ovpn_profile() -> Profile {
         serde_json::from_str(concat!(
-            r#"{"id":"one","name":"Example","kind":"ovpn","gateway":"vpn.example.com","username":"","networks":[],"dnsDomains":["serpro"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp","#,
+            r#"{"id":"one","name":"Example","kind":"ovpn","gateway":"vpn.example.com","username":"","networks":[],"dnsDomains":["corp"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp","#,
             r#""ovpn":{"certificateId":"01ab","module":"/opt/pkcs11/token.so","tls":"any"}}"#
         )).unwrap()
     }
@@ -348,7 +348,7 @@ mod failure_tests {
         for invalid in [
             "opt/token.so".into(),
             "/opt/../token.so".into(),
-            "/opt/token.dylib".into(),
+            "/opt/token.dll".into(),
             "/opt/token\n.so".into(),
             format!("/{}.so", "é".repeat(2047)),
         ] {
@@ -385,15 +385,15 @@ mod failure_tests {
     fn ovpn_dns_accepts_a_single_label_but_ssl_requires_a_dot() {
         assert_eq!(ovpn_profile().validate(), Ok(()));
         let mut ssl = profile();
-        ssl.dns_domains = vec!["serpro".into()];
+        ssl.dns_domains = vec!["corp".into()];
         assert_eq!(ssl.validate(), Err("invalid_profile"));
-        ssl.dns_domains = vec!["serpro.example".into()];
+        ssl.dns_domains = vec!["corp.example".into()];
         assert_eq!(ssl.validate(), Ok(()));
 
         for domains in [
-            vec!["serpro".into(), "serpro".into()],
-            vec!["-serpro".into()],
-            vec!["serpro.".into()],
+            vec!["corp".into(), "corp".into()],
+            vec!["-corp".into()],
+            vec!["corp.".into()],
             (0..9).map(|i| format!("domain{i}")).collect(),
         ] {
             let mut profile = ovpn_profile();
@@ -473,5 +473,25 @@ mod failure_tests {
                 "health"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod module_path_tests {
+    use super::valid_module_path;
+    #[test]
+    fn accepts_only_absolute_module_paths_without_parent_components() {
+        for path in ["/opt/lib.so", "/opt/lib.dylib"] {
+            assert!(valid_module_path(path), "{path}");
+        }
+        for path in [
+            "opt/lib.so",
+            "/opt/lib",
+            "/opt/../lib.so",
+            "/opt/../lib.dylib",
+            "/opt/lib.so\n",
+        ] {
+            assert!(!valid_module_path(path), "{path}");
+        }
     }
 }

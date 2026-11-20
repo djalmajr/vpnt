@@ -12,7 +12,8 @@ mod fixture;
 
 use fixture::{Fixture, free_udp_ports};
 use std::{
-    fs,
+    fs, io,
+    net::Ipv4Addr,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -52,13 +53,24 @@ fn connect_and_stop(fixture: &Fixture, signatures: Signatures, profile: &str) ->
     paddings.lock().unwrap().clone()
 }
 
-fn wait_for_connected(session: &Session, limit: Duration) {
+fn wait_for_connected(session: &Session, limit: Duration) -> Vec<Progress> {
     let deadline = Instant::now() + limit;
     let mut seen = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match session.progress().recv_timeout(left) {
-            Ok(Progress::State(state)) if state.phase == Phase::Connected => return,
-            Ok(progress) => seen.push(progress),
+            Ok(progress) => {
+                #[cfg(target_os = "linux")]
+                if let Progress::Restarting { epoch, .. } = &progress {
+                    // This dev-null fixture has no network configuration to withdraw.
+                    session.release_restart_hold(*epoch);
+                }
+                let connected =
+                    matches!(&progress, Progress::State(state) if state.phase == Phase::Connected);
+                seen.push(progress);
+                if connected {
+                    return seen;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -82,7 +94,7 @@ fn tls13_handshake_is_signed_with_pss_through_the_management_channel() {
 
 #[test]
 fn pkcs1_only_holds_when_the_server_offers_pss_and_tls13() {
-    // The case of the SerproID token against a real server, with a profile
+    // The case of a cloud PKCS#11 token against a real server, with a profile
     // that asks for TLS 1.3. Mutation captured: without the OpenSSL override
     // or the trailing --tls-version-max, the server's PSS offer is taken,
     // openvpn refuses to ask for it and the handshake fails; sending a
@@ -186,6 +198,91 @@ fn receives_pushed_network() {
         "openvpn invoked dns-updown"
     );
     assert!(!log.contains("resolvectl"), "openvpn invoked resolvectl");
+}
+
+#[test]
+fn soft_restart_reconnects_with_the_same_network() {
+    check_soft_restart("restart", "", Ipv4Addr::new(10, 81, 0, 2));
+}
+
+#[test]
+fn soft_restart_with_persist_tun_publishes_the_changed_address() {
+    check_soft_restart(
+        "persist-restart",
+        "persist-tun\n",
+        Ipv4Addr::new(10, 81, 0, 42),
+    );
+}
+
+fn check_soft_restart(name: &str, profile: &str, next_address: Ipv4Addr) {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(fixture) = Fixture::new(name) else {
+        return;
+    };
+    let ports = free_udp_ports();
+    let server = fixture.server(ports);
+    let pid_file = fixture.path("client.pid");
+    let launch = Launch {
+        openvpn: fixture.openvpn.clone(),
+        config: fixture.client_config(ports, profile),
+        dev: None,
+        signatures: Signatures::Pkcs1Only,
+        extra: vec!["--writepid".into(), pid_file.clone().into_os_string()],
+        env: Vec::new(),
+    };
+    let signer = fixture.signer();
+    let paddings = Arc::clone(&signer.paddings);
+    let session = Session::start(launch, signer).unwrap();
+    let initial_events = wait_for_connected(&session, Duration::from_secs(15));
+    let initial = initial_events
+        .iter()
+        .find_map(|event| match event {
+            Progress::Up(network) => Some(network),
+            _ => None,
+        })
+        .expect("initial connection did not publish a network");
+    assert_eq!(initial.address, Ipv4Addr::new(10, 81, 0, 2));
+    let pid: libc::pid_t = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    // The point-to-point fixture has one peer state. Start a fresh server to
+    // exercise PUSH_REPLY for the new connection.
+    drop(server);
+    let _restarted_server = fixture.server_with_address(ports, next_address);
+    // The private fixture PID file belongs to this client, whose Child is
+    // still owned and unreaped by the session.
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGUSR1) },
+        0,
+        "{}",
+        io::Error::last_os_error()
+    );
+    let events = wait_for_connected(&session, Duration::from_secs(15));
+    let (up, network) = events
+        .iter()
+        .enumerate()
+        .find_map(|(position, event)| match event {
+            Progress::Up(network) if network.address == next_address => Some((position, network)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("restart did not publish Up with {next_address} before Connected: {events:?}")
+        });
+    assert!(
+        events[..up]
+            .iter()
+            .any(|event| matches!(event, Progress::Down)),
+        "restart did not publish Down before Up: {events:?}"
+    );
+    let mut expected = initial.clone();
+    expected.address = next_address;
+    assert_eq!(*network, expected);
+    assert_eq!(paddings.lock().unwrap().as_slice(), [Padding::Pkcs1; 2]);
+    session.stop().unwrap();
+    assert!(session.wait().unwrap().status.success());
 }
 
 #[cfg(target_os = "linux")]

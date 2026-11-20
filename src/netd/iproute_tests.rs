@@ -42,7 +42,7 @@ fn exact_argv_and_dns_branches() {
     );
     assert_eq!(delete_args(&name), ["link", "del", "dev", "vpnt0"]);
     assert_eq!(existing_args(), ["-j", "-d", "link", "show"]);
-    let c = config(r#"["10.200.0.1","1.1.1.1"]"#, r#"["serpro","example.org"]"#);
+    let c = config(r#"["10.200.0.1","1.1.1.1"]"#, r#"["corp","example.org"]"#);
     let commands = configure_commands(&c);
     let actual: Vec<_> = commands
         .iter()
@@ -62,7 +62,7 @@ fn exact_argv_and_dns_branches() {
             (false, vec!["route", "add", "172.16.0.0/12", "dev", "vpnt0"]),
             (true, vec!["revert", "vpnt0"]),
             (true, vec!["dns", "vpnt0", "10.200.0.1", "1.1.1.1"]),
-            (true, vec!["domain", "vpnt0", "~serpro", "~example.org"]),
+            (true, vec!["domain", "vpnt0", "~corp", "~example.org"]),
             (true, vec!["default-route", "vpnt0", "false"]),
         ]
     );

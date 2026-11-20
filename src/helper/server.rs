@@ -331,7 +331,7 @@ fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message
                 profile,
                 ovpn_config,
             } => {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 {
                     let normalized = if let Some(text) = ovpn_config {
                         if profile.kind != crate::model::VpnKind::Ovpn {
@@ -355,7 +355,7 @@ fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message
                             }
                         })
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     if ovpn_config.is_some() {
                         return Err(ErrorCode::InvalidRequest);
@@ -364,9 +364,9 @@ fn apply_admin(store: &ProfileStore, request: protocol::AdminRequest) -> Message
                 }
             }
             AdminCommand::RemoveProfile { id } => {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let result = store.remove_admin_profile(&id);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let result = store.remove(&id);
                 result.map_err(store_error)
             }

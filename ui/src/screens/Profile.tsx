@@ -81,6 +81,9 @@ export function Profile({
   const isOvpn = value.kind === "ovpn";
   const ovpn = value.ovpn ?? blankOvpn();
   const moduleValid = validModule(ovpn.module);
+  // Open Advanced once when the module still needs to be entered; after that
+  // the person controls it, so completing a valid path does not hide the field.
+  const [advancedOpen, setAdvancedOpen] = useState(!moduleValid);
   const requiresImport = !vpn || initial.kind !== "ovpn";
   const domains =
     value.kind === "ssl" || isOvpn
@@ -367,7 +370,7 @@ export function Profile({
                 <input
                   value={dnsDomains}
                   disabled={saving}
-                  placeholder={isOvpn ? "serpro" : "corp.example.com"}
+                  placeholder={isOvpn ? "corp.example" : "corp.example.com"}
                   onChange={(event) => setDnsDomains(event.target.value)}
                   spellCheck={false}
                   autoComplete="off"
@@ -439,7 +442,10 @@ export function Profile({
                 ))}
               </Group>
             )}
-            <details>
+            <details
+              open={advancedOpen}
+              onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+            >
               <summary>{t("ovpnAdvanced")}</summary>
               <Group>
                 <label className="field">
@@ -448,6 +454,7 @@ export function Profile({
                     value={ovpn.module}
                     disabled={saving || listing}
                     aria-invalid={!moduleValid}
+                    placeholder="/usr/lib/libpkcs11-module.so"
                     onChange={(event) => {
                       set("ovpn", {
                         ...ovpn,
@@ -632,7 +639,7 @@ function importMessage(error: unknown): {
 function validModule(module: string): boolean {
   return (
     module.startsWith("/") &&
-    module.endsWith(".so") &&
+    (module.endsWith(".so") || module.endsWith(".dylib")) &&
     new TextEncoder().encode(module).length <= 4096 &&
     !/\p{Cc}/u.test(module) &&
     !module.split("/").includes("..")

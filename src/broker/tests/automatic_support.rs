@@ -97,12 +97,17 @@ pub(super) fn connect<S: SecretStore>(broker: &mut Broker<S>, peer: &Peer, id: &
 
 pub(super) fn probe<S: SecretStore>(broker: &mut Broker<S>, id: &str, failures: u32) {
     run(broker, Command::Probe { id: id.into() }).unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    // Synchronization guard, not a latency requirement: the peer may take a
+    // 3 s pause, while a stalled poll still fails with the state it observed.
+    let until = Instant::now() + Duration::from_secs(15);
     while broker.connections[id].failures != failures {
         broker.poll();
         assert!(
             Instant::now() < until,
-            "the helper failure counter did not reach {failures}"
+            "the helper failure counter did not reach {failures} for {id}: helper={}, states={:?}, generations={:?}",
+            broker.helper,
+            super::states(broker),
+            super::generations(broker),
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -113,33 +118,42 @@ pub(super) fn automatic<S: SecretStore>(broker: &mut Broker<S>) {
     broker.perform_automatic(|| true);
 }
 
-/// The peer sends the injected stale frame before it answers this probe; the
-/// probe request/answer are the FIFO barrier that proves the Broker consumed
-/// the stale frame on the ordered Client stream. The peer stays fake/in-process.
-pub(super) fn consume_stale_with_probe<S: SecretStore>(broker: &mut Broker<S>, peer: &Peer) {
-    std::fs::write(peer.marker.with_extension("probe_ok"), b"").unwrap();
-    run(broker, Command::Probe { id: "one".into() }).unwrap();
-    let probe = broker.connections["one"]
+/// Any frame the peer sent before it answers this diagnostics request is
+/// already on the ordered Client stream, so the correlated reply is the FIFO
+/// barrier that proves the Broker consumed it. The reply carries no tunnel
+/// state (`src/broker/mod.rs` Message::Diagnostics), so it cannot restore the
+/// state the caller asserts after it returns. The peer stays fake/in-process.
+pub(super) fn consume_stale_with_diagnostics<S: SecretStore>(broker: &mut Broker<S>) {
+    // An earlier request would make the barrier prove nothing about the stale
+    // frame, so the request that clears must be the one made here.
+    assert!(
+        broker.diagnostics.pending.is_none(),
+        "the diagnostics barrier requires no earlier pending request"
+    );
+    broker.request_diagnostics();
+    let request = broker
+        .diagnostics
         .pending
-        .as_ref()
-        .expect("probe pending")
-        .id
-        .clone();
-    let until = Instant::now() + Duration::from_secs(4);
+        .clone()
+        .expect("the diagnostics barrier requires a pending request");
+    let until = Instant::now() + Duration::from_secs(15);
     loop {
         broker.poll();
         assert_eq!(
             broker.helper, "installed",
-            "the probe barrier requires an intact helper"
+            "the diagnostics barrier requires an intact helper"
         );
-        if broker.connections["one"]
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.id == probe && pending.accepted)
-        {
+        if broker.diagnostics.pending.as_deref() != Some(request.as_str()) {
             return;
         }
-        assert!(Instant::now() < until, "probe barrier timed out");
+        assert!(
+            Instant::now() < until,
+            "diagnostics barrier timed out: helper={}, state={:?}, generation={:?}, diagnostics_pending={:?}",
+            broker.helper,
+            broker.connections.get("one").map(|c| c.view.state),
+            broker.connections.get("one").map(|c| c.generation),
+            broker.diagnostics.pending,
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 }

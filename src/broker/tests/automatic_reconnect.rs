@@ -6,7 +6,7 @@ use crate::preferences::ProbeInterval;
 fn reconnect_off_never_loads_after_the_manual_connect_or_queues_an_attempt() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, false));
     connect(&mut broker, &peer, "one");
@@ -25,7 +25,7 @@ fn reconnect_off_never_loads_after_the_manual_connect_or_queues_an_attempt() {
 fn third_failure_reconnects_once_in_a_new_generation_and_preserves_the_other_profile() {
     let mut peer = Peer::new("ipsec");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -61,7 +61,7 @@ fn third_failure_reconnects_once_in_a_new_generation_and_preserves_the_other_pro
 fn responsive_probe_resets_the_streak_and_a_new_episode_reconnects_once() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -92,7 +92,7 @@ fn responsive_probe_resets_the_streak_and_a_new_episode_reconnects_once() {
 fn duplicate_and_old_generation_failure_events_cannot_queue_another_attempt() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -100,7 +100,11 @@ fn duplicate_and_old_generation_failure_events_cannot_queue_another_attempt() {
         probe(&mut broker, "one", failures);
     }
     // A duplicate current-generation failure-3 event must not enqueue twice.
+    // The second probe would observe the counter at 3 and return before its
+    // own Changed is consumed, so the ordered diagnostics reply is the FIFO
+    // barrier that proves the duplicate frame reached the Broker first.
     probe(&mut broker, "one", 3);
+    consume_stale_with_diagnostics(&mut broker);
     automatic(&mut broker);
     wait(&mut broker, |s| state(s, "one") == State::Connected);
     assert_eq!(broker.connections["one"].generation, 2);
@@ -110,30 +114,43 @@ fn duplicate_and_old_generation_failure_events_cannot_queue_another_attempt() {
         "duplicate failure-3 must not leave a queued automatic action"
     );
     // A late event for the replaced generation is ignored by the broker. The
-    // Probe below is the ordered wire barrier: its request/answer follows the
-    // stale frame on the same Client stream.
-    std::fs::write(
-        peer.marker.with_extension("stale"),
+    // Diagnostics below is the ordered wire barrier: its request/reply follows
+    // the stale frame on the same Client stream and changes no tunnel state.
+    write_stale(
+        &peer,
         br#"{"id":"one","generation":1,"state":"unresponsive","failures":3}"#,
-    )
-    .unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
+    );
+    let until = Instant::now() + Duration::from_secs(15);
     while !peer.marker.with_extension("stale.sent").exists() {
-        assert!(Instant::now() < until, "late event was not consumed");
+        let c = &broker.connections["one"];
+        assert!(
+            Instant::now() < until,
+            "duplicate late event receipt timed out: helper={}, state={:?}, generation={}, pending={}, accepted={:?}, stale.sent={}",
+            broker.helper,
+            c.view.state,
+            c.generation,
+            c.pending.is_some(),
+            c.pending.as_ref().map(|p| p.accepted),
+            peer.marker.with_extension("stale.sent").exists()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
-    consume_stale_with_probe(&mut broker, &peer);
+    consume_stale_with_diagnostics(&mut broker);
     assert_eq!(state(&broker.snapshot(), "one"), State::Connected);
     assert_eq!(broker.connections["one"].generation, 2);
     assert_eq!(command_count(&peer, "connect"), 2);
     assert_eq!(calls.recorded().len(), 2);
+    assert!(
+        broker.automatic.is_empty(),
+        "a late failure-3 event of the replaced generation must not queue an automatic action"
+    );
 }
 
 #[test]
 fn helper_denial_restores_the_source_generation_and_does_not_loop() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -142,10 +159,16 @@ fn helper_denial_restores_the_source_generation_and_does_not_loop() {
     }
     std::fs::write(peer.marker.with_extension("deny_connect"), b"").unwrap();
     automatic(&mut broker);
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(15);
     while broker.connections["one"].generation != 1 || broker.connections["one"].pending.is_some() {
         broker.poll();
-        assert!(Instant::now() < until, "helper denial was not processed");
+        assert!(
+            Instant::now() < until,
+            "helper denial was not processed: helper={}, states={:?}, generations={:?}",
+            broker.helper,
+            states(&broker),
+            generations(&broker),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let snapshot = broker.snapshot();
@@ -167,7 +190,7 @@ fn helper_denial_restores_the_source_generation_and_does_not_loop() {
 fn secret_failure_does_not_loop_the_same_generation() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, fail) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -191,7 +214,7 @@ fn secret_failure_does_not_loop_the_same_generation() {
 fn late_old_generation_failure_does_not_reactivate() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
@@ -202,17 +225,26 @@ fn late_old_generation_failure_does_not_reactivate() {
     wait(&mut broker, |s| state(s, "one") == State::Connected);
     assert_eq!(broker.connections["one"].generation, 2);
     assert_eq!(command_count(&peer, "connect"), 2);
-    std::fs::write(
-        peer.marker.with_extension("stale"),
+    write_stale(
+        &peer,
         br#"{"id":"one","generation":1,"state":"unresponsive","failures":3}"#,
-    )
-    .unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
+    );
+    let until = Instant::now() + Duration::from_secs(15);
     while !peer.marker.with_extension("stale.sent").exists() {
-        assert!(Instant::now() < until, "late event was not consumed");
+        let c = &broker.connections["one"];
+        assert!(
+            Instant::now() < until,
+            "old generation receipt timed out: helper={}, state={:?}, generation={}, pending={}, accepted={:?}, stale.sent={}",
+            broker.helper,
+            c.view.state,
+            c.generation,
+            c.pending.is_some(),
+            c.pending.as_ref().map(|p| p.accepted),
+            peer.marker.with_extension("stale.sent").exists()
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
-    consume_stale_with_probe(&mut broker, &peer);
+    consume_stale_with_diagnostics(&mut broker);
     let snapshot = broker.snapshot();
     assert_eq!(
         state(&snapshot, "one"),
@@ -222,6 +254,10 @@ fn late_old_generation_failure_does_not_reactivate() {
     assert_eq!(broker.connections["one"].generation, 2);
     assert_eq!(command_count(&peer, "connect"), 2);
     assert_eq!(calls.recorded().len(), 2);
+    assert!(
+        broker.automatic.is_empty(),
+        "an old-generation failure must not queue an automatic action"
+    );
 }
 
 fn reconnect_queued(broker: &Broker<RecordingSecrets>, id: &str) -> bool {
@@ -234,7 +270,7 @@ fn reconnect_queued(broker: &Broker<RecordingSecrets>, id: &str) -> bool {
 fn a_manual_action_for_one_profile_preserves_the_other_profiles_pending_auto() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     set_preferences(&mut broker, preferences(ProbeInterval::TEN, false, true));
     connect(&mut broker, &peer, "one");
