@@ -1,5 +1,4 @@
 import type { OvpnSettings, VpnKind, Profile as VpnProfile } from "./model";
-import { isLinuxPlatform } from "./platform";
 
 // The remote port is a real configuration field: the backend consumes
 // `profile.port` as the remote port (StrongSwan IKE defaults to 500), so the
@@ -8,7 +7,7 @@ const defaultPorts = { ipsec: 500, ssl: 443, ovpn: 1194 } as const;
 
 export const blankOvpn = (): OvpnSettings => ({
   certificateId: "",
-  module: isLinuxPlatform() ? "/usr/lib/libserproidp11.so" : "",
+  module: "",
   tls: "pkcs1_only",
 });
 

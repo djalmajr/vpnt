@@ -98,7 +98,7 @@ fn isolated_network_replacement_and_cleanup() {
     let first = config(
         "10.9.0.2",
         serde_json::json!([{"network":"10.20.0.0","prefix":16},{"network":"172.16.0.0","prefix":12}]),
-        serde_json::json!(["serpro"]),
+        serde_json::json!(["corp"]),
     );
     fixture.backend.configure(&first).unwrap();
     let routes = ip(&["-j", "route", "show", "dev", "vpnt0"]);
@@ -166,7 +166,7 @@ fn isolated_network_replacement_and_cleanup() {
     );
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        "revert vpnt0\ndns vpnt0 10.200.0.1\ndomain vpnt0 ~serpro\ndefault-route vpnt0 false\nrevert vpnt0\ndns vpnt0 10.200.0.1\ndefault-route vpnt0 true\nrevert vpnt0\n"
+        "revert vpnt0\ndns vpnt0 10.200.0.1\ndomain vpnt0 ~corp\ndefault-route vpnt0 false\nrevert vpnt0\ndns vpnt0 10.200.0.1\ndefault-route vpnt0 true\nrevert vpnt0\n"
     );
 
     for args in [

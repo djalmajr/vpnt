@@ -268,7 +268,7 @@ mod failure_tests {
     }
     fn ovpn_profile() -> Profile {
         serde_json::from_str(concat!(
-            r#"{"id":"one","name":"Example","kind":"ovpn","gateway":"vpn.example.com","username":"","networks":[],"dnsDomains":["serpro"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp","#,
+            r#"{"id":"one","name":"Example","kind":"ovpn","gateway":"vpn.example.com","username":"","networks":[],"dnsDomains":["corp"],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp","#,
             r#""ovpn":{"certificateId":"01ab","module":"/opt/pkcs11/token.so","tls":"any"}}"#
         )).unwrap()
     }
@@ -385,15 +385,15 @@ mod failure_tests {
     fn ovpn_dns_accepts_a_single_label_but_ssl_requires_a_dot() {
         assert_eq!(ovpn_profile().validate(), Ok(()));
         let mut ssl = profile();
-        ssl.dns_domains = vec!["serpro".into()];
+        ssl.dns_domains = vec!["corp".into()];
         assert_eq!(ssl.validate(), Err("invalid_profile"));
-        ssl.dns_domains = vec!["serpro.example".into()];
+        ssl.dns_domains = vec!["corp.example".into()];
         assert_eq!(ssl.validate(), Ok(()));
 
         for domains in [
-            vec!["serpro".into(), "serpro".into()],
-            vec!["-serpro".into()],
-            vec!["serpro.".into()],
+            vec!["corp".into(), "corp".into()],
+            vec!["-corp".into()],
+            vec!["corp.".into()],
             (0..9).map(|i| format!("domain{i}")).collect(),
         ] {
             let mut profile = ovpn_profile();

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { blankProfile } from "./profileDefaults";
+import { blankOvpn, blankProfile } from "./profileDefaults";
 
 // Guarda de regressão: o tipo do perfil decide a porta remota padrão que o
 // backend consome como remote_port (IKE 500 no IPsec, 443 no SSL).
@@ -38,6 +38,14 @@ describe("padrões do novo perfil", () => {
       expect(profile.id).toMatch(/^[0-9a-f]{32}$/);
     }
     expect(first.id).not.toBe(second.id);
+  });
+
+  test("OVPN nasce sem módulo PKCS#11", () => {
+    expect(blankOvpn()).toEqual({
+      certificateId: "",
+      module: "",
+      tls: "pkcs1_only",
+    });
   });
 
   test("cada perfil recebe a própria lista de redes", () => {
