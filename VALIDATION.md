@@ -142,9 +142,12 @@ a partir de um terminal com o grupo novo: `newgrp vpnt` e, nele, `vpnt &`.
 
 ### Validação real manual
 
-Resultado: **parcial** (2026-11-19, Omarchy, pacotes locais `0.1.0-1`). Passos 1
-a 5 passaram. No passo 6, a reconexão do `ping-restart` passou; a queda da
-interface física e suspender e retomar seguem pendentes. Execute somente
+Resultado: **passou** (2026-11-20, Omarchy, pacote local `0.1.0-1` gerado de
+`main` em `1b18102` com o #20). Os passos 1 a 5 e 7 passaram, e também o
+`ping-restart` do passo 6. A queda da interface física e suspender e retomar
+ficam como acompanhamento: não fazem parte do aceite. A primeira rodada, em
+2026-11-19, com pacotes locais anteriores, teve o mesmo resultado nos passos
+1 a 5. Execute somente
 no host autorizado, com servidor de VPN, domínio interno e host interno
 próprios. Guarde o estado de rede antes. O `resolvectl` lista os links em ordem
 variável, então a função ordena os blocos por link:
@@ -167,14 +170,16 @@ estado_rede > rede-antes.txt
    valores. Sem domínio, e sem DOMAIN enviado pelo servidor, o DNS da VPN vira o
    padrão do sistema. Conecte pelo ícone e aprove no celular.
    **[PASS]** perfil importado, certificado escolhido no app, aprovação no
-   celular.
+   celular. Em 20/11, depois da reinstalação, o app reabriu e conectou pelo
+   ícone com uma aprovação.
 2. Confira a interface `vpntN`, o endereço e as rotas recebidos, o DNS por
    domínio (`resolvectl status vpntN` com `~<domínio>` e `Default Route: no`) e
    o acesso ao host interno pelo túnel (`resolvectl query`, `ip route get` e um
    pedido HTTPS com a AC do provedor). Um nome de fora do domínio interno
    continua resolvendo pela interface física.
    **[PASS]** rotas só pela tun, rota padrão intacta, DNS restrito ao domínio,
-   HTTP 302 do host interno pelo túnel, `openvpn` sem root.
+   HTTP 302 do host interno pelo túnel, `openvpn` sem root. Em 20/11: nome do
+   host interno resolvido pela tun, rota até ele pela tun e TCP 443 aberto.
 3. Desconecte e compare o estado; o diff esperado é vazio:
 
 ```sh
@@ -182,7 +187,8 @@ estado_rede > rede-depois.txt
 diff -u rede-antes.txt rede-depois.txt
 ```
 
-   **[PASS]** diff vazio, nenhuma tun `vpnt*`.
+   **[PASS]** diff vazio, nenhuma tun `vpnt*`. Em 20/11, o estado depois de
+   desconectar ficou idêntico ao tirado com o app aberto e antes de conectar.
 4. Repita a conexão e mate o `openvpn`; depois repita e mate o processo do app
    escolhido pelo dono. Em cada caso, confira que o helper limpa a tun e
    compare novamente o estado de rede.
@@ -194,7 +200,8 @@ kill -9 "$pid"
 
    **[PASS]** nos dois casos a tun sumiu em até 2 s e o diff ficou vazio; ao
    matar o app, o runtime e o `openvpn` morreram junto e só o helper root
-   continuou ativo.
+   continuou ativo. Em 20/11, `SIGKILL` no app e no runtime: o `openvpn` saiu,
+   o helper registrou `deleted` no mesmo segundo e o diff ficou vazio.
 5. Confira que não há regra sudoers do vpnt (`pacman -Ql vpnt | grep -i
    sudoers`), inclusive nos arquivos incluídos; revise os arquivos de sudoers
    conforme a configuração do host.
@@ -218,11 +225,19 @@ kill -USR1 "$pid"
    - `ping-restart`: **[PASS]** o vpnt segurou o `hold release` por 800 ms
      enquanto retirava rotas e DNS, a assinatura nova voltou em 671 ms, rotas e
      DNS voltaram no `CONNECTED` e o host interno respondeu pelo túnel, sem
-     clique no app. Antes da correção, a sessão travava: o módulo do token
+     clique no app. Em 20/11, uma amostra a cada 2 s por 3 min depois do
+     `SIGUSR1`: só a primeira falhou no TCP 443. O processo `openvpn` foi o
+     mesmo, as rotas e o DNS seguiram presentes nas amostras e o helper
+     reconfigurou a tun duas vezes. Antes da correção, a sessão travava: o módulo do token
      chamava o serviço do fornecedor por um endereço coberto pelas rotas
      empurradas, e o pedido entrava no túnel parado.
    - Queda da interface física com retorno: **[NOT RUN]**.
    - Suspender e retomar: **[NOT RUN]**.
+7. Se o host tinha outro cliente OVPN do provedor, remova-o, com as units, a
+   tun persistente e as regras de sudoers que ele instalou. Guarde de novo o
+   estado de rede, reconecte pelo vpnt e repita os passos 2 e 4.
+   **[PASS]** sem o cliente anterior, a conexão pelo ícone, a rota e o TCP 443
+   até o host interno funcionaram, e o `SIGKILL` no app deixou o diff vazio.
 
 IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
 fixture não substitui essa validação com VPN real.
