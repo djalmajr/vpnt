@@ -49,6 +49,7 @@ fn incomplete_by_default() -> bool {
 pub enum Kind {
     Ssl,
     Ipsec,
+    Ovpn,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -631,6 +632,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn ovpn_kind_roundtrips_through_serde_write_read_and_scan() {
+        let f = Fixture::new();
+        let mut item = f.fence();
+        item.kind = Kind::Ovpn;
+        assert_eq!(
+            serde_json::to_value(item.kind).unwrap(),
+            serde_json::json!("ovpn")
+        );
+        assert_eq!(
+            serde_json::from_str::<Kind>("\"ovpn\"").unwrap(),
+            Kind::Ovpn
+        );
+        write(&f.root, f.owner, &item).unwrap();
+        assert_eq!(f.read().unwrap(), Some(item.clone()));
+        let scanned = scan(&f.root, f.owner, f.uid, &std::collections::BTreeSet::new()).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!((scanned[0].0.as_str(), scanned[0].1), ("a-b", 3));
+        assert_eq!(scanned[0].2.as_ref().unwrap(), &item);
     }
 
     #[test]
