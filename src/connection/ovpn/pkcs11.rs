@@ -17,26 +17,30 @@ use cryptoki::{
     slot::Slot,
     types::Ulong,
 };
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::{
     collections::BTreeMap,
-    sync::{
-        RwLock, RwLockReadGuard, TryLockError, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{RwLock, RwLockReadGuard, TryLockError, Weak},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use std::{
     collections::HashSet,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod signing_gate {
-    use super::{Arc, RwLock, RwLockReadGuard};
+    use super::{
+        Arc, AtomicBool, Duration, Instant, Ordering, RwLock, RwLockReadGuard, TokenError,
+        TryLockError, thread,
+    };
 
     pub(crate) struct Permit<'a> {
         gate: &'a Arc<RwLock<()>>,
@@ -53,6 +57,40 @@ mod signing_gate {
         Permit {
             gate,
             _guard: gate.read().unwrap_or_else(|error| error.into_inner()),
+        }
+    }
+
+    pub(super) fn try_acquire(gate: &Arc<RwLock<()>>) -> Option<Permit<'_>> {
+        let guard = match gate.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        Some(Permit {
+            gate,
+            _guard: guard,
+        })
+    }
+
+    pub(super) fn sign_until<'gate, T: Into<Option<Vec<u8>>>>(
+        canceled: &AtomicBool,
+        expires: Instant,
+        mut try_permit: impl FnMut() -> Option<Permit<'gate>>,
+        sign: impl FnOnce(Permit<'gate>) -> Result<T, TokenError>,
+    ) -> Result<Option<Vec<u8>>, TokenError> {
+        loop {
+            let remaining = expires.saturating_duration_since(Instant::now());
+            if canceled.load(Ordering::Acquire) || remaining.is_zero() {
+                return Ok(None);
+            }
+            let Some(permit) = try_permit() else {
+                thread::sleep(remaining.min(Duration::from_millis(50)));
+                continue;
+            };
+            if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
+                return Ok(None);
+            }
+            return sign(permit).map(Into::into);
         }
     }
 }
@@ -284,12 +322,36 @@ pub struct TokenKey {
     /// Kept open: closing a token's last session logs the user out, which
     /// would repeat the approval on every renegotiation.
     session: Option<Session>,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     gate: Arc<RwLock<()>>,
 }
 
+static NEVER_CANCELED: AtomicBool = AtomicBool::new(false);
+
+fn canceled_or_expired(canceled: &AtomicBool, expires: Option<Instant>) -> bool {
+    canceled.load(Ordering::Acquire) || expires.is_some_and(|end| Instant::now() >= end)
+}
+
+struct SignContext<'a> {
+    #[cfg(unix)]
+    permit: signing_gate::Permit<'a>,
+    canceled: &'a AtomicBool,
+    expires: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl<'a> From<signing_gate::Permit<'a>> for SignContext<'a> {
+    fn from(permit: signing_gate::Permit<'a>) -> Self {
+        Self {
+            permit,
+            canceled: &NEVER_CANCELED,
+            expires: None,
+        }
+    }
+}
+
 impl TokenKey {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn module_gate(module: &Path) -> Arc<RwLock<()>> {
         static GATES: Mutex<BTreeMap<PathBuf, Weak<RwLock<()>>>> = Mutex::new(BTreeMap::new());
         let mut gates = GATES.lock().unwrap_or_else(|error| error.into_inner());
@@ -302,27 +364,28 @@ impl TokenKey {
         gate
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn signing_guard(gate: &Arc<RwLock<()>>) -> signing_gate::Permit<'_> {
         signing_gate::acquire(gate)
     }
 
     pub fn open(module: &Path, id: &[u8]) -> Result<Self, TokenError> {
         with_admitted_module(module, admit_module, |module| {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             {
                 let gate = Self::module_gate(module);
                 let _opening = gate.write().unwrap_or_else(|error| error.into_inner());
-                Self::open_admitted(module, id, Arc::clone(&gate))
+                Self::open_admitted(module, id, &NEVER_CANCELED, None, Arc::clone(&gate))
             }
-            #[cfg(not(target_os = "linux"))]
-            Self::open_admitted(module, id)
-        })
+            #[cfg(not(unix))]
+            Self::open_admitted(module, id, &NEVER_CANCELED, None)
+        })?
+        .ok_or(TokenError::NotFound)
     }
 
     /// A detached management thread may still be inside a signing call.
     /// Wait without entering the provider until it releases the module gate.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn open_until(
         module: &Path,
         id: &[u8],
@@ -347,7 +410,7 @@ impl TokenKey {
                 if canceled.load(Ordering::Acquire) || Instant::now() >= expires {
                     return Ok(None);
                 }
-                return Self::open_admitted(module, id, Arc::clone(&gate)).map(Some);
+                return Self::open_admitted(module, id, canceled, Some(expires), Arc::clone(&gate));
             }
         })
     }
@@ -355,22 +418,28 @@ impl TokenKey {
     fn open_admitted(
         module: &Path,
         id: &[u8],
-        #[cfg(target_os = "linux")] gate: Arc<RwLock<()>>,
-    ) -> Result<Self, TokenError> {
+        canceled: &AtomicBool,
+        expires: Option<Instant>,
+        #[cfg(unix)] gate: Arc<RwLock<()>>,
+    ) -> Result<Option<Self>, TokenError> {
         let pkcs11 = context_admitted(module)?;
-        for slot in pkcs11.get_slots_with_token()? {
+        let slots = pkcs11.get_slots_with_token()?;
+        if canceled_or_expired(canceled, expires) {
+            return Ok(None);
+        }
+        for slot in slots {
             let Some(session) = open_session(&pkcs11, slot)? else {
                 continue;
             };
             if find(&session, ObjectClass::CERTIFICATE, id)?.is_some() {
-                return Ok(Self {
+                return Ok(Some(Self {
                     pkcs11,
                     slot,
                     id: id.to_vec(),
                     session: Some(session),
-                    #[cfg(target_os = "linux")]
+                    #[cfg(unix)]
                     gate,
-                });
+                }));
             }
         }
         Err(TokenError::NotFound)
@@ -395,47 +464,99 @@ impl TokenKey {
     /// Blocks while the token waits for the user, which for a cloud token
     /// means an approval on another device.
     pub fn sign(&mut self, padding: Padding, data: &[u8]) -> Result<Vec<u8>, TokenError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let gate = Arc::clone(&self.gate);
-        self.sign_with_session(
-            padding,
-            data,
-            #[cfg(target_os = "linux")]
-            Self::signing_guard(&gate),
-        )
+        #[cfg(unix)]
+        let context = Self::signing_guard(&gate);
+        #[cfg(not(unix))]
+        let context = SignContext {
+            canceled: &NEVER_CANCELED,
+            expires: None,
+        };
+        self.sign_with_session(padding, data, context)?
+            .ok_or(TokenError::NotFound)
     }
 
-    fn sign_with_session(
+    /// Wait for the signing gate and check cancellation and expiry before
+    /// handing its permit to the existing signing path.
+    #[cfg(unix)]
+    pub(crate) fn sign_until(
         &mut self,
         padding: Padding,
         data: &[u8],
-        #[cfg(target_os = "linux")] signing: signing_gate::Permit<'_>,
-    ) -> Result<Vec<u8>, TokenError> {
-        #[cfg(target_os = "linux")]
-        if !signing.belongs_to(&self.gate) {
+        canceled: &AtomicBool,
+        expires: Instant,
+    ) -> Result<Option<Vec<u8>>, TokenError> {
+        let gate = Arc::clone(&self.gate);
+        signing_gate::sign_until(
+            canceled,
+            expires,
+            || signing_gate::try_acquire(&gate),
+            |permit| {
+                self.sign_with_session(
+                    padding,
+                    data,
+                    SignContext {
+                        permit,
+                        canceled,
+                        expires: Some(expires),
+                    },
+                )
+            },
+        )
+    }
+
+    fn sign_with_session<'a>(
+        &mut self,
+        padding: Padding,
+        data: &[u8],
+        context: impl Into<SignContext<'a>>,
+    ) -> Result<Option<Vec<u8>>, TokenError> {
+        let context = context.into();
+        #[cfg(unix)]
+        if !context.permit.belongs_to(&self.gate) {
             return Err(TokenError::Module);
         }
+        enum Attempt {
+            Signed(Vec<u8>),
+            KeyMissing,
+            Stopped,
+        }
+        let stopped = || canceled_or_expired(context.canceled, context.expires);
         let mechanism = mechanism(padding);
-        let attempt = |session: &Session, id: &[u8]| -> Result<Option<Vec<u8>>, Error> {
+        let attempt = |session: &Session, id: &[u8]| -> Result<Attempt, Error> {
             let Some(key) = find(session, ObjectClass::PRIVATE_KEY, id)? else {
-                return Ok(None);
+                return Ok(Attempt::KeyMissing);
             };
-            session.sign(&mechanism, key, data).map(Some)
+            if stopped() {
+                return Ok(Attempt::Stopped);
+            }
+            session.sign(&mechanism, key, data).map(Attempt::Signed)
         };
         // Some tokens hide private objects until login; others refuse to sign.
-        match self.with_session(attempt) {
-            Ok(Some(signature)) => Ok(signature),
-            Ok(None) | Err(Error::Pkcs11(RvError::UserNotLoggedIn, _)) => {
-                self.login()?;
-                self.with_session(attempt)?.ok_or(TokenError::NotFound)
+        let result = match self.with_session(attempt) {
+            Ok(Attempt::KeyMissing) | Err(Error::Pkcs11(RvError::UserNotLoggedIn, _)) => {
+                if stopped() || !self.login(context.canceled, context.expires)? {
+                    return Ok(None);
+                }
+                self.with_session(attempt)?
             }
-            Err(error) => Err(error.into()),
+            result => result?,
+        };
+        match result {
+            Attempt::Signed(signature) => Ok(Some(signature)),
+            Attempt::KeyMissing => Err(TokenError::NotFound),
+            Attempt::Stopped => Ok(None),
         }
     }
 
     /// Only a protected authentication path logs in without a PIN; on other
     /// tokens an empty login could count as a wrong PIN and lock the card.
-    fn login(&mut self) -> Result<(), TokenError> {
+    fn login(
+        &mut self,
+        canceled: &AtomicBool,
+        expires: Option<Instant>,
+    ) -> Result<bool, TokenError> {
         if !self
             .pkcs11
             .get_token_info(self.slot)?
@@ -443,11 +564,16 @@ impl TokenKey {
         {
             return Err(TokenError::PinRequired);
         }
-        self.with_session(|session, _| match session.login(UserType::User, None) {
-            Ok(()) | Err(Error::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => Ok(()),
-            Err(error) => Err(error),
-        })?;
-        Ok(())
+        self.with_session(|session, _| {
+            if canceled_or_expired(canceled, expires) {
+                return Ok(false);
+            }
+            match session.login(UserType::User, None) {
+                Ok(()) | Err(Error::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => Ok(true),
+                Err(error) => Err(error),
+            }
+        })
+        .map_err(TokenError::from)
     }
 
     fn with_session<T>(

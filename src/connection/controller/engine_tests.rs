@@ -2200,3 +2200,48 @@ fn a_failure_note_reaches_only_an_announced_peer_and_a_new_attempt_clears_it() {
         assert_eq!(states[0].failure, None);
     }
 }
+
+#[test]
+fn sign_reply_is_refused_with_invalid_request_and_the_engine_keeps_serving() {
+    let mut harness = Harness::new(vec![profile("one")], 64);
+    for (n, result) in [
+        serde_json::json!({"certificate":"MAA="}),
+        serde_json::json!({"signature":"MAA="}),
+        serde_json::json!({"error":"canceled"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("sign-reply-{n}");
+        let body = serde_json::json!({
+            "id": id,
+            "command": {
+                "type": "sign_reply",
+                "id": 7,
+                "profile": "one",
+                "generation": 1,
+                "epoch": 9,
+                "result": result
+            }
+        });
+        harness
+            .input
+            .as_ref()
+            .unwrap()
+            .send(parse_request(body.to_string().as_bytes()).unwrap())
+            .unwrap();
+        harness.wait(|h| {
+            h.seen.iter().any(|m| {
+                matches!(m, Message::Failed { id: actual, error: ErrorCode::InvalidRequest } if actual == &id)
+            })
+        });
+    }
+    let snapshot = harness.command(Command::Snapshot {});
+    harness.wait(|h| {
+        h.seen
+            .iter()
+            .any(|m| matches!(m, Message::Snapshot { id, .. } if id == &snapshot))
+    });
+    assert!(harness.kernel.lock().unwrap().attempts.is_empty());
+    harness.finish();
+}

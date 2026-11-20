@@ -47,7 +47,7 @@ fn a_missing_module_is_a_module_error() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn signing_rejects_a_permit_from_another_module_gate() {
     let fixture = super::super::private_dir::PrivateDir::create(&std::env::temp_dir()).unwrap();
@@ -114,6 +114,397 @@ CK_ULONG C_GetFunctionList(struct FunctionList **list) {
     assert_eq!(
         key.sign(Padding::Pkcs1, &[]),
         Err(TokenError::Failed(RvError::GeneralError))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sign_until_leaves_the_provider_untouched_when_canceled_behind_the_gate() {
+    use std::sync::mpsc;
+
+    let gate = Arc::new(RwLock::new(()));
+    let canceled = AtomicBool::new(false);
+    let (waiting, wait) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel();
+    let (finished, finish) = mpsc::channel();
+    let budget = Duration::from_secs(5);
+    let held = gate.write().unwrap();
+    thread::scope(|scope| {
+        let gate = &gate;
+        let canceled = &canceled;
+        scope.spawn(move || {
+            let mut signs = 0;
+            let mut observed_writer = false;
+            let result = signing_gate::sign_until(
+                canceled,
+                Instant::now() + budget,
+                || {
+                    if observed_writer {
+                        waiting.send(()).unwrap();
+                        resumed.recv_timeout(budget).unwrap();
+                        Some(signing_gate::try_acquire(gate).expect("the writer released the gate"))
+                    } else {
+                        assert!(signing_gate::try_acquire(gate).is_none());
+                        observed_writer = true;
+                        None
+                    }
+                },
+                |_| {
+                    signs += 1;
+                    Ok(vec![1])
+                },
+            );
+            finished.send((result, signs)).unwrap();
+        });
+        wait.recv_timeout(budget).unwrap();
+        canceled.store(true, Ordering::Release);
+        drop(held);
+        resume.send(()).unwrap();
+        assert_eq!(finish.recv_timeout(budget).unwrap(), (Ok(None), 0));
+        assert!(
+            gate.try_write().is_ok(),
+            "the canceled wait must release its permit"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn sign_until_leaves_the_provider_untouched_when_the_gate_wait_expires() {
+    let gate = Arc::new(RwLock::new(()));
+    let held = gate.write().unwrap();
+    let canceled = AtomicBool::new(false);
+    let mut blocked = false;
+    let mut signs = 0;
+    let expires = Instant::now() + Duration::from_millis(200);
+    let result = signing_gate::sign_until(
+        &canceled,
+        expires,
+        || {
+            let permit = signing_gate::try_acquire(&gate);
+            blocked |= permit.is_none();
+            permit
+        },
+        |_| {
+            signs += 1;
+            Ok(vec![1])
+        },
+    );
+    assert!(blocked);
+    assert!(Instant::now() >= expires);
+    assert_eq!((result, signs), (Ok(None), 0));
+    drop(held);
+}
+
+#[cfg(unix)]
+#[test]
+fn sign_until_returns_without_waiting_for_the_writer_to_release() {
+    use std::sync::mpsc;
+
+    let fixture = super::super::private_dir::PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let source = fixture.path.join("fixture.c");
+    let module = fixture.path.join("fixture.so");
+    // Loading only needs a function list. This fixture has no provider
+    // operations, so an unexpected attempt to open a session is an error.
+    std::fs::write(
+        &source,
+        r#"
+struct FunctionList {
+    unsigned char major, minor;
+    void (*functions[68])(void);
+};
+static struct FunctionList functions = { .major = 2, .minor = 40 };
+unsigned long C_GetFunctionList(struct FunctionList **list) {
+    *list = &functions;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("/usr/bin/cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&module)
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let gate = Arc::new(RwLock::new(()));
+    let mut key = TokenKey {
+        pkcs11: Arc::new(Pkcs11::new(&module).unwrap()),
+        slot: Slot::try_from(1_u32).unwrap(),
+        id: vec![1],
+        session: None,
+        gate: Arc::clone(&gate),
+    };
+    let canceled = AtomicBool::new(false);
+    let budget = Duration::from_secs(5);
+    let (started, start) = mpsc::channel();
+    let (finished, finish) = mpsc::channel();
+    let held = gate.write().unwrap();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let expires = Instant::now() + budget.saturating_mul(2);
+            started.send(()).unwrap();
+            let result = key.sign_until(Padding::Pkcs1, &[], &canceled, expires);
+            finished.send(result).unwrap();
+        });
+        start.recv_timeout(budget).unwrap();
+        canceled.store(true, Ordering::Release);
+        let result = finish.recv_timeout(budget);
+        drop(held);
+        assert_eq!(
+            result,
+            Ok(Ok(None)),
+            "cancel must return with the gate held"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn try_acquire_recovers_a_poisoned_gate_like_acquire() {
+    let gate = Arc::new(RwLock::new(()));
+    assert!(
+        thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = gate.write().unwrap();
+                    panic!("poison the fixture gate");
+                })
+                .join()
+        })
+        .is_err()
+    );
+    assert!(gate.is_poisoned());
+    assert!(signing_gate::acquire(&gate).belongs_to(&gate));
+    assert!(signing_gate::try_acquire(&gate).unwrap().belongs_to(&gate));
+}
+
+#[cfg(unix)]
+fn with_login_fixture<T>(
+    step: u8,
+    run: impl FnOnce(&Path, &AtomicBool, Instant) -> T + Send,
+) -> (T, Vec<u8>)
+where
+    T: Send,
+{
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
+    let fixture = super::super::private_dir::PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let source = fixture.path.join("login.c");
+    let module = fixture.path.join("login.so");
+    let hold_enumeration = step == b'E';
+    let (mut operator, provider) = UnixStream::pair().unwrap();
+    let budget = Duration::from_secs(5);
+    operator.set_read_timeout(Some(budget)).unwrap();
+    provider.set_read_timeout(Some(budget)).unwrap();
+    std::fs::write(
+        &source,
+        r#"
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+typedef unsigned long Ulong;
+typedef Ulong (*Function)(void);
+struct TokenInfo {
+    unsigned char label[32], manufacturer[32], model[16], serial[16];
+    Ulong flags, sessions[4], pin_lengths[2], memory[4];
+    unsigned char versions[4], utc_time[16];
+};
+static int logged_in, key_available, sessions;
+
+static Ulong wait_for_revocation(char step) {
+    char resume;
+    if (write(PROVIDER_FD, &step, 1) != 1 ||
+        read(PROVIDER_FD, &resume, 1) != 1 || resume != 'R') {
+        return 5; /* CKR_GENERAL_ERROR */
+    }
+    return 0;
+}
+static Ulong initialize(void *args) { return 0; }
+static Ulong get_slots(unsigned char present, Ulong *slots, Ulong *count) {
+    if (!slots && HOLD_ENUMERATION && wait_for_revocation('E') != 0) { return 5; }
+    if (slots) { *slots = 1; }
+    *count = 1;
+    return 0;
+}
+
+static Ulong token_info(Ulong slot, struct TokenInfo *info) {
+    if (HOLD_TOKEN_INFO && wait_for_revocation('T') != 0) { return 5; }
+    memset(info, 0, sizeof(*info));
+    info->flags = 0x100; /* CKF_PROTECTED_AUTHENTICATION_PATH */
+    return 0;
+}
+static Ulong open_session(Ulong slot, Ulong flags, void *app, Function notify, Ulong *session) {
+    if (HOLD_ENUMERATION && write(PROVIDER_FD, "O", 1) != 1) { return 5; }
+    if (HOLD_REOPEN && sessions++ == 1 && wait_for_revocation('R') != 0) { return 5; }
+    *session = 1;
+    return 0;
+}
+static Ulong close_session(Ulong session) {
+    return HOLD_ENUMERATION && write(PROVIDER_FD, "X", 1) != 1 ? 5 : 0;
+}
+static Ulong login(Ulong session, Ulong user, unsigned char *pin, Ulong length) {
+    if (HOLD_ENUMERATION || HOLD_TOKEN_INFO || HOLD_REOPEN
+            ? write(PROVIDER_FD, "L", 1) != 1 : wait_for_revocation('L') != 0) {
+        return 5;
+    }
+    if (HOLD_REOPEN && sessions == 1) { return 0xb3; /* CKR_SESSION_HANDLE_INVALID */ }
+    logged_in = 1;
+    return 0;
+}
+struct Attribute { Ulong type; void *value; Ulong length; };
+static Ulong find_init(Ulong session, struct Attribute *filter, Ulong count) {
+    /* CKA_CLASS is first in the template. CKO_CERTIFICATE is public. */
+    key_available = *(Ulong *)filter[0].value == 1 || logged_in;
+    return 0;
+}
+static Ulong find(Ulong session, Ulong *keys, Ulong max, Ulong *count) {
+    *count = key_available;
+    if (key_available) {
+        *keys = 2;
+        key_available = 0;
+    }
+    return 0;
+}
+static Ulong find_final(Ulong session) { return 0; }
+static Ulong sign_init(Ulong session, void *mechanism, Ulong key) { return 0; }
+static Ulong sign(Ulong session, unsigned char *data, Ulong len, unsigned char *out, Ulong *size) {
+    if (write(PROVIDER_FD, "S", 1) != 1) { return 5; }
+    if (out) { *out = 42; }
+    *size = 1;
+    return 0;
+}
+struct FunctionList {
+    unsigned char major, minor;
+    Function functions[68];
+};
+static struct FunctionList functions = { .major = 2, .minor = 40, .functions = {
+    [0] = (Function)initialize, [4] = (Function)get_slots, [6] = (Function)token_info, [12] = (Function)open_session, [13] = (Function)close_session,
+    [18] = (Function)login, [26] = (Function)find_init, [27] = (Function)find,
+    [28] = (Function)find_final, [42] = (Function)sign_init, [43] = (Function)sign,
+}};
+Ulong C_GetFunctionList(struct FunctionList **list) { *list = &functions; return 0; }
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("/usr/bin/cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&module)
+        .arg(format!("-DPROVIDER_FD={}", provider.as_raw_fd()))
+        .arg(format!(
+            "-DHOLD_ENUMERATION={}",
+            i32::from(hold_enumeration)
+        ))
+        .arg(format!("-DHOLD_TOKEN_INFO={}", i32::from(step == b'T')))
+        .arg(format!("-DHOLD_REOPEN={}", i32::from(step == b'R')))
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let canceled = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let canceled = &canceled;
+        let worker = scope.spawn(move || {
+            let _provider = provider;
+            run(&module, canceled, Instant::now() + budget * 2)
+        });
+        let mut reached = [0];
+        let mut events = Vec::new();
+        if step == b'R' {
+            operator.read_exact(&mut reached).unwrap();
+            assert_eq!(reached, [b'L'], "the first C_Login must force a retry");
+            events.push(reached[0]);
+        }
+        operator.read_exact(&mut reached).unwrap();
+        assert_eq!(
+            reached,
+            [step],
+            "the fixture must reach the blocked provider call"
+        );
+        canceled.store(true, Ordering::Release);
+        operator.write_all(b"R").unwrap();
+        let result = worker.join().unwrap();
+        operator.read_to_end(&mut events).unwrap();
+        (result, events)
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn sign_until_skips_c_sign_when_revoked_during_provider_login() {
+    let (result, events) = with_login_fixture(b'L', |module, canceled, expires| {
+        let mut key = TokenKey {
+            pkcs11: Arc::new(Pkcs11::new(module).unwrap()),
+            slot: Slot::try_from(1_u32).unwrap(),
+            id: vec![1],
+            session: None,
+            gate: Arc::new(RwLock::new(())),
+        };
+        key.sign_until(Padding::Pkcs1, &[], canceled, expires)
+    });
+    assert_eq!(
+        (result, events.len()),
+        (Ok(None), 0),
+        "revocation during C_Login must prevent C_Sign"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sign_until_skips_c_login_when_revoked_during_token_info() {
+    for (step, logins_before_revocation, operation) in [
+        (b'T', 0, "C_GetTokenInfo"),
+        (b'R', 1, "reopening the session"),
+    ] {
+        let (result, events) = with_login_fixture(step, |module, canceled, expires| {
+            let mut key = TokenKey {
+                pkcs11: Arc::new(Pkcs11::new(module).unwrap()),
+                slot: Slot::try_from(1_u32).unwrap(),
+                id: vec![1],
+                session: None,
+                gate: Arc::new(RwLock::new(())),
+            };
+            key.sign_until(Padding::Pkcs1, &[], canceled, expires)
+        });
+        let logins = events.iter().filter(|event| **event == b'L').count();
+        assert_eq!(
+            (result, logins),
+            (Ok(None), logins_before_revocation),
+            "revocation during {operation} must prevent another C_Login"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn open_until_skips_session_and_login_when_revoked_during_slot_enumeration() {
+    let (result, events) = with_login_fixture(b'E', |module, canceled, expires| {
+        TokenKey::open_until(module, &[1], canceled, expires).map(|key| {
+            // The consumer's blocking signer can log in if it receives a key.
+            key.map(|mut key| key.sign(Padding::Pkcs1, &[]))
+        })
+    });
+    let opened = events.iter().filter(|event| **event == b'O').count();
+    let closed = events.iter().filter(|event| **event == b'X').count();
+    let logins = events.iter().filter(|event| **event == b'L').count();
+    assert_eq!(
+        (result, opened, closed, logins),
+        (Ok(None), 0, 0, 0),
+        "revocation during C_GetSlotList must stop the open before a session can log in"
     );
 }
 

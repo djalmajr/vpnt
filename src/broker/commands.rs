@@ -1,4 +1,5 @@
 use super::*;
+
 impl<S: SecretStore> Broker<S> {
     pub fn dispatch(
         &mut self,
@@ -264,7 +265,7 @@ impl<S: SecretStore> Broker<S> {
             }),
         )
     }
-    fn disconnect(&mut self, id: &str) -> Result<(), &'static str> {
+    pub(super) fn disconnect(&mut self, id: &str) -> Result<(), &'static str> {
         let c = self.connections.get(id).ok_or("not_found")?;
         let generation = c.generation.checked_add(1).ok_or("unavailable")?;
         self.submit(
@@ -277,26 +278,55 @@ impl<S: SecretStore> Broker<S> {
             Some(State::Disconnecting),
         )
     }
-    fn submit(
+    pub(super) fn submit(
         &mut self,
         id: &str,
         generation: u64,
         command: protocol::Command,
         state: Option<State>,
     ) -> Result<(), &'static str> {
+        self.submit_with_send(id, generation, command, state, Client::send)
+    }
+
+    pub(super) fn submit_with_send(
+        &mut self,
+        id: &str,
+        generation: u64,
+        command: protocol::Command,
+        state: Option<State>,
+        send: impl FnOnce(&Client, Request) -> Result<(), Error>,
+    ) -> Result<(), &'static str> {
         if !self.ready {
             return Err("backend_unavailable");
         }
         let next = self.next.checked_add(1).ok_or("unavailable")?;
         let request = format!("operation-{next}");
-        self.client
-            .as_ref()
-            .ok_or("backend_unavailable")?
-            .send(Request {
+        let connecting = matches!(command, protocol::Command::Connect { .. });
+        let disconnecting = matches!(command, protocol::Command::Disconnect { .. });
+        let client = self.client.as_ref().ok_or("backend_unavailable")?;
+        let replacing = connecting
+            && self
+                .connections
+                .get(id)
+                .is_some_and(|c| c.generation != generation);
+        let paused = if disconnecting || replacing {
+            self.signing.pause_pending_for_send(id)
+        } else {
+            None
+        };
+        let sent = send(
+            client,
+            Request {
                 id: request.clone(),
                 command,
-            })
-            .map_err(|_| "backend_unavailable")?;
+            },
+        );
+        if sent.is_err() {
+            if let Some(canceled) = paused {
+                canceled.resume_after_failed_send();
+            }
+            return Err("backend_unavailable");
+        }
         self.next = next;
         let c = self.connections.get_mut(id).ok_or("not_found")?;
         c.pending = Some(Pending {
@@ -307,6 +337,12 @@ impl<S: SecretStore> Broker<S> {
         c.generation = generation;
         if let Some(state) = state {
             set_state(c, state);
+        }
+        if connecting {
+            self.register_signing_connect(id);
+        }
+        if connecting || disconnecting {
+            self.reconcile_signing();
         }
         Ok(())
     }
