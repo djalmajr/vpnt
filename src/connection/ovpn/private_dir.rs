@@ -101,13 +101,17 @@ impl PrivateDir {
     }
 }
 
-/// Confirms what `mkdir` made without following a planted symlink. The mode
-/// must be exactly 0700: a restrictive umask or an injected chmod is refused.
+/// Confirms what `mkdir` made without following a planted symlink. The access
+/// bits must be exactly 0700: a restrictive umask or an injected chmod is
+/// refused. Linux copies a setgid parent's bit onto new directories; with no
+/// group access it only names the group of later entries, so it is accepted.
+/// Setuid and sticky are never inherited and are refused.
 fn verify(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    let mode = metadata.mode() & 0o7777;
     if !metadata.is_dir()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o7777 != 0o700
+        || (mode != 0o700 && mode != 0o2700)
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -122,6 +126,12 @@ fn verify(path: &Path) -> io::Result<()> {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
+        // Only a directory of this effective user is ours to remove; an entry
+        // swapped in by someone else is left alone.
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {}
+            _ => return,
+        }
         // A restrictive umask can leave the rejected directory unreadable.
         // Restore owner rwx on the entry we created so remove_dir_all can
         // clean it up. AT_SYMLINK_NOFOLLOW keeps the change on the entry
@@ -192,10 +202,16 @@ mod tests {
     }
 
     fn unique_base() -> PathBuf {
+        // Parallel tests in one process can read the same clock value.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let salt = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let base = std::env::temp_dir().join(format!("vpnt-pdir-{}-{salt:x}", std::process::id()));
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "vpnt-pdir-{}-{salt:x}-{serial}",
+            std::process::id()
+        ));
         fs::create_dir(&base).unwrap();
         fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
         base
@@ -260,5 +276,38 @@ mod tests {
 
         fs::set_permissions(&good, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(verify(&good).is_err(), "wrong mode accepted");
+
+        // A setgid parent hands its bit to new directories on Linux; with no
+        // group access it is accepted. Setuid and sticky are not inherited.
+        for (mode, accepted) in [(0o2700, true), (0o4700, false), (0o1700, false)] {
+            fs::set_permissions(&good, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                fs::symlink_metadata(&good).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "the fixture could not set {mode:o}"
+            );
+            assert_eq!(verify(&good).is_ok(), accepted, "mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn drop_leaves_an_entry_it_does_not_own_as_a_directory() {
+        let base = unique_base();
+        let _cleanup = RemoveTree(base.clone());
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"").unwrap();
+        let swapped = base.join("swapped");
+        std::os::unix::fs::symlink(&target, &swapped).unwrap();
+
+        drop(PrivateDir {
+            path: swapped.clone(),
+        });
+
+        assert!(
+            fs::symlink_metadata(&swapped).is_ok(),
+            "the swapped-in link was removed"
+        );
+        assert!(target.join("keep").exists(), "the link target was touched");
     }
 }

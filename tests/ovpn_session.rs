@@ -163,21 +163,38 @@ fn session_uses_the_shared_base_for_its_private_directory() {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-    #[cfg(target_os = "linux")]
-    let config = ConfigSource::Path(PathBuf::from("/dev/null"));
-    #[cfg(not(target_os = "linux"))]
-    let config = ConfigSource::private(b"");
-    let launch = Launch {
-        openvpn: executable,
-        config,
-        dev: None,
-        signatures: Signatures::Any,
-        extra: Vec::new(),
-        env: Vec::new(),
+    let launch = || {
+        #[cfg(target_os = "linux")]
+        let config = ConfigSource::Path(PathBuf::from("/dev/null"));
+        #[cfg(not(target_os = "linux"))]
+        let config = ConfigSource::private(b"");
+        Launch {
+            openvpn: executable.clone(),
+            config,
+            dev: None,
+            signatures: Signatures::Any,
+            extra: Vec::new(),
+            env: Vec::new(),
+        }
     };
     let base = TestBase::new();
     let expected = base.path().canonicalize().unwrap();
-    let session = Session::start_with(launch, NoSign, base.path(), restart_policy()).unwrap();
+    // The script was written moments ago: another test thread that forks while
+    // it was open for writing makes exec fail with "Text file busy" until that
+    // child execs, as `start_scripted` in session_tests.rs also retries.
+    let mut started = None;
+    for _ in 0..50 {
+        match Session::start_with(launch(), NoSign, base.path(), restart_policy()) {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                started = Some(result.unwrap());
+                break;
+            }
+        }
+    }
+    let session = started.expect("scripted openvpn stayed busy");
     session.wait().unwrap();
     let evidence = fs::read_to_string(&marker).unwrap();
     let mut management = "";
