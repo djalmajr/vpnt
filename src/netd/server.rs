@@ -37,6 +37,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
+const RETRY_BUDGET: Duration = Duration::from_secs(2);
+
+fn retry_delays() -> impl Iterator<Item = Duration> {
+    [250, 500, 1000, 2000]
+        .into_iter()
+        .chain(std::iter::repeat(5000))
+        .map(Duration::from_millis)
+}
 
 fn admit(uid: u32) -> Result<(), ErrorCode> {
     if uid == 0 {
@@ -91,6 +100,7 @@ pub(super) struct Server<B> {
     pending: Mutex<HashMap<TunName, CleanupProof>>,
     retry_running: AtomicBool,
     lock_timeout: Duration,
+    open_lock_timeout: Duration,
     #[cfg(test)]
     network_directory: Option<PathBuf>,
     hello_timeout: Duration,
@@ -106,6 +116,7 @@ impl<B: Backend + 'static> Server<B> {
             pending: Mutex::new(HashMap::new()),
             retry_running: AtomicBool::new(false),
             lock_timeout: NETWORK_LOCK_TIMEOUT,
+            open_lock_timeout: OPEN_LOCK_TIMEOUT,
             #[cfg(test)]
             network_directory: None,
             hello_timeout,
@@ -143,23 +154,46 @@ impl<B: Backend + 'static> Server<B> {
             .extend(pending.into_iter().map(|name| (name, CleanupProof::Marked)));
         Ok(())
     }
-    fn retry_after_accept(self: &Arc<Self>) {
-        if self.pending.lock().expect("pending mutex").is_empty()
-            || self.retry_running.swap(true, Ordering::AcqRel)
+    fn retry_pending(self: &Arc<Self>) {
         {
-            return;
-        }
-        let server = Arc::clone(self);
-        if let Err(error) = thread::Builder::new().spawn(move || {
-            let deadline = server.lock_deadline();
-            if let Ok(lock) = server.request_lock(deadline) {
-                server.retry_pass(&lock, deadline);
+            let pending = self.pending.lock().expect("pending mutex");
+            if pending.is_empty() || self.retry_running.swap(true, Ordering::Relaxed) {
+                return;
             }
-            server.retry_running.store(false, Ordering::Release);
+        }
+        let server = Arc::downgrade(self);
+        if let Err(error) = thread::Builder::new().spawn(move || {
+            for delay in retry_delays() {
+                thread::sleep(delay);
+                let Some(server) = server.upgrade() else {
+                    break;
+                };
+                if !server.retry_needed() {
+                    break;
+                }
+                if let Ok(lock) = server.request_lock(server.lock_deadline()) {
+                    server.retry_pass(&lock, Instant::now() + RETRY_BUDGET);
+                }
+                if !server.retry_needed() {
+                    break;
+                }
+            }
         }) {
-            self.retry_running.store(false, Ordering::Release);
+            let _pending = self.pending.lock().expect("pending mutex");
+            self.retry_running.store(false, Ordering::Relaxed);
             network_error("cleanup_worker_failed", error);
         }
+    }
+
+    fn retry_needed(&self) -> bool {
+        let pending = self.pending.lock().expect("pending mutex");
+        if pending.is_empty() {
+            // Serialize relinquishing the worker with enqueue and startup so a
+            // concurrent deferral either has a worker or starts a new one.
+            self.retry_running.store(false, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     fn retry_pass(&self, _lock: &NetworkGuard, deadline: Instant) {
@@ -213,7 +247,7 @@ impl<B: Backend + 'static> Server<B> {
         thread::Builder::new()
             .spawn(move || {
                 if admit(uid).is_ok() {
-                    slot.server.retry_after_accept();
+                    slot.server.retry_pending();
                 }
                 let _ = slot.server.session(&stream, uid, accepted);
             })
@@ -271,11 +305,8 @@ impl<B: Backend + 'static> Server<B> {
             stream.write_all(&encode_response(&lease.handle(request)))?;
         }
     }
-    fn create(&self, uid: u32, deadline: Instant) -> Result<TunName, ErrorCode> {
+    fn create(&self, uid: u32) -> Result<TunName, ErrorCode> {
         let existing = self.backend.existing().map_err(|_| ErrorCode::Backend)?;
-        if Instant::now() >= deadline {
-            return Err(ErrorCode::Backend);
-        }
         let mut reserved = self.reserved.lock().expect("reservation mutex");
         let name = (0..100)
             .map(|index| TunName::parse(&format!("vpnt{index}")).expect("generated name"))
@@ -420,7 +451,7 @@ impl<B: Backend + 'static> Session<'_, B> {
                 if self.owned.len() >= 2 {
                     return Err(ErrorCode::Limit);
                 }
-                let deadline = self.server.lock_deadline();
+                let deadline = Instant::now() + self.server.open_lock_timeout;
                 let lock = self.server.request_lock(deadline)?;
                 // Reject an occupied or unsafe registry before any backend write,
                 // including a retry. The guard keeps that decision current.
@@ -430,8 +461,8 @@ impl<B: Backend + 'static> Session<'_, B> {
                 {
                     return Err(ErrorCode::RouteConflict);
                 }
-                self.server.retry_pass(&lock, deadline);
-                let name = self.server.create(self.uid, deadline)?;
+                self.server.retry_pass(&lock, Instant::now() + RETRY_BUDGET);
+                let name = self.server.create(self.uid)?;
                 self.owned.push(name.clone());
                 Ok(Response::Opened(name))
             }
@@ -512,12 +543,13 @@ impl<B: Backend + 'static> Drop for Session<'_, B> {
         if self.owned.is_empty() {
             return;
         }
-        let Ok(_lock) = self.server.request_lock(self.server.lock_deadline()) else {
+        let Ok(lock) = self.server.request_lock(self.server.lock_deadline()) else {
             // The kernel marks remain the ownership proof for a later retry.
             for name in &self.owned {
                 self.server.defer(name, CleanupProof::Marked);
                 log_tun("cleanup_lock_pending", self.uid, name);
             }
+            self.server.retry_pending();
             return;
         };
         for name in &self.owned {
@@ -530,6 +562,8 @@ impl<B: Backend + 'static> Drop for Session<'_, B> {
                 self.server.defer(name, CleanupProof::Marked);
             }
         }
+        drop(lock);
+        self.server.retry_pending();
     }
 }
 
