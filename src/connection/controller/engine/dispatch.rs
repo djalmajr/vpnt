@@ -67,6 +67,13 @@ pub(super) fn dispatch<F: Factory>(
             ));
             return;
         }
+        #[cfg(unix)]
+        Command::SignReply { .. } => {
+            // No signature request can be pending in this slice: a reply is
+            // an invalid command for the current state.
+            fail(output, ErrorCode::InvalidRequest);
+            return;
+        }
         Command::Connect { id, generation, .. }
         | Command::Disconnect { id, generation }
         | Command::Probe { id, generation } => (id, *generation),
@@ -151,6 +158,8 @@ pub(super) fn dispatch<F: Factory>(
                 return;
             }
         }
+        #[cfg(unix)]
+        Command::SignReply { .. } => unreachable!(),
         Command::Snapshot {}
         | Command::Diagnostics {}
         | Command::SetProbeInterval { .. }
