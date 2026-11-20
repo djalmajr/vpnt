@@ -142,6 +142,10 @@ fn instance_fixture() {
         replay_instance(&root);
         return;
     }
+    if mode == "public-entry" {
+        check_public_entry(&root);
+        return;
+    }
     let socket_path = root.join("control");
     if mode == "no-read" {
         let transport = connect_fixture(&socket_path);
@@ -194,6 +198,38 @@ fn instance_fixture() {
         );
     }
     assert_eq!(fd_count(), before);
+}
+
+fn dumpable() -> libc::c_int {
+    // SAFETY: PR_GET_DUMPABLE takes only zeroed integer arguments.
+    unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }
+}
+
+// Runs in its own process: the public entry point must protect the supervisor
+// before it opens anything, so it does even when the record does not exist.
+fn check_public_entry(root: &Path) {
+    assert_eq!(dumpable(), 1, "the fixture process starts dumpable");
+    let result = connect_instance(
+        &root.join("control"),
+        &root.join("absent-record"),
+        GENERATION,
+        Backend::Ipsec,
+        INVOCATION,
+        ids().gid,
+    );
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::NotFound));
+    assert_eq!(dumpable(), 0, "connect_instance left the process dumpable");
+}
+
+#[test]
+fn connect_instance_protects_the_supervisor_before_opening_the_channel() {
+    let fixture = Fixture::new();
+    let mut process = child(&fixture, "public-entry", false, 0);
+    let status = process.0.wait().unwrap();
+    assert!(
+        status.success(),
+        "isolated entry-point check failed: {status}"
+    );
 }
 
 fn fd_count() -> usize {
@@ -349,6 +385,28 @@ fn rejects_record_scope_and_reuse() {
     assert!(
         matches!(open_record(&record, ids().uid), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
     );
+}
+
+#[test]
+fn open_record_refuses_a_link_in_any_path_component() {
+    let fixture = Fixture::new();
+    drop(fixture.publish(ids(), PHASE_TIMEOUT).unwrap());
+    let record = fixture.0.join(GENERATION);
+    assert!(
+        open_record(&record, ids().uid).is_ok(),
+        "control: plain path"
+    );
+
+    let final_link = fixture.0.join("final-link");
+    std::os::unix::fs::symlink(&record, &final_link).unwrap();
+    let ancestor_link = fixture.0.join("ancestor-link");
+    std::os::unix::fs::symlink(&fixture.0, &ancestor_link).unwrap();
+    for path in [final_link, ancestor_link.join(GENERATION)] {
+        let error = open_record(&path, ids().uid)
+            .err()
+            .expect("a link was read");
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{path:?}: {error}");
+    }
 }
 
 #[test]

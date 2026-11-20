@@ -372,15 +372,36 @@ fn check_mode(
     Ok(())
 }
 
+/// `struct open_how` of openat2(2); the `libc` one is non-exhaustive.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
 fn open_record(path: &Path, owner: libc::uid_t) -> io::Result<Record> {
     let path = path_cstring(path.as_os_str())?;
-    // SAFETY: open reads a NUL-terminated path and returns a new FD.
-    let fd = new_fd(unsafe {
-        libc::open(
+    // RESOLVE_NO_SYMLINKS refuses a link in any component, ancestors included;
+    // O_NOFOLLOW only covers the last one. A kernel without openat2 returns
+    // ENOSYS, and the read fails closed instead of falling back to open.
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_NO_SYMLINKS,
+    };
+    // SAFETY: openat2 reads a NUL-terminated path and an open_how of the
+    // stated size, and returns a new FD.
+    let raw = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
             path.as_ptr(),
-            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            ptr::from_ref(&how),
+            size_of::<OpenHow>(),
         )
-    })?;
+    };
+    let fd = new_fd(RawFd::try_from(raw).map_err(|_| invalid("invalid openat2 result"))?)?;
     check_mode(fd.as_fd(), owner, libc::S_IFREG, 0o600)?;
     let mut data = Vec::new();
     File::from(fd)
