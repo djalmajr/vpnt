@@ -125,11 +125,15 @@ fn factory_requests_one_signer_per_injected_attempt() {
         )
     );
     let signers = Arc::new(Signers::default());
-    let factory = factory.with_ovpn_signers(signers.clone());
+    let factory = factory
+        .with_ovpn_signers(signers.clone())
+        .fixture_fence_root(root.0.clone(), uid);
     assert!(factory.supports(VpnKind::Ovpn));
     let super::super::factory::AttemptKind::Ovpn(mut attempt) = create(&factory, uid, 2) else {
         panic!("injected OVPN was denied");
     };
+    assert_eq!(attempt.cycle.network.journal.root, root.0);
+    assert_eq!(attempt.cycle.network.journal.owner, uid);
     assert!(
         attempt
             .read_config()
@@ -197,6 +201,7 @@ fn with_launch_fixture(text: &str, run: impl FnOnce(&mut NativeOvpnAttempt<'_>, 
         owner,
         routes,
         Arc::new(AtomicBool::new(false)),
+        (root.0.clone(), uid),
     );
     run(&mut attempt, &store);
     assert!(attempt.cleanup());
@@ -1129,6 +1134,7 @@ fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnU
         lease: None,
         fence: None,
         dns: None,
+        journal: Journal::new((root.0.clone(), uid)),
     };
     let link = OvpnUtun::prove(
         "utun40",
@@ -1137,6 +1143,145 @@ fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnU
     )
     .unwrap();
     check_network(&mut network, &link);
+}
+
+fn fixture_process() -> Process {
+    Process {
+        identity: crate::connection::macos::process::Identity {
+            pid: 321,
+            start: (123, 456),
+        },
+        parent: 111,
+        uid: 0,
+        real_uid: 0,
+        running: true,
+        executable: "/fixture/runtime/bin/openvpn".into(),
+    }
+}
+
+#[test]
+fn native_ovpn_journals_spawn_and_interface_before_the_address_attempt() {
+    with_native_network(|network, _| {
+        let directory = paths::ovpn_sessions_directory().join("vpnt-ovpn-111-a-0");
+        network
+            .journal_spawn(&directory, &fixture_process())
+            .unwrap();
+        let read = |network: &NativeNetwork<'_>| {
+            fence::read(
+                &network.journal.root,
+                network.journal.owner,
+                network.owner.uid,
+                &network.owner.profile,
+                1,
+            )
+            .unwrap()
+            .expect("journal must exist")
+        };
+        let initial = read(network);
+        assert_eq!(initial.session_dir.as_deref(), directory.to_str());
+        assert_eq!(initial.processes[0].pid, 321);
+        assert_eq!(initial.processes[0].start_usec, 456);
+        assert!(initial.incomplete && initial.interface.is_none());
+        let device = "utun4294967295";
+        let absent_link = OvpnUtun::prove(
+            device,
+            &Interfaces::default(),
+            &fixture_interfaces(&[(device, 65534)]),
+        )
+        .unwrap();
+        // No real link can match this synthetic snapshot. The write must
+        // precede even an address operation that returns an error.
+        let result = network.address(
+            &absent_link,
+            &up(Some(device)),
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(result.is_err());
+        let addressed = read(network);
+        assert_eq!(
+            addressed.interface,
+            Some(Interface {
+                name: device.into(),
+                index: 65534
+            })
+        );
+        network.journal_cleanup().unwrap();
+        assert!(!read(network).incomplete);
+    });
+}
+
+#[test]
+fn native_ovpn_propagates_initial_journal_failure_before_network() {
+    with_native_network(|network, _| {
+        let directory = paths::ovpn_sessions_directory().join("vpnt-ovpn-111-a-0");
+        network.journal.owner ^= 1;
+        assert!(
+            network
+                .journal_spawn(&directory, &fixture_process())
+                .is_err_and(|failure| failure.step == Step::Spawn)
+        );
+        assert!(network.journal.record.is_none());
+        assert!(network.address.is_none());
+    });
+}
+
+#[test]
+fn session_directory_reports_the_actual_private_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Root::new();
+    let executable = fixture.0.join("fake-openvpn");
+    fs::write(
+        &executable,
+        concat!(
+            "#!/usr/bin/env python3\n",
+            "import sys, socket\n",
+            "if '--version' in sys.argv:\n",
+            "  print('OpenVPN 2.6.19'); sys.exit(0)\n",
+            "with socket.socket(socket.AF_UNIX) as stream:\n",
+            "  stream.connect(sys.argv[sys.argv.index('--management') + 1])\n",
+            "  for line in stream.makefile('rb'):\n",
+            "    if line.startswith(b'signal SIGTERM'): break\n",
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let temp = std::env::temp_dir();
+    let base = ('A'..='Z')
+        .find_map(|letter| {
+            let path = temp.join(letter.to_string());
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => Some(Root(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => panic!("fixture base: {error}"),
+            }
+        })
+        .expect("no short base available");
+    let session = Session::start_with(
+        Launch {
+            openvpn: executable,
+            config: ConfigSource::private(b"directory-fixture"),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        },
+        FixtureSigner,
+        &base.0,
+        RestartPolicy::CallerOrStop,
+    )
+    .unwrap();
+    let directory = session.directory().to_path_buf();
+    assert_eq!(directory.parent().unwrap(), base.0.canonicalize().unwrap());
+    assert!(fence::is_ovpn_session_name(
+        directory.file_name().unwrap().to_str().unwrap()
+    ));
+    assert_eq!(
+        fs::read(directory.join("config")).unwrap(),
+        b"directory-fixture"
+    );
+    drop(session);
+    assert!(!directory.exists());
 }
 
 #[test]
@@ -1183,6 +1328,10 @@ fn native_ovpn_withdrawal_retries_its_lease_without_deleting_the_ssl_default() {
             routes.backend_mut().fixture_allow_default_delete();
         }
 
+        let directory = paths::ovpn_sessions_directory().join("vpnt-ovpn-111-a-0");
+        network
+            .journal_spawn(&directory, &fixture_process())
+            .unwrap();
         network
             .routes(
                 link,
@@ -1190,6 +1339,23 @@ fn native_ovpn_withdrawal_retries_its_lease_without_deleting_the_ssl_default() {
                 Instant::now() + Duration::from_secs(1),
             )
             .unwrap();
+        let on_disk = fence::read(
+            &network.journal.root,
+            network.journal.owner,
+            network.owner.uid,
+            &network.owner.profile,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(on_disk.incomplete);
+        assert_eq!(
+            on_disk.routes,
+            routes.lock().unwrap().inventory(&network.owner)
+        );
+        assert_eq!(on_disk.routes.len(), 1);
+        assert!(on_disk.routes[0].created);
+        network.journal_cleanup().unwrap();
         let fence = network.fence.as_ref().unwrap().clone();
         assert!(!network.withdraw_routes().unwrap());
         assert!(network.lease.is_none());

@@ -208,6 +208,7 @@ impl<'a> Factory for NativeFactory<'a> {
                 owner,
                 self.routes.clone(),
                 canceled,
+                (self.fence_root.clone(), self.fence_owner),
             )));
         }
         if profile.kind == VpnKind::Ipsec {

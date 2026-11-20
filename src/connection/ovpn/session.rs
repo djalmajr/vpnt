@@ -703,6 +703,12 @@ impl Session {
         })
     }
 
+    /// The private directory owned by this session, for the macOS journal.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn directory(&self) -> &Path {
+        &self._directory.path
+    }
+
     /// Identity of the openvpn child until this session reaps it. Read it
     /// only to identify the process (PID, start and executable) before the
     /// reap: signalling and killing stay with `Session`, and no caller may

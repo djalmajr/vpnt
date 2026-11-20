@@ -2,6 +2,7 @@
 use super::*;
 use crate::{
     connection::{
+        fence::{self, Fence, Interface, ProcessIdentity},
         macos::{process::Process, routing::ResourceFence, vip::ovpn_link::OvpnUtun},
         ovpn::{
             management::Reason as OvpnReason,
@@ -13,12 +14,18 @@ use crate::{
             },
             signing::Padding,
         },
-        routes::Error as RouteError,
+        routes::{AbandonedRoute, Error as RouteError},
     },
     helper::{paths, ppp_supervisor::ServiceId, runtime::Program},
     model::OvpnTls,
 };
-use std::{io, net::Ipv4Addr, thread};
+use std::{
+    io,
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const RESTART_WITHDRAWAL_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -78,6 +85,12 @@ trait Network {
     ) -> Result<(), Failure>;
     fn close_dns(&mut self) -> Result<(), Failure>;
     fn withdraw_routes(&mut self) -> Result<bool, Failure>;
+    fn journal_cleanup(&mut self) -> Result<(), Failure> {
+        Ok(())
+    }
+    fn journal_withdrawn(&mut self) -> Result<(), Failure> {
+        Ok(())
+    }
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -196,6 +209,7 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
     fn withdraw_config(&mut self) -> Result<bool, Failure> {
         self.network_active = false;
         let expires = self.network.now() + RESTART_WITHDRAWAL_TIMEOUT;
+        self.network.journal_cleanup()?;
         self.network.close_dns()?;
 
         let at = || Failure::at(Step::Routes);
@@ -216,6 +230,10 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                 true
             };
             if link_gone && self.network.withdraw_routes()? {
+                if self.network.now() >= expires {
+                    return Err(at());
+                }
+                self.network.journal_withdrawn()?;
                 if self.network.now() >= expires {
                     return Err(at());
                 }
@@ -315,6 +333,9 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
 
     fn cleanup(&mut self) -> bool {
         self.network_active = false;
+        if self.network.journal_cleanup().is_err() {
+            return false;
+        }
         let dns_closed = self.network.close_dns().is_ok();
         if !self.stopped {
             self.stopped = true;
@@ -421,7 +442,13 @@ impl Tunnel for RealTunnel {
             return true;
         };
         match Process::read(pid) {
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
+            Err(error) => {
+                error.kind() == io::ErrorKind::NotFound
+                    // proc_pidpath can return NotFound while the PID still exists.
+                    // SAFETY: pid came from the owned Child, and signal zero only checks existence.
+                    && unsafe { libc::kill(pid as i32, 0) } != 0
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            }
             Ok(current) => self.identity.as_ref().is_some_and(|expected| {
                 if current.identity == expected.identity
                     && current.executable != expected.executable
@@ -443,6 +470,78 @@ struct NativeNetwork<'a> {
     lease: Option<Lease>,
     fence: Option<ResourceFence>,
     dns: Option<DnsLease>,
+    journal: Journal,
+}
+
+struct Journal {
+    root: PathBuf,
+    owner: u32,
+    record: Option<Fence>,
+}
+
+impl Journal {
+    fn new((root, owner): (PathBuf, u32)) -> Self {
+        Self {
+            root,
+            owner,
+            record: None,
+        }
+    }
+
+    fn begin(&mut self, owner: &Owner, directory: &Path, process: &Process) -> io::Result<()> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidData);
+        let written_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| invalid())?;
+        let record = Fence {
+            version: 1,
+            uid: owner.uid,
+            profile: owner.profile.clone(),
+            generation: owner.generation,
+            kind: fence::Kind::Ovpn,
+            reason: crate::helper::runtime::cleanup::Reason::Journal.id().into(),
+            incomplete: true,
+            written_unix_ms: u64::try_from(written_unix_ms.as_millis()).map_err(|_| invalid())?,
+            service_id: None,
+            dns_key: None,
+            session_dir: Some(directory.to_str().ok_or_else(invalid)?.into()),
+            processes: vec![ProcessIdentity {
+                pid: process.identity.pid,
+                start_sec: i64::try_from(process.identity.start.0).map_err(|_| invalid())?,
+                start_usec: i32::try_from(process.identity.start.1).map_err(|_| invalid())?,
+                program: process.executable.to_str().ok_or_else(invalid)?.into(),
+            }],
+            interface: None,
+            sink: None,
+            retired: Vec::new(),
+            routes: Vec::new(),
+        };
+        fence::write(&self.root, self.owner, &record)?;
+        self.record = Some(record);
+        Ok(())
+    }
+
+    fn update(&mut self, change: impl FnOnce(&mut Fence)) -> io::Result<()> {
+        if let Some(record) = &mut self.record {
+            change(record);
+            fence::write(&self.root, self.owner, record)?;
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self) -> Result<(), fence::Error> {
+        if let Some(record) = &self.record {
+            fence::remove(
+                &self.root,
+                self.owner,
+                record.uid,
+                &record.profile,
+                record.generation,
+            )?;
+            self.record = None;
+        }
+        Ok(())
+    }
 }
 
 fn route_result(error: RouteError) -> Failure {
@@ -457,6 +556,14 @@ fn route_guard(expires: Instant, canceled: &AtomicBool) -> Result<(), RouteError
         return Err(RouteError::TimedOut);
     }
     Ok(())
+}
+
+impl NativeNetwork<'_> {
+    fn journal_spawn(&mut self, directory: &Path, identity: &Process) -> Result<(), Failure> {
+        self.journal
+            .begin(&self.owner, directory, identity)
+            .map_err(|_| Failure::at(Step::Spawn))
+    }
 }
 
 impl Network for NativeNetwork<'_> {
@@ -488,6 +595,16 @@ impl Network for NativeNetwork<'_> {
                 return Err(error());
             }
         }
+        let name = config.device.as_ref().ok_or_else(error)?;
+        self.journal
+            .update(|record| {
+                record.incomplete = true;
+                record.interface = Some(Interface {
+                    name: name.clone(),
+                    index: link.index(),
+                });
+            })
+            .map_err(|_| error())?;
         self.address = Some((link.clone(), config.address, config.prefix));
         link.assign_address(config.address, config.prefix, expires, &self.canceled)
             .map_err(|_| error())
@@ -530,11 +647,26 @@ impl Network for NativeNetwork<'_> {
             .map_err(route_result)?;
         self.token = Some(token);
         self.fence = Some(fence);
-        self.lease = Some(
-            routes
-                .acquire_guarded(self.owner.clone(), &plan, guard)
-                .map_err(route_acquire_failure)?,
-        );
+        // The registered backend plan bounds even a partially applied acquire.
+        self.journal
+            .update(|record| {
+                record.routes = plan
+                    .iter()
+                    .map(|&route| AbandonedRoute {
+                        route,
+                        created: false,
+                    })
+                    .collect();
+            })
+            .map_err(|_| Failure::at(Step::Routes))?;
+        let result = routes.acquire_guarded(self.owner.clone(), &plan, guard);
+        // Keep the live lease before any subsequent I/O can fail.
+        let result = result.map(|lease| self.lease = Some(lease));
+        let written = self
+            .journal
+            .update(|record| record.routes = routes.inventory(&self.owner));
+        result.map_err(route_acquire_failure)?;
+        written.map_err(|_| Failure::at(Step::Routes))?;
         Ok(())
     }
 
@@ -551,6 +683,12 @@ impl Network for NativeNetwork<'_> {
         let lease = self
             .dns
             .insert(DnsLease::new(service.clone()).map_err(|_| at())?);
+        self.journal
+            .update(|record| {
+                record.service_id = Some(service.as_str().into());
+                record.dns_key = Some(lease.key());
+            })
+            .map_err(|_| at())?;
         lease.publish(servers, domains).map_err(|_| at())
     }
 
@@ -616,7 +754,7 @@ impl Network for NativeNetwork<'_> {
     fn finish(&mut self) -> Result<(), Failure> {
         let at = || Failure::at(Step::Routes);
         if let Some((link, _, _)) = &self.address
-            && !link.index_absent().map_err(|_| at())?
+            && !link.absent(&Interfaces::read().map_err(|_| at())?)
         {
             return Err(at());
         }
@@ -624,6 +762,24 @@ impl Network for NativeNetwork<'_> {
             return Err(at());
         }
         Ok(())
+    }
+
+    fn journal_cleanup(&mut self) -> Result<(), Failure> {
+        self.journal
+            .update(|record| record.incomplete = false)
+            .map_err(|_| Failure::at(Step::Routes))
+    }
+
+    fn journal_withdrawn(&mut self) -> Result<(), Failure> {
+        self.journal
+            .update(|record| {
+                record.incomplete = true;
+                record.interface = None;
+                record.routes.clear();
+                record.service_id = None;
+                record.dns_key = None;
+            })
+            .map_err(|_| Failure::at(Step::Routes))
     }
 
     fn validate_routes(&mut self) -> Result<(), Failure> {
@@ -667,6 +823,7 @@ impl<'a> NativeOvpnAttempt<'a> {
         owner: Owner,
         routes: Routes<'a>,
         canceled: Arc<AtomicBool>,
+        storage: (PathBuf, u32),
     ) -> Self {
         Self {
             profile,
@@ -683,6 +840,7 @@ impl<'a> NativeOvpnAttempt<'a> {
                     lease: None,
                     fence: None,
                     dns: None,
+                    journal: Journal::new(storage),
                 },
             ),
             profile_use: None,
@@ -849,6 +1007,9 @@ impl NativeOvpnAttempt<'_> {
         {
             return Err(at());
         }
+        self.cycle
+            .network
+            .journal_spawn(session.directory(), identity)?;
         self.cycle.initial_deadline = Some(expires);
         Ok(())
     }
@@ -887,6 +1048,9 @@ impl Attempt for NativeOvpnAttempt<'_> {
 
     fn cleanup(&mut self) -> bool {
         if !self.cycle.cleanup() {
+            return false;
+        }
+        if self.cycle.network.journal.remove().is_err() {
             return false;
         }
         self.cycle.session.identity = None;
