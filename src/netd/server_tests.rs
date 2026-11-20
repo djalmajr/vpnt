@@ -18,6 +18,7 @@ pub(in crate::netd) struct Fake {
     failed_delete_times: Mutex<Vec<Instant>>,
     inventory_calls: AtomicUsize,
     fail_inventory_call: AtomicUsize,
+    slow_inventory_calls: AtomicUsize,
     conflict: AtomicBool,
     fail_create: AtomicBool,
     fail_configure: AtomicBool,
@@ -102,6 +103,9 @@ impl Backend for Arc<Fake> {
         if let Some((started, resume)) = pause {
             started.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        if call <= self.slow_inventory_calls.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(3));
         }
         let owned = self.names.lock().unwrap().clone();
         let foreign = self.foreign.lock().unwrap().clone();
@@ -1030,7 +1034,7 @@ fn ovpn_receipt_survives_server_restart_until_startup_cleanup() {
     assert!(restarted.pending.lock().unwrap().contains_key(&name));
     assert!(ovpn_receipt(&f));
     let lock = f.network_lock();
-    restarted.retry_pass(&lock, Some(restarted.lock_deadline()), None);
+    restarted.retry_inline(&lock, restarted.lock_deadline());
     assert!(!ovpn_present(&f.fake).unwrap());
 }
 
@@ -1104,11 +1108,102 @@ fn enqueue_marked(f: &Fixture, name: &str) -> TunName {
 }
 
 #[test]
+fn open_acquires_network_lock_between_background_items() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1001);
+    hello(&mut wire);
+    enqueue_marked(&f, "vpnt0");
+    enqueue_marked(&f, "vpnt1");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+    f.fake.slow_inventory_calls.store(2, Ordering::SeqCst);
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut wire);
+    wire.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(9)))
+        .unwrap();
+    resume.send(()).unwrap();
+    let opened = response(&mut wire);
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+
+    assert!(
+        matches!(opened, Response::Opened(ref name) if name.as_str() == "vpnt0"),
+        "{opened:?}"
+    );
+    assert_eq!(
+        events,
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "create vpnt0 1001",
+            "delete vpnt1",
+        ]
+    );
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn background_cleanup_skips_entry_removed_by_inline_retry() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1001);
+    hello(&mut wire);
+    enqueue_marked(&f, "vpnt0");
+    enqueue_marked(&f, "vpnt1");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut wire);
+    resume.send(()).unwrap();
+    let opened = response(&mut wire);
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+
+    assert!(matches!(opened, Response::Opened(name) if name.as_str() == "vpnt0"));
+    assert_eq!(
+        events,
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "delete vpnt1",
+            "create vpnt0 1001",
+        ]
+    );
+    assert_eq!(
+        f.fake.inventory_calls.load(Ordering::SeqCst),
+        3,
+        "worker inventories only its first item; inline retry and create each inventory once"
+    );
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
 fn background_cleanup_deletes_after_a_three_second_inventory() {
     use std::sync::mpsc::channel;
 
     let f = Fixture::new(HELLO_TIMEOUT);
-    let name = enqueue_marked(&f, "vpnt0");
+    let first = enqueue_marked(&f, "vpnt0");
+    let second = enqueue_marked(&f, "vpnt1");
     let (in_inventory, inventory) = channel();
     let (resume, proceed) = channel();
     *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
@@ -1121,15 +1216,22 @@ fn background_cleanup_deletes_after_a_three_second_inventory() {
 
     assert_eq!(
         f.fake.inventory_calls.load(Ordering::SeqCst),
-        1,
-        "cleanup must delete in the same pass as the slow inventory"
+        2,
+        "each item must be inventoried exactly once"
     );
     assert_eq!(
         *f.fake.events.lock().unwrap(),
-        ["create vpnt0 1000", "delete vpnt0"]
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "delete vpnt1"
+        ]
     );
-    assert!(!f.fake.names.lock().unwrap().contains(&name));
-    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    for name in [first, second] {
+        assert!(!f.fake.names.lock().unwrap().contains(&name));
+        assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    }
 }
 
 #[test]

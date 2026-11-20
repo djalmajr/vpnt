@@ -39,6 +39,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const NETWORK_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const RETRY_BUDGET: Duration = Duration::from_secs(2);
+const RETRY_ITEM_PAUSE: Duration = Duration::from_millis(50);
 
 fn retry_delays() -> impl Iterator<Item = Duration> {
     [250, 500, 1000, 2000]
@@ -91,6 +92,13 @@ impl CleanupProof {
             Self::Created { ifindex } => entry.is_tun && entry.ifindex == ifindex,
         }
     }
+}
+
+enum RetryOutcome {
+    Deadline,
+    Unattempted,
+    NoDeletion,
+    Deleted,
 }
 
 pub(super) struct Server<B> {
@@ -164,16 +172,17 @@ impl<B: Backend + 'static> Server<B> {
         let server = Arc::downgrade(self);
         if let Err(error) = thread::Builder::new().spawn(move || {
             let mut resume = None;
-            for delay in retry_delays() {
-                thread::sleep(delay);
+            let mut delays = retry_delays();
+            loop {
+                thread::sleep(delays.next().expect("retry delays never end"));
                 let Some(server) = server.upgrade() else {
                     break;
                 };
                 if !server.retry_needed() {
                     break;
                 }
-                if let Ok(lock) = server.request_lock(server.lock_deadline()) {
-                    resume = server.retry_pass(&lock, None, resume.as_ref());
+                if server.retry_background_pass(&mut resume) {
+                    delays = retry_delays();
                 }
                 if !server.retry_needed() {
                     break;
@@ -197,56 +206,111 @@ impl<B: Backend + 'static> Server<B> {
         true
     }
 
-    fn retry_pass(
-        &self,
-        _lock: &NetworkGuard,
-        deadline: Option<Instant>,
-        resume: Option<&TunName>,
-    ) -> Option<TunName> {
-        let deadline = deadline.map(|end| end.min(Instant::now() + self.backend.retry_wait()));
+    fn pending_names(&self) -> Vec<TunName> {
         let mut names: Vec<_> = self
             .pending
             .lock()
             .expect("pending mutex")
-            .iter()
-            .map(|(name, proof)| (name.clone(), *proof))
+            .keys()
+            .cloned()
             .collect();
-        names.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        if let Some(resume) = resume {
-            // If inline cleanup removed the cursor, start at its successor.
-            let start = names.partition_point(|(name, _)| name.as_str() < resume.as_str());
-            names.rotate_left(start);
-        }
+        names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        names
+    }
+
+    fn retry_background_pass(&self, resume: &mut Option<TunName>) -> bool {
+        let names = self.pending_names();
         let mut unattempted = None;
-        for (name, proof) in names {
-            // Only inline cleanup limits the pass. Each backend command
-            // still has its own deadline.
-            if deadline.is_some_and(|end| Instant::now() >= end) {
+        let mut deleted = false;
+        for remaining in (0..names.len()).rev() {
+            // If the cursor was cleared by inline cleanup, use its successor.
+            let index = resume.as_ref().map_or(0, |name| {
+                names.partition_point(|pending| pending.as_str() < name.as_str())
+            }) % names.len();
+            let name = &names[index];
+            let Ok(lock) = self.request_lock(Instant::now() + self.open_lock_timeout) else {
+                *resume = Some(name.clone());
+                return false;
+            };
+            // Hold the guard for one item: inventory, DNS revert and link
+            // deletion, each bounded by the backend's command timeout.
+            let outcome = self.retry_item(&lock, name, None);
+            drop(lock);
+
+            match outcome {
+                RetryOutcome::Deleted => deleted = true,
+                RetryOutcome::Unattempted => {
+                    unattempted.get_or_insert(name);
+                }
+                RetryOutcome::NoDeletion | RetryOutcome::Deadline => {}
+            }
+            *resume = Some(names[(index + 1) % names.len()].clone());
+            if remaining > 0 {
+                thread::sleep(RETRY_ITEM_PAUSE);
+            }
+        }
+        if let Some(name) = unattempted {
+            *resume = Some(name.clone());
+        }
+        deleted
+    }
+
+    fn retry_inline(&self, lock: &NetworkGuard, deadline: Instant) {
+        let deadline = deadline.min(Instant::now() + self.backend.retry_wait());
+        for name in self.pending_names() {
+            if let RetryOutcome::Deadline = self.retry_item(lock, &name, Some(deadline)) {
                 break;
             }
-            let Ok(existing) = self.backend.existing() else {
-                log_tun("cleanup_inventory_failed", 0, &name);
-                unattempted.get_or_insert(name);
-                continue;
-            };
-            match existing.iter().find(|entry| entry.name == name) {
-                Some(entry) if !proof.matches(entry) => {
-                    log_tun("cleanup_name_conflict", 0, &name);
-                    unattempted.get_or_insert(name);
-                    continue;
-                }
-                Some(_) if deadline.is_some_and(|end| Instant::now() >= end) => break,
-                Some(_) if self.backend.delete_tun(&name).is_err() => {
-                    log_tun("cleanup_retry_failed", 0, &name);
-                    continue;
-                }
-                _ => {}
-            }
-            self.pending.lock().expect("pending mutex").remove(&name);
-            self.release(&name);
-            log_tun("cleanup_released", 0, &name);
         }
-        unattempted
+    }
+
+    fn retry_item(
+        &self,
+        _lock: &NetworkGuard,
+        name: &TunName,
+        deadline: Option<Instant>,
+    ) -> RetryOutcome {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return RetryOutcome::Deadline;
+        }
+        let Some(proof) = self
+            .pending
+            .lock()
+            .expect("pending mutex")
+            .get(name)
+            .copied()
+        else {
+            return RetryOutcome::NoDeletion;
+        };
+        let Ok(existing) = self.backend.existing() else {
+            log_tun("cleanup_inventory_failed", 0, name);
+            return RetryOutcome::Unattempted;
+        };
+        let deleted = match existing.iter().find(|entry| entry.name == *name) {
+            Some(entry) if !proof.matches(entry) => {
+                log_tun("cleanup_name_conflict", 0, name);
+                return RetryOutcome::Unattempted;
+            }
+            Some(_) if deadline.is_some_and(|end| Instant::now() >= end) => {
+                return RetryOutcome::Deadline;
+            }
+            Some(_) => {
+                if self.backend.delete_tun(name).is_err() {
+                    log_tun("cleanup_retry_failed", 0, name);
+                    return RetryOutcome::NoDeletion;
+                }
+                true
+            }
+            None => false,
+        };
+        self.pending.lock().expect("pending mutex").remove(name);
+        self.release(name);
+        log_tun("cleanup_released", 0, name);
+        if deleted {
+            RetryOutcome::Deleted
+        } else {
+            RetryOutcome::NoDeletion
+        }
     }
     pub(super) fn dispatch(
         self: &Arc<Self>,
@@ -484,7 +548,7 @@ impl<B: Backend + 'static> Session<'_, B> {
                     return Err(ErrorCode::RouteConflict);
                 }
                 self.server
-                    .retry_pass(&lock, Some(Instant::now() + RETRY_BUDGET), None);
+                    .retry_inline(&lock, Instant::now() + RETRY_BUDGET);
                 let name = self.server.create(self.uid)?;
                 self.owned.push(name.clone());
                 Ok(Response::Opened(name))
