@@ -1396,3 +1396,72 @@ fn reply_block_ends_at_eof() {
     let error = peer.reply_block(Duration::from_secs(2)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
 }
+
+#[test]
+fn pid_identity_is_available_only_before_the_reap() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 2.0);
+    let mut session = start_scripted(&executable, FakeToken::default());
+    assert_eq!(session.pid(), Some(session.openvpn.child.id()));
+    // `wait` consumes the session; this is the same reap path it calls.
+    let status = session.reap().unwrap();
+    assert!(status.success());
+    assert_eq!(session.pid(), None);
+    let _ = session.stop();
+}
+
+#[test]
+fn wait_clears_the_pid_identity_it_owned() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let identity = Arc::clone(&session.pid);
+    assert!(session.pid().is_some());
+    let outcome = session.wait().unwrap();
+    assert!(outcome.status.success());
+    assert_eq!(identity.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn drop_reaps_and_invalidates_the_shared_identity() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let identity = Arc::clone(&session.pid);
+    let pid = session.pid().unwrap();
+    drop(session);
+    let result = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+    assert_eq!(result, -1, "drop did not reap the child");
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert_eq!(
+        identity.load(Ordering::Acquire),
+        0,
+        "drop reaped PID {pid} but retained the identity"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_exited_observes_the_exit_without_reaping_it() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.5);
+    let session = start_scripted(&executable, FakeToken::default());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = None;
+    while observed.is_none() && Instant::now() < deadline {
+        observed = session.exited();
+        if observed.is_none() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(
+        observed.is_some(),
+        "the child exited without being observed"
+    );
+    assert!(session.pid().is_some(), "exited must not reap the child");
+    let outcome = session.wait().unwrap();
+    assert!(outcome.status.success(), "wait lost the child status");
+}

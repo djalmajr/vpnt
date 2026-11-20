@@ -162,7 +162,6 @@ pub(super) fn run(
         let mut retry_probe = false;
         #[cfg(target_os = "linux")]
         let mut busy_since = None;
-        #[cfg(target_os = "linux")]
         let mut seen_epoch = attempt.restart_epoch();
         loop {
             if canceled() {
@@ -177,7 +176,6 @@ pub(super) fn run(
             if canceled() {
                 return Ok(());
             }
-            #[cfg(target_os = "linux")]
             {
                 // A periodic health check can drain a whole restart between
                 // probes. Failures from before it say nothing about the
@@ -185,9 +183,15 @@ pub(super) fn run(
                 let epoch = attempt.restart_epoch();
                 if epoch != seen_epoch {
                     seen_epoch = epoch;
+                    // Attempts that never restart keep epoch 0 and never
+                    // reach this branch; an OVPN attempt does on both systems.
                     failures = 0;
-                    busy_since = None;
-                    retry_probe = true;
+                    // The probe retry and busy deferral exist only on Linux.
+                    #[cfg(target_os = "linux")]
+                    {
+                        busy_since = None;
+                        retry_probe = true;
+                    }
                 }
             }
             // The due time is always derived from the last actual probe plus the
