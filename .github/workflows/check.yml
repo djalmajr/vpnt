@@ -89,8 +89,20 @@ jobs:
           # use the OpenSSL 3 that softhsm already depends on.
           export PATH="$(brew --prefix openssl@3)/bin:$PATH"
           openssl version
-          module=$(brew list --verbose softhsm | awk '/\/libsofthsm2\.(so|dylib)$/ { print; exit }')
-          test -n "$module" && test -f "$module"
+          brewed=$(brew list --verbose softhsm | awk '/\/libsofthsm2\.(so|dylib)$/ { print; exit }')
+          test -n "$brewed" && test -f "$brewed"
+          # Homebrew's Cellar is group-writable (admin), which the module
+          # admission refuses by design; list through a private copy in the
+          # per-user temporary directory, whose ancestors are not writable by
+          # group or others.
+          private=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)vpnt-softhsm.XXXXXX")
+          trap 'rm -rf "$private"' EXIT
+          module="$private/$(basename "$brewed")"
+          install -m 0644 "$brewed" "$module"
+          otool -L "$module"
+          dir=$(cd "$private" && pwd -P)
+          while [ "$dir" != / ]; do ls -ld "$dir"; dir=$(dirname "$dir"); done
+          ls -ld /
           output=$(mktemp)
           VPNT_TEST_SOFTHSM="$module" cargo +1.99.0 test --locked --test ovpn_token -- --nocapture > "$output" 2>&1 || { cat "$output"; exit 1; }
           cat "$output"
