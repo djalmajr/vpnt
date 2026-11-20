@@ -14,7 +14,7 @@ use base64::{
     engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
 };
 #[cfg(unix)]
-use serde::de::{DeserializeOwned, Deserializer, Error as DeserializeError};
+use serde::de::{Deserializer, Error as DeserializeError};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::fmt;
@@ -325,17 +325,32 @@ fn strict_base64() -> GeneralPurpose {
 }
 
 /// `untagged` enums also accept positional sequences for their struct
-/// variants. Both signer fields are closed objects on the wire: go through a
-/// JSON map first so arrays, strings, numbers and null are refused, while the
-/// existing struct fields keep their own `deny_unknown_fields`.
+/// variants. Both signer fields are closed objects on the wire: only a map is
+/// accepted, so arrays, strings, numbers and null are refused. The entries are
+/// handed on as they arrive, never collected into a map first, so a repeated
+/// key reaches the derived decoder, which refuses it like the rest of the
+/// protocol does, and `deny_unknown_fields` still applies.
 #[cfg(unix)]
 fn deserialize_json_object<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
     D: Deserializer<'de>,
 {
-    let object = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
-    serde_json::from_value(serde_json::Value::Object(object)).map_err(DeserializeError::custom)
+    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
 }
 
 #[cfg(unix)]
@@ -1357,6 +1372,44 @@ mod sign_protocol_tests {
         assert!(parse_reply(&reply_frame(json!({ "certificate": "MAA=" }))).is_ok());
         for result in [json!(["canceled"]), json!(["MAA="]), json!(null), json!(1)] {
             invalid_request(parse_reply(&reply_frame(result)));
+        }
+    }
+
+    #[test]
+    fn a_repeated_key_inside_op_or_result_is_refused() {
+        // json! cannot repeat a key, so the frames are written by hand. Each
+        // pair differs only in the repetition, which proves the frame itself
+        // is otherwise valid.
+        let pss = encoded(&[0x33u8; 32]);
+        let other = encoded(&[0x44u8; 32]);
+        let op = |inner: &str| {
+            format!(
+                r#"{{"type":"sign_request","id":7,"profile":"one","generation":1,"epoch":9,"op":{{{inner}}}}}"#
+            )
+        };
+        let single = format!(r#""op":"sign","padding":"pss","hash":"sha256","data":"{pss}""#);
+        assert!(read_sign(&op(&single)).is_ok());
+        for repeated in [
+            format!(r#"{single},"data":"{other}""#),
+            format!(r#"{single},"hash":"sha256""#),
+            format!(r#"{single},"padding":"pss""#),
+            r#""op":"certificate","op":"certificate""#.to_string(),
+        ] {
+            invalid_request(read_sign(&op(&repeated)));
+        }
+        let result = |inner: &str| {
+            format!(
+                r#"{{"id":"req-1","command":{{"type":"sign_reply","id":7,"profile":"one","generation":1,"epoch":9,"result":{{{inner}}}}}}}"#
+            )
+        };
+        assert!(parse_reply(&result(r#""error":"canceled""#)).is_ok());
+        assert!(parse_reply(&result(r#""certificate":"MAA=""#)).is_ok());
+        for repeated in [
+            r#""error":"canceled","error":"unavailable""#,
+            r#""certificate":"MAA=","certificate":"MAA=""#,
+            r#""signature":"MAA=","signature":"MAA=""#,
+        ] {
+            invalid_request(parse_reply(&result(repeated)));
         }
     }
 
