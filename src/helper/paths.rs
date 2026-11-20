@@ -6,6 +6,12 @@ pub const INSTALLER: &str = env!("VPNT_INSTALLER_PATH");
 pub const STAGING: &str = env!("VPNT_STAGING_PATH");
 pub const PINENTRY: &str = env!("VPNT_PINENTRY_PATH");
 pub const PPP_SUPERVISOR: &str = env!("VPNT_PPP_SUPERVISOR_PATH");
+/// Private base for per-session OVPN directories created by the helper.
+/// The installer owns this subtree (root:admin, 0700). It is not cleaned on
+/// boot: removing orphaned session directories at startup belongs to VPT-19.
+pub fn ovpn_sessions_directory() -> PathBuf {
+    Path::new(STATE).join("ovpn")
+}
 pub const USERS: &str = "/Library/Application Support/vpnt/users";
 pub const STATE: &str = "/Library/Application Support/vpnt";
 

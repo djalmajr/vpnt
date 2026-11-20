@@ -234,6 +234,24 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Fetch locked Rust dependencies for the offline charon oracle
         run: cargo +1.99.0 fetch --locked
+      - name: Exercise the portable OVPN session with the runtime OpenVPN
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: |
+          set -euo pipefail
+          runtime="${GITHUB_WORKSPACE}/target/vpnt-runtime"
+          openvpn="${runtime}/bin/openvpn"
+          test -x "$openvpn"
+          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)"
+          printf '%s\n' "$output"
+          if grep -q 'skipped, VPNT_TEST_OPENVPN is not set' <<<"$output"; then
+            echo 'ovpn_session was skipped' >&2
+            exit 1
+          fi
+          if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"; then
+            echo 'no ovpn_session test passed' >&2
+            exit 1
+          fi
       - name: Verify rendered charon configuration with the original strongSwan parser
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

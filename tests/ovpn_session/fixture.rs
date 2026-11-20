@@ -1,7 +1,9 @@
 //! A throwaway CA, a point-to-point openvpn server and a key-file signer that
 //! stands in for the token by calling `openssl pkeyutl`.
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
     net::{Ipv4Addr, UdpSocket},
     os::unix::fs::DirBuilderExt,
@@ -170,9 +172,19 @@ impl Fixture {
         Server(command.spawn().unwrap())
     }
 
-    /// `extra` lines are appended to the profile.
+    /// Fixture-only directives that the production profile inspector does
+    /// not allow. On macOS they go to trusted launch arguments instead.
+    #[cfg(not(target_os = "linux"))]
+    fn fixture_only(line: &str) -> bool {
+        line.starts_with("log ") || line.starts_with("tls-version-max ")
+    }
+
+    /// `extra` lines are appended to the profile on Linux. On macOS the
+    /// profile is production-shaped (inline CA, allowlisted directives only)
+    /// and the fixture-only options move to `client_extra`.
     pub fn client_config(&self, ports: (u16, u16), extra: &str) -> PathBuf {
         let path = self.path("client.ovpn");
+        #[cfg(target_os = "linux")]
         let config = format!(
             "tls-client\npull\ndev null\nproto udp4\nlocal 127.0.0.1\nlport {}\nremote 127.0.0.1 {}\n\
              ca {}\nremote-cert-tls server\nverb 1\n{extra}",
@@ -180,8 +192,47 @@ impl Fixture {
             ports.0,
             self.path("ca.crt").display()
         );
+        #[cfg(not(target_os = "linux"))]
+        let config = {
+            let profile_extra: String = extra
+                .lines()
+                .filter(|line| !Self::fixture_only(line))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            format!(
+                "tls-client\npull\ndev null\nproto udp4\nremote 127.0.0.1 {}\n\
+                 <ca>\n{}</ca>\nremote-cert-tls server\nverb 1\n{profile_extra}",
+                ports.0,
+                fs::read_to_string(self.path("ca.crt")).unwrap()
+            )
+        };
         fs::write(&path, config).unwrap();
         path
+    }
+
+    /// Trusted argv for options that belong to this fixture, not to an
+    /// imported profile. Linux keeps them in the profile as before.
+    pub fn client_extra(&self, ports: (u16, u16), extra: &str) -> Vec<OsString> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (ports, extra);
+            Vec::new()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut args: Vec<OsString> = vec![
+                "--local".into(),
+                "127.0.0.1".into(),
+                "--lport".into(),
+                ports.1.to_string().into(),
+            ];
+            for line in extra.lines().filter(|line| Self::fixture_only(line)) {
+                let (name, value) = line.split_once(' ').unwrap();
+                args.push(format!("--{name}").into());
+                args.push(value.into());
+            }
+            args
+        }
     }
 
     pub fn signer(&self) -> KeyFileSigner {

@@ -12,8 +12,6 @@ use super::{
     private_dir::PrivateDir,
     signing::Padding,
 };
-#[cfg(target_os = "linux")]
-use std::sync::{Condvar, atomic::AtomicU64};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -24,8 +22,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
@@ -154,6 +152,10 @@ pub enum ConfigSource {
     Path(PathBuf),
     #[cfg(target_os = "linux")]
     Sealed(std::os::fd::OwnedFd),
+    /// Already inspected and normalized profile bytes. Outside Linux the
+    /// session writes them to its private directory before spawning openvpn.
+    #[cfg(not(target_os = "linux"))]
+    Private(Vec<u8>),
 }
 impl From<PathBuf> for ConfigSource {
     fn from(path: PathBuf) -> Self {
@@ -187,6 +189,13 @@ impl ConfigSource {
             return Err(io::Error::last_os_error());
         }
         Ok(Self::Sealed(OwnedFd::from(file)))
+    }
+
+    /// Takes ownership of normalized bytes; the caller has already admitted
+    /// the profile and must not keep a path openvpn could read instead.
+    #[cfg(not(target_os = "linux"))]
+    pub fn private(text: &[u8]) -> Self {
+        Self::Private(text.to_vec())
     }
 }
 
@@ -227,39 +236,54 @@ pub enum Progress {
     BadNetwork(NetworkError),
     AwaitingApproval,
     State(State),
-    #[cfg(target_os = "linux")]
-    Restarting {
-        state: State,
-        epoch: u64,
-    },
+    Restarting { state: State, epoch: u64 },
     Refused(SignError),
 }
 
-#[cfg(target_os = "linux")]
+/// Who acknowledges a management restart before openvpn may sign again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RestartPolicy {
+    /// Release the hold as soon as `Restarting` is published. This keeps the
+    /// pre-VPT-19 macOS behavior (`>HOLD` answered at once).
+    #[default]
+    Immediate,
+    /// The controller withdraws the network and calls
+    /// `Session::release_restart_hold(epoch)`; Linux uses this policy.
+    Caller,
+}
+
 const RESTART_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(target_os = "linux")]
-#[derive(Default)]
 struct RestartHold {
+    policy: RestartPolicy,
     state: Mutex<RestartHoldState>,
     changed: Condvar,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct RestartHoldState {
     pending: Option<u64>,
     stopped: bool,
 }
 
-#[cfg(target_os = "linux")]
 impl RestartHold {
+    fn new(policy: RestartPolicy) -> Self {
+        Self {
+            policy,
+            state: Mutex::new(RestartHoldState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
     fn progress(&self, state: State) -> Progress {
         match state.phase {
-            management::Phase::Reconnecting => Progress::Restarting {
-                state,
-                epoch: self.begin(),
-            },
+            management::Phase::Reconnecting => {
+                let epoch = self.begin();
+                if self.policy == RestartPolicy::Immediate {
+                    self.release(epoch);
+                }
+                Progress::Restarting { state, epoch }
+            }
             _ => Progress::State(state),
         }
     }
@@ -315,10 +339,8 @@ impl RestartHold {
     }
 }
 
-#[cfg(target_os = "linux")]
 struct RestartHoldOwner(Arc<RestartHold>);
 
-#[cfg(target_os = "linux")]
 impl Drop for RestartHoldOwner {
     fn drop(&mut self) {
         self.0.stop();
@@ -341,7 +363,6 @@ pub struct Session {
     finished: mpsc::Receiver<()>,
     progress: mpsc::Receiver<Progress>,
     approval_pending: Arc<AtomicBool>,
-    #[cfg(target_os = "linux")]
     restart_hold: RestartHoldOwner,
     _directory: PrivateDir,
     #[cfg(target_os = "linux")]
@@ -349,28 +370,63 @@ pub struct Session {
 }
 
 impl Session {
-    /// On Linux the child receives SIGTERM when the thread calling this method
-    /// dies; that thread must outlive the session.
+    /// Compatibility entry point: on Linux the child receives SIGTERM when the
+    /// thread calling this method dies, and the caller acknowledges restarts.
+    /// Elsewhere it uses the temp directory and the immediate-release policy.
     pub fn start<C: Into<ConfigSource>>(
         launch: Launch<C>,
         signer: impl Signer,
     ) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let (base, policy) = (PathBuf::from("/tmp"), RestartPolicy::Caller);
+        #[cfg(not(target_os = "linux"))]
+        let (base, policy) = (std::env::temp_dir(), RestartPolicy::default());
+        Self::start_with(launch, signer, &base, policy)
+    }
+
+    /// Starts a session with the base directory and restart policy chosen by
+    /// the caller. Both are kept out of `Launch` so existing launchers compile.
+    pub fn start_with<C: Into<ConfigSource>>(
+        launch: Launch<C>,
+        signer: impl Signer,
+        base: &Path,
+        restart_policy: RestartPolicy,
+    ) -> io::Result<Self> {
         let config = launch.config.into();
+        #[cfg(not(target_os = "linux"))]
+        let base = {
+            let canonical = super::private_dir::validate_base(base)?;
+            super::private_dir::check_socket_limit(&canonical)?;
+            canonical
+        };
         let version = version_for(&launch.openvpn)?;
-        let directory = PrivateDir::create(Path::new("/tmp"))?;
+        let directory = PrivateDir::create(&base)?;
+        #[cfg(not(target_os = "linux"))]
+        let config_path = match &config {
+            // Legacy path callers still get the private, verified file; Linux
+            // keeps its sealed descriptor and never reaches this branch.
+            ConfigSource::Path(path) => {
+                write_private_config(&directory.path, &inspect_path_bytes(path)?)?
+            }
+            ConfigSource::Private(bytes) => write_private_config(&directory.path, bytes)?,
+        };
         let socket = directory.path.join("management");
         let listener = UnixListener::bind(&socket)?;
         let mut command = Command::new(&launch.openvpn);
         command.arg("--config");
+        #[cfg(target_os = "linux")]
         match &config {
             ConfigSource::Path(path) => {
                 command.arg(path);
             }
-            #[cfg(target_os = "linux")]
             ConfigSource::Sealed(_) => {
                 command.arg("/dev/fd/3");
             }
         }
+        // Both macOS branches hand the child the file this session wrote and
+        // verified; the original profile path never reaches the argv.
+        #[cfg(not(target_os = "linux"))]
+        command.arg(&config_path);
         if let Some(dev) = &launch.dev {
             command.args(["--dev", dev, "--dev-type", "tun", "--disable-dco"]);
         }
@@ -445,6 +501,8 @@ impl Session {
                 });
             }
         }
+        // No PDEATHSIG outside Linux: the macOS controller owns the Child and
+        // supervises it; this session only spawns and keeps it (VPT-19).
         let mut openvpn = Openvpn(command.spawn()?);
         let stream = accept(&listener, &mut openvpn.0)?;
         drop(listener);
@@ -465,9 +523,7 @@ impl Session {
         let (done, finished) = mpsc::channel();
         let approval_pending = Arc::new(AtomicBool::new(false));
         let approval = Arc::clone(&approval_pending);
-        #[cfg(target_os = "linux")]
-        let restart_hold = RestartHoldOwner(Arc::default());
-        #[cfg(target_os = "linux")]
+        let restart_hold = RestartHoldOwner(Arc::new(RestartHold::new(restart_policy)));
         let management_hold = Arc::clone(&restart_hold.0);
         let worker = thread::Builder::new()
             .name("vpnt-ovpn-management".into())
@@ -480,7 +536,6 @@ impl Session {
                     &sender,
                     &last_reason,
                     &approval,
-                    #[cfg(target_os = "linux")]
                     Some(&management_hold),
                 );
             })?;
@@ -492,7 +547,6 @@ impl Session {
             finished,
             progress,
             approval_pending,
-            #[cfg(target_os = "linux")]
             restart_hold,
             _directory: directory,
             #[cfg(target_os = "linux")]
@@ -532,7 +586,7 @@ impl Session {
     }
 
     /// Acknowledges the withdrawal for one management restart notification.
-    #[cfg(target_os = "linux")]
+    /// A caller using `RestartPolicy::Immediate` has nothing to acknowledge.
     pub fn release_restart_hold(&self, epoch: u64) {
         self.restart_hold.0.release(epoch);
     }
@@ -540,7 +594,8 @@ impl Session {
     /// Asks openvpn to leave, notifying the server.
     pub fn stop(&self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(2);
-        #[cfg(target_os = "linux")]
+        // A pending withdrawal must not keep the management thread parked
+        // while TERMINATE is written, on any platform.
         self.restart_hold.0.stop();
         loop {
             let mut control = match self.control.try_lock() {
@@ -583,11 +638,11 @@ impl Session {
         #[cfg(target_os = "linux")]
         let drain = {
             let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
-            self.restart_hold.0.stop();
             (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now())
         };
         #[cfg(not(target_os = "linux"))]
         let drain = DRAIN_TIMEOUT;
+        self.restart_hold.0.stop();
         match self.finished.recv_timeout(drain) {
             Err(RecvTimeoutError::Timeout) => {
                 let _ = lock(&self.control).shutdown(Shutdown::Both);
@@ -611,6 +666,93 @@ impl Drop for Openvpn {
             let _ = self.0.wait();
         }
     }
+}
+
+/// Compatibility path for callers that only have a profile path: admit and
+/// normalize it here, then let `write_private_config` own the openvpn copy.
+#[cfg(not(target_os = "linux"))]
+fn inspect_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    const LIMIT: u64 = 256 * 1024;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "OVPN profile failed the owner, mode or link check",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OVPN profile is too large",
+        ));
+    }
+    let inspected = super::profile::inspect(&bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OVPN profile rejected by inspection",
+        )
+    })?;
+    Ok(inspected.normalized.into_bytes())
+}
+
+/// Writes inspected bytes once into the private session directory. The file is
+/// re-opened without following links and checked before its path reaches
+/// `--config`; nothing outside this directory is ever used as the config.
+#[cfg(not(target_os = "linux"))]
+fn write_private_config(directory: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = directory.join("config");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    drop(file);
+    verify_private_config(&path, bytes)?;
+    Ok(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_private_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private config failed the owner, mode or link check",
+        ));
+    }
+    let mut content = Vec::new();
+    file.take(bytes.len() as u64 + 1)
+        .read_to_end(&mut content)?;
+    if content != bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private config content changed",
+        ));
+    }
+    Ok(())
 }
 
 fn accept(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> {
@@ -656,7 +798,6 @@ fn drive(
         progress,
         reason,
         &AtomicBool::new(false),
-        #[cfg(target_os = "linux")]
         None,
     );
 }
@@ -668,7 +809,7 @@ fn drive_with_approval(
     progress: &mpsc::Sender<Progress>,
     reason: &Mutex<Option<Reason>>,
     approval_pending: &AtomicBool,
-    #[cfg(target_os = "linux")] restart_hold: Option<&RestartHold>,
+    restart_hold: Option<&RestartHold>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
@@ -737,7 +878,6 @@ fn drive_with_approval(
             Event::EnvEnd => None,
             Event::Env { .. } | Event::MalformedEnv | Event::Malformed => unreachable!(),
             Event::Hold => {
-                #[cfg(target_os = "linux")]
                 if let Some(hold) = restart_hold {
                     hold.send_release(control);
                     continue;
@@ -752,7 +892,6 @@ fn drive_with_approval(
                 Ok(padding) => {
                     // A HOLD may arrive before the restart state. The token is
                     // still called only after that restart's routes are withdrawn.
-                    #[cfg(target_os = "linux")]
                     if let Some(hold) = restart_hold
                         && !hold.await_withdrawal()
                     {
@@ -774,9 +913,6 @@ fn drive_with_approval(
                 if state.reason.is_some() {
                     *lock(reason) = state.reason;
                 }
-                #[cfg(not(target_os = "linux"))]
-                let update = Progress::State(state);
-                #[cfg(target_os = "linux")]
                 let update = match restart_hold {
                     Some(hold) => hold.progress(state),
                     None => Progress::State(state),
