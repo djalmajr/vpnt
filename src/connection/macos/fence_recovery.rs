@@ -97,14 +97,22 @@ fn route_absent_in(table: &Snapshot, route: Route) -> Result<bool, ()> {
 }
 
 pub(crate) fn ovpn_network_absent(interface: &Interface) -> io::Result<bool> {
-    if Interfaces::read()?
+    ovpn_network_absent_with(interface, Interfaces::read, Snapshot::read)
+}
+
+pub(crate) fn ovpn_network_absent_with(
+    interface: &Interface,
+    read_interfaces: impl FnOnce() -> io::Result<Interfaces>,
+    read_routes: impl FnOnce() -> Result<Snapshot, crate::connection::routes::Error>,
+) -> io::Result<bool> {
+    if read_interfaces()?
         .entries
         .values()
-        .any(|entry| entry.name == interface.name || entry.index == interface.index)
+        .any(|entry| entry.name == interface.name && entry.index == interface.index)
     {
         return Ok(false);
     }
-    let routes = Snapshot::read().map_err(|_| io::Error::other("route observation"))?;
+    let routes = read_routes().map_err(|_| io::Error::other("route observation"))?;
     Ok(routes
         .records
         .iter()

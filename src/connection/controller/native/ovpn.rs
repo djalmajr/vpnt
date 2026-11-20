@@ -209,7 +209,7 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
     fn withdraw_config(&mut self) -> Result<bool, Failure> {
         self.network_active = false;
         let expires = self.network.now() + RESTART_WITHDRAWAL_TIMEOUT;
-        self.network.journal_cleanup()?;
+        let journaled = self.network.journal_cleanup();
         self.network.close_dns()?;
 
         let at = || Failure::at(Step::Routes);
@@ -233,6 +233,9 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                 if self.network.now() >= expires {
                     return Err(at());
                 }
+                // Finish withdrawing the old network even if the write
+                // failed. Keep HOLD closed and stop through normal cleanup.
+                journaled?;
                 self.network.journal_withdrawn()?;
                 if self.network.now() >= expires {
                     return Err(at());
@@ -333,9 +336,7 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
 
     fn cleanup(&mut self) -> bool {
         self.network_active = false;
-        if self.network.journal_cleanup().is_err() {
-            return false;
-        }
+        let _ = self.network.journal_cleanup();
         let dns_closed = self.network.close_dns().is_ok();
         if !self.stopped {
             self.stopped = true;
@@ -523,8 +524,10 @@ impl Journal {
 
     fn update(&mut self, change: impl FnOnce(&mut Fence)) -> io::Result<()> {
         if let Some(record) = &mut self.record {
-            change(record);
-            fence::write(&self.root, self.owner, record)?;
+            let mut next = record.clone();
+            change(&mut next);
+            fence::write(&self.root, self.owner, &next)?;
+            *record = next;
         }
         Ok(())
     }
@@ -754,7 +757,7 @@ impl Network for NativeNetwork<'_> {
     fn finish(&mut self) -> Result<(), Failure> {
         let at = || Failure::at(Step::Routes);
         if let Some((link, _, _)) = &self.address
-            && !link.absent(&Interfaces::read().map_err(|_| at())?)
+            && link.matches(&Interfaces::read().map_err(|_| at())?)
         {
             return Err(at());
         }
@@ -767,6 +770,7 @@ impl Network for NativeNetwork<'_> {
     fn journal_cleanup(&mut self) -> Result<(), Failure> {
         self.journal
             .update(|record| record.incomplete = false)
+            .inspect_err(|error| eprintln!("ovpn_cleanup_journal_failed: {:?}", error.kind()))
             .map_err(|_| Failure::at(Step::Routes))
     }
 
@@ -779,6 +783,7 @@ impl Network for NativeNetwork<'_> {
                 record.service_id = None;
                 record.dns_key = None;
             })
+            .inspect_err(|error| eprintln!("ovpn_withdrawn_journal_failed: {:?}", error.kind()))
             .map_err(|_| Failure::at(Step::Routes))
     }
 

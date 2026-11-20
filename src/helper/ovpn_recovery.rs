@@ -42,37 +42,7 @@ pub(super) fn recover(controller: &ControllerLock, uid: u32) {
             return;
         }
     };
-    let referenced = match sessions.referenced_sessions() {
-        Ok(names) => names,
-        Err(error) => {
-            warn(c"session_inventory", error);
-            return;
-        }
-    };
-    match fence::scan(sessions.state, sessions.owner, uid, &BTreeSet::new()) {
-        Ok(records) => {
-            for (_, _, record) in records {
-                match record {
-                    Ok(record) if record.kind == Kind::Ovpn => {
-                        if let Err((stage, error)) =
-                            sessions.recover_fence(&record, process_absent, network_absent)
-                        {
-                            warn(stage, error);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn(c"read_fence", fence_error(error)),
-                }
-            }
-        }
-        Err(error) => {
-            warn(c"scan_fences", fence_error(error));
-            return;
-        }
-    }
-    if let Err(error) = sessions.sweep(&referenced, warn) {
-        warn(c"sweep", error);
-    }
+    sessions.recover_user(uid, process_absent, network_absent, warn);
 }
 
 type Failure = (&'static CStr, io::Error);
@@ -290,47 +260,101 @@ impl<'a> Sessions<'a> {
         })
     }
 
+    fn recover_user(
+        &self,
+        uid: u32,
+        mut await_process: impl FnMut(&ProcessIdentity) -> io::Result<()>,
+        mut await_network: impl FnMut(&Interface) -> io::Result<()>,
+        mut report: impl FnMut(&CStr, io::Error),
+    ) {
+        // Snapshot references before any directed cleanup, so the sweep
+        // also excludes directories whose recovery was attempted this time.
+        let referenced = self.referenced_sessions();
+        match self.user_fence_entries(uid) {
+            Ok(Some(entries)) => {
+                // Snapshot the names before removing any entries from this directory.
+                for entry in entries.collect::<Vec<_>>() {
+                    let record =
+                        entry.and_then(|entry| self.read_user_fence(uid, &entry.file_name()));
+                    match record {
+                        Ok(record) if record.kind == Kind::Ovpn => {
+                            if let Err((stage, error)) =
+                                self.recover_fence(&record, &mut await_process, &mut await_network)
+                            {
+                                report(stage, error);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => report(c"read_fence", error),
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => report(c"scan_fences", error),
+        }
+        match referenced {
+            Ok(referenced) => {
+                if let Err(error) = self.sweep(&referenced, &mut report) {
+                    report(c"sweep", error);
+                }
+            }
+            Err(error) => report(c"session_inventory", error),
+        }
+    }
+
+    fn fence_directory(&self, path: &Path) -> io::Result<Option<File>> {
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(DIRECTORY)
+            .open(path)
+        {
+            Ok(directory) => {
+                private(&directory, self.owner)?;
+                Ok(Some(directory))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn user_fence_entries(&self, uid: u32) -> io::Result<Option<fs::ReadDir>> {
+        let path = self.state.join("fences");
+        let Some(directory) = self.fence_directory(&path)? else {
+            return Ok(None);
+        };
+        let name = CString::new(uid.to_string()).expect("decimal UID");
+        let directory = match open_at(&directory, &name, DIRECTORY) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        private(&directory, self.owner)?;
+        fs::read_dir(path.join(uid.to_string())).map(Some)
+    }
+
+    fn read_user_fence(&self, uid: u32, name: &std::ffi::OsStr) -> io::Result<Fence> {
+        let name = name.to_str().ok_or_else(invalid)?;
+        let (profile, generation) = name
+            .strip_suffix(".json")
+            .and_then(|stem| stem.rsplit_once('-'))
+            .ok_or_else(invalid)?;
+        let generation = generation.parse::<u64>().map_err(|_| invalid())?;
+        if name != format!("{profile}-{generation}.json") {
+            return Err(invalid());
+        }
+        fence::read(self.state, self.owner, uid, profile, generation)
+            .map_err(fence_error)?
+            .ok_or_else(invalid)
+    }
+
     fn recover_fence(
         &self,
         record: &Fence,
         mut await_process: impl FnMut(&ProcessIdentity) -> io::Result<()>,
         await_network: impl FnOnce(&Interface) -> io::Result<()>,
     ) -> Result<(), Failure> {
-        let bad_record = || (c"validate_fence", invalid());
-        let name = record
-            .session_dir
-            .as_deref()
-            .and_then(fence::ovpn_session_dir_name)
-            .ok_or_else(bad_record)?;
-        if record.processes.is_empty()
-            || record.processes.iter().any(|process| {
-                process.pid == 0
-                    || i32::try_from(process.pid).is_err()
-                    || process.start_sec <= 0
-                    || !(0..1_000_000).contains(&process.start_usec)
-                    || !Path::new(&process.program).is_absolute()
-            })
-            || record.sink.is_some()
-            || !record.retired.is_empty()
-        {
-            return Err(bad_record());
-        }
-        if let Some(interface) = &record.interface {
-            if !interface
-                .name
-                .strip_prefix("utun")
-                .is_some_and(|unit| unit.parse::<u32>().is_ok())
-                || interface.index == 0
-                || record
-                    .routes
-                    .iter()
-                    .any(|route| u32::from(route.route.interface) != interface.index)
-            {
-                return Err(bad_record());
-            }
-        } else if !record.routes.is_empty() {
-            return Err(bad_record());
-        }
+        let name =
+            Self::checked_session_name(record).map_err(|error| (c"validate_fence", error))?;
         for process in &record.processes {
             await_process(process).map_err(|error| (c"process", error))?;
         }
@@ -346,6 +370,44 @@ impl<'a> Sessions<'a> {
             record.generation,
         )
         .map_err(|error| (c"remove_fence", fence_error(error)))
+    }
+
+    fn checked_session_name(record: &Fence) -> io::Result<&str> {
+        let name = record
+            .session_dir
+            .as_deref()
+            .and_then(fence::ovpn_session_dir_name)
+            .ok_or_else(invalid)?;
+        if record.processes.is_empty()
+            || record.processes.iter().any(|process| {
+                process.pid == 0
+                    || i32::try_from(process.pid).is_err()
+                    || process.start_sec <= 0
+                    || !(0..1_000_000).contains(&process.start_usec)
+                    || !Path::new(&process.program).is_absolute()
+            })
+            || record.sink.is_some()
+            || !record.retired.is_empty()
+        {
+            return Err(invalid());
+        }
+        if let Some(interface) = &record.interface {
+            if !interface
+                .name
+                .strip_prefix("utun")
+                .is_some_and(|unit| unit.parse::<u32>().is_ok())
+                || interface.index == 0
+                || record
+                    .routes
+                    .iter()
+                    .any(|route| u32::from(route.route.interface) != interface.index)
+            {
+                return Err(invalid());
+            }
+        } else if !record.routes.is_empty() {
+            return Err(invalid());
+        }
+        Ok(name)
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
@@ -374,16 +436,9 @@ impl<'a> Sessions<'a> {
 
     fn referenced_sessions(&self) -> io::Result<BTreeSet<String>> {
         let path = self.state.join("fences");
-        let directory = match OpenOptions::new()
-            .read(true)
-            .custom_flags(DIRECTORY)
-            .open(&path)
-        {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-            Err(error) => return Err(error),
+        let Some(_directory) = self.fence_directory(&path)? else {
+            return Ok(BTreeSet::new());
         };
-        private(&directory, self.owner)?;
         let mut names = BTreeSet::new();
         // The base is shared by all UIDs. The controller lock and private
         // root prevent another controller from changing this inventory.
@@ -397,16 +452,8 @@ impl<'a> Sessions<'a> {
                 .ok_or_else(invalid)?;
             for record in fence::read_all(self.state, self.owner, uid).map_err(fence_error)? {
                 if record.kind == Kind::Ovpn {
-                    // An old or invalid record cannot prove its directory
-                    // unreferenced. Leave the sweep for a later startup.
-                    let name = record
-                        .session_dir
-                        .as_deref()
-                        .and_then(fence::ovpn_session_dir_name)
-                        .ok_or_else(invalid)?;
-                    if !names.insert(name.to_owned()) {
-                        return Err(invalid());
-                    }
+                    // A legacy or invalid record leaves the global inventory incomplete.
+                    names.insert(Self::checked_session_name(&record)?.to_owned());
                 }
             }
         }
@@ -781,12 +828,161 @@ mod tests {
     }
 
     #[test]
-    fn inventory_refuses_two_fences_pointing_to_the_same_private_dir() {
+    fn sweep_preserves_duplicate_references_without_suspending_other_cleanup() {
         let fixture = Fixture::new();
         fixture.save(fixture.uid);
         fixture.save(fixture.uid + 1);
         fixture.directory(&fixture.base.join(PROTECTED));
-        assert!(fixture.sessions().referenced_sessions().is_err());
+        let orphan = fixture.base.join(ORPHAN);
+        fixture.directory(&orphan);
+        let sessions = fixture.sessions();
+        let referenced = sessions.referenced_sessions().unwrap();
+        sessions
+            .sweep(&referenced, |stage, error| panic!("{stage:?}: {error}"))
+            .unwrap();
         assert!(fixture.base.join(PROTECTED).join("config").exists());
+        assert!(!orphan.exists());
+    }
+    #[test]
+    fn startup_recovers_valid_fence_and_suspends_sweep_on_incomplete_inventory() {
+        for invalid_other in [false, true] {
+            let fixture = Fixture::new();
+            let valid = fixture.save(fixture.uid);
+            let legacy = Fence {
+                profile: "legacy".into(),
+                session_dir: None,
+                ..valid
+            };
+            fence::write(&fixture.root, fixture.owner, &legacy).unwrap();
+            if invalid_other {
+                let other_uid = fixture.uid + 1;
+                fixture.save(other_uid);
+                fs::write(fixture.fence_path(other_uid), b"{").unwrap();
+            }
+            let active = fixture.base.join(PROTECTED);
+            let orphan = fixture.base.join(ORPHAN);
+            fixture.directory(&active);
+            fixture.directory(&orphan);
+            let mut warnings = Vec::new();
+            fixture.sessions().recover_user(
+                fixture.uid,
+                |_| Ok(()),
+                |_| Ok(()),
+                |stage, error| warnings.push((stage.to_owned(), error.kind())),
+            );
+            assert!(
+                !fixture.fence_path(fixture.uid).exists(),
+                "valid fence remains"
+            );
+            assert!(!active.exists());
+            assert!(
+                orphan.join("config").exists(),
+                "incomplete sweep deleted an orphan"
+            );
+            assert_eq!(
+                fence::read(&fixture.root, fixture.owner, fixture.uid, "legacy", 1).unwrap(),
+                Some(legacy)
+            );
+            if invalid_other {
+                assert_eq!(fs::read(fixture.fence_path(fixture.uid + 1)).unwrap(), b"{");
+            }
+            assert!(warnings.contains(&(c"validate_fence".to_owned(), io::ErrorKind::InvalidData)));
+        }
+    }
+
+    #[test]
+    fn startup_recovers_when_only_another_users_fence_is_invalid() {
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        fixture.save(fixture.uid + 1);
+        fs::write(fixture.fence_path(fixture.uid + 1), b"{").unwrap();
+        fixture.directory(&fixture.base.join(PROTECTED));
+        fixture
+            .sessions()
+            .recover_user(fixture.uid, |_| Ok(()), |_| Ok(()), |_, _| {});
+        assert!(!fixture.fence_path(fixture.uid).exists());
+    }
+
+    #[test]
+    fn startup_recovers_past_an_unexpected_current_user_fence_filename() {
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        let unknown = fixture.fence_path(fixture.uid).with_file_name("unexpected");
+        fs::write(&unknown, b"{").unwrap();
+        fixture.directory(&fixture.base.join(PROTECTED));
+        let orphan = fixture.base.join(ORPHAN);
+        fixture.directory(&orphan);
+        fixture
+            .sessions()
+            .recover_user(fixture.uid, |_| Ok(()), |_| Ok(()), |_, _| {});
+        assert!(!fixture.fence_path(fixture.uid).exists());
+        assert_eq!(fs::read(unknown).unwrap(), b"{");
+        assert!(orphan.join("config").exists());
+    }
+
+    #[test]
+    fn startup_recovers_reused_utun_name_only_after_recorded_index_routes_disappear() {
+        use crate::connection::{
+            macos::{
+                fence_recovery::ovpn_network_absent_with,
+                routing::{Record, Snapshot},
+                vip::ovpn_link::fixture_interfaces,
+            },
+            routes::Key,
+        };
+
+        let fixture = Fixture::new();
+        let item = fixture.save(fixture.uid);
+        let directory = fixture.base.join(PROTECTED);
+        fixture.directory(&directory);
+        let sessions = fixture.sessions();
+        let observe = |interface: &Interface, name, index, route_index| {
+            let absent = ovpn_network_absent_with(
+                interface,
+                || Ok(fixture_interfaces(&[(name, index)])),
+                || {
+                    Ok(Snapshot {
+                        records: vec![Record {
+                            key: Key {
+                                network: "192.0.2.0/24".parse().unwrap(),
+                                scope: 0,
+                            },
+                            interface: route_index,
+                            flags: 0,
+                            gateway: None,
+                            source: None,
+                        }],
+                    })
+                },
+            )?;
+            if absent {
+                Ok(())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        };
+        for (name, index, route_index) in
+            [("utun12", 12, 44), ("utun12", 44, 12), ("utun44", 12, 12)]
+        {
+            let error = sessions
+                .recover_fence(
+                    &item,
+                    |_| Ok(()),
+                    |interface| observe(interface, name, index, route_index),
+                )
+                .unwrap_err();
+            assert_eq!(error.0, c"interface");
+            assert!(fixture.fence_path(fixture.uid).exists());
+            assert!(directory.join("config").exists());
+        }
+        sessions.recover_user(
+            fixture.uid,
+            |_| Ok(()),
+            |interface| observe(interface, "utun12", 44, 44),
+            |stage, error| panic!("{stage:?}: {error}"),
+        );
+        assert!(!directory.exists());
+        assert!(!fixture.fence_path(fixture.uid).exists());
+        assert!(observe(item.interface.as_ref().unwrap(), "utun44", 12, 44).is_ok());
     }
 }

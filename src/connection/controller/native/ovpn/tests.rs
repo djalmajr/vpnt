@@ -284,6 +284,8 @@ enum Effect {
     Routes(u32, usize),
     Dns(ServiceId, Vec<Ipv4Addr>, Vec<String>),
     CloseDns,
+    JournalCleanup,
+    JournalWithdrawn,
     Withdraw,
     WaitForWithdrawal,
     Release(u64),
@@ -442,6 +444,20 @@ impl Network for FakeNetwork {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn journal_cleanup(&mut self) -> Result<(), Failure> {
+        if self.fail == Some(Effect::JournalCleanup) {
+            return Err(Failure::at(Step::Routes));
+        }
+        Ok(())
+    }
+
+    fn journal_withdrawn(&mut self) -> Result<(), Failure> {
+        if self.fail == Some(Effect::JournalWithdrawn) {
+            return Err(Failure::at(Step::Routes));
+        }
+        Ok(())
     }
 
     fn now(&self) -> Instant {
@@ -993,6 +1009,28 @@ fn cleanup_reaps_before_network_release_and_retries_without_second_stop() {
 }
 
 #[test]
+fn restart_withdraws_resources_and_keeps_hold_closed_when_journal_write_fails() {
+    for failure in [Effect::JournalCleanup, Effect::JournalWithdrawn] {
+        let mut cycle = fixture();
+        cycle.open();
+        cycle.take_effects();
+        cycle.network.current = Interfaces::default();
+        cycle.network.fail = Some(failure);
+        cycle.push(restart(8, None));
+        assert_eq!(cycle.ready(&profile()).unwrap_err().step, Step::Routes);
+        assert_eq!(cycle.take_effects(), [Effect::CloseDns, Effect::Withdraw]);
+
+        cycle.session.exit.set(Some(None));
+        cycle.session.absent = true;
+        assert!(cycle.cleanup());
+        assert_eq!(
+            cycle.take_effects(),
+            [Effect::CloseDns, Effect::Stop, Effect::Reap, Effect::Finish]
+        );
+    }
+}
+
+#[test]
 fn cleanup_forces_a_live_child_within_the_stop_budget() {
     for stop_error in [Some(io::ErrorKind::TimedOut), None] {
         let mut cycle = fixture();
@@ -1110,6 +1148,10 @@ fn expired_management_hold_fails_even_if_the_child_ignores_terminate() {
 }
 
 fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnUtun)) {
+    with_owned_native_network(|mut network, link| check_network(&mut network, link));
+}
+
+fn with_owned_native_network(check_network: impl FnOnce(NativeNetwork<'_>, &OvpnUtun)) {
     let root = Root::new();
     let uid = unsafe { libc::geteuid() };
     fs::OpenOptions::new()
@@ -1121,7 +1163,7 @@ fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnU
     let controller = ControllerLock::fixture(&root.0, uid).unwrap();
     let mut backend = NativeBackend::fixture(&controller).unwrap();
     backend.fixture_route_io();
-    let mut network = NativeNetwork {
+    let network = NativeNetwork {
         owner: Owner {
             uid: 501,
             profile: "ovpn".into(),
@@ -1142,7 +1184,7 @@ fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnU
         &fixture_interfaces(&[("utun40", 40)]),
     )
     .unwrap();
-    check_network(&mut network, &link);
+    check_network(network, &link);
 }
 
 fn fixture_process() -> Process {
@@ -1222,6 +1264,35 @@ fn native_ovpn_propagates_initial_journal_failure_before_network() {
         );
         assert!(network.journal.record.is_none());
         assert!(network.address.is_none());
+    });
+}
+
+#[test]
+fn native_ovpn_cleanup_stops_child_and_preserves_fence_when_journal_write_fails() {
+    with_owned_native_network(|mut network, _| {
+        let directory = paths::ovpn_sessions_directory().join("vpnt-ovpn-111-a-0");
+        network
+            .journal_spawn(&directory, &fixture_process())
+            .unwrap();
+        let original_owner = network.journal.owner;
+        let path = network.journal.root.join("fences/501/ovpn-1.json");
+        let original = fs::read(&path).unwrap();
+        let tunnel = FakeTunnel::default();
+        let effects = tunnel.effects.clone();
+        tunnel.exit.set(Some(None));
+        let mut cycle = Cycle::new(tunnel, network);
+        cycle.network.journal.owner ^= 1;
+
+        assert!(!cycle.cleanup(), "child absence has not been confirmed");
+        assert_eq!(*effects.borrow(), [Effect::Stop, Effect::Reap]);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(cycle.network.journal.record.as_ref().unwrap().incomplete);
+
+        cycle.session.absent = true;
+        cycle.network.journal.owner = original_owner;
+        assert!(cycle.cleanup());
+        cycle.network.journal.remove().unwrap();
+        assert!(!path.exists());
     });
 }
 
