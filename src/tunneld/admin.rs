@@ -148,8 +148,7 @@ impl Directory {
         Ok(lock)
     }
 
-    fn lock_exclusive(&self, timeout: Duration) -> io::Result<File> {
-        let lock = self.open_or_create_lock()?;
+    fn lock_exclusive(&self, lock: File, timeout: Duration) -> io::Result<File> {
         self.check_lock(&lock)?;
         let deadline = Instant::now() + timeout;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -168,16 +167,19 @@ impl Directory {
         ))
     }
 
+    fn open_existing_lock(&self) -> io::Result<File> {
+        open_at(&self.parent, LOCK_NAME, libc::O_RDWR | POLICY_FLAGS, 0)
+    }
+
     fn open_or_create_lock(&self) -> io::Result<File> {
-        let flags = libc::O_RDWR | POLICY_FLAGS;
-        match open_at(&self.parent, LOCK_NAME, flags, 0) {
+        match self.open_existing_lock() {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             result => return result,
         }
         match open_at(
             &self.parent,
             LOCK_NAME,
-            flags | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | POLICY_FLAGS | libc::O_CREAT | libc::O_EXCL,
             0o600,
         ) {
             Ok(lock) => {
@@ -190,9 +192,7 @@ impl Directory {
                 lock.set_permissions(Permissions::from_mode(0o600))?;
                 Ok(lock)
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                open_at(&self.parent, LOCK_NAME, flags, 0)
-            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self.open_existing_lock(),
             Err(error) => Err(error),
         }
     }
@@ -448,7 +448,20 @@ fn update_with_timeout(
             "policy changed while awaiting confirmation",
         ));
     }
-    let _lock = current.lock_exclusive(timeout)?;
+    let lock = if revoke {
+        match current.open_existing_lock() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "policy lock is missing; run policy apply first",
+                ));
+            }
+            result => result?,
+        }
+    } else {
+        current.open_or_create_lock()?
+    };
+    let _lock = current.lock_exclusive(lock, timeout)?;
     if !previous.unchanged(&current.read()?)? {
         return Err(io::Error::other(
             "policy changed while awaiting confirmation",
@@ -648,6 +661,33 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_revoke_requires_an_existing_lock() {
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        let path = fixture.path();
+        let before = File::open(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(fixture.lock_path()).unwrap();
+
+        let args = ["revoke", "1000", "ipsec", "vpn.example", "500"].map(OsString::from);
+        let change = parse_change(&args, io::empty()).unwrap();
+        let result = update(&fixture.store, change, |_, revoke, _| {
+            assert!(revoke);
+            Ok(true)
+        });
+
+        assert!(!fixture.lock_path().try_exists().unwrap());
+        assert!(same_file(&before, &File::open(&path).unwrap()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "policy lock is missing; run policy apply first"
+        );
+    }
+
+    #[test]
     fn terminal_confirmation_shows_policy_and_requires_the_exact_answer() {
         for (answer, expected) in [(b"no\n".as_slice(), false), (b"yes\n", true)] {
             let (mut master_fd, mut slave_fd) = (-1, -1);
@@ -788,7 +828,9 @@ mod tests {
             io::ErrorKind::WouldBlock,
         );
         drop(reader);
-        let admin = directory.lock_exclusive(LOCK_TIMEOUT).unwrap();
+        let admin = directory
+            .lock_exclusive(directory.open_existing_lock().unwrap(), LOCK_TIMEOUT)
+            .unwrap();
         assert!(same_file(&admin, &inode).unwrap());
         assert_eq!(
             flock(&inode, libc::LOCK_SH | libc::LOCK_NB)
@@ -831,7 +873,13 @@ mod tests {
         let directory = fixture.store.open().unwrap();
         let rejected = |dir: &Directory| {
             assert!(dir.lock_shared().is_err());
-            assert!(dir.lock_exclusive(LOCK_TIMEOUT).is_err());
+            for opened in [dir.open_existing_lock(), dir.open_or_create_lock()] {
+                assert!(
+                    opened
+                        .and_then(|lock| dir.lock_exclusive(lock, LOCK_TIMEOUT))
+                        .is_err()
+                );
+            }
         };
         for mode in [0o640, 0o604] {
             fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
