@@ -38,11 +38,17 @@ fn newly_discovered_blocked_profile_requires_negotiated_capability() {
 #[test]
 fn old_helper_echoes_probe_and_never_receives_verify_cleanup() {
     let mut peer = Peer::new("flow");
-    let mut broker = Broker::new(Some(peer.take()), Secrets::new());
-    let until = Instant::now() + Duration::from_secs(4);
+    let mut broker = broker_with(&mut peer, Secrets::new());
+    let until = Instant::now() + Duration::from_secs(15);
     while !broker.ready || broker.cleanup_probe.is_some() {
         broker.poll();
-        assert!(Instant::now() < until, "capability probe timed out");
+        assert!(
+            Instant::now() < until,
+            "capability probe timed out: helper={}, ready={}, states={:?}",
+            broker.helper,
+            broker.ready,
+            states(&broker),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(!broker.cleanup_capable);
@@ -67,11 +73,17 @@ fn old_helper_echoes_probe_and_never_receives_verify_cleanup() {
 #[test]
 fn busy_connect_after_capability_snapshot_requests_fresh_cleanup_state() {
     let mut peer = Peer::new("flow");
-    let mut broker = Broker::new(Some(peer.take()), Secrets::new());
-    let until = Instant::now() + Duration::from_secs(4);
+    let mut broker = broker_with(&mut peer, Secrets::new());
+    let until = Instant::now() + Duration::from_secs(15);
     while !broker.ready || broker.cleanup_probe.is_some() {
         broker.poll();
-        assert!(Instant::now() < until);
+        assert!(
+            Instant::now() < until,
+            "capability probe timed out: helper={}, ready={}, states={:?}",
+            broker.helper,
+            broker.ready,
+            states(&broker),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     broker.cleanup_capable = true;
@@ -146,13 +158,16 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
     let mut first = Peer::new("restart");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(first.take()), secrets);
+    let mut broker = broker_with(&mut first, secrets);
     let attempts = Arc::new(AtomicUsize::new(0));
     let calls = attempts.clone();
     let (send, receive) = std::sync::mpsc::channel();
     broker.retry = Some(retry::Retry::fixture(move || {
         calls.fetch_add(1, Ordering::Relaxed);
         let mut peer = Peer::new("flow");
+        // `resume` arms the broker's startup deadline the moment this closure
+        // returns the client, so the replacement peer must already be reading.
+        peer_started(&peer);
         let client = peer.take();
         send.send(peer).unwrap();
         Ok(client)
@@ -190,6 +205,7 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
     second.advance();
     wait(&mut broker, |s| s.vpns[0].state == State::Connected);
     assert_eq!(loads.load(Ordering::Relaxed), 2);
+    let quit = std::time::SystemTime::now();
     dispatch(&mut broker, Command::Quit {});
     let until = Instant::now() + Duration::from_millis(400);
     while Instant::now() < until {
@@ -197,7 +213,56 @@ fn runtime_restarts_only_after_its_child_exits_and_never_replays_a_connection() 
         assert_eq!(attempts.load(Ordering::Relaxed), 1, "quit cannot relaunch");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(second.cleaned());
+    // A quit must not relaunch after the old child has actually exited.
+    let reaped = Instant::now() + Duration::from_secs(15);
+    while !broker.client.as_ref().unwrap().finished() {
+        assert!(
+            Instant::now() < reaped,
+            "fixture child exit guard timed out: helper={}, states={:?}",
+            broker.helper,
+            states(&broker),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    broker.poll();
+    assert_eq!(broker.snapshot().helper, "missing");
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        1,
+        "quit cannot relaunch after the previous child exits"
+    );
+    // Synchronization guard only; the 3.5 s readiness limit is checked below
+    // against the marker mtime written by the fixture at the source.
+    let cleaned = Instant::now() + Duration::from_secs(15);
+    while !second.cleaned() {
+        assert!(
+            Instant::now() < cleaned,
+            "fixture cleanup guard timed out: marker={:?}",
+            second.marker.with_extension("cleaned"),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = std::fs::metadata(second.marker.with_extension("cleaned"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(quit)
+        .unwrap_or_else(|early| {
+            // A coarse file clock can stamp a cleanup that followed the quit
+            // within a tick slightly before it; that is no delay. A larger
+            // gap means the clock stepped back, which would hide a delay.
+            assert!(
+                early.duration() <= Duration::from_millis(50),
+                "cleanup marker stamped {} ms before the quit",
+                early.duration().as_millis()
+            );
+            Duration::ZERO
+        });
+    assert!(
+        elapsed <= Duration::from_millis(3500),
+        "cleanup after quit took {} ms",
+        elapsed.as_millis()
+    );
     drop(broker);
     drop(second);
 }
@@ -215,6 +280,9 @@ fn runtime_recovery_revalidates_every_snapshot_and_backs_off_on_unavailable_laun
             return Err(Error::Unavailable);
         }
         let mut peer = Peer::new(if call == 2 { "version" } else { "flow" });
+        // `resume` arms the broker's startup deadline the moment this closure
+        // returns the client, so the replacement peer must already be reading.
+        peer_started(&peer);
         let client = peer.take();
         send.send(peer).unwrap();
         Ok(client)
@@ -288,9 +356,15 @@ s.close()
         command.args(["-c", &script]);
         let client = Client::fixture(command).unwrap();
         let mut broker = Broker::new(Some(client), Secrets::new());
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + Duration::from_secs(15);
         while !broker.client.as_ref().unwrap().finished() {
-            assert!(Instant::now() < until, "fixture child did not exit");
+            assert!(
+                Instant::now() < until,
+                "fixture child did not exit: helper={}, ready={}, states={:?}",
+                broker.helper,
+                broker.ready,
+                states(&broker),
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let snapshot = broker.snapshot();
@@ -336,9 +410,15 @@ s.close()
             command: protocol::Command::Snapshot {},
         })
         .unwrap();
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + Duration::from_secs(15);
     while !broker.client.as_ref().unwrap().finished() {
-        assert!(Instant::now() < until, "fixture child did not exit");
+        assert!(
+            Instant::now() < until,
+            "fixture child did not exit: helper={}, ready={}, states={:?}",
+            broker.helper,
+            broker.ready,
+            states(&broker),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(broker.snapshot().helper, "missing");
@@ -460,19 +540,29 @@ fn cleanup_verification_snapshot_tracks_correlation_failure_and_channel_loss() {
         )
         .unwrap();
     assert!(started.vpns[0].cleanup_verifying);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let lost = loop {
         let snapshot = broker.snapshot();
         if snapshot.helper == "missing" {
             break snapshot;
         }
-        assert!(Instant::now() < deadline, "helper channel did not close");
+        assert!(
+            Instant::now() < deadline,
+            "helper channel did not close: helper={}, ready={}, states={:?}",
+            broker.helper,
+            broker.ready,
+            states(&broker),
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     assert_eq!(lost.helper, "missing");
     assert!(lost.vpns.iter().all(|v| !v.cleanup_verifying));
+    let finished_until = Instant::now() + Duration::from_secs(15);
     while !finished() {
-        assert!(Instant::now() < deadline, "fixture child did not finish");
+        assert!(
+            Instant::now() < finished_until,
+            "fixture child did not finish after its channel closed"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }

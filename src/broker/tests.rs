@@ -48,16 +48,58 @@ impl SecretStore for Secrets {
         Ok(())
     }
 }
+fn states<S: SecretStore>(b: &Broker<S>) -> Vec<(&str, State)> {
+    b.connections
+        .iter()
+        .map(|(id, c)| (id.as_str(), c.view.state))
+        .collect()
+}
+fn generations<S: SecretStore>(b: &Broker<S>) -> Vec<(&str, u64)> {
+    b.connections
+        .iter()
+        .map(|(id, c)| (id.as_str(), c.generation))
+        .collect()
+}
+// Synchronization guard, not a latency requirement: a 3 s pause anywhere in
+// the fixture plus scheduling must pass, and a stalled caller still fails with
+// its own location and the state it observed.
+#[track_caller]
 fn wait<S: SecretStore>(b: &mut Broker<S>, mut predicate: impl FnMut(&Snapshot) -> bool) {
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(15);
     loop {
         let s = b.snapshot();
         if predicate(&s) {
             return;
         }
-        assert!(Instant::now() < until, "broker condition timed out");
+        assert!(
+            Instant::now() < until,
+            "broker condition timed out at {}: helper={}, states={:?}, generations={:?}",
+            std::panic::Location::caller(),
+            b.helper,
+            states(b),
+            generations(b),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+// `Broker::new` arms its own 5 s startup deadline, so the fixture peer must
+// already be inside its read loop before the broker exists. Same guard shape:
+// a 3 s pause in the peer start is fine, a stalled peer still fails here.
+fn peer_started(peer: &Peer) {
+    let started = peer.marker.with_extension("started");
+    let until = Instant::now() + Duration::from_secs(15);
+    while !started.exists() {
+        assert!(
+            Instant::now() < until,
+            "fixture startup guard timed out: started=false marker={}",
+            started.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn broker_with<S: SecretStore>(peer: &mut Peer, secrets: S) -> Broker<S> {
+    peer_started(peer);
+    Broker::new(Some(peer.take()), secrets)
 }
 fn write_stale(peer: &Peer, contents: impl AsRef<[u8]>) {
     let temporary = peer.marker.with_extension("stale.tmp");
@@ -78,16 +120,19 @@ fn build_identity_marks_old_helpers_outdated_without_disabling_tunnels() {
     ] {
         let mut peer = Peer::new(mode);
         let root = peer.root().to_owned();
-        let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+        let mut broker = broker_with(&mut peer, Secrets::new());
         if !packaged {
             broker.expected_build = None;
         }
-        let until = Instant::now() + Duration::from_secs(4);
+        let until = Instant::now() + Duration::from_secs(15);
         while !broker.ready {
             broker.poll();
             assert!(
                 Instant::now() < until,
-                "{mode} did not produce an initial snapshot"
+                "{mode} did not produce an initial snapshot: helper={}, states={:?}, generations={:?}",
+                broker.helper,
+                states(&broker),
+                generations(&broker),
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -128,7 +173,7 @@ fn completed_attempts_request_diagnostics_and_publish_the_redacted_reply() {
         let sink = saved.clone();
         let uid = unsafe { libc::geteuid() };
         let sink_home = home.clone();
-        let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+        let mut broker = broker_with(&mut peer, Secrets::new());
         broker.diagnostics.with_sink(move |text| {
             diagnostics::save_at(&sink_home, uid, &text).unwrap();
             sink.lock().unwrap().push(text);
@@ -154,10 +199,16 @@ fn completed_attempts_request_diagnostics_and_publish_the_redacted_reply() {
             let generation = broker.connections["one"].generation;
             write_stale(&peer, serde_json::to_vec(&serde_json::json!({"id":"one", "generation":generation, "state":case, "failures":0})).unwrap());
         }
-        let until = Instant::now() + Duration::from_secs(4);
+        let until = Instant::now() + Duration::from_secs(15);
         while saved.lock().unwrap().is_empty() {
             broker.poll();
-            assert!(Instant::now() < until, "diagnostic not saved after {case}");
+            assert!(
+                Instant::now() < until,
+                "diagnostic not saved after {case}: helper={}, states={:?}, generation={:?}",
+                broker.helper,
+                states(&broker),
+                generations(&broker),
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let text = saved.lock().unwrap()[0].clone();
@@ -190,7 +241,7 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
     let mut peer = Peer::new("flow");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     assert_eq!(loads.load(Ordering::Relaxed), 0);
     let s = dispatch(&mut broker, Command::Toggle { id: "one".into() });
@@ -203,7 +254,7 @@ fn helper_acceptance_never_claims_traffic_and_cancel_rejects_late_connected_gene
         .unwrap()
         .id
         .clone();
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let waiting = loop {
         let snapshot = broker.snapshot();
         if broker.connections["one"]
@@ -263,7 +314,7 @@ fn incompatible_helper_or_expired_keychain_load_cannot_receive_credentials_or_st
         let mut peer = Peer::new(mode);
         let secrets = Secrets::new();
         let loads = secrets.loads.clone();
-        let mut broker = Broker::new(Some(peer.take()), secrets);
+        let mut broker = broker_with(&mut peer, secrets);
         wait(&mut broker, |s| s.helper == "outdated");
         assert_eq!(
             broker
@@ -279,7 +330,7 @@ fn incompatible_helper_or_expired_keychain_load_cannot_receive_credentials_or_st
     let mut peer = Peer::new("flow");
     let mut secrets = Secrets::new();
     secrets.delay = Duration::from_millis(30);
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     assert!(
         broker
@@ -295,7 +346,7 @@ fn incompatible_helper_or_expired_keychain_load_cannot_receive_credentials_or_st
 #[test]
 fn helper_loss_removes_connected_indications_without_turning_process_exit_into_off() {
     let mut peer = Peer::new("exit");
-    let mut broker = Broker::new(Some(peer.take()), Secrets::new());
+    let mut broker = broker_with(&mut peer, Secrets::new());
     wait(&mut broker, |s| s.helper == "installed");
     dispatch(&mut broker, Command::Toggle { id: "one".into() });
     wait(&mut broker, |s| {
@@ -351,7 +402,7 @@ fn native_isolated_keychain_supplies_the_child_without_putting_credentials_in_th
             .unwrap(),
     ));
     let store = crate::keychain::MacKeychain::from_keychain(chain.0.as_ref().unwrap().clone());
-    let mut broker = Broker::new(Some(peer.take()), store);
+    let mut broker = broker_with(&mut peer, store);
     wait(&mut broker, |s| s.helper == "installed");
     assert!(broker.snapshot().vpns.iter().all(|v| !v.has_password));
     broker
@@ -396,11 +447,16 @@ fn an_initial_connected_snapshot_is_rejected_before_any_credential_load() {
     let mut peer = Peer::new("unearned");
     let secrets = Secrets::new();
     let loads = secrets.loads.clone();
-    let mut b = Broker::new(Some(peer.take()), secrets);
-    let until = Instant::now() + Duration::from_secs(4);
+    let mut b = broker_with(&mut peer, secrets);
+    let until = Instant::now() + Duration::from_secs(15);
     while b.starting() {
         b.poll();
-        assert!(Instant::now() < until);
+        assert!(
+            Instant::now() < until,
+            "the fixture did not produce a snapshot to reject: helper={}, states={:?}",
+            b.helper,
+            states(&b),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     let s = b.snapshot();

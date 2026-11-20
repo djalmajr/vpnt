@@ -6,7 +6,7 @@ use crate::preferences::ProbeInterval;
 fn interval_reconciles_to_v3_and_the_next_connect_carries_it_without_loading() {
     let mut peer = Peer::new("flow");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     // The positive recording barrier: the peer has processed the startup
     // snapshot, so the absence checks below are not empty-file artifacts.
@@ -15,13 +15,18 @@ fn interval_reconciles_to_v3_and_the_next_connect_carries_it_without_loading() {
         "the peer command recorder must be live before negative assertions"
     );
     set_preferences(&mut broker, preferences(ProbeInterval::THIRTY, true, false));
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(15);
     while !intervals(&peer)
         .iter()
         .any(|value| value["type"] == "set_probe_interval" && value["interval"] == 30)
     {
         broker.poll();
-        assert!(Instant::now() < until, "interval was not reconciled");
+        assert!(
+            Instant::now() < until,
+            "interval was not reconciled: helper={}, intervals={:?}",
+            broker.helper,
+            intervals(&peer),
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -64,7 +69,7 @@ fn interval_reconciles_to_v3_and_the_next_connect_carries_it_without_loading() {
 fn v3_shaped_old_protocol_version_is_incompatible_before_any_credential_or_connect() {
     let mut peer = Peer::new("old");
     let (secrets, calls, _) = RecordingSecrets::new();
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "outdated");
     assert!(calls.recorded().is_empty());
     assert!(run(&mut broker, Command::Toggle { id: "one".into() }).is_err());
