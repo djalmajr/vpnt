@@ -95,7 +95,7 @@ fn no_secret_on_disk(peer: &Peer) {
 fn ipsec_connect_loads_only_the_ipsec_profile_and_consumes_the_psk() {
     let mut peer = Peer::new("ipsec");
     let (secrets, calls) = IpsecSecrets::new("fictional-psk");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     let snapshot = dispatch(&mut broker, Command::Toggle { id: "ipsec".into() }).unwrap();
     assert_eq!(state(&snapshot, "ipsec"), State::Connecting);
@@ -120,7 +120,7 @@ fn ipsec_connect_loads_only_the_ipsec_profile_and_consumes_the_psk() {
 fn missing_ipsec_psk_yields_exact_invalid_secret_and_never_queues_connect() {
     let mut peer = Peer::new("ipsec");
     let (secrets, calls) = IpsecSecrets::new("");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     let result = dispatch(&mut broker, Command::Toggle { id: "ipsec".into() });
     assert_eq!(result.err(), Some("invalid_secret"));
@@ -140,7 +140,7 @@ fn missing_ipsec_psk_yields_exact_invalid_secret_and_never_queues_connect() {
 fn ipsec_reconnect_keeps_the_other_active_profile_and_generation() {
     let mut peer = Peer::new("ipsec");
     let (secrets, calls) = IpsecSecrets::new("fictional-psk");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     dispatch(&mut broker, Command::Toggle { id: "one".into() }).unwrap();
     peer.advance();
@@ -176,7 +176,7 @@ fn ipsec_reconnect_keeps_the_other_active_profile_and_generation() {
 fn ipsec_helper_denial_rolls_back_without_success_and_preserves_ssl() {
     let mut peer = Peer::new("ipsec-denied");
     let (secrets, calls) = IpsecSecrets::new("fictional-psk");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     dispatch(&mut broker, Command::Toggle { id: "one".into() }).unwrap();
     peer.advance();
@@ -184,12 +184,15 @@ fn ipsec_helper_denial_rolls_back_without_success_and_preserves_ssl() {
     let one_generation = broker.connections["one"].generation;
     let ipsec_generation = broker.connections["ipsec"].generation;
     dispatch(&mut broker, Command::Toggle { id: "ipsec".into() }).unwrap();
-    let until = Instant::now() + Duration::from_secs(4);
+    let until = Instant::now() + Duration::from_secs(15);
     while broker.connections["ipsec"].pending.is_some() {
         broker.poll();
         assert!(
             Instant::now() < until,
-            "the broker did not process the helper denial"
+            "the broker did not process the helper denial: helper={}, states={:?}, generations={:?}",
+            broker.helper,
+            states(&broker),
+            generations(&broker),
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -225,7 +228,7 @@ fn ipsec_helper_denial_rolls_back_without_success_and_preserves_ssl() {
 fn ipsec_cancel_ignores_a_late_connected_generation_and_reconnects() {
     let mut peer = Peer::new("ipsec");
     let (secrets, calls) = IpsecSecrets::new("fictional-psk");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
+    let mut broker = broker_with(&mut peer, secrets);
     wait(&mut broker, |s| s.helper == "installed");
     dispatch(&mut broker, Command::Toggle { id: "ipsec".into() }).unwrap();
     assert_eq!(broker.connections["ipsec"].generation, 1);

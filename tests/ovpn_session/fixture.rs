@@ -3,7 +3,8 @@
 use std::{
     env, fs,
     io::Write,
-    net::UdpSocket,
+    net::{Ipv4Addr, UdpSocket},
+    os::unix::fs::DirBuilderExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -27,8 +28,10 @@ impl Fixture {
             return None;
         };
         let directory = env::temp_dir().join(format!("vpnt-ovpn-it-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
         let fixture = Self {
             directory,
             openvpn: PathBuf::from(openvpn),
@@ -110,6 +113,10 @@ impl Fixture {
 
     /// A default server: it offers TLS 1.3 and RSA-PSS, like the real ones.
     pub fn server(&self, ports: (u16, u16)) -> Server {
+        self.server_with_address(ports, Ipv4Addr::new(10, 81, 0, 2))
+    }
+
+    pub fn server_with_address(&self, ports: (u16, u16), address: Ipv4Addr) -> Server {
         let mut command = Command::new(&self.openvpn);
         command
             .current_dir(&self.directory)
@@ -142,7 +149,7 @@ impl Fixture {
                 "--push",
                 "topology subnet",
                 "--push",
-                "ifconfig 10.81.0.2 255.255.255.0",
+                &format!("ifconfig {address} 255.255.255.0"),
                 "--push",
                 "route-gateway 10.81.0.1",
                 "--push",

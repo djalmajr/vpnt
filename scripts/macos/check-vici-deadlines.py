@@ -50,6 +50,7 @@ def main():
         ('cancellation-waits-whole-deadline', budget, lambda s: replace(s, 'milliseconds.min(25)', 'milliseconds'), canceled),
         ('expired-budget-accepted', budget, lambda s: replace(s, 'Instant::now() >= self.expires', 'false'), expired),
         ('caller-deadline-extended', budget, lambda s: replace(s, 'let budget = Self { expires, cancel };', 'let budget = Self { expires: expires + Duration::from_secs(5), cancel };'), deadline),
+        ('connect-timeout-extended', client, lambda s: replace(s, 'Self::open(path, owner, Budget::new(timeout)?)', 'Self::open(path, owner, Budget::new(timeout + Duration::from_secs(5))?)'), path),
         ('cancel-reported-as-timeout', 'src/helper/vici.rs', lambda s: replace(s, '            Self::Canceled\n', '            Self::Timeout\n'), canceled),
         ('os-abort-reported-as-cancel', 'src/helper/vici.rs', lambda s: replace(s, 'if error\n            .get_ref()', 'if error.kind() == io::ErrorKind::ConnectionAborted || error\n            .get_ref()'), preflight),
         ('peer-uid-unchecked', client, lambda s: replace(s, 'peer_uid(&stream)? != owner', 'peer_uid(&stream)? == owner.wrapping_add(2)'), preflight),
