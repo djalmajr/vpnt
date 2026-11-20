@@ -38,6 +38,11 @@ use std::{
     sync::{Arc, Mutex, atomic::AtomicUsize},
 };
 
+/// Synchronization guard, not a latency requirement: a loaded runner may
+/// delay the worker thread, while a stalled step still fails with the state
+/// it observed.
+const SYNC_GUARD: Duration = Duration::from_secs(15);
+
 #[derive(Default)]
 struct Observed {
     configs: Vec<Config>,
@@ -481,6 +486,9 @@ enum RecoveryEvent {
     ApprovalPending(bool),
     CompleteRestart(mpsc::Sender<()>),
     Expire,
+    /// Expires the window and queues a phase for the same health check, so no
+    /// worker poll can fall between the two.
+    ExpireThen(Phase),
     ProbeSucceeds,
     SetProbeBusy(bool),
     BlockProbe {
@@ -550,6 +558,16 @@ impl Attempt for RecoveryAttempt {
                     self.attempt.reconnect_started =
                         Some(Instant::now() - Duration::from_secs(120));
                 }
+                RecoveryEvent::ExpireThen(phase) => {
+                    self.attempt.reconnect_started =
+                        Some(Instant::now() - Duration::from_secs(120));
+                    self.attempt
+                        .tunnel
+                        .as_mut()
+                        .unwrap()
+                        .events
+                        .push_back(state_event(phase));
+                }
                 RecoveryEvent::ProbeSucceeds => self.probes_pass = true,
                 RecoveryEvent::SetProbeBusy(busy) => self.busy = busy,
                 RecoveryEvent::BlockProbe {
@@ -576,7 +594,7 @@ impl Attempt for RecoveryAttempt {
         }
         if let Some((entered, release)) = self.blocked_probe.take() {
             let _ = entered.send(());
-            let _ = release.recv_timeout(Duration::from_secs(3));
+            let _ = release.recv_timeout(SYNC_GUARD);
         }
         self.last_probe_busy = self.busy;
         if self.last_probe_busy {
@@ -676,7 +694,7 @@ impl RecoveryWorker {
                 release: gate,
             })
             .unwrap();
-        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        ready.recv_timeout(SYNC_GUARD).unwrap();
         (blocked, release)
     }
 
@@ -686,7 +704,7 @@ impl RecoveryWorker {
             .send(RecoveryEvent::ObserveNextHealth(report))
             .unwrap();
         release.send(()).unwrap();
-        observed.recv_timeout(Duration::from_secs(2)).unwrap()
+        observed.recv_timeout(SYNC_GUARD).unwrap()
     }
 
     fn expect(&self, state: ConnectionState, failures: u32) {
@@ -697,7 +715,7 @@ impl RecoveryWorker {
     }
 
     fn wait<T>(&self, predicate: impl Fn() -> Option<T>) -> T {
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + SYNC_GUARD;
         loop {
             if let Some(result) = predicate() {
                 return result;
@@ -768,9 +786,9 @@ fn soft_restart_discards_a_failed_probe_already_in_flight() {
             release: gate,
         })
         .unwrap();
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    ready.recv_timeout(SYNC_GUARD).unwrap();
     worker.probe();
-    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+    blocked.recv_timeout(SYNC_GUARD).unwrap();
 
     worker.phase(Phase::Reconnecting);
     let (report, observed) = mpsc::channel();
@@ -779,10 +797,7 @@ fn soft_restart_discards_a_failed_probe_already_in_flight() {
         .send(RecoveryEvent::ObserveNextHealth(report))
         .unwrap();
     release.send(()).unwrap();
-    let status = observed
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .unwrap();
+    let status = observed.recv_timeout(SYNC_GUARD).unwrap().unwrap();
     assert_eq!(
         (status.state, status.failures),
         (ConnectionState::Reconnecting, 0)
@@ -808,9 +823,9 @@ fn completed_restarts_discard_an_in_flight_probe_and_reset_the_failure_streak() 
             release: gate,
         })
         .unwrap();
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    ready.recv_timeout(SYNC_GUARD).unwrap();
     worker.probe();
-    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+    blocked.recv_timeout(SYNC_GUARD).unwrap();
 
     for _ in 0..2 {
         worker.phase(Phase::Reconnecting);
@@ -839,18 +854,15 @@ fn completed_restarts_discard_an_in_flight_probe_and_reset_the_failure_streak() 
         .send(RecoveryEvent::ObserveNextHealth(report))
         .unwrap();
     release.send(()).unwrap();
-    let status = observed
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap()
-        .unwrap();
+    let status = observed.recv_timeout(SYNC_GUARD).unwrap().unwrap();
     // The failed pre-restart probe never publishes. The automatic retry is
     // the first failure of the restored tunnel, even with a 60 s cadence.
     assert_eq!(
         (status.state, status.failures),
         (ConnectionState::Unresponsive, 2)
     );
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
-    blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+    ready.recv_timeout(SYNC_GUARD).unwrap();
+    blocked.recv_timeout(SYNC_GUARD).unwrap();
     worker
         .events
         .send(RecoveryEvent::SetProbeBusy(false))
@@ -868,7 +880,7 @@ fn probe_deferral_keeps_manual_request_and_failure_streak() {
 
     let (entered, release) = worker.arm_busy_probe();
     worker.probe();
-    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered.recv_timeout(SYNC_GUARD).unwrap();
     let before = worker.status.lock().unwrap().take();
     assert_eq!(before.unwrap().failures, 1);
     worker
@@ -887,11 +899,14 @@ fn probe_deferral_counts_a_failure_after_one_cadence() {
     let worker = RecoveryWorker::start();
     let (entered, release) = worker.arm_busy_probe();
     worker.probe();
-    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered.recv_timeout(SYNC_GUARD).unwrap();
     // Keep the slot busy at every poll while the clock is shortened.
     let before = *worker.status.lock().unwrap();
     assert_eq!(worker.after_probe(release), before);
-    worker.interval.set(Duration::from_millis(10));
+    // The status slot keeps only the latest value. A 250 ms cadence between
+    // failure samples gives the reader more time before a later sample
+    // overwrites the first failure; a count per poll is already caught above.
+    worker.interval.set(Duration::from_millis(250));
     worker.expect(ConnectionState::Unresponsive, 1);
 }
 
@@ -900,7 +915,7 @@ fn probe_deferral_allows_cancellation_while_the_slot_is_busy() {
     let mut worker = RecoveryWorker::start();
     let (entered, release) = worker.arm_busy_probe();
     worker.probe();
-    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    entered.recv_timeout(SYNC_GUARD).unwrap();
     let before = *worker.status.lock().unwrap();
     assert_eq!(worker.after_probe(release), before);
     worker.canceled.store(true, Ordering::Release);
@@ -914,10 +929,15 @@ fn soft_restart_deadline_is_not_extended_by_repeated_reconnects() {
     let worker = RecoveryWorker::start();
     worker.phase(Phase::Reconnecting);
     worker.expect(ConnectionState::Reconnecting, 0);
-    worker.events.send(RecoveryEvent::Expire).unwrap();
-    worker.phase(Phase::Reconnecting);
-    worker.probe();
+    // One health check sees the expired window and the repeated phase. Only an
+    // extended deadline keeps the worker in recovery; otherwise the end of the
+    // window probes once by itself, so a manual request would race with it.
+    worker
+        .events
+        .send(RecoveryEvent::ExpireThen(Phase::Reconnecting))
+        .unwrap();
     worker.expect(ConnectionState::Unresponsive, 1);
+    assert_eq!(worker.probes.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1119,7 +1139,7 @@ fn real_session_exit_waits_for_auth_failure_on_fifty_attempts() {
             },
             NoStart,
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + SYNC_GUARD;
         let failure = loop {
             match attempt.ready() {
                 Err(e) => break Some(e),
@@ -1194,7 +1214,7 @@ fn probe_deadline_cancellation_and_single_inflight_job() {
             gate: gate.clone(),
             worker: Some(worker),
         };
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        started_rx.recv_timeout(SYNC_GUARD).unwrap();
         if cancel_while_waiting {
             canceled.store(true, Ordering::Release);
         }
@@ -1205,7 +1225,7 @@ fn probe_deadline_cancellation_and_single_inflight_job() {
             cv.notify_all();
         }
         guard.worker.take().unwrap().join().unwrap();
-        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        finished_rx.recv_timeout(SYNC_GUARD).unwrap();
         assert_eq!(
             answer.expect("probe failed to respect deadline or cancellation"),
             (false, false, false, true)
@@ -1414,14 +1434,14 @@ fn replacement_waits_for_a_pending_signature_before_opening_the_token() {
                 .expect("the fixture is not a loadable module");
             opened.send(failure).unwrap();
         });
-        starting.recv_timeout(Duration::from_secs(2)).unwrap();
+        starting.recv_timeout(SYNC_GUARD).unwrap();
         let while_signing = opening.recv_timeout(Duration::from_millis(100));
         drop(signing);
         assert!(matches!(
             while_signing,
             Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        let failure = opening.recv_timeout(Duration::from_secs(2)).unwrap();
+        let failure = opening.recv_timeout(SYNC_GUARD).unwrap();
         replacement.join().unwrap();
         assert_eq!(failure.step, Step::Profile);
     });
@@ -1617,7 +1637,7 @@ fn dead_session_is_not_healthy_while_the_signer_is_blocked() {
         },
         NoStart,
     );
-    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    started.recv_timeout(SYNC_GUARD).unwrap();
     let began = Instant::now();
     let mut result = Ok(false);
     while began.elapsed() < Duration::from_millis(1500) {
@@ -1685,17 +1705,17 @@ fn complete_restart_between_probes_resets_failure_streak() {
             release: gate,
         })
         .unwrap();
-    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    ready.recv_timeout(SYNC_GUARD).unwrap();
     let (processed, done) = mpsc::channel();
     worker
         .events
         .send(RecoveryEvent::CompleteRestart(processed))
         .unwrap();
-    done.recv_timeout(Duration::from_secs(2)).unwrap();
+    done.recv_timeout(SYNC_GUARD).unwrap();
 
     // No manual request: the restart itself must schedule the next probe.
     blocked
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(SYNC_GUARD)
         .expect("restart should schedule a probe without a manual request");
     let _ = worker.status.lock().unwrap().take();
     let status = worker
@@ -1899,7 +1919,7 @@ with socket.socket(socket.AF_UNIX) as sock:
         Err(mpsc::RecvTimeoutError::Timeout),
         "signer entered before the controller withdrew the routes"
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + SYNC_GUARD;
     let result = loop {
         let result = attempt.healthy();
         if attempt.reconnect_started.is_some() || result.is_err() {
@@ -1913,15 +1933,11 @@ with socket.socket(socket.AF_UNIX) as sock:
     } else {
         result.unwrap();
         assert_eq!(
-            signing
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap(),
+            signing.lock().unwrap().recv_timeout(SYNC_GUARD).unwrap(),
             configured.then_some((0, 0))
         );
         // Wait until the peer has read the whole signature before terminating.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SYNC_GUARD;
         while !scratch.0.join("signed").exists() {
             assert!(
                 Instant::now() < deadline,
