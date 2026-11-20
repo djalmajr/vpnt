@@ -302,8 +302,8 @@ impl Policy {
         if bytes.len() > maximum {
             return Err(invalid("policy exceeds byte limit"));
         }
-        let Named(mut policy) =
-            serde_json::from_slice::<Named<Self>>(bytes).map_err(io::Error::other)?;
+        let Named(mut policy) = serde_json::from_slice::<Named<Self>>(bytes)
+            .map_err(|_| invalid("invalid policy document"))?;
         if policy.version != protocol::VERSION || policy.entries.len() > MAX_ENTRIES {
             return Err(invalid("unsupported policy version or too many entries"));
         }

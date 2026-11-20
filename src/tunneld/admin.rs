@@ -10,9 +10,14 @@ use std::{
     },
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 const POLICY_PATH: &str = "/etc/vpnt/tunnel-policy.json";
+const LOCK_NAME: &CStr = c"tunnel-policy.lock";
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const DIRECTORY_FLAGS: c_int = libc::O_DIRECTORY | libc::O_NOFOLLOW;
 const POLICY_FLAGS: c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
@@ -136,16 +141,74 @@ fn open_at(parent: &File, name: &CStr, flags: c_int, mode: libc::mode_t) -> io::
 }
 
 impl Directory {
-    pub(super) fn lock_shared(&self) -> io::Result<()> {
-        self.lock(libc::LOCK_SH | libc::LOCK_NB)
+    pub(super) fn lock_shared(&self) -> io::Result<File> {
+        let lock = open_at(&self.parent, LOCK_NAME, libc::O_RDONLY | POLICY_FLAGS, 0)?;
+        self.check_lock(&lock)?;
+        flock(&lock, libc::LOCK_SH | libc::LOCK_NB)?;
+        Ok(lock)
     }
 
-    fn lock(&self, operation: c_int) -> io::Result<()> {
-        // The protected parent directory is the stable lock inode. Each
-        // operation opens it independently and holds it through its decision.
-        // SAFETY: this File owns a valid descriptor for the lifetime of the lock.
-        if unsafe { libc::flock(self.parent.as_raw_fd(), operation) } != 0 {
-            return Err(io::Error::last_os_error());
+    fn lock_exclusive(&self, timeout: Duration) -> io::Result<File> {
+        let lock = self.open_or_create_lock()?;
+        self.check_lock(&lock)?;
+        let deadline = Instant::now() + timeout;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(()) => return Ok(lock),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(remaining.min(LOCK_RETRY_INTERVAL));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for policy lock",
+        ))
+    }
+
+    fn open_or_create_lock(&self) -> io::Result<File> {
+        let flags = libc::O_RDWR | POLICY_FLAGS;
+        match open_at(&self.parent, LOCK_NAME, flags, 0) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
+        }
+        match open_at(
+            &self.parent,
+            LOCK_NAME,
+            flags | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        ) {
+            Ok(lock) => {
+                if lock.metadata()?.gid() != self.group {
+                    // SAFETY: the descriptor owns the newly created regular lock file.
+                    if unsafe { libc::fchown(lock.as_raw_fd(), self.owner, self.group) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                lock.set_permissions(Permissions::from_mode(0o600))?;
+                Ok(lock)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                open_at(&self.parent, LOCK_NAME, flags, 0)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn check_lock(&self, lock: &File) -> io::Result<()> {
+        let meta = lock.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != self.owner
+            || meta.gid() != self.group
+            || meta.nlink() != 1
+            || meta.mode() & 0o7777 != 0o600
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "insecure policy lock",
+            ));
         }
         Ok(())
     }
@@ -233,6 +296,14 @@ impl Directory {
         }
         Ok(())
     }
+}
+
+fn flock(file: &File, operation: c_int) -> io::Result<()> {
+    // SAFETY: this File owns a valid descriptor for the lifetime of the lock.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 struct Temporary<'a> {
@@ -345,6 +416,15 @@ fn update(
     change: Change,
     confirm: impl FnOnce(&Key, bool, &[u8]) -> io::Result<bool>,
 ) -> io::Result<()> {
+    update_with_timeout(store, change, LOCK_TIMEOUT, confirm)
+}
+
+fn update_with_timeout(
+    store: &PolicyStore,
+    change: Change,
+    timeout: Duration,
+    confirm: impl FnOnce(&Key, bool, &[u8]) -> io::Result<bool>,
+) -> io::Result<()> {
     let directory = store.open()?;
     let previous = directory.read()?;
     let mut next = previous.policy.clone();
@@ -363,8 +443,13 @@ fn update(
     }
 
     let current = store.open()?;
-    current.lock(libc::LOCK_EX)?;
-    if !same_file(&directory.parent, &current.parent)? || !previous.unchanged(&current.read()?)? {
+    if !same_file(&directory.parent, &current.parent)? {
+        return Err(io::Error::other(
+            "policy changed while awaiting confirmation",
+        ));
+    }
+    let _lock = current.lock_exclusive(timeout)?;
+    if !previous.unchanged(&current.read()?)? {
         return Err(io::Error::other(
             "policy changed while awaiting confirmation",
         ));
@@ -408,10 +493,15 @@ pub fn run(args: &[OsString]) -> i32 {
             confirm_tty(&mut tty, key, revoke, bytes)
         })
     })();
+    report_result(result, io::stderr().lock())
+}
+
+fn report_result(result: io::Result<()>, mut stderr: impl Write) -> i32 {
     match result {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("vpnt-tunneld: {error}");
+            writeln!(stderr, "vpnt-tunneld: {error}")
+                .expect("write policy administration diagnostic");
             1
         }
     }
@@ -465,6 +555,10 @@ impl PolicyFixture {
         self.store.root.join(POLICY_PATH.trim_start_matches('/'))
     }
 
+    pub(super) fn lock_path(&self) -> PathBuf {
+        self.path().with_file_name("tunnel-policy.lock")
+    }
+
     pub(super) fn install(&self) {
         update(
             &self.store,
@@ -504,6 +598,7 @@ mod tests {
         });
         assert_eq!(no_tty.unwrap_err().raw_os_error(), Some(libc::ENXIO));
         assert!(!fixture.path().exists());
+        assert!(!fixture.lock_path().exists());
         assert_eq!(
             update(&fixture.store, apply(), |_, _, _| Ok(false))
                 .unwrap_err()
@@ -511,6 +606,7 @@ mod tests {
             io::ErrorKind::PermissionDenied
         );
         assert!(!fixture.path().exists());
+        assert!(!fixture.lock_path().exists());
 
         let mut displayed = Vec::new();
         update(&fixture.store, apply(), |key, revoke, bytes| {
@@ -524,6 +620,13 @@ mod tests {
         let path = fixture.path();
         assert_eq!(fs::read(&path).unwrap(), displayed);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+        let lock = File::open(fixture.lock_path()).unwrap();
+        let meta = lock.metadata().unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.nlink()),
+            (fixture.store.owner, fixture.store.group, 1)
+        );
         let before = File::open(&path).unwrap();
         let args = ["revoke", "1000", "ipsec", "vpn.example", "500"].map(OsString::from);
         let change = parse_change(&args, io::empty()).unwrap();
@@ -540,7 +643,8 @@ mod tests {
             fs::read(&path).unwrap(),
             b"{\"version\":1,\"entries\":[]}\n"
         );
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert!(same_file(&lock, &File::open(fixture.lock_path()).unwrap()).unwrap());
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
     }
 
     #[test]
@@ -601,6 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_schema_diagnostic_is_fixed() {
+        for snapshot in [
+            br#"{"version":1,"entries":[],"fixture_field":"fixture_value"}"#.as_slice(),
+            br#"{"version":1,"entries":[],"fixture_field\u001b[31m":"fixture_value\u001b[31m"}"#,
+            br#"{"version":"fixture_value\u001b[31m","entries":[]}"#,
+        ] {
+            let Err(error) = parse_change(&["apply".into()], snapshot) else {
+                panic!("invalid snapshot was accepted");
+            };
+            assert_invalid_policy_diagnostic(error);
+        }
+
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        fs::write(
+            fixture.path(),
+            br#"{"version":1,"entries":[],"fixture_field\u001b[31m":"fixture_value\u001b[31m"}"#,
+        )
+        .unwrap();
+        let error = update(&fixture.store, apply(), |_, _, _| {
+            panic!("an invalid policy reached confirmation")
+        })
+        .unwrap_err();
+        assert_invalid_policy_diagnostic(error);
+    }
+
+    fn assert_invalid_policy_diagnostic(error: io::Error) {
+        let mut stderr = Vec::new();
+        assert_eq!(report_result(Err(error), &mut stderr), 1);
+        assert_eq!(stderr, b"vpnt-tunneld: invalid policy document\n");
+    }
+
+    #[test]
+    fn invalid_revoke_arguments_are_not_echoed() {
+        for (index, input, message) in [
+            (1, "1\x1b[31m", "invalid UID"),
+            (2, "ipsec\x1b[31m", "invalid backend"),
+            (3, "vpn.example\x1b[31m", "invalid hostname or port"),
+            (4, "500\x1b[31m", "invalid port"),
+        ] {
+            let mut args = ["revoke", "1000", "ipsec", "vpn.example", "500"].map(OsString::from);
+            args[index] = input.into();
+            let Err(error) = parse_change(&args, io::empty()) else {
+                panic!("invalid revoke arguments were accepted");
+            };
+            let mut stderr = Vec::new();
+            assert_eq!(report_result(Err(error), &mut stderr), 1);
+            assert_eq!(stderr, format!("vpnt-tunneld: {message}\n").as_bytes());
+        }
+    }
+
+    #[test]
     fn concurrent_confirmed_change_is_detected_even_for_identical_bytes() {
         let fixture = PolicyFixture::new();
         fixture.install();
@@ -618,27 +774,87 @@ mod tests {
     }
 
     #[test]
-    fn readers_and_admin_lock_the_same_directory_inode() {
+    fn readers_and_admin_lock_the_dedicated_inode() {
         let fixture = PolicyFixture::new();
-        let reader = fixture.store.open().unwrap();
-        let admin = fixture.store.open().unwrap();
-        reader.lock_shared().unwrap();
+        fixture.install();
+        let directory = fixture.store.open().unwrap();
+        let inode = File::open(fixture.lock_path()).unwrap();
+        let reader = directory.lock_shared().unwrap();
+        assert!(same_file(&reader, &inode).unwrap());
         assert_eq!(
-            admin
-                .lock(libc::LOCK_EX | libc::LOCK_NB)
+            flock(&inode, libc::LOCK_EX | libc::LOCK_NB)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock,
         );
         drop(reader);
-        admin.lock(libc::LOCK_EX | libc::LOCK_NB).unwrap();
-        let reader = fixture.store.open().unwrap();
+        let admin = directory.lock_exclusive(LOCK_TIMEOUT).unwrap();
+        assert!(same_file(&admin, &inode).unwrap());
         assert_eq!(
-            reader.lock_shared().unwrap_err().kind(),
+            flock(&inode, libc::LOCK_SH | libc::LOCK_NB)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(
+            directory.lock_shared().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
         drop(admin);
-        reader.lock_shared().unwrap();
+        directory.lock_shared().unwrap();
+    }
+
+    #[test]
+    fn administrative_lock_times_out_without_replacing_policy() {
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        let previous = File::open(fixture.path()).unwrap();
+        let reader = fixture.store.open().unwrap().lock_shared().unwrap();
+        let timeout = Duration::from_millis(50);
+        let start = Instant::now();
+        let error =
+            update_with_timeout(&fixture.store, apply(), timeout, |_, _, _| Ok(true)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "timed out waiting for policy lock");
+        assert!(start.elapsed() >= timeout && start.elapsed() < LOCK_TIMEOUT);
+        assert!(same_file(&previous, &File::open(fixture.path()).unwrap()).unwrap());
+        drop(reader);
+        fixture.install();
+        assert!(!same_file(&previous, &File::open(fixture.path()).unwrap()).unwrap());
+    }
+
+    #[test]
+    fn readers_and_admin_reject_insecure_locks() {
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        let path = fixture.lock_path();
+        let directory = fixture.store.open().unwrap();
+        let rejected = |dir: &Directory| {
+            assert!(dir.lock_shared().is_err());
+            assert!(dir.lock_exclusive(LOCK_TIMEOUT).is_err());
+        };
+        for mode in [0o640, 0o604] {
+            fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+            rejected(&directory);
+        }
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+
+        let mut wrong_owner = fixture.store.open().unwrap();
+        wrong_owner.owner ^= 1;
+        rejected(&wrong_owner);
+        let mut wrong_group = fixture.store.open().unwrap();
+        wrong_group.group ^= 1;
+        rejected(&wrong_group);
+
+        let alternate = path.with_extension("alternate");
+        fs::hard_link(&path, &alternate).unwrap();
+        rejected(&directory);
+        fs::remove_file(&path).unwrap();
+        symlink(&alternate, &path).unwrap();
+        rejected(&directory);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        rejected(&directory);
     }
 
     #[test]
