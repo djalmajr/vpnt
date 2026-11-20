@@ -158,6 +158,9 @@ pub(super) fn run(
         let mut failures = 0_u32;
         #[cfg(not(target_os = "linux"))]
         let mut announced_phase = None;
+        // A restart seen between or during probes owes the tunnel a fresh one.
+        #[cfg(not(target_os = "linux"))]
+        let mut retry_probe = false;
         #[cfg(target_os = "linux")]
         let mut recovery = None;
         #[cfg(target_os = "linux")]
@@ -188,10 +191,14 @@ pub(super) fn run(
                     // Attempts that never restart keep epoch 0 and never
                     // reach this branch; an OVPN attempt does on both systems.
                     failures = 0;
-                    // The probe retry and busy deferral exist only on Linux.
+                    // The busy deferral exists only on Linux.
                     #[cfg(target_os = "linux")]
                     {
                         busy_since = None;
+                        retry_probe = true;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
                         retry_probe = true;
                     }
                 }
@@ -209,8 +216,12 @@ pub(super) fn run(
                 && (due || requested || recovery.is_some() || retry_probe || busy_since.is_some());
             #[cfg(not(target_os = "linux"))]
             let phase = attempt.phase();
+            // Leaving a phase probes at once, so the card does not keep the
+            // phase until the next cadence and a request made during it is
+            // answered by that probe.
             #[cfg(not(target_os = "linux"))]
-            let due = phase.is_none() && (requested || due);
+            let due =
+                phase.is_none() && (requested || due || announced_phase.is_some() || retry_probe);
             let restart_epoch = due.then(|| attempt.restart_epoch());
             let responsive = if due {
                 // The first traffic probe verifies the new tunnel; a later
@@ -286,7 +297,11 @@ pub(super) fn run(
             #[cfg(not(target_os = "linux"))]
             let responsive = {
                 // Revalidation can observe an entire restart during the probe.
+                // The next pass sees the new epoch and asks for another probe.
                 let restarted = restart_epoch.is_some_and(|epoch| epoch != attempt.restart_epoch());
+                if restart_epoch.is_some() {
+                    retry_probe = false;
+                }
                 let phase = if responsive.is_some() {
                     attempt.phase()
                 } else {
