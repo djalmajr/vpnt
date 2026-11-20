@@ -3,7 +3,11 @@
 use super::*;
 use crate::connection::ovpn::signing::Hash;
 use base64::{Engine, engine::general_purpose::STANDARD};
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::fs::MetadataExt;
 use std::{io::BufRead, os::unix::fs::PermissionsExt};
+#[cfg(not(target_os = "linux"))]
+use std::{os::unix::ffi::OsStrExt, os::unix::fs::DirBuilderExt};
 
 #[derive(Clone, Default)]
 struct FakeToken {
@@ -254,10 +258,36 @@ fn the_socket_directory_is_private_and_removed() {
     assert!(!path.exists());
 }
 
-fn launch(openvpn: &Path) -> Launch {
+fn session_base() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+fn test_policy() -> RestartPolicy {
+    #[cfg(target_os = "linux")]
+    {
+        RestartPolicy::Caller
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        RestartPolicy::Immediate
+    }
+}
+
+fn launch(openvpn: &Path) -> Launch<ConfigSource> {
+    #[cfg(target_os = "linux")]
+    let config = ConfigSource::Path(PathBuf::from("/dev/null"));
+    #[cfg(not(target_os = "linux"))]
+    let config = ConfigSource::private(b"");
     Launch {
         openvpn: openvpn.to_path_buf(),
-        config: PathBuf::from("/dev/null"),
+        config,
         dev: None,
         signatures: Signatures::Any,
         extra: Vec::new(),
@@ -291,8 +321,12 @@ fn scripted_openvpn(directory: &Path, lines: &str, linger: f32) -> PathBuf {
 /// forks while the script was open for writing can make exec fail with
 /// "Text file busy" until that child execs; that error is retried.
 fn start_scripted(openvpn: &Path, token: FakeToken) -> Session {
+    start_scripted_with_policy(openvpn, token, test_policy())
+}
+
+fn start_scripted_with_policy(openvpn: &Path, token: FakeToken, policy: RestartPolicy) -> Session {
     for _ in 0..50 {
-        match Session::start(launch(openvpn), token.clone()) {
+        match Session::start_with(launch(openvpn), token.clone(), &session_base(), policy) {
             Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -690,28 +724,35 @@ fn observed_exit_has_a_total_management_drain_budget() {
     );
 }
 
-#[cfg(target_os = "linux")]
 struct RestartPeer {
     session: Session,
     wire: BufReader<UnixStream>,
     _scratch: PrivateDir,
+    signing: mpsc::Receiver<()>,
 }
 
-#[cfg(target_os = "linux")]
 impl RestartPeer {
     const RECONNECTING: &'static str = ">STATE:2,RECONNECTING,ping-restart,,,,,\n";
     const HOLD: &'static str = ">HOLD:Waiting for hold release:0\n";
+    #[cfg(target_os = "linux")]
     const CONNECTED: &'static str = ">STATE:3,CONNECTED,SUCCESS,192.0.2.2\n";
 
+    #[cfg(target_os = "linux")]
     fn start() -> Self {
-        let scratch = PrivateDir::create(Path::new("/tmp")).unwrap();
+        Self::start_with(FakeToken::default(), test_policy())
+    }
+
+    fn start_with(mut token: FakeToken, policy: RestartPolicy) -> Self {
+        let (entered, signing) = mpsc::channel();
+        token.signing = Some(entered);
+        let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
         let relay = scratch.path.join("relay");
         let listener = UnixListener::bind(&relay).unwrap();
         listener.set_nonblocking(true).unwrap();
         let executable = scratch.path.join("openvpn");
         fs::write(
             &executable,
-            r#"#!/usr/bin/python3
+            r#"#!/usr/bin/env python3
 import select, socket, sys
 if "--version" in sys.argv:
     print("OpenVPN 2.6.19")
@@ -732,11 +773,15 @@ with socket.socket(socket.AF_UNIX) as management, socket.socket(socket.AF_UNIX) 
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let session = start_scripted(&executable, FakeToken::default());
+        let session = start_scripted_with_policy(&executable, token, policy);
         let until = Instant::now() + Duration::from_secs(2);
         let wire = loop {
             match listener.accept() {
-                Ok((stream, _)) => break BufReader::new(stream),
+                // BSD accept inherits O_NONBLOCK from the listener; Linux does not.
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    break BufReader::new(stream);
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < until, "relay did not connect");
                     thread::sleep(Duration::from_millis(5));
@@ -748,6 +793,7 @@ with socket.socket(socket.AF_UNIX) as management, socket.socket(socket.AF_UNIX) 
             session,
             wire,
             _scratch: scratch,
+            signing,
         };
         let timeout = Duration::from_secs(2);
         assert_eq!(peer.reply(timeout).unwrap(), management::VERSION);
@@ -788,6 +834,30 @@ with socket.socket(socket.AF_UNIX) as management, socket.socket(socket.AF_UNIX) 
             matches!(&reply, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
             "restart hold released before acknowledgement: {reply:?}"
         );
+    }
+
+    fn reply_block(&mut self, timeout: Duration) -> io::Result<String> {
+        // macOS refuses SO_RCVTIMEO on an already-shutdown peer; the read
+        // below still reports EOF.
+        if let Err(error) = self.wire.get_ref().set_read_timeout(Some(timeout))
+            && error.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(error);
+        }
+        let mut text = String::new();
+        loop {
+            let mut line = String::new();
+            if self.wire.read_line(&mut line)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "signature reply ended before END",
+                ));
+            }
+            text.push_str(&line);
+            if line == "END\n" {
+                return Ok(text);
+            }
+        }
     }
 
     fn finish(self) -> Outcome {
@@ -831,10 +901,11 @@ fn restart_hold_rejects_the_acknowledgement_of_an_older_epoch() {
     assert!(peer.finish().status.success());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn restart_hold_stop_wakes_the_management_thread() {
-    let mut peer = RestartPeer::start();
+    // The reviewer's stop probe, now portable: with Caller the hold must be
+    // released by stop() on macOS too, before EXITING can be read.
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::Caller);
     peer.reconnect();
     peer.say(RestartPeer::HOLD);
     peer.expect_held();
@@ -912,4 +983,416 @@ fn invalid_signature_is_refused_while_a_restart_waits() {
         Ok(Progress::Refused(SignError::Unsupported))
     ));
     assert!(peer.finish().status.success());
+}
+
+#[test]
+fn restart_policy_immediate_answers_hold_without_an_acknowledgement() {
+    // Mutation captured: holding the macOS restart for the caller costs ten
+    // seconds on every reconnect while VPT-19 does not exist yet.
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::Immediate);
+    let started = Instant::now();
+    let epoch = peer.reconnect();
+    assert!(epoch > 0);
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(Duration::from_secs(2)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    assert!(started.elapsed() < Duration::from_secs(2), "{started:?}");
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(Duration::from_secs(1)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    assert!(peer.finish().status.success());
+}
+
+#[test]
+fn restart_policy_caller_waits_for_the_acknowledgement_and_times_out() {
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::Caller);
+    let started = Instant::now();
+    let epoch = peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    peer.expect_held();
+    peer.session.release_restart_hold(epoch);
+    assert_eq!(
+        peer.reply(Duration::from_secs(2)).unwrap(),
+        management::HOLD_RELEASE
+    );
+
+    let second = peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(Duration::from_secs(12)).unwrap(),
+        management::HOLD_RELEASE
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(10),
+        "hold timed out early: {:?}",
+        started.elapsed()
+    );
+    peer.session.release_restart_hold(second);
+    assert!(peer.finish().status.success());
+}
+
+#[test]
+fn signature_waits_for_withdrawal_after_request_validation() {
+    // Validation, then withdrawal, then the signer: each boundary has its own
+    // assertion so a mutant that moves any of them is caught.
+    let (release, gate) = mpsc::channel();
+    let token = FakeToken {
+        gate: Some(Arc::new(Mutex::new(gate))),
+        ..FakeToken::default()
+    };
+    let mut peer = RestartPeer::start_with(token, RestartPolicy::Caller);
+    let epoch = peer.reconnect();
+
+    peer.say(">PK_SIGN:AAEC,unknown-algorithm\n");
+    assert_eq!(
+        peer.reply(Duration::from_secs(2)).unwrap(),
+        management::TERMINATE
+    );
+    assert_eq!(
+        peer.session.progress().recv_timeout(Duration::from_secs(2)),
+        Ok(Progress::Refused(SignError::Unsupported))
+    );
+
+    peer.say(&pss_request(32));
+    assert!(
+        peer.signing
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "the signer was called before the withdrawal"
+    );
+    assert!(
+        peer.reply(Duration::from_millis(200)).is_err(),
+        "a signature was sent before the withdrawal"
+    );
+    assert!(
+        peer.session.progress().try_recv().is_err(),
+        "approval was announced before the withdrawal"
+    );
+
+    peer.session.release_restart_hold(epoch);
+    assert_eq!(peer.signing.recv_timeout(Duration::from_secs(2)), Ok(()));
+    let _ = release.send(());
+    assert_eq!(
+        peer.reply_block(Duration::from_secs(2)).unwrap(),
+        "pk-sig\nCQkJCQ==\nEND\n"
+    );
+    assert_eq!(
+        peer.session.progress().recv_timeout(Duration::from_secs(2)),
+        Ok(Progress::AwaitingApproval)
+    );
+    assert!(peer.finish().status.success());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn private_config_is_verified_and_refuses_planted_files() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let bytes = b"client\n";
+    let path = write_private_config(&scratch.path, bytes).unwrap();
+    assert_eq!(path, scratch.path.join("config"));
+    let metadata = fs::metadata(&path).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(fs::read(&path).unwrap(), bytes.as_slice());
+    assert!(verify_private_config(&path, bytes).is_ok());
+
+    // O_EXCL: a file or symlink planted under the config name is never reused.
+    assert_eq!(
+        write_private_config(&scratch.path, bytes)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    fs::remove_file(&path).unwrap();
+    let outside = scratch.path.join("outside");
+    fs::write(&outside, bytes).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    assert!(verify_private_config(&path, bytes).is_err());
+    assert!(write_private_config(&scratch.path, bytes).is_err());
+    fs::remove_file(&path).unwrap();
+
+    let path = write_private_config(&scratch.path, bytes).unwrap();
+    fs::write(&path, b"changed\n").unwrap();
+    assert_eq!(
+        verify_private_config(&path, bytes).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    fs::write(&path, bytes).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(verify_private_config(&path, bytes).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&path, scratch.path.join("alias")).unwrap();
+    assert!(verify_private_config(&path, bytes).is_err());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn session_start_passes_the_private_config_to_openvpn() {
+    // Mutation captured: passing a path or a different file to --config loses
+    // the identity guarantee; the stand-in reads exactly what openvpn is given.
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let bytes = b"dev null\n";
+    let marker = scratch.path.join("config-evidence");
+    let executable = scratch.path.join("openvpn");
+    fs::write(
+        &executable,
+        format!(
+            "#!/usr/bin/env python3\nimport os, socket, sys, time\n\
+             if '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\n\
+             a=sys.argv\np=a[a.index('--config')+1]\n\
+             assert oct(os.stat(p).st_mode & 0o777) == '0o600'\n\
+             assert open(p,'rb').read() == bytes({:?})\n\
+             open({:?},'w').write(p)\n\
+             s=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\n\
+             time.sleep(.2)\n",
+            bytes.to_vec(),
+            marker.display().to_string()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut settings = launch(&executable);
+    settings.config = ConfigSource::private(bytes);
+    let session = Session::start_with(
+        settings,
+        FakeToken::default(),
+        &session_base(),
+        RestartPolicy::Immediate,
+    )
+    .unwrap();
+    session.wait().unwrap();
+    let used = fs::read_to_string(&marker).unwrap();
+    assert!(
+        Path::new(&used).starts_with(session_base().canonicalize().unwrap()),
+        "{used}"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn an_unsafe_or_overlong_session_base_is_refused_before_spawn() {
+    let writable = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    fs::set_permissions(&writable.path, fs::Permissions::from_mode(0o775)).unwrap();
+    let settings = launch(Path::new("/nonexistent-openvpn"));
+    let error = Session::start_with(
+        settings,
+        FakeToken::default(),
+        &writable.path,
+        RestartPolicy::Immediate,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    assert!(error.to_string().contains("unsafe session base"), "{error}");
+    assert_eq!(fs::read_dir(&writable.path).unwrap().count(), 0);
+
+    let base = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let mut long = base.path.clone();
+    for _ in 0..4 {
+        long.push("segment0123456789abcdef");
+        fs::create_dir(&long).unwrap();
+    }
+    assert!(crate::connection::ovpn::private_dir::check_socket_limit(&long).is_err());
+    let settings = launch(Path::new("/nonexistent-openvpn"));
+    let error = Session::start_with(
+        settings,
+        FakeToken::default(),
+        &long,
+        RestartPolicy::Immediate,
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("socket path"), "{error}");
+}
+
+#[cfg(not(target_os = "linux"))]
+struct TestDir(PathBuf);
+
+#[cfg(not(target_os = "linux"))]
+impl TestDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const SHORT_NAMES: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+#[cfg(not(target_os = "linux"))]
+fn short_name_offset() -> usize {
+    std::process::id() as usize % SHORT_NAMES.len()
+}
+
+/// One-character names keep the worst-case socket path under 104 bytes.
+/// The pid chooses the first candidate; `create` decides the winner, so two
+/// test binaries sharing TMPDIR never claim the same entry.
+#[cfg(not(target_os = "linux"))]
+fn reserve_short_dir(parent: &Path, prefix: &str) -> (TestDir, char) {
+    for step in 0..SHORT_NAMES.len() {
+        let name = SHORT_NAMES[(short_name_offset() + step) % SHORT_NAMES.len()] as char;
+        let path = parent.join(format!("{prefix}{name}"));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return (TestDir(path), name),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("reserving {}: {error}", path.display()),
+        }
+    }
+    panic!("no free short fixture name under {}", parent.display());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_short_symlink(parent: &Path, target: &Path, avoid: char) -> TestDir {
+    for step in 0..SHORT_NAMES.len() {
+        let name = SHORT_NAMES[(short_name_offset() + step) % SHORT_NAMES.len()] as char;
+        if name == avoid {
+            continue;
+        }
+        let path = parent.join(name.to_string());
+        match std::os::unix::fs::symlink(target, &path) {
+            Ok(()) => return TestDir(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("reserving {}: {error}", path.display()),
+        }
+    }
+    panic!("no free short symlink name under {}", parent.display());
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let Ok(metadata) = fs::symlink_metadata(&self.0) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            let _ = fs::remove_file(&self.0);
+        } else {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recording_openvpn(directory: &Path, marker: &Path) -> PathBuf {
+    let executable = directory.join("openvpn");
+    fs::write(
+        &executable,
+        format!(
+            "#!/usr/bin/env python3\nimport socket, sys, time\n\
+             if '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\n\
+             a=sys.argv\nopen({:?},'w').write(a[a.index('--config')+1])\n\
+             s=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\n\
+             time.sleep(.2)\n",
+            marker.display().to_string()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    executable
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn path_launch_consumes_the_private_copy() {
+    let scratch = PrivateDir::create(&session_base()).unwrap();
+    let marker = scratch.path.join("config-evidence");
+    let executable = recording_openvpn(&scratch.path, &marker);
+    let original = scratch.path.join("input.ovpn");
+    let bytes = b"remote 127.0.0.1 1194\n<ca>\nfixture\n</ca>\n";
+    fs::write(&original, bytes).unwrap();
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut settings = launch(&executable);
+    settings.config = ConfigSource::Path(original.clone());
+    let session = Session::start_with(
+        settings,
+        FakeToken::default(),
+        &session_base(),
+        RestartPolicy::Immediate,
+    )
+    .unwrap();
+    let used = PathBuf::from(fs::read_to_string(&marker).unwrap());
+    assert_ne!(used, original, "child used the original profile path");
+    assert!(
+        used.starts_with(session_base().canonicalize().unwrap()),
+        "{used:?}"
+    );
+    assert_eq!(fs::read(&used).unwrap(), bytes.as_slice());
+    session.wait().unwrap();
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn validated_canonical_base_is_the_one_used_for_the_session() {
+    let scratch = PrivateDir::create(&session_base()).unwrap();
+    let (real, real_name) = reserve_short_dir(&session_base(), "");
+    let alias = reserve_short_symlink(&session_base(), real.path(), real_name);
+    let marker = scratch.path.join("config-evidence");
+    let executable = recording_openvpn(&scratch.path, &marker);
+    let session = Session::start_with(
+        launch(&executable),
+        FakeToken::default(),
+        alias.path(),
+        RestartPolicy::Immediate,
+    )
+    .unwrap();
+    session.wait().unwrap();
+    let used = PathBuf::from(fs::read_to_string(&marker).unwrap());
+    assert!(
+        used.starts_with(real.path().canonicalize().unwrap()),
+        "alias escaped the validated chain: {used:?}"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn production_base_fits_the_socket_and_spaces_reach_argv() {
+    let production = crate::helper::paths::ovpn_sessions_directory();
+    assert!(production.to_string_lossy().contains(' '));
+    assert!(crate::connection::ovpn::private_dir::check_socket_limit(&production).is_ok());
+
+    let scratch = PrivateDir::create(&session_base()).unwrap();
+    // HOME is short enough for a unique name that still contains a space.
+    let home = PathBuf::from(
+        std::env::var_os("HOME").expect("HOME is required for the short spaced fixture"),
+    );
+    let (spaced, _) = reserve_short_dir(&home, "vp ");
+    assert!(spaced.path().to_string_lossy().contains(' '));
+    assert!(crate::connection::ovpn::private_dir::check_socket_limit(spaced.path()).is_ok());
+    let marker = scratch.path.join("config-evidence");
+    let executable = recording_openvpn(&scratch.path, &marker);
+    let session = Session::start_with(
+        launch(&executable),
+        FakeToken::default(),
+        spaced.path(),
+        RestartPolicy::Immediate,
+    )
+    .unwrap();
+    session.wait().unwrap();
+    let used = PathBuf::from(fs::read_to_string(&marker).unwrap());
+    assert!(
+        used.starts_with(spaced.path().canonicalize().unwrap()),
+        "{used:?}"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn socket_limit_reserves_two_digits_for_the_attempt() {
+    let base = Path::new("/").join("a".repeat(59));
+    assert_eq!(base.as_os_str().as_bytes().len(), 60);
+    assert!(
+        crate::connection::ovpn::private_dir::check_socket_limit(&base).is_err(),
+        "a two-digit attempt must push the worst-case socket over the limit"
+    );
+}
+
+#[test]
+fn reply_block_ends_at_eof() {
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::Immediate);
+    peer.wire.get_mut().shutdown(Shutdown::Both).unwrap();
+    let error = peer.reply_block(Duration::from_secs(2)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
 }

@@ -1,7 +1,13 @@
 //! A throwaway CA, a point-to-point openvpn server and a key-file signer that
 //! stands in for the token by calling `openssl pkeyutl`.
+//!
+//! VPNT_TEST_OPENSSL names the OpenSSL 3 or later binary for both, `openssl`
+//! from PATH by default. On macOS that can be LibreSSL or OpenSSL 1.1, and
+//! both refuse `req` under `OPENSSL_CONF=/dev/null`.
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
     net::{Ipv4Addr, UdpSocket},
     os::unix::fs::DirBuilderExt,
@@ -13,6 +19,19 @@ use vpnt::connection::ovpn::{
     session::{SignError, Signer},
     signing::{Hash, Padding},
 };
+
+/// Config for the fixture's `openssl req`, so the CA does not depend on the
+/// host's openssl.cnf.
+const REQ_CONFIG: &str = "\
+[req]
+distinguished_name = dn
+x509_extensions = ca
+[dn]
+[ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+";
 
 pub struct Fixture {
     pub directory: PathBuf,
@@ -36,8 +55,14 @@ impl Fixture {
             directory,
             openvpn: PathBuf::from(openvpn),
         };
+        // The CA's extensions come from this file, not the host's openssl.cnf:
+        // under OPENSSL_CONF=/dev/null OpenSSL 3 and 4 issue a CA without
+        // basicConstraints, and openvpn then rejects the chain.
+        fs::write(fixture.path("openssl.cnf"), REQ_CONFIG).unwrap();
         fixture.openssl(&[
             "req",
+            "-config",
+            "openssl.cnf",
             "-x509",
             "-newkey",
             "rsa:2048",
@@ -62,7 +87,17 @@ impl Fixture {
             );
             let subject = format!("/CN=vpnt-test-{peer}");
             fixture.openssl(&[
-                "req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &csr, "-subj",
+                "req",
+                "-config",
+                "openssl.cnf",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                &key,
+                "-out",
+                &csr,
+                "-subj",
                 &subject,
             ]);
             let extensions = format!("{peer}.ext");
@@ -84,6 +119,8 @@ impl Fixture {
                 &extensions,
             ]);
         }
+        // An unusable chain fails here, not as a TLS retry loop in openvpn.
+        fixture.openssl(&["verify", "-CAfile", "ca.crt", "server.crt", "client.crt"]);
         fixture.openssl(&[
             "x509",
             "-in",
@@ -101,14 +138,19 @@ impl Fixture {
     }
 
     fn openssl(&self, args: &[&str]) {
-        let status = Command::new("openssl")
+        let output = openssl()
             .args(args)
             .current_dir(&self.directory)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .expect("VPNT_TEST_OPENVPN is set, so the openssl command is required");
-        assert!(status.success(), "openssl {args:?}");
+        assert!(
+            output.status.success(),
+            "openssl {args:?} ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A default server: it offers TLS 1.3 and RSA-PSS, like the real ones.
@@ -170,9 +212,19 @@ impl Fixture {
         Server(command.spawn().unwrap())
     }
 
-    /// `extra` lines are appended to the profile.
+    /// Fixture-only directives that the production profile inspector does
+    /// not allow. On macOS they go to trusted launch arguments instead.
+    #[cfg(not(target_os = "linux"))]
+    fn fixture_only(line: &str) -> bool {
+        line.starts_with("log ") || line.starts_with("tls-version-max ")
+    }
+
+    /// `extra` lines are appended to the profile on Linux. On macOS the
+    /// profile is production-shaped (inline CA, allowlisted directives only)
+    /// and the fixture-only options move to `client_extra`.
     pub fn client_config(&self, ports: (u16, u16), extra: &str) -> PathBuf {
         let path = self.path("client.ovpn");
+        #[cfg(target_os = "linux")]
         let config = format!(
             "tls-client\npull\ndev null\nproto udp4\nlocal 127.0.0.1\nlport {}\nremote 127.0.0.1 {}\n\
              ca {}\nremote-cert-tls server\nverb 1\n{extra}",
@@ -180,8 +232,47 @@ impl Fixture {
             ports.0,
             self.path("ca.crt").display()
         );
+        #[cfg(not(target_os = "linux"))]
+        let config = {
+            let profile_extra: String = extra
+                .lines()
+                .filter(|line| !Self::fixture_only(line))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            format!(
+                "tls-client\npull\ndev null\nproto udp4\nremote 127.0.0.1 {}\n\
+                 <ca>\n{}</ca>\nremote-cert-tls server\nverb 1\n{profile_extra}",
+                ports.0,
+                fs::read_to_string(self.path("ca.crt")).unwrap()
+            )
+        };
         fs::write(&path, config).unwrap();
         path
+    }
+
+    /// Trusted argv for options that belong to this fixture, not to an
+    /// imported profile. Linux keeps them in the profile as before.
+    pub fn client_extra(&self, ports: (u16, u16), extra: &str) -> Vec<OsString> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (ports, extra);
+            Vec::new()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut args: Vec<OsString> = vec![
+                "--local".into(),
+                "127.0.0.1".into(),
+                "--lport".into(),
+                ports.1.to_string().into(),
+            ];
+            for line in extra.lines().filter(|line| Self::fixture_only(line)) {
+                let (name, value) = line.split_once(' ').unwrap();
+                args.push(format!("--{name}").into());
+                args.push(value.into());
+            }
+            args
+        }
     }
 
     pub fn signer(&self) -> KeyFileSigner {
@@ -234,7 +325,7 @@ impl Signer for KeyFileSigner {
             ],
             Padding::Pss(_) => return Err(SignError::Unsupported),
         };
-        let mut child = Command::new("openssl")
+        let mut child = openssl()
             .args(["pkeyutl", "-sign", "-inkey"])
             .arg(&self.key)
             .args(options)
@@ -255,6 +346,10 @@ impl Signer for KeyFileSigner {
             .then_some(output.stdout)
             .ok_or(SignError::Unavailable)
     }
+}
+
+fn openssl() -> Command {
+    Command::new(env::var_os("VPNT_TEST_OPENSSL").unwrap_or_else(|| OsString::from("openssl")))
 }
 
 pub fn free_udp_ports() -> (u16, u16) {

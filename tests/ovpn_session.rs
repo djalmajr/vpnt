@@ -4,30 +4,284 @@
 //! token.
 //!
 //! Runs when VPNT_TEST_OPENVPN names an openvpn binary (2.6 or later); without
-//! it every test returns early and proves nothing.
+//! it every test returns early and proves nothing. VPNT_TEST_OPENSSL can name
+//! the OpenSSL binary the fixture uses (see `fixture.rs`).
 #![cfg(unix)]
 
 #[path = "ovpn_session/fixture.rs"]
 mod fixture;
 
 use fixture::{Fixture, free_udp_ports};
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs, io,
     net::Ipv4Addr,
-    path::Path,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+#[cfg(not(target_os = "linux"))]
+use vpnt::connection::ovpn::profile;
 use vpnt::connection::ovpn::{
     management::Phase,
-    session::{Launch, Progress, Session, Signatures},
+    session::{
+        ConfigSource, Launch, Progress, RestartPolicy, Session, SignError, Signatures, Signer,
+    },
     signing::{Hash, Padding},
 };
 
 /// Sessions share /tmp, which the cleanup test counts.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+fn session_base() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // One character: the canonical macOS temp path plus the worst-case
+        // private directory still fits the 104-byte socket path.
+        let base = std::env::temp_dir().join("s");
+        fs::DirBuilder::new().mode(0o700).create(&base).ok();
+        base
+    }
+}
+
+/// Only the shared-base test gets its own Linux base, so a mutant that ignores
+/// the caller's base cannot hide behind the /tmp default. Other Linux
+/// integration tests keep using /tmp.
+struct TestBase(PathBuf);
+
+impl TestBase {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        let path = {
+            let salt = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let path = PathBuf::from("/tmp").join(format!("vb{}-{salt:x}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            path
+        };
+        #[cfg(not(target_os = "linux"))]
+        let path = session_base();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestBase {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn restart_policy() -> RestartPolicy {
+    #[cfg(target_os = "linux")]
+    {
+        RestartPolicy::Caller
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        RestartPolicy::Immediate
+    }
+}
+
+fn config_source(path: &Path) -> ConfigSource {
+    #[cfg(target_os = "linux")]
+    {
+        ConfigSource::Path(path.to_path_buf())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let inspected = profile::inspect(&fs::read(path).unwrap()).unwrap();
+        ConfigSource::private(inspected.normalized.as_bytes())
+    }
+}
+
 /// Connects, then stops; returns the paddings the token was asked for.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        let path = session_base().join(format!("vpnt-int-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct NoSign;
+
+impl Signer for NoSign {
+    fn certificate(&mut self) -> Result<Vec<u8>, SignError> {
+        Ok(vec![1])
+    }
+
+    fn sign(&mut self, _padding: Padding, _data: &[u8]) -> Result<Vec<u8>, SignError> {
+        Ok(vec![2])
+    }
+}
+
+/// The session must create its directory in the base the test passes, not in
+/// a platform default that the cleanup oracle does not inspect.
+#[test]
+fn session_uses_the_shared_base_for_its_private_directory() {
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let scratch = Scratch::new();
+    let marker = scratch.path().join("config-evidence");
+    let executable = scratch.path().join("openvpn");
+    fs::write(
+        &executable,
+        format!(
+            "#!/usr/bin/env python3\nimport socket, sys, time\n\
+             if '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\n\
+             a=sys.argv\n\
+             open({:?},'w').write('management=%s\\nconfig=%s\\n' % (a[a.index('--management')+1], a[a.index('--config')+1]))\n\
+             s=socket.socket(socket.AF_UNIX)\ns.connect(a[a.index('--management')+1])\n\
+             time.sleep(.2)\n",
+            marker.display().to_string()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let launch = || {
+        #[cfg(target_os = "linux")]
+        let config = ConfigSource::Path(PathBuf::from("/dev/null"));
+        #[cfg(not(target_os = "linux"))]
+        let config = ConfigSource::private(b"");
+        Launch {
+            openvpn: executable.clone(),
+            config,
+            dev: None,
+            signatures: Signatures::Any,
+            extra: Vec::new(),
+            env: Vec::new(),
+        }
+    };
+    let base = TestBase::new();
+    let expected = base.path().canonicalize().unwrap();
+    // The script was written moments ago: another test thread that forks while
+    // it was open for writing makes exec fail with "Text file busy" until that
+    // child execs, as `start_scripted` in session_tests.rs also retries.
+    let mut started = None;
+    for _ in 0..50 {
+        match Session::start_with(launch(), NoSign, base.path(), restart_policy()) {
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                started = Some(result.unwrap());
+                break;
+            }
+        }
+    }
+    let session = started.expect("scripted openvpn stayed busy");
+    session.wait().unwrap();
+    let evidence = fs::read_to_string(&marker).unwrap();
+    let mut management = "";
+    let mut config = "";
+    for line in evidence.lines() {
+        if let Some(path) = line.strip_prefix("management=") {
+            management = path;
+        } else if let Some(path) = line.strip_prefix("config=") {
+            config = path;
+        }
+    }
+    // Both platforms put the management socket directly in the caller's base.
+    // Linux keeps the contract of passing /dev/null as the config; only macOS
+    // gets the private copy checked here.
+    let directory = Path::new(management)
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("{management} has no session directory"));
+    assert_eq!(
+        directory,
+        expected.as_path(),
+        "{management} is not directly under {}",
+        expected.display()
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(config, "/dev/null", "Linux argv changed");
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        Path::new(config).starts_with(&expected),
+        "{config} is outside {}",
+        expected.display()
+    );
+}
+
+/// The reviewer's parser probe: with `/usr/bin/true` in place of openvpn the
+/// fixture must pass production inspection and reach the spawn, failing only
+/// at the version check. The child re-enters this test with the substitute.
+#[test]
+fn fixture_profile_passes_inspection_and_reaches_spawn() {
+    const CHILD: &str = "VPNT_PARSER_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let fixture = Fixture::new("parser-proof").unwrap();
+        let ports = free_udp_ports();
+        let path = fixture.client_config(ports, "");
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("<ca>\n"),
+            "the macOS fixture must use an inline CA"
+        );
+        let launch = Launch {
+            openvpn: fixture.openvpn.clone(),
+            config: config_source(&path),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: fixture.client_extra(ports, ""),
+            env: Vec::new(),
+        };
+        let error =
+            Session::start_with(launch, fixture.signer(), &session_base(), restart_policy())
+                .err()
+                .expect("/usr/bin/true cannot negotiate a management connection");
+        assert!(
+            error.to_string().contains("exited before connecting")
+                || error.to_string().contains("version check failed"),
+            "the fixture must pass inspection and reach spawn: {error}"
+        );
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture_profile_passes_inspection_and_reaches_spawn",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("VPNT_TEST_OPENVPN", "/usr/bin/true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn connect_and_stop(fixture: &Fixture, signatures: Signatures, profile: &str) -> Vec<Padding> {
     let ports = free_udp_ports();
     let _server = fixture.server(ports);
@@ -35,13 +289,13 @@ fn connect_and_stop(fixture: &Fixture, signatures: Signatures, profile: &str) ->
     let paddings = Arc::clone(&signer.paddings);
     let launch = Launch {
         openvpn: fixture.openvpn.clone(),
-        config: fixture.client_config(ports, profile),
+        config: config_source(&fixture.client_config(ports, profile)),
         dev: None,
         signatures,
-        extra: Vec::new(),
+        extra: fixture.client_extra(ports, profile),
         env: Vec::new(),
     };
-    let session = Session::start(launch, signer).unwrap();
+    let session = Session::start_with(launch, signer, &session_base(), restart_policy()).unwrap();
     wait_for_connected(&session, Duration::from_secs(30));
     session.stop().unwrap();
     let outcome = session.wait().unwrap();
@@ -110,19 +364,20 @@ fn pkcs1_only_holds_when_the_server_offers_pss_and_tls13() {
 #[test]
 fn the_private_socket_directory_is_gone_after_the_session() {
     // Mutation captured: dropping PrivateDir's cleanup leaves one directory
-    // per connection in /tmp.
+    // per connection in the base the session really uses.
     let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
     let Some(fixture) = Fixture::new("cleanup") else {
         return;
     };
-    let before = leftover_directories();
+    let base = session_base();
+    let before = leftover_directories(&base);
     connect_and_stop(&fixture, Signatures::Any, "");
-    assert_eq!(leftover_directories(), before);
+    assert_eq!(leftover_directories(&base), before);
 }
 
-fn leftover_directories() -> usize {
+fn leftover_directories(base: &Path) -> usize {
     let prefix = format!("vpnt-ovpn-{}-", std::process::id());
-    fs::read_dir(Path::new("/tmp"))
+    fs::read_dir(base)
         .map(|entries| {
             entries
                 .flatten()
@@ -144,13 +399,14 @@ fn receives_pushed_network() {
     let profile = format!("log {}\nverb 4\n", log.display());
     let launch = Launch {
         openvpn: fixture.openvpn.clone(),
-        config: fixture.client_config(ports, &profile),
+        config: config_source(&fixture.client_config(ports, &profile)),
         dev: None,
         signatures: Signatures::Any,
-        extra: Vec::new(),
+        extra: fixture.client_extra(ports, &profile),
         env: Vec::new(),
     };
-    let session = Session::start(launch, fixture.signer()).unwrap();
+    let session =
+        Session::start_with(launch, fixture.signer(), &session_base(), restart_policy()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut found = None;
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -224,15 +480,20 @@ fn check_soft_restart(name: &str, profile: &str, next_address: Ipv4Addr) {
     let pid_file = fixture.path("client.pid");
     let launch = Launch {
         openvpn: fixture.openvpn.clone(),
-        config: fixture.client_config(ports, profile),
+        config: config_source(&fixture.client_config(ports, profile)),
         dev: None,
         signatures: Signatures::Pkcs1Only,
-        extra: vec!["--writepid".into(), pid_file.clone().into_os_string()],
+        extra: {
+            let mut args = fixture.client_extra(ports, profile);
+            args.push("--writepid".into());
+            args.push(pid_file.clone().into_os_string());
+            args
+        },
         env: Vec::new(),
     };
     let signer = fixture.signer();
     let paddings = Arc::clone(&signer.paddings);
-    let session = Session::start(launch, signer).unwrap();
+    let session = Session::start_with(launch, signer, &session_base(), restart_policy()).unwrap();
     let initial_events = wait_for_connected(&session, Duration::from_secs(15));
     let initial = initial_events
         .iter()
@@ -298,7 +559,7 @@ fn pdeathsig_stops_openvpn_when_starting_process_exits() {
         let signer = fixture.signer();
         let launch = Launch {
             openvpn: std::env::var_os("VPNT_TEST_OPENVPN").unwrap().into(),
-            config: dir.join("client.ovpn"),
+            config: config_source(&dir.join("client.ovpn")),
             dev: None,
             signatures: Signatures::Any,
             extra: Vec::new(),

@@ -260,6 +260,37 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal
       - name: Fetch locked Rust dependencies for the offline charon oracle
         run: cargo +1.99.0 fetch --locked
+      - name: Exercise the portable OVPN session with the runtime OpenVPN
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+        run: |
+          set -euo pipefail
+          runtime="${GITHUB_WORKSPACE}/target/vpnt-runtime"
+          openvpn="${runtime}/bin/openvpn"
+          test -x "$openvpn"
+          # The fixture's CA and signer need OpenSSL 3 or later; the openssl in
+          # PATH here is OpenSSL 1.1, which refuses req with OPENSSL_CONF=/dev/null.
+          fixture_openssl="$(brew --prefix openssl@4)/bin/openssl"
+          test -x "$fixture_openssl"
+          "$fixture_openssl" version
+          # Build first, so the runtime's library path reaches only the tests
+          # and the openvpn they start, never rustc or build scripts.
+          cargo +1.99.0 test --locked --no-default-features --test ovpn_session --no-run
+          status=0
+          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" VPNT_TEST_OPENSSL="$fixture_openssl" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)" || status=$?
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "ovpn_session failed with status $status" >&2
+            exit "$status"
+          fi
+          if grep -q 'skipped, VPNT_TEST_OPENVPN is not set' <<<"$output"; then
+            echo 'ovpn_session was skipped' >&2
+            exit 1
+          fi
+          if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$output"; then
+            echo 'no ovpn_session test passed' >&2
+            exit 1
+          fi
       - name: Verify rendered charon configuration with the original strongSwan parser
         env:
           RUSTUP_TOOLCHAIN: 1.99.0

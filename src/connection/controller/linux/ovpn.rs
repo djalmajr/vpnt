@@ -6,7 +6,7 @@ use crate::{
         management::{Phase, Reason},
         network::NetworkConfig,
         pkcs11::TokenKey,
-        session::{ConfigSource, Launch, Progress, Session, SignError, Signatures},
+        session::{ConfigSource, Launch, Progress, RestartPolicy, Session, SignError, Signatures},
     },
     helper::protocol::{ErrorCode, Step},
     model::{OvpnSettings, OvpnTls, Profile, VpnKind},
@@ -228,7 +228,9 @@ impl Starter<RealNetwork, RealTunnel> for RealStart {
                 Step::Spawn,
             ));
         }
-        let session = Session::start(
+        // Linux keeps its existing /tmp directories and the controller-owned
+        // acknowledgement of each restart.
+        let session = Session::start_with(
             Launch {
                 openvpn: program.into(),
                 config,
@@ -241,6 +243,8 @@ impl Starter<RealNetwork, RealTunnel> for RealStart {
                 env: vec![],
             },
             key,
+            Path::new("/tmp"),
+            RestartPolicy::Caller,
         )
         .map_err(|_| Failure::at(Step::Spawn))?;
         Ok(RealTunnel {
