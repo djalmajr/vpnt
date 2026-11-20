@@ -1116,8 +1116,7 @@ fn real_session_exit_waits_for_auth_failure_on_fifty_attempts() {
     let script = format!(
         "#!/usr/bin/python3\nimport socket,sys\nif '--version' in sys.argv: print('OpenVPN 2.6.19'); sys.exit(0)\ns=socket.socket(socket.AF_UNIX)\ns.connect(sys.argv[sys.argv.index('--management')+1])\ns.sendall({lines:?}.encode())\n"
     );
-    fs::write(&program, script).unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_support::write_script_with_mode(&program, &script, 0o755);
     for round in 0..50 {
         let launch = Launch {
             openvpn: program.clone(),
@@ -1562,8 +1561,7 @@ fn sealed_profile_survives_rename_and_link_after_session_start() {
     let script = format!(
         "#!/usr/bin/python3\nimport socket,sys,time,pathlib\nif '--version' in sys.argv: print('OpenVPN 2.6.19');sys.exit(0)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[sys.argv.index('--management')+1])\nend=time.monotonic()+5\nwhile not pathlib.Path({release:?}).exists() and time.monotonic()<end: time.sleep(.005)\nc=sys.argv[sys.argv.index('--config')+1]\npathlib.Path({observed:?}).write_text(c+'\\n'+pathlib.Path(c).read_text())\n"
     );
-    fs::write(&program, script).unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_script(&program, &script);
     let session = Session::start(
         Launch {
             openvpn: program,
@@ -1607,8 +1605,10 @@ fn dead_session_is_not_healthy_while_the_signer_is_blocked() {
     }
     let scratch = Scratch::new();
     let program = scratch.0.join("openvpn");
-    fs::write(&program,"#!/usr/bin/python3\nimport socket,sys\nif '--version' in sys.argv: print('OpenVPN 2.6.19');sys.exit(0)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[sys.argv.index('--management')+1])\ns.sendall(b'>PK_SIGN:BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=,RSA_PKCS1_PSS_PADDING,hashalg=SHA256,saltlen=digest\\n')\n").unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::write_script(
+        &program,
+        "#!/usr/bin/python3\nimport socket,sys\nif '--version' in sys.argv: print('OpenVPN 2.6.19');sys.exit(0)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[sys.argv.index('--management')+1])\ns.sendall(b'>PK_SIGN:BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=,RSA_PKCS1_PSS_PADDING,hashalg=SHA256,saltlen=digest\\n')\n",
+    );
     let (entered, started) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     let session = Session::start(
@@ -1815,11 +1815,11 @@ fn restart_signature_after_network(configured: bool, fails: bool, hold_first: bo
 
     let scratch = Scratch::new();
     let program = scratch.0.join("openvpn");
-    fs::write(
+    crate::test_support::write_script(
         &program,
-        format!(
+        &format!(
             "#!/usr/bin/python3\nHOLD_FIRST = {}\n{}",
-            if hold_first {{ "True" }} else {{ "False" }},
+            if hold_first { "True" } else { "False" },
             r#"import pathlib, socket, sys
 if "--version" in sys.argv:
     print("OpenVPN 2.6.19")
@@ -1856,9 +1856,7 @@ with socket.socket(socket.AF_UNIX) as sock:
         pathlib.Path(__file__).with_name("terminated").touch()
 "#
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let observed = Arc::new(Mutex::new(Observed::default()));
     let mut attempt = OvpnAttempt::fixture(
         profile(),
