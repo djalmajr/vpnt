@@ -137,3 +137,7 @@ path = "src/bin/vpnt-pppd.rs"
 [[bin]]
 name = "vpnt-helper"
 path = "src/bin/vpnt-helper.rs"
+
+[[bin]]
+name = "vpnt-tunneld"
+path = "src/bin/vpnt-tunneld.rs"
