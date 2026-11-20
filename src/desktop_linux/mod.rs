@@ -287,7 +287,7 @@ pub fn run(demo: bool, show: bool) -> Result<(), Box<dyn std::error::Error>> {
                                 placement::resize_request(current, opening, anchor, height),
                             );
                         } else {
-                            fix_height(&window, height.clamp(180, 720));
+                            fix_height(&window, placement::unplaced_height(height));
                         }
                     }
                     let id = request.id.clone();
@@ -461,7 +461,7 @@ fn reposition(
     positioner: &impl Placer,
     request: placement::PlacementRequest,
 ) -> bool {
-    let height = request.requested.clamp(180, 720);
+    let height = placement::unplaced_height(request.requested);
     window.release_bounds();
     window.set_height(height);
     if !positioner.supported() || positioner.send(request).is_err() {
@@ -489,7 +489,7 @@ fn resize_visible(
             return;
         }
     }
-    fix_height(window, request.requested.clamp(180, 720));
+    fix_height(window, placement::unplaced_height(request.requested));
 }
 
 /// Fixes the panel at the height the positioner applied, or at the requested one

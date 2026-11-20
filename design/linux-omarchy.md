@@ -12,6 +12,21 @@ Vale para **todo** shell com `data-platform="linux"`, com ou sem `data-desktop="
 
 Sem `height: 100%` e sem regra no `body`: `html` e `body` permanecem em fluxo natural. A navegação rola em `.panel-content`, acima do rodapé, que não faz parte da superfície rolável. Os portais do menu Options e da dica acessível moram no `body` e usam `position: fixed` (Radix Popper com `strategy: "fixed"` e `help-tooltip`), então não dependem de um contexto de rolagem na raiz; o limite final é o recorte físico da janela do host. Ao abrir o menu, a janela recebe uma reserva temporária de altura, liberada ao fechar; se faltar altura física, o conteúdo rola em `.panel-content` e o rodapé continua visível. Nenhum token novo entra nesta exceção. A prova nativa com o app instalado continua pendente; veja os passos manuais no relatório da rodada.
 
+Por decisão do Djalma em 2026-11-19, o teto de 720 px não se aplica ao Linux: o
+mesmo token existente é reescrito sob `:root[data-platform="linux"]` para
+`--panel-max-height: 100vh`, e `ui/src/panelSizing.ts` não limita o pedido ao
+teto quando o marcador está presente. A UI pede a altura natural do conteúdo,
+com piso em `panel-min-height` (480 px) e sem teto de 720; o host limita só pelo
+piso de 180 px e pela altura disponível calculada em `frame_with_gap` (altura do
+monitor menos áreas reservadas, margem e gap). A reserva temporária do menu
+continua valendo. Quando o conteúdo passa da altura disponível, só o miolo rola:
+o cabeçalho é sticky (com `scroll-padding-top` igual à altura do cabeçalho mais
+`space-sm`, para o foco por teclado não parar sob ele; no WebKit o caminho de
+foco para alguns pixels antes do padding, medido no macOS e no Linux) e o rodapé fica fora da superfície rolável
+em todos os hosts. Sem geometria do monitor (posicionador ausente ou com falha),
+o host não sabe a altura disponível e mantém o teto de 720 px
+(`placement::unplaced_height`). No macOS nada muda: o teto de 720 px continua.
+
 ## Mapa de cores
 
 `<original>` representa o último fallback da coluna à direita (claro / escuro). Valores iguais em ambos são repetidos. Os nomes são os tokens de cor de `styles.css`.

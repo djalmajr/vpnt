@@ -45,6 +45,12 @@ fora de panel-content, a área rolável do conteúdo do painel. O flex reserva a
 altura real do rodapé, sem sobrepor o conteúdo; a janela curta limita o painel ao viewport.
 A versão usa font-control (12 px), o token pequeno existente. O menu conserva
 seu portal e a reserva temporária de altura.
+Por decisão do Djalma em 2026-11-19, o `Header` compartilhado também fica fixo,
+no topo da superfície rolável, em todos os hosts. Ele usa `position: sticky`
+com `top: 0`, fundo `surface` e `z-index: 1`: continua no fluxo e na ordem de
+Tab, não muda cor, espaço nem fonte, e cobre o conteúdo que passa por baixo sem
+encobrir o menu nem a dica (`z-index: 2`, ambos em portal no `body`). Só o miolo
+da tela rola; o rodapé continua fora dessa área.
 Voltar e as rotas do rodapé usam a mesma guarda de alterações pendentes do
 perfil, inclusive na criação: confirmar descarte segue ao destino escolhido;
 continuar editando preserva o formulário. Durante salvar, essas saídas ficam

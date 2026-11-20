@@ -122,9 +122,13 @@ body {
   margin: 0;
 }
 /* On Linux only .panel-content scrolls, and the root shows no scrollbar of its
-   own. The window bounds the panel; html and body stay in natural flow. */
+   own. The window bounds the panel; html and body stay in natural flow. The
+   host also removes the 720 px ceiling there: --panel-max-height becomes the
+   viewport, so the panel stops only at the monitor's available height, and
+   panelSizing.ts skips the token ceiling when asking the host for a size. */
 :root[data-platform="linux"] {
   overflow: hidden;
+  --panel-max-height: 100vh;
 }
 button,
 input,
@@ -230,8 +234,9 @@ textarea::placeholder {
   width: var(--panel-width);
   max-width: 100%;
   /* Predefined height: the window opens at this size and keeps it across
-     pages, so nothing shifts. Taller content grows up to the limit; a shorter
-     screen clamps the window and the content scrolls above the footer. */
+     pages, so nothing shifts. Taller content grows up to the host limit (the
+     macOS ceiling or the monitor's available height on Linux); a shorter
+     screen clamps the window and the content scrolls between header and footer. */
   min-height: min(100vh, var(--panel-min-height));
   max-height: min(100vh, var(--panel-max-height));
   overflow: hidden;
@@ -247,6 +252,10 @@ textarea::placeholder {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  /* The sticky header covers the top of the scroll area; keyboard focus must
+     scroll a control below it, not under it. WebKit's focus path stops a few
+     pixels short of the padding, so the layout gap is added on top. */
+  scroll-padding-top: calc(var(--control-height) + var(--space-sm));
 }
 .panel-content > * {
   flex-shrink: 0;
@@ -257,7 +266,16 @@ textarea::placeholder {
 .field-error {
   flex-basis: 100%;
 }
+/* The header stays at the top of the scroll surface on every host. Sticky
+   keeps it in flow (no layout shift and no Tab-order change); the opaque
+   surface hides content passing underneath, and z-index 1 stays below the
+   portalled menu and help tooltip (both 2). The footer is outside this
+   scroller, so only the middle of the screen rolls. */
 .header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
   display: flex;
   align-items: center;
   justify-content: space-between;

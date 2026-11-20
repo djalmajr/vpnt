@@ -261,7 +261,10 @@ linha; traduções não devem ser cortadas para conservar uma altura fixa.
 ## Layout
 
 Espaçamento, dimensões e posicionamento seguem os tokens; o conteúdo deve permanecer
-legível e as ações acessíveis mesmo em telas menores.
+legível e as ações acessíveis mesmo em telas menores. Por decisão do Djalma em
+2026-11-19, o cabeçalho fica fixo no topo da área rolável em todos os hosts e,
+no Linux, o painel cresce até a altura disponível do monitor antes de rolar só
+o miolo; no macOS, o teto de 720 px (`panel-max-height`) continua.
 
 [Detalhes de layout](design/layout.md)
 

@@ -111,7 +111,11 @@ function mockPanelDom(viewport = { innerWidth: 320, innerHeight: 480 }) {
     querySelector: () => content,
     children: [content],
   };
-  const root = { toggleAttribute() {}, removeAttribute() {} };
+  const root = {
+    dataset: {} as Record<string, string>,
+    toggleAttribute() {},
+    removeAttribute() {},
+  };
   const target = {};
   const observed = new Set<unknown>();
   let resize = () => {};
@@ -161,6 +165,7 @@ function mockPanelDom(viewport = { innerWidth: 320, innerHeight: 480 }) {
     child,
     content,
     observed,
+    root,
     viewport,
     setContentHeight: (height: number) => {
       contentHeight = height;
@@ -177,6 +182,38 @@ function mockPanelDom(viewport = { innerWidth: 320, innerHeight: 480 }) {
     },
   };
 }
+
+test("no Linux o pedido passa de 720 com conteúdo alto; sem o marcador o teto vale", () => {
+  const dom = mockPanelDom();
+  const { root } = dom;
+  try {
+    const requests: number[] = [];
+    const reserve = createReserve();
+    const stop = observePanelHeight((height) => requests.push(height), reserve);
+    expect(requests).toEqual([648]);
+    dom.setContentHeight(1300);
+    dom.resize();
+    expect(requests.at(-1)).toBe(720);
+    root.dataset.platform = "linux";
+    dom.resize();
+    expect(requests.at(-1)).toBe(1348);
+    const owner = Symbol();
+    reserve.hold(owner, 1500);
+    expect(requests.at(-1)).toBe(1500);
+    reserve.release(owner);
+    expect(requests.at(-1)).toBe(1348);
+    dom.setContentHeight(80);
+    dom.resize();
+    expect(requests.at(-1)).toBe(480);
+    root.dataset.platform = "";
+    dom.setContentHeight(1300);
+    dom.resize();
+    expect(requests.at(-1)).toBe(720);
+    stop();
+  } finally {
+    dom.restore();
+  }
+});
 
 test("conteúdo limitado pelo viewport cresce até o teto e é observado por dentro", () => {
   const dom = mockPanelDom();
