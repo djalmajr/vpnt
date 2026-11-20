@@ -18,7 +18,7 @@ use crate::{
     helper::{paths, ppp_supervisor::ServiceId, runtime::Program},
     model::OvpnTls,
 };
-use std::{net::Ipv4Addr, sync::mpsc, thread};
+use std::{io, net::Ipv4Addr, thread};
 
 const RESTART_WITHDRAWAL_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_WAIT: Duration = Duration::from_secs(10);
@@ -45,13 +45,17 @@ trait Tunnel {
     fn next(&mut self) -> Option<Progress>;
     fn approval_pending(&self) -> bool;
     fn exited(&self) -> Option<Option<OvpnReason>>;
-    fn pid(&self) -> Option<u32>;
+    fn restart_hold_expired(&self) -> bool;
     fn release_restart_hold(&mut self, epoch: u64);
-    fn stop(&mut self);
-    fn wait(&mut self, timeout: Duration) -> bool;
+    fn has_session(&self) -> bool;
+    fn stop(&mut self) -> io::Result<()>;
+    fn reap(&mut self);
+    fn force_stop(&mut self);
+    fn confirm_absent(&self) -> bool;
 }
 
 trait Network {
+    fn canceled(&self) -> bool;
     fn interfaces(&mut self) -> std::io::Result<Interfaces>;
     fn address(
         &mut self,
@@ -77,7 +81,7 @@ trait Network {
     fn now(&self) -> Instant {
         Instant::now()
     }
-    fn wait_for_withdrawal(&mut self, expires: Instant) {
+    fn pause(&mut self, expires: Instant) {
         thread::sleep(
             expires
                 .saturating_duration_since(self.now())
@@ -177,19 +181,37 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
         Ok(())
     }
 
-    fn withdraw_config(&mut self) -> Result<(), Failure> {
+    fn can_continue(&self) -> Result<bool, Failure> {
+        if self.network.canceled() {
+            return Ok(false);
+        }
+        match self.session.exited() {
+            Some(Some(OvpnReason::AuthFailure)) => Err(rejected()),
+            Some(_) => Err(Failure::at(Step::Tunnel)),
+            None if self.session.restart_hold_expired() => Err(Failure::at(Step::Tunnel)),
+            None => Ok(true),
+        }
+    }
+
+    fn withdraw_config(&mut self) -> Result<bool, Failure> {
         self.network_active = false;
         let expires = self.network.now() + RESTART_WITHDRAWAL_TIMEOUT;
         self.network.close_dns()?;
 
         let at = || Failure::at(Step::Routes);
         loop {
+            if !self.can_continue()? {
+                return Ok(false);
+            }
             if self.network.now() >= expires {
                 return Err(at());
             }
             let link_gone = if let Some((link, _)) = &self.last_up {
-                let interfaces = self.network.interfaces().map_err(|_| at())?;
-                link.absent(&interfaces)
+                match self.network.interfaces() {
+                    Ok(interfaces) => link.absent(&interfaces),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                    Err(_) => return Err(at()),
+                }
             } else {
                 true
             };
@@ -198,9 +220,9 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                     return Err(at());
                 }
                 self.last_up = None;
-                return Ok(());
+                return Ok(true);
             }
-            self.network.wait_for_withdrawal(expires);
+            self.network.pause(expires);
         }
     }
 
@@ -221,10 +243,16 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                 Progress::Restarting { epoch, .. } => {
                     self.phase = Some(ConnectionState::Reconnecting);
                     self.restart_epoch = epoch;
-                    self.withdraw_config()?;
+                    if !self.withdraw_config()? || !self.can_continue()? {
+                        return Ok(());
+                    }
                     self.session.release_restart_hold(epoch);
                 }
                 Progress::Up(config) => {
+                    if !self.can_continue()? {
+                        self.network_active = false;
+                        return Ok(());
+                    }
                     self.apply_network(profile, config)?;
                     self.phase = None;
                 }
@@ -234,9 +262,10 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                 Progress::State(_) => {}
             }
         }
-        match exit {
+        match self.session.exited().or(exit) {
             Some(Some(OvpnReason::AuthFailure)) => Err(rejected()),
             Some(_) if !self.stopped => Err(Failure::at(Step::Tunnel)),
+            _ if self.session.restart_hold_expired() => Err(Failure::at(Step::Tunnel)),
             _ => Ok(()),
         }
     }
@@ -288,14 +317,36 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
         self.network_active = false;
         let dns_closed = self.network.close_dns().is_ok();
         if !self.stopped {
-            self.session.stop();
             self.stopped = true;
+            if self.session.has_session() {
+                self.stop_session();
+            }
         }
-        if !self.session.wait(STOP_WAIT) {
+        if !self.session.confirm_absent() {
             return false;
         }
         let network_closed = self.network.finish().is_ok();
         dns_closed && network_closed
+    }
+
+    fn stop_session(&mut self) {
+        if let Err(error) = self.session.stop() {
+            eprintln!("ovpn_stop_failed: {:?}", error.kind());
+            self.session.force_stop();
+            return;
+        }
+        let expires = self.network.now() + STOP_WAIT;
+        loop {
+            if self.session.exited().is_some() {
+                self.session.reap();
+                return;
+            }
+            if self.network.now() >= expires {
+                self.session.force_stop();
+                return;
+            }
+            self.network.pause(expires);
+        }
     }
 }
 
@@ -310,8 +361,10 @@ fn rejected() -> Failure {
 #[derive(Default)]
 struct RealTunnel {
     session: Option<Session>,
-    waiting: Option<mpsc::Receiver<bool>>,
-    wait_failed: bool,
+    pid: Option<u32>,
+    // Retained until absence is confirmed. Never used to signal a process.
+    identity: Option<Process>,
+    reaped: bool,
 }
 
 impl Tunnel for RealTunnel {
@@ -327,8 +380,10 @@ impl Tunnel for RealTunnel {
         self.session.as_ref()?.exited()
     }
 
-    fn pid(&self) -> Option<u32> {
-        self.session.as_ref()?.pid()
+    fn restart_hold_expired(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(Session::restart_hold_expired)
     }
 
     fn release_restart_hold(&mut self, epoch: u64) {
@@ -337,47 +392,44 @@ impl Tunnel for RealTunnel {
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(session) = &self.session
-            && let Err(error) = session.stop()
-        {
-            eprintln!("ovpn_stop_failed: {:?}", error.kind());
+    fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn stop(&mut self) -> io::Result<()> {
+        self.session.as_ref().map_or(Ok(()), Session::stop)
+    }
+
+    fn reap(&mut self) {
+        if let Some(session) = self.session.take() {
+            match session.wait() {
+                Ok(_) => self.reaped = true,
+                Err(error) => eprintln!("ovpn_wait_failed: {:?}", error.kind()),
+            }
         }
     }
 
-    fn wait(&mut self, timeout: Duration) -> bool {
-        if self.wait_failed {
-            return false;
+    fn force_stop(&mut self) {
+        drop(self.session.take());
+    }
+
+    fn confirm_absent(&self) -> bool {
+        if self.reaped {
+            return true;
         }
-        if let Some(session) = self.session.take() {
-            let (send, recv) = mpsc::sync_channel(1);
-            if thread::Builder::new()
-                .name("vpnt-ovpn-wait".into())
-                .spawn(move || {
-                    let waited = session.wait().map_err(|error| {
-                        eprintln!("ovpn_wait_failed: {:?}", error.kind());
-                    });
-                    let _ = send.send(waited.is_ok());
-                })
-                .is_err()
-            {
-                eprintln!("ovpn_wait_thread_failed");
-                self.wait_failed = true;
-                return false;
-            }
-            self.waiting = Some(recv);
-        }
-        match self.waiting.as_ref().map(|recv| recv.recv_timeout(timeout)) {
-            Some(Ok(true)) => {
-                self.waiting = None;
-                true
-            }
-            Some(Err(mpsc::RecvTimeoutError::Timeout)) => false,
-            Some(_) => {
-                self.wait_failed = true;
-                false
-            }
-            None => true,
+        let Some(pid) = self.pid else {
+            return true;
+        };
+        match Process::read(pid) {
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+            Ok(current) => self.identity.as_ref().is_some_and(|expected| {
+                if current.identity == expected.identity
+                    && current.executable != expected.executable
+                {
+                    eprintln!("ovpn_process_executable_changed");
+                }
+                current.identity != expected.identity
+            }),
         }
     }
 }
@@ -408,6 +460,10 @@ fn route_guard(expires: Instant, canceled: &AtomicBool) -> Result<(), RouteError
 }
 
 impl Network for NativeNetwork<'_> {
+    fn canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
     fn interfaces(&mut self) -> std::io::Result<Interfaces> {
         Interfaces::read()
     }
@@ -600,8 +656,6 @@ pub(super) struct NativeOvpnAttempt<'a> {
     profiles: Arc<Profiles>,
     signer: Option<Box<dyn Signer>>,
     cycle: Cycle<RealTunnel, NativeNetwork<'a>>,
-    // Kept for the journal slice. Do not reap or signal using this observation.
-    identity: Option<Process>,
     profile_use: Option<ProfileUse>,
 }
 
@@ -631,7 +685,6 @@ impl<'a> NativeOvpnAttempt<'a> {
                     dns: None,
                 },
             ),
-            identity: None,
             profile_use: None,
         }
     }
@@ -771,12 +824,23 @@ impl NativeOvpnAttempt<'_> {
             env: vec![],
         };
         self.cycle.session.session = Some(
-            Session::start_with(launch, BoxedSigner(signer), &base, RestartPolicy::Caller)
-                .map_err(|_| at())?,
+            Session::start_with(
+                launch,
+                BoxedSigner(signer),
+                &base,
+                RestartPolicy::CallerOrStop,
+            )
+            .map_err(|_| at())?,
         );
-        let pid = self.cycle.session.pid().ok_or_else(at)?;
-        let identity = Process::read(pid).map_err(|_| at())?;
-        if self.cycle.session.pid() != Some(pid)
+        let session = self.cycle.session.session.as_ref().unwrap();
+        let pid = session.pid().ok_or_else(at)?;
+        self.cycle.session.pid = Some(pid);
+        let identity = self
+            .cycle
+            .session
+            .identity
+            .insert(Process::read(pid).map_err(|_| at())?);
+        if session.pid() != Some(pid)
             || !identity.running
             || identity.parent != std::process::id()
             || identity.uid != 0
@@ -785,7 +849,6 @@ impl NativeOvpnAttempt<'_> {
         {
             return Err(at());
         }
-        self.identity = Some(identity);
         self.cycle.initial_deadline = Some(expires);
         Ok(())
     }
@@ -826,7 +889,8 @@ impl Attempt for NativeOvpnAttempt<'_> {
         if !self.cycle.cleanup() {
             return false;
         }
-        self.identity = None;
+        self.cycle.session.identity = None;
+        self.cycle.session.pid = None;
         if let Some(reservation) = &self.profile_use {
             if reservation.complete().is_err() {
                 return false;

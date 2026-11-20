@@ -44,6 +44,7 @@ impl<'a> NativeBackend<'a> {
                 controller,
                 writer: None,
                 observe_cleanup_only: false,
+                fixture: None,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -83,6 +84,8 @@ impl<'a> NativeBackend<'a> {
                 controller,
                 writer: None,
                 observe_cleanup_only: false,
+                #[cfg(test)]
+                fixture: None,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -239,13 +242,15 @@ struct NativeTable<'a> {
     controller: &'a ControllerLock,
     writer: Option<AddWriter<'a>>,
     observe_cleanup_only: bool,
+    #[cfg(test)]
+    fixture: Option<Arc<Mutex<FixtureRouteIo>>>,
 }
 impl<'a> NativeTable<'a> {
-    fn cleanup_writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
+    fn check_cleanup_write(&self) -> Result<(), Error> {
         if self.observe_cleanup_only {
             return Err(Error::Busy);
         }
-        self.writer()
+        Ok(())
     }
 
     fn writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
@@ -257,6 +262,10 @@ impl<'a> NativeTable<'a> {
 }
 impl Table for NativeTable<'_> {
     fn exact(&mut self, key: Key) -> Result<Option<Route>, Error> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return Ok(fixture.lock().unwrap().rows.get(&key).copied());
+        }
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         Snapshot::read()?
             .exact(key)?
@@ -268,16 +277,142 @@ impl Table for NativeTable<'_> {
         route: TransportDefault,
         canceled: &AtomicBool,
     ) -> Result<Attempt, Error> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return Ok(fixture.lock().unwrap().add(route.route()));
+        }
         self.writer()?
             .add_transport_default(route, canceled)
             .map(|confirmation| Attempt { confirmation })
     }
     fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error> {
-        self.cleanup_writer()?.get_transport_default(route)
+        self.check_cleanup_write()?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            let fixture = fixture.lock().unwrap();
+            if !fixture.allow_default_delete {
+                return Err(Error::Busy);
+            }
+            let expected = route.route();
+            return Ok(fixture.rows.get(&expected.key).map(|row| Record {
+                key: row.key,
+                interface: row.interface,
+                flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_STATIC | libc::RTF_IFSCOPE,
+                gateway: match row.next_hop {
+                    NextHop::Gateway(address) => Some(super::Gateway::Address(address)),
+                    _ => None,
+                },
+                source: None,
+            }));
+        }
+        self.writer()?.get_transport_default(route)
     }
     fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error> {
-        self.cleanup_writer()?
+        self.check_cleanup_write()?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.default_deletes += 1;
+            fixture.rows.remove(&route.route().key);
+            return Ok(Attempt {
+                confirmation: Ok(()),
+            });
+        }
+        self.writer()?
             .delete_transport_default(route)
             .map(|confirmation| Attempt { confirmation })
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FixtureRouteIo {
+    rows: std::collections::BTreeMap<Key, Route>,
+    allow_default_delete: bool,
+    default_deletes: usize,
+}
+
+#[cfg(test)]
+impl FixtureRouteIo {
+    fn add(&mut self, route: Route) -> Attempt {
+        assert!(self.rows.insert(route.key, route).is_none());
+        Attempt {
+            confirmation: Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+struct FixtureDefault {
+    route: TransportDefault,
+    canceled: AtomicBool,
+}
+
+#[cfg(test)]
+impl Scope for FixtureDefault {
+    fn index(&self) -> u16 {
+        30
+    }
+
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        Some((self.route, &self.canceled))
+    }
+
+    fn active(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn add(&mut self, _: Route) -> Result<Attempt, Error> {
+        unreachable!("fixture owns only the transport default")
+    }
+
+    fn detach_if_stopped(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn cleanup_complete(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+impl NativeBackend<'_> {
+    pub(crate) fn fixture_route_io(&mut self) {
+        self.registry.table_mut().fixture = Some(Arc::default());
+    }
+
+    pub(crate) fn fixture_default(&mut self, owner: Owner, route: Route) -> InterfaceToken {
+        self.registry
+            .register(
+                RegisteredScope::Utun(Box::new(FixtureDefault {
+                    route: TransportDefault::try_from(route).unwrap(),
+                    canceled: AtomicBool::new(false),
+                })),
+                owner,
+                vec![route],
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn fixture_remove_route(&mut self, route: Route) {
+        assert_eq!(self.fixture_io().rows.remove(&route.key), Some(route));
+    }
+
+    pub(crate) fn fixture_allow_default_delete(&mut self) {
+        self.fixture_io().allow_default_delete = true;
+    }
+
+    pub(crate) fn fixture_default_deletes(&mut self) -> usize {
+        self.fixture_io().default_deletes
+    }
+
+    fn fixture_io(&mut self) -> std::sync::MutexGuard<'_, FixtureRouteIo> {
+        self.registry
+            .table_mut()
+            .fixture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
     }
 }

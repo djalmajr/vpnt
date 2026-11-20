@@ -266,7 +266,11 @@ use crate::connection::{
     macos::vip::ovpn_link::fixture_interfaces,
     ovpn::management::{Phase, State},
 };
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Effect {
@@ -279,7 +283,8 @@ enum Effect {
     WaitForWithdrawal,
     Release(u64),
     Stop,
-    Wait(Duration),
+    Reap,
+    ForceStop,
     Finish,
     Probe(u32),
 }
@@ -290,13 +295,22 @@ type Effects = Rc<RefCell<Vec<Effect>>>;
 struct FakeTunnel {
     effects: Effects,
     events: VecDeque<Progress>,
+    on_up: Option<Box<dyn FnOnce()>>,
     pending: bool,
-    exit: Option<Option<OvpnReason>>,
-    reaped: bool,
+    hold_expired: bool,
+    exit: Rc<Cell<Option<Option<OvpnReason>>>>,
+    absent: bool,
+    stop_error: Option<io::ErrorKind>,
 }
 impl Tunnel for FakeTunnel {
     fn next(&mut self) -> Option<Progress> {
-        self.events.pop_front()
+        let event = self.events.pop_front();
+        if matches!(event, Some(Progress::Up(_)))
+            && let Some(action) = self.on_up.take()
+        {
+            action();
+        }
+        event
     }
 
     fn approval_pending(&self) -> bool {
@@ -304,24 +318,36 @@ impl Tunnel for FakeTunnel {
     }
 
     fn exited(&self) -> Option<Option<OvpnReason>> {
-        self.exit
+        self.exit.get()
     }
 
-    fn pid(&self) -> Option<u32> {
-        None
+    fn restart_hold_expired(&self) -> bool {
+        self.hold_expired
     }
 
     fn release_restart_hold(&mut self, epoch: u64) {
         self.effects.borrow_mut().push(Effect::Release(epoch));
     }
 
-    fn stop(&mut self) {
-        self.effects.borrow_mut().push(Effect::Stop);
+    fn has_session(&self) -> bool {
+        true
     }
 
-    fn wait(&mut self, timeout: Duration) -> bool {
-        self.effects.borrow_mut().push(Effect::Wait(timeout));
-        self.reaped
+    fn stop(&mut self) -> io::Result<()> {
+        self.effects.borrow_mut().push(Effect::Stop);
+        self.stop_error.map_or(Ok(()), |kind| Err(kind.into()))
+    }
+
+    fn reap(&mut self) {
+        self.effects.borrow_mut().push(Effect::Reap);
+    }
+
+    fn force_stop(&mut self) {
+        self.effects.borrow_mut().push(Effect::ForceStop);
+    }
+
+    fn confirm_absent(&self) -> bool {
+        self.absent
     }
 }
 
@@ -330,6 +356,10 @@ struct FakeNetwork {
     current: Interfaces,
     now: Instant,
     following_snapshots: VecDeque<Interfaces>,
+    snapshot_errors: usize,
+    on_wait: Option<Box<dyn FnOnce()>>,
+    on_withdraw: Option<Box<dyn FnOnce()>>,
+    canceled: Rc<AtomicBool>,
     pending_withdrawals: usize,
     fail: Option<Effect>,
 }
@@ -341,7 +371,15 @@ impl FakeNetwork {
     }
 }
 impl Network for FakeNetwork {
+    fn canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
     fn interfaces(&mut self) -> std::io::Result<Interfaces> {
+        if self.snapshot_errors > 0 {
+            self.snapshot_errors -= 1;
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
         Ok(self.current.clone())
     }
 
@@ -391,6 +429,9 @@ impl Network for FakeNetwork {
 
     fn withdraw_routes(&mut self) -> Result<bool, Failure> {
         self.record(Effect::Withdraw, Step::Routes)?;
+        if let Some(action) = self.on_withdraw.take() {
+            action();
+        }
         if self.pending_withdrawals > 0 {
             self.pending_withdrawals -= 1;
             return Ok(false);
@@ -402,11 +443,14 @@ impl Network for FakeNetwork {
         self.now
     }
 
-    fn wait_for_withdrawal(&mut self, expires: Instant) {
+    fn pause(&mut self, expires: Instant) {
         self.effects.borrow_mut().push(Effect::WaitForWithdrawal);
         self.now = (self.now + Duration::from_secs(1)).min(expires);
         if let Some(next) = self.following_snapshots.pop_front() {
             self.current = next;
+        }
+        if let Some(action) = self.on_wait.take() {
+            action();
         }
     }
 
@@ -438,6 +482,10 @@ fn fixture() -> Cycle<FakeTunnel, FakeNetwork> {
         current: fixture_interfaces(&[("utun40", 40), ("en0", 2), ("utun7", 7)]),
         now: Instant::now(),
         following_snapshots: VecDeque::new(),
+        snapshot_errors: 0,
+        on_wait: None,
+        on_withdraw: None,
+        canceled: Rc::new(AtomicBool::new(false)),
         pending_withdrawals: 0,
         fail: None,
     };
@@ -688,17 +736,133 @@ fn restart_timeout_keeps_hold_closed_and_cleanup_stops_the_session() {
             if utun_persists { 0 } else { 5 }
         );
 
-        cycle.session.reaped = true;
+        cycle.session.exit.set(Some(None));
+        cycle.session.absent = true;
         assert!(cycle.cleanup());
         assert_eq!(
             cycle.take_effects(),
-            [
-                Effect::CloseDns,
-                Effect::Stop,
-                Effect::Wait(STOP_WAIT),
-                Effect::Finish
-            ]
+            [Effect::CloseDns, Effect::Stop, Effect::Reap, Effect::Finish]
         );
+    }
+}
+
+#[test]
+fn withdrawal_rechecks_cancellation_and_exit_after_waiting() {
+    for exit in [false, true] {
+        let mut cycle = fixture();
+        cycle.open();
+        cycle.take_effects();
+        cycle
+            .network
+            .following_snapshots
+            .push_back(Interfaces::default());
+        let canceled = cycle.network.canceled.clone();
+        let observed = cycle.session.exit.clone();
+        cycle.network.on_wait = Some(Box::new(move || {
+            if exit {
+                observed.set(Some(None));
+            } else {
+                canceled.store(true, Ordering::Release);
+            }
+        }));
+        cycle.push(restart(15, None));
+        cycle.push(Progress::Up(up(Some("utun40"))));
+        let result = cycle.ready(&profile());
+        if exit {
+            assert_eq!(result.unwrap_err().step, Step::Tunnel);
+        } else {
+            assert!(!result.unwrap());
+        }
+        assert_eq!(
+            cycle.take_effects(),
+            [Effect::CloseDns, Effect::WaitForWithdrawal]
+        );
+    }
+}
+
+#[test]
+fn restart_rechecks_cancellation_and_exit_after_routes_are_absent() {
+    for exit in [false, true] {
+        let mut cycle = fixture();
+        cycle.open();
+        cycle.take_effects();
+        cycle.network.current = Interfaces::default();
+        let canceled = cycle.network.canceled.clone();
+        let observed = cycle.session.exit.clone();
+        cycle.network.on_withdraw = Some(Box::new(move || {
+            if exit {
+                observed.set(Some(None));
+            } else {
+                canceled.store(true, Ordering::Release);
+            }
+        }));
+        cycle.push(restart(15, None));
+        let result = cycle.ready(&profile());
+        if exit {
+            assert_eq!(result.unwrap_err().step, Step::Tunnel);
+        } else {
+            assert!(!result.unwrap());
+        }
+        assert_eq!(cycle.take_effects(), [Effect::CloseDns, Effect::Withdraw]);
+    }
+}
+
+#[test]
+fn pending_up_rechecks_cancellation_and_exit_before_network_effects() {
+    for exit in [false, true] {
+        let mut cycle = fixture();
+        let canceled = cycle.network.canceled.clone();
+        let observed = cycle.session.exit.clone();
+        cycle.session.on_up = Some(Box::new(move || {
+            if exit {
+                observed.set(Some(None));
+            } else {
+                canceled.store(true, Ordering::Release);
+            }
+        }));
+        cycle.push(Progress::Up(up(Some("utun40"))));
+        let result = cycle.ready(&profile());
+        if exit {
+            assert_eq!(result.unwrap_err().step, Step::Tunnel);
+        } else {
+            assert!(!result.unwrap());
+        }
+        assert!(cycle.take_effects().is_empty());
+    }
+}
+
+#[test]
+fn withdrawal_retries_an_incomplete_interface_snapshot_within_its_budget() {
+    for (errors, completed) in [(1, true), (10, false)] {
+        let mut cycle = fixture();
+        cycle.open();
+        cycle.take_effects();
+        cycle.network.current = Interfaces::default();
+        cycle.network.snapshot_errors = errors;
+        let started = cycle.network.now;
+        cycle.push(restart(15, None));
+        let result = cycle.ready(&profile());
+        let effects = cycle.take_effects();
+        if completed {
+            assert!(!result.unwrap());
+            assert_eq!(
+                effects,
+                [
+                    Effect::CloseDns,
+                    Effect::WaitForWithdrawal,
+                    Effect::Withdraw,
+                    Effect::Release(15)
+                ]
+            );
+        } else {
+            assert_eq!(result.unwrap_err().step, Step::Routes);
+            assert_eq!(cycle.network.now - started, RESTART_WITHDRAWAL_TIMEOUT);
+            assert!(
+                effects[1..]
+                    .iter()
+                    .all(|effect| *effect == Effect::WaitForWithdrawal)
+            );
+        }
     }
 }
 
@@ -797,7 +961,7 @@ fn phase_and_tunnel_failures_preserve_approval_and_authentication() {
             Step::Tunnel
         )
     );
-    cycle.session.exit = Some(None);
+    cycle.session.exit.set(Some(None));
     cycle.push(Progress::Up(up(Some("utun40"))));
     assert_eq!(cycle.ready(&profile()).unwrap_err().step, Step::Tunnel);
     assert!(cycle.take_effects().is_empty());
@@ -808,22 +972,251 @@ fn cleanup_reaps_before_network_release_and_retries_without_second_stop() {
     let mut cycle = fixture();
     cycle.open();
     cycle.take_effects();
+    cycle.session.exit.set(Some(None));
     assert!(!cycle.cleanup());
     assert_eq!(
         cycle.take_effects(),
-        [Effect::CloseDns, Effect::Stop, Effect::Wait(STOP_WAIT)]
+        [Effect::CloseDns, Effect::Stop, Effect::Reap]
     );
-    cycle.session.reaped = true;
+    cycle.session.absent = true;
     cycle.network.fail = Some(Effect::Finish);
     assert!(!cycle.cleanup());
-    assert_eq!(
-        cycle.take_effects(),
-        [Effect::CloseDns, Effect::Wait(STOP_WAIT), Effect::Finish]
-    );
+    assert_eq!(cycle.take_effects(), [Effect::CloseDns, Effect::Finish]);
     cycle.network.fail = None;
+    assert!(cycle.cleanup());
+    assert_eq!(cycle.take_effects(), [Effect::CloseDns, Effect::Finish]);
+}
+
+#[test]
+fn cleanup_forces_a_live_child_within_the_stop_budget() {
+    for stop_error in [Some(io::ErrorKind::TimedOut), None] {
+        let mut cycle = fixture();
+        cycle.session.stop_error = stop_error;
+        cycle.session.absent = true;
+        let started = cycle.network.now;
+        assert!(cycle.cleanup());
+        let effects = cycle.take_effects();
+        assert_eq!(&effects[..2], &[Effect::CloseDns, Effect::Stop]);
+        assert_eq!(
+            &effects[effects.len() - 2..],
+            &[Effect::ForceStop, Effect::Finish]
+        );
+        let expected_wait = if stop_error.is_some() {
+            Duration::ZERO
+        } else {
+            STOP_WAIT
+        };
+        assert_eq!(cycle.network.now - started, expected_wait);
+    }
+}
+
+#[test]
+fn cleanup_uses_the_fallback_as_soon_as_stop_fails() {
+    let mut cycle = fixture();
+    cycle.session.stop_error = Some(io::ErrorKind::BrokenPipe);
+    cycle.session.exit.set(Some(None));
+    cycle.session.absent = true;
+
     assert!(cycle.cleanup());
     assert_eq!(
         cycle.take_effects(),
-        [Effect::CloseDns, Effect::Wait(STOP_WAIT), Effect::Finish]
+        [
+            Effect::CloseDns,
+            Effect::Stop,
+            Effect::ForceStop,
+            Effect::Finish
+        ]
     );
+}
+
+#[test]
+fn reap_receipt_confirms_absence_when_a_pid_is_reused_without_identity() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Root::new();
+    let executable = root.0.join("openvpn");
+    fs::write(
+        &executable,
+        r#"#!/usr/bin/python3
+import socket, sys
+if '--version' in sys.argv:
+    print('OpenVPN 2.6.19')
+    sys.exit(0)
+with socket.socket(socket.AF_UNIX) as management:
+    management.settimeout(5)
+    management.connect(sys.argv[sys.argv.index('--management') + 1])
+    with management.makefile('rb') as commands:
+        for line in commands:
+            if line == b'signal SIGTERM\n':
+                break
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let session = Session::start_with(
+        Launch {
+            openvpn: executable,
+            config: ConfigSource::private(b"dev tun\n"),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: vec![],
+            env: vec![],
+        },
+        FixtureSigner,
+        &std::env::temp_dir(),
+        RestartPolicy::CallerOrStop,
+    )
+    .unwrap();
+    let mut tunnel = RealTunnel {
+        pid: session.pid(),
+        session: Some(session),
+        ..RealTunnel::default()
+    };
+    assert!(!tunnel.confirm_absent());
+    tunnel.stop().unwrap();
+    tunnel.reap();
+
+    // Use a live process to model the reused PID without depending on kernel allocation.
+    tunnel.pid = Some(std::process::id());
+    let without_receipt = RealTunnel {
+        pid: tunnel.pid,
+        ..RealTunnel::default()
+    };
+    assert!(!without_receipt.confirm_absent());
+    assert!(tunnel.confirm_absent());
+}
+
+#[test]
+fn expired_management_hold_fails_even_if_the_child_ignores_terminate() {
+    let mut cycle = fixture();
+    cycle.open();
+    cycle.take_effects();
+    cycle.session.hold_expired = true;
+    assert_eq!(cycle.poll(&profile()).unwrap_err().step, Step::Tunnel);
+    assert!(cycle.take_effects().is_empty());
+
+    let started = cycle.network.now;
+    assert!(!cycle.cleanup());
+    assert_eq!(cycle.network.now - started, STOP_WAIT);
+    assert_eq!(cycle.take_effects().last(), Some(&Effect::ForceStop));
+    cycle.session.absent = true;
+    assert!(cycle.cleanup());
+    assert_eq!(cycle.take_effects(), [Effect::CloseDns, Effect::Finish]);
+}
+
+fn with_native_network(check_network: impl FnOnce(&mut NativeNetwork<'_>, &OvpnUtun)) {
+    let root = Root::new();
+    let uid = unsafe { libc::geteuid() };
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.0.join(".controller.lock"))
+        .unwrap();
+    let controller = ControllerLock::fixture(&root.0, uid).unwrap();
+    let mut backend = NativeBackend::fixture(&controller).unwrap();
+    backend.fixture_route_io();
+    let mut network = NativeNetwork {
+        owner: Owner {
+            uid: 501,
+            profile: "ovpn".into(),
+            generation: 1,
+        },
+        routes: Arc::new(Mutex::new(Coordinator::new(backend).unwrap())),
+        canceled: Arc::new(AtomicBool::new(false)),
+        address: None,
+        token: None,
+        lease: None,
+        fence: None,
+        dns: None,
+    };
+    let link = OvpnUtun::prove(
+        "utun40",
+        &Interfaces::default(),
+        &fixture_interfaces(&[("utun40", 40)]),
+    )
+    .unwrap();
+    check_network(&mut network, &link);
+}
+
+#[test]
+fn native_mtu_delivers_the_requested_value_to_the_write_boundary() {
+    use crate::connection::macos::vip::ovpn_link::capture_mtu_writes;
+
+    with_native_network(|network, link| {
+        let values = capture_mtu_writes(|| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            network.mtu(link, 1420, deadline).unwrap();
+            network.mtu(link, 1500, deadline).unwrap();
+        });
+        assert_eq!(values, [1420, 1500]);
+    });
+}
+
+#[test]
+fn native_ovpn_withdrawal_retries_its_lease_without_deleting_the_ssl_default() {
+    use crate::connection::routes::{Address, Key, NextHop, Route};
+
+    with_native_network(|network, link| {
+        let ssl_owner = Owner {
+            profile: "ssl".into(),
+            ..network.owner.clone()
+        };
+        let default = Route {
+            key: Key {
+                network: "0.0.0.0/0".parse().unwrap(),
+                scope: 7,
+            },
+            interface: 7,
+            next_hop: NextHop::Gateway(Address::unscoped("192.0.2.1".parse().unwrap())),
+        };
+        let routes = network.routes.clone();
+        let ssl_scope;
+        {
+            let mut routes = routes.lock().unwrap();
+            ssl_scope = routes
+                .backend_mut()
+                .fixture_default(ssl_owner.clone(), default);
+            let lease = routes.acquire(ssl_owner.clone(), &[default]).unwrap();
+            assert!(routes.backend_mut().begin_cleanup(&ssl_scope).unwrap());
+            assert_eq!(routes.release(lease).unwrap().pending, 1);
+            routes.backend_mut().fixture_allow_default_delete();
+        }
+
+        network
+            .routes(
+                link,
+                &up(Some("utun40")),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        let fence = network.fence.as_ref().unwrap().clone();
+        assert!(!network.withdraw_routes().unwrap());
+        assert!(network.lease.is_none());
+        assert!(network.token.is_some());
+        assert!(!fence.is_complete());
+        {
+            let mut routes = routes.lock().unwrap();
+            let inventory = routes.inventory(&network.owner);
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].route.interface, 40);
+            assert!(routes.has_owner(&ssl_owner));
+            assert_eq!(routes.backend_mut().fixture_default_deletes(), 0);
+            routes
+                .backend_mut()
+                .fixture_remove_route(inventory[0].route);
+        }
+
+        assert!(network.withdraw_routes().unwrap());
+        assert!(network.token.is_none());
+        assert!(fence.is_complete());
+        let mut routes = routes.lock().unwrap();
+        assert!(!routes.has_owner(&network.owner));
+        assert!(!routes.backend_mut().fixture_has_scope(&network.owner));
+        assert!(routes.has_owner(&ssl_owner));
+        assert_eq!(routes.backend_mut().fixture_default_deletes(), 0);
+        assert_eq!(routes.retry_cleanup().removed, 1);
+        assert_eq!(routes.backend_mut().fixture_default_deletes(), 1);
+        routes.backend_mut().finish_cleanup(&ssl_scope).unwrap();
+    });
 }

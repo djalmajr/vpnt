@@ -255,20 +255,26 @@ pub enum RestartPolicy {
     /// The controller withdraws the network and calls
     /// `Session::release_restart_hold(epoch)`; Linux uses this policy.
     Caller,
+    /// Stop the session if the caller does not acknowledge the withdrawal.
+    CallerOrStop,
 }
 
 const RESTART_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+const MANAGEMENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RestartHold {
     policy: RestartPolicy,
     state: Mutex<RestartHoldState>,
     changed: Condvar,
+    deadline_stop: OnceLock<io::Result<()>>,
 }
 
 #[derive(Default)]
 struct RestartHoldState {
     pending: Option<u64>,
     stopped: bool,
+    deadline: Option<Instant>,
+    timed_out: bool,
 }
 
 impl RestartHold {
@@ -277,6 +283,7 @@ impl RestartHold {
             policy,
             state: Mutex::new(RestartHoldState::default()),
             changed: Condvar::new(),
+            deadline_stop: OnceLock::new(),
         }
     }
 
@@ -297,26 +304,39 @@ impl RestartHold {
         // A notification from a retired session must not match a new session's hold.
         static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
         let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
-        lock(&self.state).pending = Some(epoch);
+        let mut state = lock(&self.state);
+        state.pending = Some(epoch);
+        state.deadline = None;
         epoch
     }
 
     fn release(&self, epoch: u64) {
         let mut state = lock(&self.state);
-        if state.pending == Some(epoch) {
+        if state.pending == Some(epoch)
+            && (self.policy != RestartPolicy::CallerOrStop
+                || !state.stopped
+                    && state
+                        .deadline
+                        .is_none_or(|deadline| Instant::now() < deadline))
+        {
             state.pending = None;
             self.changed.notify_one();
         }
     }
 
-    fn stop(&self) {
-        lock(&self.state).stopped = true;
+    fn stop(&self) -> bool {
+        let mut state = lock(&self.state);
+        state.stopped = true;
         self.changed.notify_one();
+        state.timed_out
     }
 
     /// Waits until the pending restart, if any, has its routes withdrawn.
     /// Returns false when the session is stopping.
-    fn await_withdrawal(&self) -> bool {
+    fn await_withdrawal(&self, control: &Mutex<UnixStream>) -> bool {
+        if self.policy == RestartPolicy::CallerOrStop {
+            return self.await_withdrawal_or_stop(control);
+        }
         let (mut state, _) = self
             .changed
             .wait_timeout_while(lock(&self.state), RESTART_HOLD_TIMEOUT, |state| {
@@ -331,8 +351,50 @@ impl RestartHold {
         true
     }
 
+    fn await_withdrawal_or_stop(&self, control: &Mutex<UnixStream>) -> bool {
+        let mut state = lock(&self.state);
+        loop {
+            if state.stopped || state.pending.is_none() {
+                return !state.stopped;
+            }
+            let deadline = *state
+                .deadline
+                .get_or_insert_with(|| Instant::now() + RESTART_HOLD_TIMEOUT);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Resolve the deadline and acknowledgements under the same lock.
+                state.stopped = true;
+                state.timed_out = true;
+                drop(state);
+                if let Err(error) =
+                    self.stop_after_timeout(control, Instant::now() + MANAGEMENT_STOP_TIMEOUT)
+                {
+                    eprintln!("ovpn_restart_stop_failed: {:?}", error.kind());
+                }
+                return false;
+            }
+            (state, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn stop_after_timeout(&self, control: &Mutex<UnixStream>, deadline: Instant) -> io::Result<()> {
+        // The management thread and any concurrent stop share one bounded write.
+        match self
+            .deadline_stop
+            .get_or_init(|| terminate_with_deadline(control, deadline))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error
+                .raw_os_error()
+                .map_or_else(|| error.kind().into(), io::Error::from_raw_os_error)),
+        }
+    }
+
     fn send_release(&self, control: &Mutex<UnixStream>) {
-        if !self.await_withdrawal() {
+        if !self.await_withdrawal(control) {
             return;
         }
         let mut writer = lock(control);
@@ -711,38 +773,23 @@ impl Session {
         self.restart_hold.0.release(epoch);
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restart_hold_expired(&self) -> bool {
+        lock(&self.restart_hold.0.state).timed_out
+    }
+
     /// Asks openvpn to leave, notifying the server.
     pub fn stop(&self) -> io::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MANAGEMENT_STOP_TIMEOUT;
         // A pending withdrawal must not keep the management thread parked
         // while TERMINATE is written, on any platform.
-        self.restart_hold.0.stop();
-        loop {
-            let mut control = match self.control.try_lock() {
-                Ok(control) => control,
-                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    };
-                    if remaining.is_zero() {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    thread::sleep(remaining.min(Duration::from_millis(10)));
-                    continue;
-                }
-            };
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(io::ErrorKind::TimedOut.into());
-            };
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            control.set_write_timeout(Some(remaining))?;
-            let result = control.write_all(management::TERMINATE.as_bytes());
-            drop(control);
-            return result;
+        if self.restart_hold.0.stop() {
+            return self
+                .restart_hold
+                .0
+                .stop_after_timeout(&self.control, deadline);
         }
+        terminate_with_deadline(&self.control, deadline)
     }
 
     /// Returns once openvpn has exited and its last lines were read, so a
@@ -1038,7 +1085,7 @@ fn drive_with_approval(
                     // A HOLD may arrive before the restart state. The token is
                     // still called only after that restart's routes are withdrawn.
                     if let Some(hold) = restart_hold
-                        && !hold.await_withdrawal()
+                        && !hold.await_withdrawal(control)
                     {
                         continue;
                     }
@@ -1095,6 +1142,35 @@ fn refuse(progress: &mpsc::Sender<Progress>, error: SignError) -> String {
 
 fn send(control: &Mutex<UnixStream>, text: &str) -> io::Result<()> {
     lock(control).write_all(text.as_bytes())
+}
+
+fn terminate_with_deadline(control: &Mutex<UnixStream>, deadline: Instant) -> io::Result<()> {
+    loop {
+        let mut control = match control.try_lock() {
+            Ok(control) => control,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(io::ErrorKind::TimedOut.into());
+                };
+                if remaining.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+                continue;
+            }
+        };
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::ErrorKind::TimedOut.into());
+        };
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        control.set_write_timeout(Some(remaining))?;
+        let result = control.write_all(management::TERMINATE.as_bytes());
+        drop(control);
+        return result;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

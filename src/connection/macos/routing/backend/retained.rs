@@ -231,9 +231,15 @@ struct OvpnScope<'a> {
     link: OvpnUtun,
     index: u16,
     address: Ipv4Addr,
-    writer: AddWriter<'a>,
+    writer: OvpnRouteIo<'a>,
     canceled: Arc<AtomicBool>,
     work: RouteWork,
+}
+
+enum OvpnRouteIo<'a> {
+    Native(AddWriter<'a>),
+    #[cfg(test)]
+    Fixture(Arc<std::sync::Mutex<super::FixtureRouteIo>>),
 }
 
 impl super::registry::Scope for OvpnScope<'_> {
@@ -249,6 +255,10 @@ impl super::registry::Scope for OvpnScope<'_> {
         if self.canceled.load(Ordering::Acquire) {
             return Err(Error::Canceled);
         }
+        #[cfg(test)]
+        if let OvpnRouteIo::Fixture(_) = self.writer {
+            return Ok(());
+        }
         if !self.link.address_current(self.address) {
             return Err(Error::Changed);
         }
@@ -259,7 +269,14 @@ impl super::registry::Scope for OvpnScope<'_> {
         if route.next_hop != NextHop::Interface || route.interface != self.index {
             return Err(Error::Invalid);
         }
-        let receipt = self.writer.add_ovpn_utun(
+        #[cfg(not(test))]
+        let OvpnRouteIo::Native(writer) = &mut self.writer;
+        #[cfg(test)]
+        let writer = match &mut self.writer {
+            OvpnRouteIo::Native(writer) => writer,
+            OvpnRouteIo::Fixture(fixture) => return Ok(fixture.lock().unwrap().add(route)),
+        };
+        let receipt = writer.add_ovpn_utun(
             &self.link,
             self.address,
             route.key.network,
@@ -317,11 +334,21 @@ impl<'a> NativeBackend<'a> {
                 if default.is_some() || plan.iter().any(|route| route.key.network.prefix() < 8) {
                     return Err(Error::Invalid);
                 }
+                let open = || AddWriter::open(self.controller).map(OvpnRouteIo::Native);
+                #[cfg(not(test))]
+                let writer = open()?;
+                #[cfg(test)]
+                let writer = self
+                    .registry
+                    .table_mut()
+                    .fixture
+                    .clone()
+                    .map_or_else(open, |fixture| Ok(OvpnRouteIo::Fixture(fixture)))?;
                 let scope = OvpnScope {
                     link: link.clone(),
                     index,
                     address,
-                    writer: AddWriter::open(self.controller)?,
+                    writer,
                     canceled: canceled.clone(),
                     work,
                 };

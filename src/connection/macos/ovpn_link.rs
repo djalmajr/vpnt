@@ -114,8 +114,18 @@ impl OvpnUtun {
     }
 
     pub(crate) fn set_mtu(&self, mtu: u16) -> io::Result<()> {
-        let fd = root_dgram()?;
         let mut request = mtu_request(&self.name, mtu)?;
+        #[cfg(test)]
+        if MTU_WRITES.with_borrow_mut(|writes| {
+            writes.as_mut().is_some_and(|writes| {
+                // SAFETY: mtu_request initialized the MTU member of the union.
+                writes.push(unsafe { request.ifr_ifru.ifru_mtu });
+                true
+            })
+        }) {
+            return Ok(());
+        }
+        let fd = root_dgram()?;
         if !self.current()? {
             return Err(io::ErrorKind::NotFound.into());
         }
@@ -186,6 +196,18 @@ impl OvpnUtun {
         check()?;
         Ok(false)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MTU_WRITES: std::cell::RefCell<Option<Vec<i32>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_mtu_writes(run: impl FnOnce()) -> Vec<i32> {
+    MTU_WRITES.set(Some(Vec::new()));
+    run();
+    MTU_WRITES.take().unwrap()
 }
 
 pub(super) fn assign_ipv4_alias(name: &str, address: IpAddr, prefix: u8) -> io::Result<()> {
