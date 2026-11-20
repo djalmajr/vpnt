@@ -242,6 +242,9 @@ jobs:
           runtime="${GITHUB_WORKSPACE}/target/vpnt-runtime"
           openvpn="${runtime}/bin/openvpn"
           test -x "$openvpn"
+          # The fixture creates its CA with the openssl found in PATH.
+          command -v openssl
+          openssl version
           # Build first, so the runtime's library path reaches only the tests
           # and the openvpn they start, never rustc or build scripts.
           cargo +1.99.0 test --locked --no-default-features --test ovpn_session --no-run

@@ -103,14 +103,19 @@ impl Fixture {
     }
 
     fn openssl(&self, args: &[&str]) {
-        let status = Command::new("openssl")
+        let output = Command::new("openssl")
             .args(args)
             .current_dir(&self.directory)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .expect("VPNT_TEST_OPENVPN is set, so the openssl command is required");
-        assert!(status.success(), "openssl {args:?}");
+        assert!(
+            output.status.success(),
+            "openssl {args:?} ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// A default server: it offers TLS 1.3 and RSA-PSS, like the real ones.
