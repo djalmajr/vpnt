@@ -1,12 +1,12 @@
 //! A 0700 directory removed on drop, for the management socket.
+#[cfg(not(target_os = "linux"))]
+use std::os::unix::ffi::OsStrExt;
 use std::{
     fs, io,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-#[cfg(not(target_os = "linux"))]
-use std::{os::unix::ffi::OsStrExt, os::unix::fs::MetadataExt};
 
 /// `sockaddr_un.sun_path` on macOS; the terminating NUL also has to fit.
 #[cfg(not(target_os = "linux"))]
@@ -83,7 +83,13 @@ impl PrivateDir {
                 std::process::id()
             ));
             match fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    // The guard exists before the check: a rejection removes
+                    // what mkdir just made, on both platforms.
+                    let directory = Self { path };
+                    verify(&directory.path)?;
+                    return Ok(directory);
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -95,8 +101,164 @@ impl PrivateDir {
     }
 }
 
+/// Confirms what `mkdir` made without following a planted symlink. The mode
+/// must be exactly 0700: a restrictive umask or an injected chmod is refused.
+fn verify(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private session directory failed the type, owner or mode check: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for PrivateDir {
     fn drop(&mut self) {
+        // A restrictive umask can leave the rejected directory unreadable.
+        // Restore owner rwx on the entry we created so remove_dir_all can
+        // clean it up. AT_SYMLINK_NOFOLLOW keeps the change on the entry
+        // itself even if it was replaced by a link after the check; a 0000
+        // directory cannot be opened for fchmod.
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o700 != 0o700
+            && let Ok(path) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
+                self.path.as_os_str(),
+            ))
+        {
+            // SAFETY: `path` is a valid NUL-terminated string for this call;
+            // failure only leaves the entry for remove_dir_all to report.
+            unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    0o700,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&self.path);
+        // If the chmod was unsupported, an empty unreadable directory is still
+        // removable: rmdir needs write access to the parent, not the entry.
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrivateDir, verify};
+    use std::{
+        fs, io,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct RestoreUmask(libc::mode_t);
+
+    impl RestoreUmask {
+        fn set(mask: libc::mode_t) -> Self {
+            Self(unsafe { libc::umask(mask) })
+        }
+    }
+
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    struct RemoveTree(PathBuf);
+
+    impl Drop for RemoveTree {
+        fn drop(&mut self) {
+            if let Ok(entries) = fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o700));
+                }
+            }
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_base() -> PathBuf {
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos());
+        let base = std::env::temp_dir().join(format!("vpnt-pdir-{}-{salt:x}", std::process::id()));
+        fs::create_dir(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        base
+    }
+
+    #[test]
+    fn private_directory_is_checked_after_mkdir() {
+        // The umask is process-wide: run the hostile case in a child so no
+        // other test can inherit it.
+        const CHILD: &str = "VPNT_PRIVATE_DIR_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let base = unique_base();
+            let _cleanup = RemoveTree(base.clone());
+            let _umask = RestoreUmask::set(0o777);
+            match PrivateDir::create(&base) {
+                Ok(directory) => panic!(
+                    "accepted a directory outside 0700: {}",
+                    directory.path.display()
+                ),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}"),
+            }
+            assert_eq!(
+                fs::read_dir(&base).unwrap().count(),
+                0,
+                "rejected directory was not removed"
+            );
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(format!(
+                "{}::private_directory_is_checked_after_mkdir",
+                module_path!()
+                    .strip_prefix("vpnt::")
+                    .unwrap_or(module_path!())
+            ))
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child rejected the bad mode: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn directory_check_refuses_a_symlink_and_a_wrong_mode() {
+        let base = unique_base();
+        let _cleanup = RemoveTree(base.clone());
+
+        let good = base.join("good");
+        fs::create_dir(&good).unwrap();
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(verify(&good).is_ok());
+
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert!(verify(&link).is_err(), "symlink followed");
+
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify(&good).is_err(), "wrong mode accepted");
     }
 }

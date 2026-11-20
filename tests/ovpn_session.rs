@@ -13,6 +13,8 @@ mod fixture;
 use fixture::{Fixture, free_udp_ports};
 #[cfg(not(target_os = "linux"))]
 use std::os::unix::fs::DirBuilderExt;
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs, io,
     net::Ipv4Addr,
@@ -46,6 +48,39 @@ fn session_base() -> PathBuf {
         let base = std::env::temp_dir().join("s");
         fs::DirBuilder::new().mode(0o700).create(&base).ok();
         base
+    }
+}
+
+/// Only the shared-base test gets its own Linux base, so a mutant that ignores
+/// the caller's base cannot hide behind the /tmp default. Other Linux
+/// integration tests keep using /tmp.
+struct TestBase(PathBuf);
+
+impl TestBase {
+    fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        let path = {
+            let salt = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos());
+            let path = PathBuf::from("/tmp").join(format!("vb{}-{salt:x}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            path
+        };
+        #[cfg(not(target_os = "linux"))]
+        let path = session_base();
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestBase {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -140,8 +175,9 @@ fn session_uses_the_shared_base_for_its_private_directory() {
         extra: Vec::new(),
         env: Vec::new(),
     };
-    let base = session_base().canonicalize().unwrap();
-    let session = Session::start_with(launch, NoSign, &session_base(), restart_policy()).unwrap();
+    let base = TestBase::new();
+    let expected = base.path().canonicalize().unwrap();
+    let session = Session::start_with(launch, NoSign, base.path(), restart_policy()).unwrap();
     session.wait().unwrap();
     let evidence = fs::read_to_string(&marker).unwrap();
     let mut management = "";
@@ -153,21 +189,26 @@ fn session_uses_the_shared_base_for_its_private_directory() {
             config = path;
         }
     }
-    // Both platforms put the management socket in the caller's base. Linux
-    // keeps the contract of passing /dev/null as the config; only macOS gets
-    // the private copy checked here.
-    assert!(
-        Path::new(management).starts_with(&base),
-        "{management} is outside {}",
-        base.display()
+    // Both platforms put the management socket directly in the caller's base.
+    // Linux keeps the contract of passing /dev/null as the config; only macOS
+    // gets the private copy checked here.
+    let directory = Path::new(management)
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("{management} has no session directory"));
+    assert_eq!(
+        directory,
+        expected.as_path(),
+        "{management} is not directly under {}",
+        expected.display()
     );
     #[cfg(target_os = "linux")]
     assert_eq!(config, "/dev/null", "Linux argv changed");
     #[cfg(not(target_os = "linux"))]
     assert!(
-        Path::new(config).starts_with(&base),
+        Path::new(config).starts_with(&expected),
         "{config} is outside {}",
-        base.display()
+        expected.display()
     );
 }
 

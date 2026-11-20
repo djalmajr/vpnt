@@ -400,6 +400,9 @@ impl Session {
             canonical
         };
         let version = version_for(&launch.openvpn)?;
+        #[cfg(target_os = "linux")]
+        let directory = PrivateDir::create(base)?;
+        #[cfg(not(target_os = "linux"))]
         let directory = PrivateDir::create(&base)?;
         #[cfg(not(target_os = "linux"))]
         let config_path = match &config {
