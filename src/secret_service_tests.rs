@@ -1,7 +1,6 @@
 use super::*;
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -26,12 +25,10 @@ impl Fixture {
     fn store(&self, script: &str) -> LinuxSecretService {
         let program = self.0.join("secret-tool");
         // Each fixture writes only under the directory that owns the executable.
-        fs::write(
+        crate::test_support::write_script(
             &program,
-            format!("#!/bin/sh\ncd -- \"${{0%/*}}\" || exit 2\n{script}\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+            &format!("#!/bin/sh\ncd -- \"${{0%/*}}\" || exit 2\n{script}\n"),
+        );
         LinuxSecretService::with_program(program)
     }
 

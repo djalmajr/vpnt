@@ -36,6 +36,8 @@ pub mod secrets;
 pub mod session;
 #[cfg(unix)]
 pub mod storage;
+#[cfg(all(test, unix))]
+mod test_support;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod broker;

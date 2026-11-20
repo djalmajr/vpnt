@@ -118,7 +118,7 @@ mod tests {
         fs,
         io::{self, BufRead, BufReader, Write},
         os::unix::{
-            fs::{DirBuilderExt, PermissionsExt},
+            fs::DirBuilderExt,
             net::{UnixListener, UnixStream},
         },
         sync::{
@@ -196,7 +196,7 @@ mod tests {
     fn ovpn_connect_sends_empty_credentials_without_consulting_store() {
         let fixture = Fixture::new();
         let executable = fixture.0.join("fixture-runtime");
-        fs::write(&executable, r#"#!/usr/bin/python3
+        crate::test_support::write_script(&executable, &r#"#!/usr/bin/python3
 import json
 import os
 from pathlib import Path
@@ -217,8 +217,7 @@ with os.fdopen(os.dup(0), "w") as out:
             assert command["id"] == "one" and command["generation"] == 1
             assert command["credentials"] == {"password":"","psk":""}
             Path(__file__).with_suffix(".accepted").touch()
-"#.replace("FIXTURE_VERSION", env!("CARGO_PKG_VERSION")).replace("FIXTURE_PROTOCOL", &crate::helper::protocol::VERSION.to_string())).unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+"#.replace("FIXTURE_VERSION", env!("CARGO_PKG_VERSION")).replace("FIXTURE_PROTOCOL", &crate::helper::protocol::VERSION.to_string()));
         let client = Client::linux_for_executable(&executable).unwrap();
         let secrets = Secrets::default();
         let mut fixture_broker = RuntimeBroker(Broker::new(Some(client), secrets.clone()));
