@@ -903,7 +903,10 @@ fn probe_deferral_counts_a_failure_after_one_cadence() {
     // Keep the slot busy at every poll while the clock is shortened.
     let before = *worker.status.lock().unwrap();
     assert_eq!(worker.after_probe(release), before);
-    worker.interval.set(Duration::from_millis(10));
+    // The status slot keeps only the latest value. A 250 ms cadence between
+    // failure samples gives the reader more time before a later sample
+    // overwrites the first failure; a count per poll is already caught above.
+    worker.interval.set(Duration::from_millis(250));
     worker.expect(ConnectionState::Unresponsive, 1);
 }
 
