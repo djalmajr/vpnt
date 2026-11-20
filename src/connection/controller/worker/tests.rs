@@ -1048,10 +1048,8 @@ fn restart_epoch_resets_the_failure_streak() {
         assert!(Instant::now() < deadline, "the worker did not change epoch");
         thread::sleep(Duration::from_millis(1));
     }
-    // On Linux the new epoch schedules the retry probe by itself; asking for
-    // one there too would start a third probe that races the second.
-    #[cfg(not(target_os = "linux"))]
-    signal.probe.store(true, Ordering::Release);
+    // The new epoch schedules the retry probe by itself on both systems;
+    // asking for one too would start a third probe that races the second.
     let after_restart = signal.progress(2, |p| p.state == ConnectionState::Unresponsive);
     assert_eq!(
         after_restart.failures, 1,
@@ -1184,7 +1182,7 @@ mod connected_phase {
 
     #[test]
     fn connected_approval_and_reconnecting_suspend_probes_and_resume_cadence() {
-        use ConnectionState::{AwaitingApproval, Connected, Reconnecting};
+        use ConnectionState::{AwaitingApproval, Connected, Reconnecting, Unresponsive};
 
         let observations = observe(vec![
             Tick {
@@ -1226,8 +1224,68 @@ mod connected_phase {
                 Observation(0, None),
                 Observation(0, Some((Reconnecting, 0))),
                 Observation(0, None),
-                Observation(0, None),
+                // Leaving the phase probes at once, without a timer or request,
+                // and publishes the result in place of the stale phase.
+                Observation(1, Some((Unresponsive, 1))),
                 Observation(1, Some((Connected, 0))),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_phase_exit_probes_at_once_and_then_keeps_the_cadence() {
+        use ConnectionState::{AwaitingApproval, Connected};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(AwaitingApproval),
+                ..Tick::default()
+            },
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick::default(),
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(0, Some((AwaitingApproval, 0))),
+                Observation(1, Some((Connected, 0))),
+                Observation(0, None),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_probe_crossing_a_restart_is_retried_once_without_a_request() {
+        use ConnectionState::{Connected, Unresponsive};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                restart_during_probe: true,
+                ..Tick::default()
+            },
+            Tick::default(),
+            Tick::default(),
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(1, None),
+                Observation(1, Some((Unresponsive, 1))),
+                Observation(0, None),
             ],
         );
     }
