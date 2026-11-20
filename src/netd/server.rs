@@ -163,6 +163,7 @@ impl<B: Backend + 'static> Server<B> {
         }
         let server = Arc::downgrade(self);
         if let Err(error) = thread::Builder::new().spawn(move || {
+            let mut resume = None;
             for delay in retry_delays() {
                 thread::sleep(delay);
                 let Some(server) = server.upgrade() else {
@@ -172,7 +173,7 @@ impl<B: Backend + 'static> Server<B> {
                     break;
                 }
                 if let Ok(lock) = server.request_lock(server.lock_deadline()) {
-                    server.retry_pass(&lock, Instant::now() + RETRY_BUDGET);
+                    resume = server.retry_pass(&lock, None, resume.as_ref());
                 }
                 if !server.retry_needed() {
                     break;
@@ -196,25 +197,45 @@ impl<B: Backend + 'static> Server<B> {
         true
     }
 
-    fn retry_pass(&self, _lock: &NetworkGuard, deadline: Instant) {
-        let deadline = deadline.min(Instant::now() + self.backend.retry_wait());
-        let names = self.pending.lock().expect("pending mutex").clone();
+    fn retry_pass(
+        &self,
+        _lock: &NetworkGuard,
+        deadline: Option<Instant>,
+        resume: Option<&TunName>,
+    ) -> Option<TunName> {
+        let deadline = deadline.map(|end| end.min(Instant::now() + self.backend.retry_wait()));
+        let mut names: Vec<_> = self
+            .pending
+            .lock()
+            .expect("pending mutex")
+            .iter()
+            .map(|(name, proof)| (name.clone(), *proof))
+            .collect();
+        names.sort_unstable_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        if let Some(resume) = resume {
+            // If inline cleanup removed the cursor, start at its successor.
+            let start = names.partition_point(|(name, _)| name.as_str() < resume.as_str());
+            names.rotate_left(start);
+        }
+        let mut unattempted = None;
         for (name, proof) in names {
-            // Each backend command has its own deadline. Do not start a new
-            // inventory or deletion once the retry budget has been spent.
-            if Instant::now() >= deadline {
+            // Only inline cleanup limits the pass. Each backend command
+            // still has its own deadline.
+            if deadline.is_some_and(|end| Instant::now() >= end) {
                 break;
             }
             let Ok(existing) = self.backend.existing() else {
                 log_tun("cleanup_inventory_failed", 0, &name);
+                unattempted.get_or_insert(name);
                 continue;
             };
             match existing.iter().find(|entry| entry.name == name) {
                 Some(entry) if !proof.matches(entry) => {
                     log_tun("cleanup_name_conflict", 0, &name);
+                    unattempted.get_or_insert(name);
                     continue;
                 }
-                Some(_) if Instant::now() >= deadline => break,
+                Some(_) if deadline.is_some_and(|end| Instant::now() >= end) => break,
                 Some(_) if self.backend.delete_tun(&name).is_err() => {
                     log_tun("cleanup_retry_failed", 0, &name);
                     continue;
@@ -225,6 +246,7 @@ impl<B: Backend + 'static> Server<B> {
             self.release(&name);
             log_tun("cleanup_released", 0, &name);
         }
+        unattempted
     }
     pub(super) fn dispatch(
         self: &Arc<Self>,
@@ -461,7 +483,8 @@ impl<B: Backend + 'static> Session<'_, B> {
                 {
                     return Err(ErrorCode::RouteConflict);
                 }
-                self.server.retry_pass(&lock, Instant::now() + RETRY_BUDGET);
+                self.server
+                    .retry_pass(&lock, Some(Instant::now() + RETRY_BUDGET), None);
                 let name = self.server.create(self.uid)?;
                 self.owned.push(name.clone());
                 Ok(Response::Opened(name))

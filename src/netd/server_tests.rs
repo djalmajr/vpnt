@@ -1,7 +1,7 @@
 use super::*;
 use crate::netd::iproute::Existing;
 use crate::netd::protocol::{Config, decode_response};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 type Pause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
@@ -14,7 +14,10 @@ pub(in crate::netd) struct Fake {
     partial_create: Mutex<Option<NonZeroU32>>,
     fail_delete: AtomicBool,
     fail_all_deletes: AtomicBool,
+    fail_delete_for: Mutex<Option<TunName>>,
     failed_delete_times: Mutex<Vec<Instant>>,
+    inventory_calls: AtomicUsize,
+    fail_inventory_call: AtomicUsize,
     conflict: AtomicBool,
     fail_create: AtomicBool,
     fail_configure: AtomicBool,
@@ -75,6 +78,9 @@ impl Backend for Arc<Fake> {
         if self.fail_delete.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("delete failed"));
         }
+        if self.fail_delete_for.lock().unwrap().as_ref() == Some(name) {
+            return Err(io::Error::other("delete failed"));
+        }
         let pause = self.pause_delete.lock().unwrap().take();
         if let Some((started, resume)) = pause {
             let _ = started.send(());
@@ -88,6 +94,10 @@ impl Backend for Arc<Fake> {
         Ok(())
     }
     fn existing(&self) -> io::Result<Vec<Existing>> {
+        let call = self.inventory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_inventory_call.load(Ordering::SeqCst) {
+            return Err(io::Error::other("inventory failed"));
+        }
         let pause = self.pause_inventory.lock().unwrap().take();
         if let Some((started, resume)) = pause {
             started.send(()).unwrap();
@@ -1020,7 +1030,7 @@ fn ovpn_receipt_survives_server_restart_until_startup_cleanup() {
     assert!(restarted.pending.lock().unwrap().contains_key(&name));
     assert!(ovpn_receipt(&f));
     let lock = f.network_lock();
-    restarted.retry_pass(&lock, restarted.lock_deadline());
+    restarted.retry_pass(&lock, Some(restarted.lock_deadline()), None);
     assert!(!ovpn_present(&f.fake).unwrap());
 }
 
@@ -1082,6 +1092,73 @@ fn wait_for_cleanup(mut condition: impl FnMut() -> bool) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn enqueue_marked(f: &Fixture, name: &str) -> TunName {
+    let name = TunName::parse(name).unwrap();
+    let _lock = f.network_lock();
+    f.fake.create_tun(&name, 1000).unwrap();
+    f.server.reserved.lock().unwrap().insert(name.clone());
+    f.server.defer(&name, CleanupProof::Marked);
+    name
+}
+
+#[test]
+fn background_cleanup_deletes_after_a_three_second_inventory() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let name = enqueue_marked(&f, "vpnt0");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread::sleep(Duration::from_secs(3));
+    resume.send(()).unwrap();
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+
+    assert_eq!(
+        f.fake.inventory_calls.load(Ordering::SeqCst),
+        1,
+        "cleanup must delete in the same pass as the slow inventory"
+    );
+    assert_eq!(
+        *f.fake.events.lock().unwrap(),
+        ["create vpnt0 1000", "delete vpnt0"]
+    );
+    assert!(!f.fake.names.lock().unwrap().contains(&name));
+    assert!(!f.server.reserved.lock().unwrap().contains(&name));
+}
+
+#[test]
+fn background_cleanup_resumes_with_first_pending_name_without_attempt() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let first = enqueue_marked(&f, "vpnt0");
+    let second = enqueue_marked(&f, "vpnt1");
+    *f.fake.fail_delete_for.lock().unwrap() = Some(first.clone());
+    f.fake.fail_inventory_call.store(2, Ordering::SeqCst);
+
+    f.server.retry_pending();
+    wait_for_cleanup(|| !f.server.pending.lock().unwrap().contains_key(&second));
+    let events = f.fake.events.lock().unwrap().clone();
+    let names = f.fake.names.lock().unwrap().clone();
+    let reserved = f.server.reserved.lock().unwrap().clone();
+    *f.fake.fail_delete_for.lock().unwrap() = None;
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+
+    assert!(
+        events.starts_with(&[
+            "create vpnt0 1000".into(),
+            "create vpnt1 1000".into(),
+            "delete vpnt0".into(),
+            "delete vpnt1".into(),
+        ]),
+        "the next pass must try vpnt1 before retrying vpnt0: {events:?}"
+    );
+    assert!(names.contains(&first) && reserved.contains(&first));
+    assert!(!names.contains(&second) && !reserved.contains(&second));
 }
 
 #[test]
@@ -1150,6 +1227,7 @@ fn inline_retry_stops_before_deleting_after_its_own_budget() {
     let names = f.fake.names.lock().unwrap().clone();
     drop(wire);
     worker.unwrap().join().unwrap();
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
 
     assert!(matches!(opened, Response::Opened(name) if name.as_str() == "vpnt2"));
     assert_eq!(
@@ -1163,6 +1241,9 @@ fn inline_retry_stops_before_deleting_after_its_own_budget() {
     assert!(pending.iter().all(|name| {
         matches!(retained.get(name), Some(CleanupProof::Marked)) && names.contains(name)
     }));
+    assert!(f.server.pending.lock().unwrap().is_empty());
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
 }
 
 #[test]
