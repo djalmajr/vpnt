@@ -489,7 +489,7 @@ fn sign_until_skips_c_login_when_revoked_during_token_info() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[test]
 fn open_until_skips_session_and_login_when_revoked_during_slot_enumeration() {
     let (result, events) = with_login_fixture(b'E', |module, canceled, expires| {

@@ -93,7 +93,7 @@ def main():
     mutations=[
         ("version-admission-omitted","src/broker/snapshot.rs",lambda s:replace(s,'if version != env!("CARGO_PKG_VERSION") {','if false {'),denied,False),
         ("accepted-substitutes-traffic-proof",model,lambda s:replace(s,"p.accepted = true;","p.accepted = true; set_state(c, State::Connected);"),flow,False),
-        ("stale-generation-invalidates-session",model,lambda s:replace(s,"                if generation < c.generation {\n                    return Ok(());\n                }\n",""),flow,False),
+        ("stale-generation-invalidates-session",model,lambda s:replace(s,"                if generation < c.generation {\n                    if !state.active() {\n                        self.revoke_suspended_signing(&profile_id, generation);\n                    }\n                    return Ok(());\n                }\n",""),flow,False),
         ("disconnect-all-only-first-profile",commands,lambda s:replace(s,"for id in ids {","for id in ids.into_iter().take(1) {"),flow,False),
         ("probe-disconnects-tunnel",commands,lambda s:replace(s,"protocol::Command::Probe {","protocol::Command::Disconnect {"),flow,False),
         ("expired-keychain-result-starts-tunnel",commands,expiry,denied,False),

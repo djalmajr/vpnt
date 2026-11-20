@@ -528,6 +528,10 @@ impl TokenKey {
             let Some(key) = find(session, ObjectClass::PRIVATE_KEY, id)? else {
                 return Ok(Attempt::KeyMissing);
             };
+            // Last cancellation point. cryptoki's Session::sign runs C_SignInit,
+            // a sizing C_Sign and the final C_Sign, and offers no way to abort
+            // between them: once C_SignInit starts, the operation completes and
+            // the caller discards a result that arrives after revocation.
             if stopped() {
                 return Ok(Attempt::Stopped);
             }
