@@ -242,14 +242,16 @@ jobs:
           runtime="${GITHUB_WORKSPACE}/target/vpnt-runtime"
           openvpn="${runtime}/bin/openvpn"
           test -x "$openvpn"
-          # The fixture creates its CA with the openssl found in PATH.
-          command -v openssl
-          openssl version
+          # The fixture's CA and signer need OpenSSL 3 or later; the openssl in
+          # PATH here is OpenSSL 1.1, which refuses req with OPENSSL_CONF=/dev/null.
+          fixture_openssl="$(brew --prefix openssl@4)/bin/openssl"
+          test -x "$fixture_openssl"
+          "$fixture_openssl" version
           # Build first, so the runtime's library path reaches only the tests
           # and the openvpn they start, never rustc or build scripts.
           cargo +1.99.0 test --locked --no-default-features --test ovpn_session --no-run
           status=0
-          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)" || status=$?
+          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" VPNT_TEST_OPENSSL="$fixture_openssl" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)" || status=$?
           printf '%s\n' "$output"
           if [ "$status" -ne 0 ]; then
             echo "ovpn_session failed with status $status" >&2

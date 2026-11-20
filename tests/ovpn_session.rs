@@ -4,7 +4,8 @@
 //! token.
 //!
 //! Runs when VPNT_TEST_OPENVPN names an openvpn binary (2.6 or later); without
-//! it every test returns early and proves nothing.
+//! it every test returns early and proves nothing. VPNT_TEST_OPENSSL can name
+//! the OpenSSL binary the fixture uses (see `fixture.rs`).
 #![cfg(unix)]
 
 #[path = "ovpn_session/fixture.rs"]

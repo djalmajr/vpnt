@@ -1,5 +1,9 @@
 //! A throwaway CA, a point-to-point openvpn server and a key-file signer that
 //! stands in for the token by calling `openssl pkeyutl`.
+//!
+//! VPNT_TEST_OPENSSL names the OpenSSL 3 or later binary for both, `openssl`
+//! from PATH by default. On macOS that can be LibreSSL or OpenSSL 1.1, and
+//! both refuse `req` under `OPENSSL_CONF=/dev/null`.
 use std::{
     env,
     ffi::OsString,
@@ -103,7 +107,7 @@ impl Fixture {
     }
 
     fn openssl(&self, args: &[&str]) {
-        let output = Command::new("openssl")
+        let output = openssl()
             .args(args)
             .current_dir(&self.directory)
             .stdin(Stdio::null())
@@ -290,7 +294,7 @@ impl Signer for KeyFileSigner {
             ],
             Padding::Pss(_) => return Err(SignError::Unsupported),
         };
-        let mut child = Command::new("openssl")
+        let mut child = openssl()
             .args(["pkeyutl", "-sign", "-inkey"])
             .arg(&self.key)
             .args(options)
@@ -311,6 +315,10 @@ impl Signer for KeyFileSigner {
             .then_some(output.stdout)
             .ok_or(SignError::Unavailable)
     }
+}
+
+fn openssl() -> Command {
+    Command::new(env::var_os("VPNT_TEST_OPENSSL").unwrap_or_else(|| OsString::from("openssl")))
 }
 
 pub fn free_udp_ports() -> (u16, u16) {
