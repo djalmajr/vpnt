@@ -340,3 +340,236 @@ fn losing_the_runtime_during_authorization_never_replays_or_deletes_secrets() {
     assert_eq!(h.starts.load(Ordering::Relaxed), 1);
     assert_eq!(h.removes.load(Ordering::Relaxed), 0);
 }
+
+fn ovpn_profile(id: &str) -> Profile {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "name": id, "kind": "ovpn", "gateway": "vpn.example.test",
+        "username": "", "networks": [], "port": 1194, "certificate": "",
+        "probeHost": "192.0.2.1", "probePort": 8443, "probeMethod": "tcp",
+        "ovpn": {"module": "/fixture/token.dylib", "certificateId": "01", "tls": "pkcs1_only"}
+    }))
+    .unwrap()
+}
+
+fn normalized(text: &str) -> String {
+    crate::connection::ovpn::profile::inspect(text.as_bytes())
+        .unwrap()
+        .normalized
+}
+
+/// The document the fictional administrative helper actually received.
+fn received_document(h: &Harness) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(h.peer.marker.with_extension("document")).unwrap()).unwrap()
+}
+
+#[test]
+fn ovpn_config_reaches_the_admin_helper_for_a_new_profile_and_an_edit() {
+    let mut h = Harness::new("save");
+    let first = "remote vpn.example.test 1194\r\n<ca>\r\nfirst\r\n</ca>\r\n";
+    let second = "remote vpn.example.test 1194\n<ca>\nsecond\n</ca>\n";
+    let created = ovpn_profile("review-ovpn");
+    let token = h.begin(Command::SaveProfile {
+        profile: created.clone(),
+        ovpn_config: Some(first.into()),
+    });
+    h.authorize();
+    let (done, result) = h.result();
+    assert_eq!(done, token);
+    let snapshot = result.unwrap();
+    assert_eq!(
+        snapshot
+            .vpns
+            .iter()
+            .find(|vpn| vpn.profile.id == created.id)
+            .unwrap()
+            .profile,
+        created
+    );
+    assert_eq!(h.starts.load(Ordering::Relaxed), 1);
+    let document = received_document(&h);
+    assert_eq!(document["command"]["type"], "save_profile");
+    assert_eq!(document["command"]["profile"]["id"], "review-ovpn");
+    assert_eq!(document["command"]["ovpn_config"], normalized(first));
+    assert_ne!(normalized(first), first);
+
+    // The same profile, edited with a config that replaces the first one.
+    fs::remove_file(h.peer.marker.with_extension("document")).unwrap();
+    let mut edited = created.clone();
+    edited.name = "Edited fixture".into();
+    h.begin(Command::SaveProfile {
+        profile: edited.clone(),
+        ovpn_config: Some(second.into()),
+    });
+    h.authorize();
+    let snapshot = h.result().1.unwrap();
+    assert_eq!(
+        snapshot
+            .vpns
+            .iter()
+            .find(|vpn| vpn.profile.id == edited.id)
+            .unwrap()
+            .profile,
+        edited
+    );
+    assert_eq!(h.starts.load(Ordering::Relaxed), 2);
+    let document = received_document(&h);
+    assert_eq!(document["command"]["profile"]["name"], "Edited fixture");
+    assert_eq!(document["command"]["ovpn_config"], normalized(second));
+}
+
+#[test]
+fn a_local_missing_program_warning_survives_an_unrelated_admin_snapshot() {
+    let mut h = Harness::new("save");
+    let ovpn = ovpn_profile("review-ovpn");
+    h.begin(Command::SaveProfile {
+        profile: ovpn.clone(),
+        ovpn_config: None,
+    });
+    h.authorize();
+    assert!(h.result().1.is_ok());
+    let state = |snapshot: Snapshot, id: &str| {
+        snapshot
+            .vpns
+            .iter()
+            .find(|vpn| vpn.profile.id == id)
+            .unwrap()
+            .state
+    };
+    assert_eq!(
+        state(
+            h.command(Command::Toggle {
+                id: ovpn.id.clone()
+            }),
+            &ovpn.id
+        ),
+        State::MissingProgram
+    );
+    // The local poll keeps the card off without reading credentials.
+    assert_eq!(
+        state(h.command(Command::GetSnapshot {}), &ovpn.id),
+        State::MissingProgram
+    );
+    assert_eq!(h.loads.load(Ordering::Relaxed), 0);
+
+    // An unrelated administrative edit changes the generation of its profile only.
+    let other = h
+        .broker
+        .snapshot()
+        .vpns
+        .iter()
+        .find(|vpn| vpn.profile.id == "one")
+        .unwrap()
+        .profile
+        .clone();
+    let mut edited = other.clone();
+    edited.name = "Edited unrelated fixture".into();
+    h.begin(Command::SaveProfile {
+        profile: edited.clone(),
+        ovpn_config: None,
+    });
+    h.authorize();
+    let snapshot = h.result().1.unwrap();
+    assert_eq!(state(snapshot.clone(), &ovpn.id), State::MissingProgram);
+    assert_eq!(
+        snapshot
+            .vpns
+            .iter()
+            .find(|vpn| vpn.profile.id == "one")
+            .unwrap()
+            .profile,
+        edited
+    );
+}
+
+#[test]
+fn the_missing_program_warning_holds_only_for_a_same_generation_off_snapshot() {
+    use crate::helper::{protocol, protocol::TunnelStatus};
+    let mut broker = Broker::new(
+        None,
+        Secrets {
+            loads: Arc::new(AtomicUsize::new(0)),
+            removes: Arc::new(AtomicUsize::new(0)),
+            fail_removal: false,
+        },
+    );
+    let ovpn = ovpn_profile("review-ovpn");
+    let status = |generation: u64, state: State| TunnelStatus {
+        id: ovpn.id.clone(),
+        generation,
+        state,
+        failures: 0,
+        cleaning: false,
+        failure: None,
+    };
+    let state_of = |broker: &mut Broker<Secrets>| broker.snapshot().vpns[0].state;
+    broker
+        .receive_snapshot(
+            protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+            env!("CARGO_PKG_VERSION").into(),
+            None,
+            vec![ovpn.clone()],
+            vec![status(0, State::Off)],
+        )
+        .unwrap();
+    let warn = |broker: &mut Broker<Secrets>| {
+        broker
+            .dispatch(
+                Command::Toggle {
+                    id: ovpn.id.clone(),
+                },
+                Instant::now() + Duration::from_secs(20),
+            )
+            .unwrap();
+        assert_eq!(state_of(broker), State::MissingProgram);
+    };
+    // The merge runs through the cleanup verification seam: it is the existing
+    // path that accepts a same-generation snapshot for a known profile.
+    let merge = |broker: &mut Broker<Secrets>, profile: Profile, generation: u64, state: State| {
+        let observed = broker
+            .connections
+            .iter()
+            .map(|(id, connection)| (id.clone(), connection.generation))
+            .collect();
+        broker.cleanup_verify = Some(CleanupVerify {
+            request: "merge".into(),
+            profile: ovpn.id.clone(),
+            observed,
+        });
+        broker.receive_snapshot(
+            "merge".into(),
+            env!("CARGO_PKG_VERSION").into(),
+            None,
+            vec![profile],
+            vec![TunnelStatus {
+                id: ovpn.id.clone(),
+                generation,
+                state,
+                failures: 0,
+                cleaning: false,
+                failure: None,
+            }],
+        )
+    };
+
+    warn(&mut broker);
+    merge(&mut broker, ovpn.clone(), 0, State::Off).unwrap();
+    assert_eq!(state_of(&mut broker), State::MissingProgram);
+
+    // Another helper state at the same generation is still authoritative.
+    merge(&mut broker, ovpn.clone(), 0, State::Dropped).unwrap();
+    assert_eq!(state_of(&mut broker), State::Dropped);
+
+    // A new generation follows the ordinary rule even for the same OVPN profile.
+    warn(&mut broker);
+    merge(&mut broker, ovpn.clone(), 1, State::Off).unwrap();
+    assert_eq!(state_of(&mut broker), State::Off);
+
+    // A profile that is no longer OVPN returns to the ordinary rule.
+    warn(&mut broker);
+    let mut ssl = ovpn.clone();
+    ssl.kind = VpnKind::Ssl;
+    ssl.ovpn = None;
+    ssl.username = "fictional".into();
+    merge(&mut broker, ssl, 1, State::Off).unwrap();
+    assert_eq!(state_of(&mut broker), State::Off);
+}

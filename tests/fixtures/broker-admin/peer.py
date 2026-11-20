@@ -13,6 +13,7 @@ try:
     f=s.makefile('rb',buffering=0);line=f.readline()
     if line:
         request=json.loads(line);assert not f.read(1)
+        with open(marker+".document","w") as out:json.dump(request,out)
         command=request["command"]
         with open(marker+".catalog") as data:profiles=json.load(data)
         if mode=="reject":

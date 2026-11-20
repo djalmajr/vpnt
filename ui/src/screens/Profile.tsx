@@ -639,7 +639,7 @@ function importMessage(error: unknown): {
 function validModule(module: string): boolean {
   return (
     module.startsWith("/") &&
-    module.endsWith(".so") &&
+    (module.endsWith(".so") || module.endsWith(".dylib")) &&
     new TextEncoder().encode(module).length <= 4096 &&
     !/\p{Cc}/u.test(module) &&
     !module.split("/").includes("..")

@@ -61,7 +61,7 @@ struct Connection {
 }
 
 fn needs_credentials(kind: VpnKind) -> bool {
-    !cfg!(target_os = "linux") || kind != VpnKind::Ovpn
+    !cfg!(any(target_os = "linux", target_os = "macos")) || kind != VpnKind::Ovpn
 }
 
 pub struct Broker<S: SecretStore> {
@@ -516,5 +516,14 @@ impl<S: SecretStore> Broker<S> {
     /// Test-only composition seam with a real transport and injected secrets.
     pub(crate) fn transport_fixture(client: Client, secrets: S) -> Self {
         Self::new(Some(client), secrets)
+    }
+}
+
+#[cfg(test)]
+mod ovpn_credential_tests {
+    #[test]
+    fn ovpn_does_not_require_credentials_on_unix_desktops() {
+        assert!(!super::needs_credentials(crate::model::VpnKind::Ovpn));
+        assert!(super::needs_credentials(crate::model::VpnKind::Ssl));
     }
 }

@@ -101,11 +101,11 @@ impl AdminCommand {
         if ovpn_config.is_some() && profile.kind != VpnKind::Ovpn {
             return Err("invalid_profile");
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if ovpn_config.is_some() {
             return Err("unsupported");
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let ovpn_config = ovpn_config
             .map(|text| {
                 crate::connection::ovpn::profile::inspect(text.as_bytes())

@@ -160,6 +160,9 @@ impl<'a> Factory for NativeFactory<'a> {
         credentials: Credentials,
         canceled: Arc<AtomicBool>,
     ) -> Self::Attempt {
+        if profile.kind == VpnKind::Ovpn {
+            return AttemptKind::Denied(DeniedAttempt);
+        }
         if profile.kind == VpnKind::Ipsec {
             return match self.domain.clone() {
                 Some(domain) => {
