@@ -20,6 +20,19 @@ use vpnt::connection::ovpn::{
     signing::{Hash, Padding},
 };
 
+/// Config for the fixture's `openssl req`, so the CA does not depend on the
+/// host's openssl.cnf.
+const REQ_CONFIG: &str = "\
+[req]
+distinguished_name = dn
+x509_extensions = ca
+[dn]
+[ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+";
+
 pub struct Fixture {
     pub directory: PathBuf,
     pub openvpn: PathBuf,
@@ -42,8 +55,14 @@ impl Fixture {
             directory,
             openvpn: PathBuf::from(openvpn),
         };
+        // The CA's extensions come from this file, not the host's openssl.cnf:
+        // under OPENSSL_CONF=/dev/null OpenSSL 3 and 4 issue a CA without
+        // basicConstraints, and openvpn then rejects the chain.
+        fs::write(fixture.path("openssl.cnf"), REQ_CONFIG).unwrap();
         fixture.openssl(&[
             "req",
+            "-config",
+            "openssl.cnf",
             "-x509",
             "-newkey",
             "rsa:2048",
@@ -68,7 +87,17 @@ impl Fixture {
             );
             let subject = format!("/CN=vpnt-test-{peer}");
             fixture.openssl(&[
-                "req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &csr, "-subj",
+                "req",
+                "-config",
+                "openssl.cnf",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                &key,
+                "-out",
+                &csr,
+                "-subj",
                 &subject,
             ]);
             let extensions = format!("{peer}.ext");
@@ -90,6 +119,8 @@ impl Fixture {
                 &extensions,
             ]);
         }
+        // An unusable chain fails here, not as a TLS retry loop in openvpn.
+        fixture.openssl(&["verify", "-CAfile", "ca.crt", "server.crt", "client.crt"]);
         fixture.openssl(&[
             "x509",
             "-in",
