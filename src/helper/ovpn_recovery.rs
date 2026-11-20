@@ -28,7 +28,27 @@ const DIRECTORY: i32 = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 const EXIT_WAIT: Duration = Duration::from_secs(5);
 const KILL_WAIT: Duration = Duration::from_secs(2);
 
-pub(super) fn recover(controller: &ControllerLock, uid: u32) {
+pub(super) fn has_user_fence(controller: &ControllerLock, uid: u32, deadline: Instant) -> bool {
+    controller.validate().is_ok() && has_ovpn_fence(controller.directory(), 0, uid, deadline)
+}
+
+fn has_ovpn_fence(state: &Path, owner: u32, uid: u32, deadline: Instant) -> bool {
+    let Ok(Some(entries)) = Sessions::user_fence_entries(state, owner, uid) else {
+        return false;
+    };
+    entries
+        .take_while(|_| Instant::now() < deadline)
+        .any(|entry| {
+            entry
+                .and_then(|entry| Sessions::read_user_fence(state, owner, uid, &entry.file_name()))
+                .is_ok_and(|fence| fence.kind == Kind::Ovpn)
+        })
+}
+
+pub(super) fn recover(controller: &ControllerLock, uid: u32, deadline: Instant) {
+    if check_deadline(deadline).is_err() {
+        return;
+    }
     if controller.validate().is_err() {
         warn(c"controller", io::ErrorKind::PermissionDenied.into());
         return;
@@ -42,7 +62,13 @@ pub(super) fn recover(controller: &ControllerLock, uid: u32) {
             return;
         }
     };
-    sessions.recover_user(uid, process_absent, network_absent, warn);
+    sessions.recover_user(
+        uid,
+        deadline,
+        |process| process_absent(process, deadline),
+        |interface| network_absent(interface, deadline),
+        warn,
+    );
 }
 
 type Failure = (&'static CStr, io::Error);
@@ -72,11 +98,18 @@ fn warn(stage: &CStr, error: io::Error) {
     }
 }
 
-fn wait_until(timeout: Duration, mut absent: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
-    let expires = Instant::now() + timeout;
+fn check_deadline(deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
+fn wait_until(expires: Instant, mut absent: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
     loop {
+        check_deadline(expires)?;
         if absent()? {
-            return Ok(());
+            return check_deadline(expires);
         }
         let remaining = expires.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -108,10 +141,11 @@ fn read_process(pid: u32) -> io::Result<Option<Process>> {
 
 fn stop_process(
     expected: &ProcessIdentity,
+    deadline: Instant,
     mut read: impl FnMut(u32) -> io::Result<Option<Process>>,
     verify_runtime: impl FnOnce() -> io::Result<PathBuf>,
     mut signal: impl FnMut(u32, libc::c_int) -> io::Result<()>,
-    mut wait: impl FnMut(Duration, &mut dyn FnMut() -> io::Result<bool>) -> io::Result<()>,
+    mut wait: impl FnMut(Instant, &mut dyn FnMut() -> io::Result<bool>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut current = || -> io::Result<bool> {
         let Some(process) = read(expected.pid)? else {
@@ -129,6 +163,7 @@ fn stop_process(
         }
         Ok(true)
     };
+    check_deadline(deadline)?;
     if !current()? {
         return Ok(());
     }
@@ -136,29 +171,36 @@ fn stop_process(
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     for (sig, timeout) in [(libc::SIGTERM, EXIT_WAIT), (libc::SIGKILL, KILL_WAIT)] {
+        check_deadline(deadline)?;
         if !current()? {
             return Ok(());
         }
+        check_deadline(deadline)?;
         if let Err(error) = signal(expected.pid, sig) {
             if error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
             }
             return Err(error);
         }
-        match wait(timeout, &mut || match current() {
+        let expires = deadline.min(Instant::now() + timeout);
+        match wait(expires, &mut || match current() {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             outcome => outcome.map(|running| !running),
         }) {
-            Err(error) if sig == libc::SIGTERM && error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error)
+                if sig == libc::SIGTERM
+                    && expires < deadline
+                    && error.kind() == io::ErrorKind::TimedOut => {}
             result => return result,
         }
     }
     Err(io::ErrorKind::TimedOut.into())
 }
 
-fn process_absent(expected: &ProcessIdentity) -> io::Result<()> {
+fn process_absent(expected: &ProcessIdentity, deadline: Instant) -> io::Result<()> {
     stop_process(
         expected,
+        deadline,
         read_process,
         || {
             Runtime::installed()
@@ -177,12 +219,14 @@ fn process_absent(expected: &ProcessIdentity) -> io::Result<()> {
                 Err(io::Error::last_os_error())
             }
         },
-        |timeout, absent| wait_until(timeout, absent),
+        |expires, absent| wait_until(expires, absent),
     )
 }
 
-fn network_absent(interface: &Interface) -> io::Result<()> {
-    wait_until(EXIT_WAIT, || ovpn_network_absent(interface))
+fn network_absent(interface: &Interface, deadline: Instant) -> io::Result<()> {
+    wait_until(deadline.min(Instant::now() + EXIT_WAIT), || {
+        ovpn_network_absent(interface)
+    })
 }
 
 fn private(file: &File, owner: u32) -> io::Result<()> {
@@ -263,24 +307,30 @@ impl<'a> Sessions<'a> {
     fn recover_user(
         &self,
         uid: u32,
+        deadline: Instant,
         mut await_process: impl FnMut(&ProcessIdentity) -> io::Result<()>,
         mut await_network: impl FnMut(&Interface) -> io::Result<()>,
         mut report: impl FnMut(&CStr, io::Error),
     ) {
-        // Snapshot references before any directed cleanup, so the sweep
-        // also excludes directories whose recovery was attempted this time.
-        let referenced = self.referenced_sessions();
-        match self.user_fence_entries(uid) {
+        match Self::user_fence_entries(self.state, self.owner, uid) {
             Ok(Some(entries)) => {
                 // Snapshot the names before removing any entries from this directory.
-                for entry in entries.collect::<Vec<_>>() {
-                    let record =
-                        entry.and_then(|entry| self.read_user_fence(uid, &entry.file_name()));
+                let entries: Vec<_> = entries.take_while(|_| Instant::now() < deadline).collect();
+                for entry in entries {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let record = entry.and_then(|entry| {
+                        Self::read_user_fence(self.state, self.owner, uid, &entry.file_name())
+                    });
                     match record {
                         Ok(record) if record.kind == Kind::Ovpn => {
-                            if let Err((stage, error)) =
-                                self.recover_fence(&record, &mut await_process, &mut await_network)
-                            {
+                            if let Err((stage, error)) = self.recover_fence(
+                                &record,
+                                deadline,
+                                &mut await_process,
+                                &mut await_network,
+                            ) {
                                 report(stage, error);
                             }
                         }
@@ -292,9 +342,15 @@ impl<'a> Sessions<'a> {
             Ok(None) => {}
             Err(error) => report(c"scan_fences", error),
         }
-        match referenced {
+        if Instant::now() >= deadline {
+            return;
+        }
+        // Recover the current user before scanning the global inventory.
+        // Directed recovery removes a directory before its fence, so any
+        // remaining reference still protects that directory from the sweep.
+        match self.referenced_sessions(deadline) {
             Ok(referenced) => {
-                if let Err(error) = self.sweep(&referenced, &mut report) {
+                if let Err(error) = self.sweep(&referenced, deadline, &mut report) {
                     report(c"sweep", error);
                 }
             }
@@ -302,14 +358,14 @@ impl<'a> Sessions<'a> {
         }
     }
 
-    fn fence_directory(&self, path: &Path) -> io::Result<Option<File>> {
+    fn fence_directory(path: &Path, owner: u32) -> io::Result<Option<File>> {
         match OpenOptions::new()
             .read(true)
             .custom_flags(DIRECTORY)
             .open(path)
         {
             Ok(directory) => {
-                private(&directory, self.owner)?;
+                private(&directory, owner)?;
                 Ok(Some(directory))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -317,9 +373,9 @@ impl<'a> Sessions<'a> {
         }
     }
 
-    fn user_fence_entries(&self, uid: u32) -> io::Result<Option<fs::ReadDir>> {
-        let path = self.state.join("fences");
-        let Some(directory) = self.fence_directory(&path)? else {
+    fn user_fence_entries(state: &Path, owner: u32, uid: u32) -> io::Result<Option<fs::ReadDir>> {
+        let path = state.join("fences");
+        let Some(directory) = Self::fence_directory(&path, owner)? else {
             return Ok(None);
         };
         let name = CString::new(uid.to_string()).expect("decimal UID");
@@ -328,11 +384,16 @@ impl<'a> Sessions<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        private(&directory, self.owner)?;
+        private(&directory, owner)?;
         fs::read_dir(path.join(uid.to_string())).map(Some)
     }
 
-    fn read_user_fence(&self, uid: u32, name: &std::ffi::OsStr) -> io::Result<Fence> {
+    fn read_user_fence(
+        state: &Path,
+        owner: u32,
+        uid: u32,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<Fence> {
         let name = name.to_str().ok_or_else(invalid)?;
         let (profile, generation) = name
             .strip_suffix(".json")
@@ -342,7 +403,7 @@ impl<'a> Sessions<'a> {
         if name != format!("{profile}-{generation}.json") {
             return Err(invalid());
         }
-        fence::read(self.state, self.owner, uid, profile, generation)
+        fence::read(state, owner, uid, profile, generation)
             .map_err(fence_error)?
             .ok_or_else(invalid)
     }
@@ -350,17 +411,22 @@ impl<'a> Sessions<'a> {
     fn recover_fence(
         &self,
         record: &Fence,
+        deadline: Instant,
         mut await_process: impl FnMut(&ProcessIdentity) -> io::Result<()>,
         await_network: impl FnOnce(&Interface) -> io::Result<()>,
     ) -> Result<(), Failure> {
+        check_deadline(deadline).map_err(|error| (c"deadline", error))?;
         let name =
             Self::checked_session_name(record).map_err(|error| (c"validate_fence", error))?;
         for process in &record.processes {
+            check_deadline(deadline).map_err(|error| (c"deadline", error))?;
             await_process(process).map_err(|error| (c"process", error))?;
         }
         if let Some(interface) = &record.interface {
+            check_deadline(deadline).map_err(|error| (c"deadline", error))?;
             await_network(interface).map_err(|error| (c"interface", error))?;
         }
+        check_deadline(deadline).map_err(|error| (c"deadline", error))?;
         self.remove(name).map_err(|error| (c"session_dir", error))?;
         fence::remove(
             self.state,
@@ -434,15 +500,17 @@ impl<'a> Sessions<'a> {
         self.directory.sync_all()
     }
 
-    fn referenced_sessions(&self) -> io::Result<BTreeSet<String>> {
+    fn referenced_sessions(&self, deadline: Instant) -> io::Result<BTreeSet<String>> {
+        check_deadline(deadline)?;
         let path = self.state.join("fences");
-        let Some(_directory) = self.fence_directory(&path)? else {
+        let Some(_directory) = Self::fence_directory(&path, self.owner)? else {
             return Ok(BTreeSet::new());
         };
         let mut names = BTreeSet::new();
         // The base is shared by all UIDs. The controller lock and private
         // root prevent another controller from changing this inventory.
         for user in fs::read_dir(path)? {
+            check_deadline(deadline)?;
             let name = user?.file_name();
             let name = name.to_str().ok_or_else(invalid)?;
             let uid = name
@@ -450,10 +518,15 @@ impl<'a> Sessions<'a> {
                 .ok()
                 .filter(|uid| *uid != 0 && uid.to_string() == name)
                 .ok_or_else(invalid)?;
-            for record in fence::read_all(self.state, self.owner, uid).map_err(fence_error)? {
-                if record.kind == Kind::Ovpn {
-                    // A legacy or invalid record leaves the global inventory incomplete.
-                    names.insert(Self::checked_session_name(&record)?.to_owned());
+            if let Some(entries) = Self::user_fence_entries(self.state, self.owner, uid)? {
+                for entry in entries {
+                    check_deadline(deadline)?;
+                    let record =
+                        Self::read_user_fence(self.state, self.owner, uid, &entry?.file_name())?;
+                    if record.kind == Kind::Ovpn {
+                        // A legacy or invalid record leaves the global inventory incomplete.
+                        names.insert(Self::checked_session_name(&record)?.to_owned());
+                    }
                 }
             }
         }
@@ -463,9 +536,12 @@ impl<'a> Sessions<'a> {
     fn sweep(
         &self,
         referenced: &BTreeSet<String>,
+        deadline: Instant,
         mut report: impl FnMut(&CStr, io::Error),
     ) -> io::Result<()> {
+        check_deadline(deadline)?;
         for entry in fs::read_dir(self.base)? {
+            check_deadline(deadline)?;
             let name = entry?.file_name();
             match name.to_str() {
                 Some(name) if referenced.contains(name) => {}
@@ -484,8 +560,11 @@ impl<'a> Sessions<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helper::protocol::{self, Message, Request};
     use std::{
+        io::BufReader,
         os::unix::fs::{DirBuilderExt, PermissionsExt, symlink},
+        os::unix::net::UnixStream,
         path::PathBuf,
         sync::atomic::{AtomicU32, Ordering},
     };
@@ -493,6 +572,10 @@ mod tests {
     const PROTECTED: &str = "vpnt-ovpn-234-1a-0";
     const ORPHAN: &str = "vpnt-ovpn-234-1a-1";
     const RUNTIME: &str = "/fixture/runtime/bin/openvpn";
+
+    fn ample_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
 
     fn expected_process() -> ProcessIdentity {
         ProcessIdentity {
@@ -520,6 +603,7 @@ mod tests {
         for (start, program) in [((1, 3), RUNTIME), ((1, 2), "/fixture/unrelated")] {
             stop_process(
                 &expected,
+                ample_deadline(),
                 |pid| Ok(live_process(pid, start, program)),
                 || Ok(RUNTIME.into()),
                 |_, _| panic!("signaled a different process identity"),
@@ -535,6 +619,7 @@ mod tests {
         expected.program = "/fixture/other/bin/openvpn".into();
         let error = stop_process(
             &expected,
+            ample_deadline(),
             |pid| Ok(live_process(pid, (1, 2), &expected.program)),
             || Ok(RUNTIME.into()),
             |_, _| panic!("signaled an executable outside the verified runtime"),
@@ -552,6 +637,7 @@ mod tests {
             let mut signals = Vec::new();
             stop_process(
                 &expected,
+                ample_deadline(),
                 |pid| {
                     reads += 1;
                     let start = if reads < reused_on_read {
@@ -566,8 +652,9 @@ mod tests {
                     signals.push((pid, signal));
                     Ok(())
                 },
-                |timeout, observe| {
-                    assert_eq!(timeout, EXIT_WAIT);
+                |expires, observe| {
+                    assert!(expires <= Instant::now() + EXIT_WAIT);
+                    assert!(expires > Instant::now());
                     assert!(!observe()?);
                     Err(io::ErrorKind::TimedOut.into())
                 },
@@ -583,9 +670,11 @@ mod tests {
     fn active_recovery_escalates_only_after_term_deadline_and_requires_exit() {
         let expected = expected_process();
         let mut signals = Vec::new();
-        let mut timeouts = Vec::new();
+        let mut deadlines = Vec::new();
+        let started = Instant::now();
         let result = stop_process(
             &expected,
+            ample_deadline(),
             |pid| Ok(live_process(pid, (1, 2), RUNTIME)),
             || Ok(RUNTIME.into()),
             |pid, signal| {
@@ -593,15 +682,19 @@ mod tests {
                 signals.push(signal);
                 Ok(())
             },
-            |timeout, observe| {
-                timeouts.push(timeout);
+            |expires, observe| {
+                let now = Instant::now();
+                deadlines.push((expires, now));
                 assert!(!observe()?);
                 Err(io::ErrorKind::TimedOut.into())
             },
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(signals, [libc::SIGTERM, libc::SIGKILL]);
-        assert_eq!(timeouts, [EXIT_WAIT, KILL_WAIT]);
+        assert_eq!(deadlines.len(), 2);
+        for ((expires, observed), duration) in deadlines.into_iter().zip([EXIT_WAIT, KILL_WAIT]) {
+            assert!((started + duration..=observed + duration).contains(&expires));
+        }
     }
 
     struct Fixture {
@@ -655,7 +748,7 @@ mod tests {
                     pid: 123,
                     start_sec: 1,
                     start_usec: 2,
-                    program: "/fixture/openvpn".into(),
+                    program: RUNTIME.into(),
                 }],
                 interface: Some(Interface {
                     name: "utun12".into(),
@@ -697,6 +790,223 @@ mod tests {
     }
 
     #[test]
+    fn preflight_only_counts_current_users_ovpn_fences() {
+        let fixture = Fixture::new();
+        let has = || has_ovpn_fence(&fixture.root, fixture.owner, fixture.uid, ample_deadline());
+        fixture.save(fixture.uid + 1);
+        assert!(!has());
+        let record = fixture.save(fixture.uid);
+        let unexpected = fixture.fence_path(fixture.uid).with_file_name("unexpected");
+        fs::write(unexpected, b"{").unwrap();
+        assert!(has());
+        let other_kind = Fence {
+            kind: Kind::Ssl,
+            session_dir: None,
+            ..record
+        };
+        fence::write(&fixture.root, fixture.owner, &other_kind).unwrap();
+        assert!(!has());
+    }
+
+    #[test]
+    fn ovpn_fence_notifies_before_recovery_without_consuming_snapshot() {
+        use super::super::{recover_ovpn_startup, supports_wait_notice};
+
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        fixture.directory(&fixture.base.join(PROTECTED));
+        let sessions = fixture.sessions();
+        let (mut helper, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        protocol::write_request(
+            &mut peer,
+            &Request {
+                id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+                command: protocol::Command::Snapshot {},
+            },
+        )
+        .unwrap();
+        let mut notice = None;
+        let mut recovery_deadline = None;
+        recover_ovpn_startup(
+            &mut helper,
+            &mut notice,
+            |deadline| has_ovpn_fence(&fixture.root, fixture.owner, fixture.uid, deadline),
+            |deadline| {
+                assert!(matches!(
+                    protocol::read_message(&mut BufReader::new(peer)),
+                    Ok(Some(Message::PreviousSessionFinishing { protocol_version, version }))
+                        if protocol_version == protocol::VERSION && version == env!("CARGO_PKG_VERSION")
+                ));
+                assert!(fixture.fence_path(fixture.uid).exists());
+                recovery_deadline = Some(deadline);
+                sessions.recover_user(
+                    fixture.uid,
+                    deadline,
+                    |_| Ok(()),
+                    |_| Ok(()),
+                    |stage, error| panic!("{stage:?}: {error}"),
+                );
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            recovery_deadline,
+            Some(notice.unwrap() + Duration::from_secs(30))
+        );
+        assert!(!fixture.fence_path(fixture.uid).exists());
+        assert!(supports_wait_notice(
+            &helper,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn startup_cuts_a_permanently_live_process_at_the_batch_deadline() {
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        let directory = fixture.base.join(PROTECTED);
+        fixture.directory(&directory);
+        let sessions = fixture.sessions();
+        let mut signals = Vec::new();
+        let mut failures = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        sessions.recover_user(
+            fixture.uid,
+            deadline,
+            |process| {
+                stop_process(
+                    process,
+                    deadline,
+                    |pid| Ok(live_process(pid, (1, 2), RUNTIME)),
+                    || Ok(RUNTIME.into()),
+                    |_, signal| {
+                        signals.push(signal);
+                        Ok(())
+                    },
+                    |expires, absent| {
+                        assert_eq!(expires, deadline, "TERM wait exceeds the remaining batch");
+                        assert!(!absent()?);
+                        Err(io::ErrorKind::TimedOut.into())
+                    },
+                )
+            },
+            |_| panic!("network observation started before the process proof closed"),
+            |stage, error| failures.push((stage.to_owned(), error.kind())),
+        );
+        assert_eq!(signals, [libc::SIGTERM]);
+        assert_eq!(failures, [(c"process".to_owned(), io::ErrorKind::TimedOut)]);
+        assert!(fixture.fence_path(fixture.uid).exists());
+        assert!(directory.join("config").exists());
+    }
+
+    #[test]
+    fn startup_preserves_fence_when_network_proof_returns_after_deadline() {
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        let directory = fixture.base.join(PROTECTED);
+        fixture.directory(&directory);
+        let sessions = fixture.sessions();
+        let item = fixture.item(fixture.uid);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let failure = sessions
+            .recover_fence(
+                &item,
+                deadline,
+                |_| Ok(()),
+                |_| {
+                    while Instant::now() < deadline {
+                        thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(failure.0, c"deadline");
+        assert_eq!(failure.1.kind(), io::ErrorKind::TimedOut);
+        assert!(fixture.fence_path(fixture.uid).exists());
+        assert!(directory.join("config").exists());
+        sessions
+            .recover_fence(&item, ample_deadline(), |_| Ok(()), |_| Ok(()))
+            .unwrap();
+        assert!(!fixture.fence_path(fixture.uid).exists());
+    }
+
+    #[test]
+    fn active_recovery_cuts_the_kill_wait_at_the_same_batch_deadline() {
+        let expected = expected_process();
+        let deadline = Instant::now() + EXIT_WAIT + KILL_WAIT / 2;
+        let mut waits = Vec::new();
+        let mut signals = Vec::new();
+        let result = stop_process(
+            &expected,
+            deadline,
+            |pid| Ok(live_process(pid, (1, 2), RUNTIME)),
+            || Ok(RUNTIME.into()),
+            |_, signal| {
+                signals.push(signal);
+                Ok(())
+            },
+            |expires, absent| {
+                waits.push(expires);
+                if waits.len() == 1 {
+                    return wait_until(expires, absent);
+                }
+                assert!(!absent()?);
+                Err(io::ErrorKind::TimedOut.into())
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(signals, [libc::SIGTERM, libc::SIGKILL]);
+        assert!(waits[0] < deadline);
+        assert_eq!(waits[1], deadline);
+    }
+
+    #[test]
+    fn orphan_sweep_leaves_directories_when_the_batch_is_expired() {
+        let fixture = Fixture::new();
+        fixture.save(fixture.uid);
+        let orphan = fixture.base.join(ORPHAN);
+        fixture.directory(&orphan);
+        let sessions = fixture.sessions();
+        let referenced = sessions.referenced_sessions(ample_deadline()).unwrap();
+        let expired = Instant::now();
+        sessions.recover_user(
+            fixture.uid,
+            expired,
+            |_| panic!("process observation after deadline"),
+            |_| panic!("network observation after deadline"),
+            |stage, error| panic!("{stage:?} after deadline: {error}"),
+        );
+        let failure = sessions
+            .sweep(&referenced, expired, |stage, error| {
+                panic!("{stage:?} after deadline: {error}")
+            })
+            .unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
+        assert!(fixture.fence_path(fixture.uid).exists());
+        assert!(orphan.join("config").exists());
+        let missing = fixture.base.join("missing");
+        let unavailable_base = Sessions {
+            base: &missing,
+            directory: sessions.directory.try_clone().unwrap(),
+            ..sessions
+        };
+        let failure = unavailable_base
+            .sweep(&referenced, expired, |stage, error| {
+                panic!("{stage:?} after deadline: {error}")
+            })
+            .unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::TimedOut);
+        sessions
+            .sweep(&referenced, ample_deadline(), |stage, error| {
+                panic!("{stage:?}: {error}")
+            })
+            .unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
     fn recovery_refuses_outside_and_parent_session_dirs_and_keeps_fence() {
         let fixture = Fixture::new();
         let outside = fixture.root.join(PROTECTED);
@@ -720,12 +1030,13 @@ mod tests {
             let error = sessions
                 .recover_fence(
                     &bad,
+                    ample_deadline(),
                     |_| panic!("observed process"),
                     |_| panic!("observed network"),
                 )
                 .unwrap_err();
             assert_eq!(error.0, c"validate_fence");
-            assert!(sessions.referenced_sessions().is_err());
+            assert!(sessions.referenced_sessions(ample_deadline()).is_err());
             assert_eq!(fs::read(fence_path).unwrap(), contents);
             assert_eq!(fs::read(outside.join("config")).unwrap(), b"fixture");
             assert_eq!(
@@ -745,13 +1056,15 @@ mod tests {
         let item = fixture.save(fixture.uid);
         let sessions = fixture.sessions();
         let failure = sessions
-            .recover_fence(&item, |_| Ok(()), |_| Ok(()))
+            .recover_fence(&item, ample_deadline(), |_| Ok(()), |_| Ok(()))
             .unwrap_err();
         assert_eq!(failure.0, c"session_dir");
         sessions
-            .sweep(&sessions.referenced_sessions().unwrap(), |_, _| {
-                panic!("fenced name reached sweep")
-            })
+            .sweep(
+                &sessions.referenced_sessions(ample_deadline()).unwrap(),
+                ample_deadline(),
+                |_, _| panic!("fenced name reached sweep"),
+            )
             .unwrap();
         assert_eq!(fs::read_link(link).unwrap(), outside);
         assert_eq!(fs::read(outside.join("config")).unwrap(), b"fixture");
@@ -769,6 +1082,7 @@ mod tests {
         let failure = sessions
             .recover_fence(
                 &item,
+                ample_deadline(),
                 |_| uncertain(),
                 |_| panic!("observed network before process exit"),
             )
@@ -777,13 +1091,13 @@ mod tests {
         assert!(directory.join("config").exists());
         assert!(fixture.fence_path(fixture.uid).exists());
         let failure = sessions
-            .recover_fence(&item, |_| Ok(()), |_| uncertain())
+            .recover_fence(&item, ample_deadline(), |_| Ok(()), |_| uncertain())
             .unwrap_err();
         assert_eq!(failure.0, c"interface");
         assert!(directory.join("config").exists());
         assert!(fixture.fence_path(fixture.uid).exists());
         sessions
-            .recover_fence(&item, |_| Ok(()), |_| Ok(()))
+            .recover_fence(&item, ample_deadline(), |_| Ok(()), |_| Ok(()))
             .unwrap();
         assert!(!directory.exists());
         assert!(!fixture.fence_path(fixture.uid).exists());
@@ -804,9 +1118,11 @@ mod tests {
         let mut warnings = Vec::new();
         let sessions = fixture.sessions();
         sessions
-            .sweep(&sessions.referenced_sessions().unwrap(), |stage, error| {
-                warnings.push((stage.to_owned(), error.kind()))
-            })
+            .sweep(
+                &sessions.referenced_sessions(ample_deadline()).unwrap(),
+                ample_deadline(),
+                |stage, error| warnings.push((stage.to_owned(), error.kind())),
+            )
             .unwrap();
         assert!(!orphan.exists());
         assert!(referenced.join("config").exists());
@@ -836,9 +1152,11 @@ mod tests {
         let orphan = fixture.base.join(ORPHAN);
         fixture.directory(&orphan);
         let sessions = fixture.sessions();
-        let referenced = sessions.referenced_sessions().unwrap();
+        let referenced = sessions.referenced_sessions(ample_deadline()).unwrap();
         sessions
-            .sweep(&referenced, |stage, error| panic!("{stage:?}: {error}"))
+            .sweep(&referenced, ample_deadline(), |stage, error| {
+                panic!("{stage:?}: {error}")
+            })
             .unwrap();
         assert!(fixture.base.join(PROTECTED).join("config").exists());
         assert!(!orphan.exists());
@@ -866,6 +1184,7 @@ mod tests {
             let mut warnings = Vec::new();
             fixture.sessions().recover_user(
                 fixture.uid,
+                ample_deadline(),
                 |_| Ok(()),
                 |_| Ok(()),
                 |stage, error| warnings.push((stage.to_owned(), error.kind())),
@@ -897,9 +1216,13 @@ mod tests {
         fixture.save(fixture.uid + 1);
         fs::write(fixture.fence_path(fixture.uid + 1), b"{").unwrap();
         fixture.directory(&fixture.base.join(PROTECTED));
-        fixture
-            .sessions()
-            .recover_user(fixture.uid, |_| Ok(()), |_| Ok(()), |_, _| {});
+        fixture.sessions().recover_user(
+            fixture.uid,
+            ample_deadline(),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_, _| {},
+        );
         assert!(!fixture.fence_path(fixture.uid).exists());
     }
 
@@ -912,9 +1235,13 @@ mod tests {
         fixture.directory(&fixture.base.join(PROTECTED));
         let orphan = fixture.base.join(ORPHAN);
         fixture.directory(&orphan);
-        fixture
-            .sessions()
-            .recover_user(fixture.uid, |_| Ok(()), |_| Ok(()), |_, _| {});
+        fixture.sessions().recover_user(
+            fixture.uid,
+            ample_deadline(),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_, _| {},
+        );
         assert!(!fixture.fence_path(fixture.uid).exists());
         assert_eq!(fs::read(unknown).unwrap(), b"{");
         assert!(orphan.join("config").exists());
@@ -967,6 +1294,7 @@ mod tests {
             let error = sessions
                 .recover_fence(
                     &item,
+                    ample_deadline(),
                     |_| Ok(()),
                     |interface| observe(interface, name, index, route_index),
                 )
@@ -977,6 +1305,7 @@ mod tests {
         }
         sessions.recover_user(
             fixture.uid,
+            ample_deadline(),
             |_| Ok(()),
             |interface| observe(interface, "utun12", 44, 44),
             |stage, error| panic!("{stage:?}: {error}"),
