@@ -433,8 +433,22 @@ impl<S: SecretStore> Broker<S> {
                     if c.pending.as_ref().is_some_and(|p| p.id == id) {
                         let pending = c.pending.take().unwrap();
                         if !pending.accepted {
+                            let (state, failure) = (pending.previous.1, pending.previous.2);
+                            // Connect advances the generation and sets Connecting or
+                            // Reconnecting. Probe keeps the generation, Disconnect
+                            // sets Disconnecting, and the helper accepts before changing state.
+                            #[cfg(target_os = "macos")]
+                            let (state, failure) = if error == protocol::ErrorCode::MissingProgram
+                                && c.view.profile.kind == VpnKind::Ovpn
+                                && matches!(c.view.state, State::Connecting | State::Reconnecting)
+                                && pending.previous.0.checked_add(1) == Some(c.generation)
+                            {
+                                (State::MissingProgram, None)
+                            } else {
+                                (state, failure)
+                            };
                             c.generation = pending.previous.0;
-                            transition(c, pending.previous.1, pending.previous.2);
+                            transition(c, state, failure);
                             rejected = true;
                         }
                     }
