@@ -85,6 +85,10 @@ jobs:
       - name: Exercise SoftHSM certificate listing
         run: |
           brew install softhsm
+          # The system openssl is LibreSSL, which lacks `rsa -traditional`;
+          # use the OpenSSL 3 that softhsm already depends on.
+          export PATH="$(brew --prefix openssl@3)/bin:$PATH"
+          openssl version
           module=$(brew list --verbose softhsm | awk '/\/libsofthsm2\.(so|dylib)$/ { print; exit }')
           test -n "$module" && test -f "$module"
           output=$(mktemp)
