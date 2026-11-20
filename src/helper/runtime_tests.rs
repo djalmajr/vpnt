@@ -200,3 +200,16 @@ fn inspect_rejects_openvpn_identity_and_binary_mutations() {
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o500)).unwrap();
     assert!(Runtime::inspect(directory, fixture.0.owner).is_err());
 }
+
+#[test]
+fn openvpn_program_uses_the_verified_fixed_path() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.0.program(Program::Openvpn),
+        fixture.0.directory.join("bin/openvpn")
+    );
+    assert_ne!(
+        fixture.0.program(Program::Openvpn),
+        fixture.0.program(Program::Fortinet)
+    );
+}

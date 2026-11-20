@@ -8,6 +8,8 @@ mod linux;
 pub use linux::run_linux;
 #[cfg(target_os = "macos")]
 mod native;
+#[cfg(target_os = "macos")]
+pub(crate) use native::ovpn_base::ensure_base as ensure_ovpn_base;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 mod profiles;
 mod worker;

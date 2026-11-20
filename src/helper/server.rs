@@ -195,6 +195,27 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         && let Some(controller) = lock.as_ref()
     {
         crate::connection::ipsec::NativeContext::recover_orphans(controller, caller.uid);
+        // A wrong OVPN base blocks a later OVPN attempt; it never stops the
+        // helper. Log only the error kind: no user path or target is recorded.
+        if let Err(error) = crate::connection::controller::ensure_ovpn_base(
+            &crate::helper::paths::ovpn_sessions_directory(),
+            0,
+        ) {
+            // stderr of the helper goes nowhere in a normal start; syslog is
+            // where the other controller warnings go. The kind is a fixed
+            // identifier, never a path.
+            if let Ok(kind) = std::ffi::CString::new(format!("{:?}", error.kind())) {
+                // SAFETY: fixed format with one %s, matched by a NUL-terminated
+                // string that lives until the call returns.
+                unsafe {
+                    libc::syslog(
+                        libc::LOG_WARNING,
+                        c"vpnt: ovpn session base refused: %s".as_ptr(),
+                        kind.as_ptr(),
+                    )
+                };
+            }
+        }
     }
     match mode {
         Mode::Runtime => runtime_with_build(caller, Some(build), |uid, requests, output| {

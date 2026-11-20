@@ -106,7 +106,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn admitted_runtime_only_exposes_the_two_fixed_programs() {
+fn admitted_runtime_only_exposes_the_three_fixed_programs() {
     let fixture = Fixture::new();
     let runtime = Runtime::inspect(&fixture.directory, fixture.uid).unwrap();
     assert_eq!(
@@ -116,6 +116,10 @@ fn admitted_runtime_only_exposes_the_two_fixed_programs() {
     assert_eq!(
         runtime.program(Program::Fortinet),
         fixture.directory.join("bin/openfortivpn")
+    );
+    assert_eq!(
+        runtime.program(Program::Openvpn),
+        fixture.directory.join("bin/openvpn")
     );
 }
 
