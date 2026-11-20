@@ -242,8 +242,16 @@ jobs:
           runtime="${GITHUB_WORKSPACE}/target/vpnt-runtime"
           openvpn="${runtime}/bin/openvpn"
           test -x "$openvpn"
-          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)"
+          # Build first, so the runtime's library path reaches only the tests
+          # and the openvpn they start, never rustc or build scripts.
+          cargo +1.99.0 test --locked --no-default-features --test ovpn_session --no-run
+          status=0
+          output="$(DYLD_LIBRARY_PATH="${runtime}/lib" OPENSSL_MODULES="${runtime}/lib/ossl-modules" OPENSSL_CONF=/dev/null VPNT_TEST_OPENVPN="$openvpn" cargo +1.99.0 test --locked --no-default-features --test ovpn_session -- --nocapture 2>&1)" || status=$?
           printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "ovpn_session failed with status $status" >&2
+            exit "$status"
+          fi
           if grep -q 'skipped, VPNT_TEST_OPENVPN is not set' <<<"$output"; then
             echo 'ovpn_session was skipped' >&2
             exit 1
