@@ -671,4 +671,4 @@ fn mechanism(padding: Padding) -> Mechanism<'static> {
 
 #[cfg(test)]
 #[path = "pkcs11_tests.rs"]
-mod tests;
+pub(crate) mod tests;

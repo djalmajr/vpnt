@@ -898,7 +898,7 @@ fn disconnect_releases_the_production_opener_while_the_module_gate_is_held() {
         }
     }
 
-    let path = std::env::temp_dir()
+    let path = crate::connection::ovpn::pkcs11::tests::admitted_fixture_base()
         .canonicalize()
         .unwrap()
         .join(format!("vpnt-opener-gate-{}.dylib", std::process::id()));

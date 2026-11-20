@@ -285,6 +285,15 @@ fn try_acquire_recovers_a_poisoned_gate_like_acquire() {
     assert!(signing_gate::try_acquire(&gate).unwrap().belongs_to(&gate));
 }
 
+/// Module admission refuses world-writable ancestors such as Linux's `/tmp`,
+/// so fixtures that go through it live under the build directory instead.
+#[cfg(unix)]
+pub(crate) fn admitted_fixture_base() -> std::path::PathBuf {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
 #[cfg(unix)]
 fn with_login_fixture<T>(
     step: u8,
@@ -298,7 +307,7 @@ where
         os::{fd::AsRawFd, unix::net::UnixStream},
     };
 
-    let fixture = super::super::private_dir::PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let fixture = super::super::private_dir::PrivateDir::create(&admitted_fixture_base()).unwrap();
     let source = fixture.path.join("login.c");
     let module = fixture.path.join("login.so");
     let hold_enumeration = step == b'E';
