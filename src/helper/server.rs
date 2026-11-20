@@ -3,6 +3,9 @@
 pub(crate) mod caller;
 mod io;
 #[cfg(target_os = "macos")]
+#[path = "ovpn_recovery.rs"]
+mod ovpn_recovery;
+#[cfg(target_os = "macos")]
 use super::controller_lock::ControllerLock;
 use super::{
     ppp_supervisor::signals,
@@ -215,6 +218,8 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
                     )
                 };
             }
+        } else {
+            ovpn_recovery::recover(controller, caller.uid);
         }
     }
     match mode {
