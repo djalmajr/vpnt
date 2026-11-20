@@ -36,6 +36,34 @@ fn complete_environment_and_duplicates() {
     assert_eq!(c.dns_servers, vec![Ipv4Addr::new(10, 81, 0, 1)]);
     assert_eq!(c.dns_domains, vec!["example.test"]);
     assert_eq!(c.server, Some(Ipv4Addr::new(198, 51, 100, 2)));
+    assert_eq!(c.device, None);
+}
+#[test]
+fn absent_device_never_rejects_the_up_block() {
+    let c = from_env(&pairs(&[])).unwrap();
+    assert_eq!(c.device, None);
+    let with_other_keys = from_env(&pairs(&[("dev_type", "tun")])).unwrap();
+    assert_eq!(with_other_keys.device, None);
+}
+#[test]
+fn device_is_read_validated_and_shown_in_debug() {
+    let c = from_env(&pairs(&[("dev", "vpn-0_1.t")])).unwrap();
+    assert_eq!(c.device.as_deref(), Some("vpn-0_1.t"));
+    assert!(format!("{c:?}").contains("vpn-0_1.t"));
+    for bad in [
+        "",
+        &"a".repeat(16),
+        "vpn/0",
+        "vpn 0",
+        "vpn:0",
+        "vpn\u{00e9}",
+    ] {
+        assert_eq!(
+            from_env(&pairs(&[("dev", bad)])),
+            Err(NetworkError::Malformed),
+            "dev={bad:?}"
+        );
+    }
 }
 #[test]
 fn rejects_bad_networks() {
