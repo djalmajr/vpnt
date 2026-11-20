@@ -1175,6 +1175,29 @@ fn up_after_restart_reproves_and_reapplies_on_same_or_recreated_utun() {
 }
 
 #[test]
+fn renegotiation_on_a_live_tunnel_shows_approval_only_while_it_is_pending() {
+    let mut cycle = fixture();
+    cycle.open();
+    assert_eq!(cycle.phase(), None);
+    cycle.take_effects();
+
+    // TLS renegotiation: PK_SIGN on the live tunnel, no restart and no new UP.
+    cycle.session.pending = true;
+    cycle.push(Progress::AwaitingApproval);
+    cycle.poll(&profile()).unwrap();
+    assert_eq!(cycle.phase(), Some(ConnectionState::AwaitingApproval));
+
+    cycle.session.pending = false;
+    cycle.poll(&profile()).unwrap();
+    assert_eq!(
+        cycle.phase(),
+        None,
+        "a finished renegotiation must not leave the connected tunnel awaiting approval"
+    );
+    assert!(cycle.take_effects().is_empty());
+}
+
+#[test]
 fn phase_and_tunnel_failures_preserve_approval_and_authentication() {
     let mut cycle = fixture();
     cycle.session.pending = true;

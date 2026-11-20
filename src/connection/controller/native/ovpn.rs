@@ -264,7 +264,13 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                     return Err(rejected());
                 }
                 _ if exit.is_some() => {}
-                Progress::AwaitingApproval => self.phase = Some(ConnectionState::AwaitingApproval),
+                // A renegotiation signs on a live tunnel and sends no new UP to
+                // clear a stored phase, so there only the session's live flag
+                // shows the approval.
+                Progress::AwaitingApproval if !self.network_active => {
+                    self.phase = Some(ConnectionState::AwaitingApproval)
+                }
+                Progress::AwaitingApproval => {}
                 Progress::Restarting { epoch, .. } => {
                     self.phase = Some(ConnectionState::Reconnecting);
                     self.restart_epoch = epoch;

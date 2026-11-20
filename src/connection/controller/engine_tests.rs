@@ -64,9 +64,15 @@ mod recovery {
         }
     }
 
-    #[test]
-    fn native_ovpn_waits_for_the_connect_ack_when_the_output_is_full() {
+    /// Runs a connect while the output queue is full and reports whether the
+    /// attempt was created within `window`, before the queue drained.
+    fn created_while_the_output_is_full(
+        profile: Profile,
+        password: &str,
+        window: Duration,
+    ) -> bool {
         struct Admission {
+            kind: VpnKind,
             snapshots: std::sync::atomic::AtomicUsize,
             read_snapshot: SyncSender<()>,
             created: SyncSender<()>,
@@ -75,7 +81,7 @@ mod recovery {
             type Attempt = RecoveryAttempt;
 
             fn supports(&self, kind: VpnKind) -> bool {
-                kind == VpnKind::Ovpn
+                kind == self.kind
             }
 
             fn profiles(&self) -> Result<Option<Vec<Profile>>, ErrorCode> {
@@ -102,13 +108,7 @@ mod recovery {
             }
         }
 
-        let profile = serde_json::from_value(serde_json::json!({
-            "id": "ovpn", "name": "OVPN", "kind": "ovpn", "gateway": "vpn.example.test",
-            "username": "", "networks": [], "port": 1194, "certificate": "",
-            "probeHost": "10.0.0.42", "probePort": 443, "probeMethod": "tcp",
-            "ovpn": {"module": "/example/libtoken.dylib", "certificateId": "00"}
-        }))
-        .unwrap();
+        let id = profile.id.clone();
         let (output, wire) = mpsc::sync_channel(1);
         output
             .send(Message::Accepted {
@@ -118,6 +118,7 @@ mod recovery {
         let (read_snapshot, snapshot_read) = mpsc::sync_channel(1);
         let (created, creation) = mpsc::sync_channel(1);
         let factory = Admission {
+            kind: profile.kind,
             snapshots: Default::default(),
             read_snapshot,
             created,
@@ -130,11 +131,11 @@ mod recovery {
                 .send(Request {
                     id: "connect".into(),
                     command: Command::Connect {
-                        id: "ovpn".into(),
+                        id,
                         generation: 1,
                         interval: ProbeInterval::TEN,
                         credentials: Credentials {
-                            password: "".into(),
+                            password: password.into(),
                             psk: "".into(),
                         },
                     },
@@ -162,20 +163,52 @@ mod recovery {
                 )
             });
             snapshot_read.recv_timeout(bound).unwrap();
-            assert_eq!(
-                creation.recv_timeout(Duration::from_millis(250)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            );
+            let early = creation.recv_timeout(window).is_ok();
             assert!(
                 matches!(wire.recv_timeout(bound).unwrap(), Message::Accepted { id } if id == "occupied")
             );
             assert!(
                 matches!(wire.recv_timeout(bound).unwrap(), Message::Accepted { id } if id == "connect")
             );
-            creation.recv_timeout(bound).unwrap();
+            if !early {
+                creation.recv_timeout(bound).unwrap();
+            }
             drop(input);
             engine.join().unwrap().unwrap();
-        });
+            early
+        })
+    }
+
+    #[test]
+    fn native_ovpn_waits_for_the_connect_ack_when_the_output_is_full() {
+        let profile = serde_json::from_value(serde_json::json!({
+            "id": "ovpn", "name": "OVPN", "kind": "ovpn", "gateway": "vpn.example.test",
+            "username": "", "networks": [], "port": 1194, "certificate": "",
+            "probeHost": "10.0.0.42", "probePort": 443, "probeMethod": "tcp",
+            "ovpn": {"module": "/example/libtoken.dylib", "certificateId": "00"}
+        }))
+        .unwrap();
+        assert!(!created_while_the_output_is_full(
+            profile,
+            "",
+            Duration::from_millis(250)
+        ));
+    }
+
+    #[test]
+    fn native_ssl_starts_without_waiting_for_its_ack_when_the_output_is_full() {
+        let profile = serde_json::from_value(serde_json::json!({
+            "id": "ssl", "name": "SSL", "kind": "ssl", "gateway": "vpn.example.test",
+            "username": "fictional", "networks": [], "port": 443, "certificate": "",
+            "probeHost": "10.0.0.42", "probePort": 443, "probeMethod": "tcp"
+        }))
+        .unwrap();
+        // Nothing reads the output here, so the queue stays full for the window.
+        assert!(created_while_the_output_is_full(
+            profile,
+            "fictional-password",
+            Duration::from_secs(2)
+        ));
     }
 
     struct EngineGuard(Option<JoinHandle<Result<(), ErrorCode>>>);
