@@ -3,7 +3,7 @@
 //! authenticates and receives its configuration but changes nothing locally.
 //!
 //! cargo run --example ovpn_probe -- --openvpn PATH --config PROFILE.ovpn \
-//!     --module /usr/lib/libserproidp11.so --key-id HEX [--hold SECONDS] \
+//!     --module /usr/lib/libpkcs11-module.so --key-id HEX [--hold SECONDS] \
 //!     [--log FILE] [--pkcs1-only] [-- extra openvpn arguments]
 #[cfg(unix)]
 fn main() -> Result<(), String> {

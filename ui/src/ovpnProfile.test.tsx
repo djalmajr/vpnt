@@ -7,6 +7,7 @@ import { blankProfile } from "./profileDefaults";
 import { defaultPreferences } from "./settings";
 
 const marker = "FAKE-OVPN-NOT-FOR-THE-DOM";
+const tokenModule = "/usr/lib/libpkcs11-module.so";
 const content = `remote vpn.example.test 443 udp\n<ca>\n${marker}\n</ca>\n`;
 const certificate = {
   id: "00af",
@@ -23,7 +24,7 @@ const existing: VpnView = {
     probeHost: "192.0.2.1",
     ovpn: {
       certificateId: certificate.id,
-      module: "/usr/lib/libserproidp11.so",
+      module: tokenModule,
       tls: "pkcs1_only",
     },
   },
@@ -161,6 +162,10 @@ async function edit(label: string, value: string) {
   });
 }
 
+async function enterModule(value = tokenModule) {
+  await edit("PKCS#11 module", value);
+}
+
 async function chooseFile(value: string | ArrayBuffer) {
   const input = document.querySelector<HTMLInputElement>('input[type="file"]');
   if (!input) throw new Error("Missing file input");
@@ -192,13 +197,14 @@ test("OVPN import fills metadata, keeps the text out of the DOM and sends it whe
   expect(document.body.textContent).toContain("8443");
   expect(document.body.innerHTML).not.toContain(marker);
   await edit("Address", "192.0.2.1");
-  await edit("Internal domains", "Serpro");
+  await edit("Internal domains", "Corp");
+  await edit("PKCS#11 module", tokenModule);
   await click(button("List certificates"));
   expect(
     commands.find((command) => command.type === "list_certificates"),
   ).toEqual({
     type: "list_certificates",
-    module: "/usr/lib/libserproidp11.so",
+    module: tokenModule,
   });
   expect(document.body.textContent).toContain("Test holder");
   expect(document.body.textContent).toContain("Test issuer");
@@ -221,10 +227,10 @@ test("OVPN import fills metadata, keeps the text out of the DOM and sends it whe
       port: 8443,
       ovpn: {
         certificateId: "00af",
-        module: "/usr/lib/libserproidp11.so",
+        module: tokenModule,
         tls: "pkcs1_only",
       },
-      dnsDomains: ["serpro"],
+      dnsDomains: ["corp"],
       username: "",
       networks: [],
       certificate: "",
@@ -232,6 +238,42 @@ test("OVPN import fills metadata, keeps the text out of the DOM and sends it whe
     ovpn_config: content,
   });
   expect(document.body.innerHTML).not.toContain(marker);
+});
+
+test("A new OVPN profile starts with an empty module and opens Advanced, and stays unsavable until a valid module and certificate are set", async () => {
+  await createProfile();
+  const advanced = [...document.querySelectorAll("details")].find(
+    (element) => element.querySelector("summary")?.textContent === "Advanced",
+  );
+  if (!advanced) throw new Error("Missing Advanced section");
+  expect(advanced.hasAttribute("open")).toBe(true);
+  expect(advanced.querySelector("input")?.value).toBe("");
+  expect(field("PKCS#11 module").value).toBe("");
+  expect(button("List certificates").disabled).toBe(true);
+  expect(button("Save").disabled).toBe(true);
+
+  await chooseFile(content);
+  await edit("Address", "192.0.2.1");
+  expect(button("Save").disabled).toBe(true);
+
+  for (const invalid of ["libpkcs11.so", "/usr/lib/libpkcs11"]) {
+    await enterModule(invalid);
+    expect(button("List certificates").disabled).toBe(true);
+    expect(button("Save").disabled).toBe(true);
+  }
+
+  await enterModule(tokenModule);
+  expect(advanced.hasAttribute("open")).toBe(true);
+  expect(field("PKCS#11 module").value).toBe(tokenModule);
+  expect(button("List certificates").disabled).toBe(false);
+  expect(button("Save").disabled).toBe(true);
+  await click(button("List certificates"));
+  const choice = document.querySelector<HTMLInputElement>(
+    'input[type="radio"]',
+  );
+  if (!choice) throw new Error("Missing certificate choice");
+  await click(choice);
+  expect(button("Save").disabled).toBe(false);
 });
 
 async function selectKind(kind: string) {
@@ -257,6 +299,7 @@ test("A username typed under SSL does not block saving after switching to OVPN",
   await selectKind("ovpn");
   await chooseFile(content);
   await edit("Address", "192.0.2.1");
+  await edit("PKCS#11 module", tokenModule);
   await click(button("List certificates"));
   const choice = document.querySelector<HTMLInputElement>(
     'input[type="radio"]',
@@ -293,6 +336,7 @@ test("OVPN import localizes a refusal and rejects oversized file and JSON before
 test("OVPN certificate listing reports empty and error states and allows retry", async () => {
   await createProfile();
   replyFor = () => ({ certificates: [] });
+  await enterModule();
   await click(button("List certificates"));
   expect(document.body.textContent).toContain(
     "No certificates with a private key found.",
@@ -311,6 +355,7 @@ test("OVPN certificate listing reports empty and error states and allows retry",
 test("untrusted module displays a distinct localized error", async () => {
   await createProfile();
   replyFor = () => ({ error: "untrusted_module" });
+  await enterModule();
   await click(button("List certificates"));
   expect(document.querySelector('[role="alert"]')?.textContent).toContain(
     "The PKCS#11 module or its folders are not trusted.",

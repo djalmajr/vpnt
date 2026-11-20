@@ -7,7 +7,7 @@ const defaultPorts = { ipsec: 500, ssl: 443, ovpn: 1194 } as const;
 
 export const blankOvpn = (): OvpnSettings => ({
   certificateId: "",
-  module: "/usr/lib/libserproidp11.so",
+  module: "",
   tls: "pkcs1_only",
 });
 
