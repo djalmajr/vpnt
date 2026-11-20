@@ -84,19 +84,20 @@ mod oracle_tests {
         // Declared after the directory so the forkers stop before its cleanup.
         let scratch = Scratch(root.clone());
         let stop = Arc::new(AtomicBool::new(false));
-        let forkers = Forkers {
+        // The guard exists before the first thread: if a later spawn panics,
+        // its Drop still stops and joins the threads already started.
+        let mut forkers = Forkers {
             stop: stop.clone(),
-            threads: (0..4)
-                .map(|_| {
-                    let stop = Arc::clone(&stop);
-                    thread::spawn(move || {
-                        while !stop.load(Ordering::Relaxed) {
-                            let _ = Command::new("/bin/true").status();
-                        }
-                    })
-                })
-                .collect(),
+            threads: Vec::with_capacity(4),
         };
+        for _ in 0..4 {
+            let stop = Arc::clone(&stop);
+            forkers.threads.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("/bin/true").status();
+                }
+            }));
+        }
 
         let mut busy = 0;
         for round in 0..200 {
