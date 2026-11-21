@@ -4,8 +4,8 @@ use super::backend::{Launch, Launcher, Running};
 #[cfg(test)]
 use super::protocol::Prepare;
 use super::protocol::{
-    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, decode_request, read_control,
-    timed, write_control,
+    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, State, decode_request,
+    read_control, timed, write_control,
 };
 use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
@@ -17,7 +17,10 @@ use std::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -216,11 +219,99 @@ fn serve(
     let Ok(Some(authorization)) = current else {
         return decoder.reject(ErrorCode::PermissionDenied, credential_deadline);
     };
-    let session = match launcher.launch(&offer, grant, credentials, authorization) {
+    let (completion, done) = UnixStream::pair()?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (commands, result) = thread::scope(|scope| -> Result<_, FrameError> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            let _signal_on_drop = done;
+            launcher.launch(&offer, grant, credentials, authorization, &cancel)
+        })?;
+        let commands = watch_setup(&stream, &completion, &mut decoder);
+        if !matches!(commands, Ok((_, false))) {
+            cancel.store(true, Ordering::Release);
+        }
+        let result = worker
+            .join()
+            .map_err(|_| io::Error::other("setup worker panicked"))?;
+        Ok((commands?, result))
+    })?;
+    let (statuses, stop) = commands;
+    let mut session = match result {
         Ok(session) => session,
+        Err(code) if stop => {
+            let state = if code == ErrorCode::CleanupPending {
+                State::CleanupPending
+            } else {
+                State::Stopped
+            };
+            return reply_setup_statuses(&mut decoder, statuses + 1, state);
+        }
         Err(code) => return decoder.reject(code, Instant::now() + FRAME_TIMEOUT),
     };
+    let state = match (stop, session.state()) {
+        (true, State::Starting | State::NetworkReady) => session.stop(),
+        (_, state) => state,
+    };
+    reply_setup_statuses(&mut decoder, statuses + usize::from(stop), state)?;
     dialogue(&stream, decoder, session)
+}
+
+// Preserve the first Status as a report of the launch result. Keep reading
+// while it is pending so a queued Stop or a disconnect can overtake setup.
+fn watch_setup(
+    client: &UnixStream,
+    completion: &UnixStream,
+    decoder: &mut ServerDecoder,
+) -> Result<(usize, bool), FrameError> {
+    let mut statuses = 0;
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: client.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLRDHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: completion.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll updates the initialized array of live descriptors.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+            continue;
+        }
+        if fds[0].revents != 0 {
+            match decoder.command(Instant::now() + FRAME_TIMEOUT)? {
+                Command::Status => statuses += 1,
+                Command::Stop => return Ok((statuses, true)),
+            }
+            // A half-close can follow the last queued Status. Read EOF
+            // before releasing the setup worker's result to the client.
+            if fds[0].revents & libc::POLLRDHUP != 0 {
+                continue;
+            }
+        }
+        if fds[1].revents != 0 {
+            return Ok((statuses, false));
+        }
+    }
+}
+
+fn reply_setup_statuses(
+    decoder: &mut ServerDecoder,
+    count: usize,
+    state: State,
+) -> Result<(), FrameError> {
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    for _ in 0..count {
+        decoder.reply_status(state, deadline)?;
+    }
+    Ok(())
 }
 
 /// Answer the client's commands for one admitted session. A stop, a closed
@@ -420,6 +511,7 @@ mod policy_dialogue_tests {
             _: &super::super::policy::Entry,
             _: super::super::protocol::Credentials,
             _: File,
+            _: &Arc<AtomicBool>,
         ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
             Err(ErrorCode::Backend)
         }
@@ -636,6 +728,7 @@ mod policy_dialogue_tests {
             _: &super::super::policy::Entry,
             _: super::super::protocol::Credentials,
             _: File,
+            _: &Arc<AtomicBool>,
         ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
             let backend = offer.backend();
             self.counters.launches.fetch_add(1, Ordering::SeqCst);

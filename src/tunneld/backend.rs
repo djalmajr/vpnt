@@ -7,10 +7,11 @@ use super::{
     },
     instance_protocol::{Order, Reply, Start, encode_credentials},
     network::{Network, Receipt, parse_cidr, valid_generation},
-    policy::Entry,
+    policy::{Entry, MAX_IPSEC_ROUTES},
     protocol::{CidrV4, Credentials, ErrorCode, Prepare, State},
 };
 use crate::{
+    helper::local_socket::Budget,
     netd::{iproute::Backend as NetworkBackend, server::ovpn_present},
     netlease::{NetworkGuard, NetworkLock},
 };
@@ -26,6 +27,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -54,11 +59,12 @@ pub(super) trait Launch: Send + Sync {
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode>;
 }
 
 /// One admitted session. Dropping it stops it.
-pub(super) trait Running {
+pub(super) trait Running: Send {
     fn state(&self) -> State;
     fn peer(&self) -> Option<BorrowedFd<'_>> {
         None
@@ -121,6 +127,7 @@ struct Attempt {
     registered: bool,
     directory: bool,
     started: bool,
+    credentials_sent: bool,
     receipt: Option<Receipt>,
 }
 
@@ -138,6 +145,7 @@ impl Attempt {
             registered: false,
             directory: false,
             started: false,
+            credentials_sent: false,
             receipt: None,
         }
     }
@@ -182,8 +190,22 @@ struct IpsecStart {
     credentials: zeroize::Zeroizing<Vec<u8>>,
 }
 
+fn check_setup(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel
+        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "client canceled setup",
+        ));
+    }
+    Ok(())
+}
+
 struct CapturePeer<'a, A> {
     attestor: &'a A,
+    cancel: &'a AtomicBool,
     peer: std::cell::RefCell<Option<OwnedFd>>,
 }
 
@@ -193,7 +215,9 @@ impl<A: UnitAttestor> UnitAttestor for CapturePeer<'_, A> {
     }
 
     fn attest_until(&self, fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<UnitIdentity> {
+        check_setup(self.cancel)?;
         let identity = self.attestor.attest_until(fd, deadline)?;
+        check_setup(self.cancel)?;
         self.peer.replace(Some(fd.try_clone_to_owned()?));
         Ok(identity)
     }
@@ -206,7 +230,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         setup: Option<IpsecStart>,
         authorization: Option<File>,
         channel: &mut Option<AuthenticatedChannel>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<OwnedFd, Failure> {
+        check_setup(cancel).map_err(|e| Failure::io("admission", &e))?;
         let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut {
                 Failure::new(ErrorCode::Busy, "network write lock is contended")
@@ -223,6 +249,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         {
             return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
         }
+        check_setup(cancel).map_err(|e| Failure::io("generation setup", &e))?;
         let directory = self
             .create_directory(&attempt.generation)
             .map_err(|e| Failure::io("generation directory", &e))?;
@@ -238,6 +265,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     setup.order.remote_ts.clone(),
                 )
                 .map_err(|e| Failure::io("network admission", &e))?;
+            check_setup(cancel).map_err(|e| Failure::io("lease setup", &e))?;
             receipt
                 .save(&directory, &guard)
                 .map_err(|e| Failure::io("network receipt", &e))?;
@@ -272,6 +300,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         )
         .map_err(|e| Failure::io("handshake record basename", &e))?;
 
+        check_setup(cancel).map_err(|e| Failure::io("unit setup", &e))?;
         attempt.started = true; // A failed call may still have queued the job.
         run_systemctl(
             &self.systemctl,
@@ -280,8 +309,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         )
         .map_err(|e| Failure::io("systemctl start", &e))?;
         drop(authorization);
+        check_setup(cancel).map_err(|e| Failure::io("handshake setup", &e))?;
         let attestor = CapturePeer {
             attestor: &self.attestor,
+            cancel,
             peer: Default::default(),
         };
         let authenticated = channel.insert(
@@ -290,8 +321,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 .map_err(|e| Failure::io("instance authentication", &e))?,
         );
         if let Some(setup) = setup {
-            self.establish(attempt, setup, authenticated, &directory)?;
+            self.establish(attempt, setup, authenticated, &directory, cancel)?;
         }
+        check_setup(cancel).map_err(|e| Failure::io("session publication", &e))?;
         let peer = attestor
             .peer
             .into_inner()
@@ -321,6 +353,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         mut setup: IpsecStart,
         channel: &mut AuthenticatedChannel,
         directory: &Path,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<(), Failure> {
         let receipt = attempt
             .receipt
@@ -328,16 +361,19 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .expect("IPsec receipt precedes start");
         setup.order.if_id = receipt.if_id;
         setup.order.reqid = receipt.reqid;
+        check_setup(cancel).map_err(|e| Failure::io("instance setup", &e))?;
         channel
             .send(
                 &serde_json::to_vec(&Order::Start(setup.order))
                     .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
             )
             .map_err(|e| Failure::io("instance Start", &e))?;
+        check_setup(cancel).map_err(|e| Failure::io("credential delivery", &e))?;
         let sent = channel.send(&setup.credentials);
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
-        let reply = receive_reply(channel, Instant::now() + ESTABLISHED_TIMEOUT)
+        attempt.credentials_sent = true;
+        let reply = wait_setup_reply(channel, cancel)
             .map_err(|e| Failure::io("instance setup reply", &e))?;
         let vip = match reply {
             Reply::Established {
@@ -345,10 +381,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 reqid,
                 virtual_ipv4,
                 remote_ts,
-            } if if_id == receipt.if_id
-                && reqid == receipt.reqid
-                && receipt.permits_selectors(&remote_ts) =>
-            {
+            } if if_id == receipt.if_id && reqid == receipt.reqid => {
+                receipt
+                    .select_routes(remote_ts)
+                    .map_err(|e| Failure::io("negotiated routes", &e))?;
                 virtual_ipv4
             }
             Reply::Failed { code } => return Err(Failure::new(code, "instance failed setup")),
@@ -362,7 +398,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         let guard = (self.lock)(Instant::now() + self.limits.lock)
             .map_err(|e| Failure::io("network write lock", &e))?;
         self.xfrm
-            .install(&guard, directory, receipt, vip, &setup.approved)
+            .install_checked(&guard, directory, receipt, vip, &setup.approved, || {
+                check_setup(cancel)
+            })
             .map_err(|e| Failure::io("configure XFRM network", &e))
     }
 
@@ -446,12 +484,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .runtime
             .join(INSTANCE_DIRECTORY)
             .join(&attempt.generation);
-        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
-        let stopped = match channel {
+        // The lease remains registered while the supervisor settles. Send
+        // Stop before waiting for the network writer lock.
+        let stopped = match channel.filter(|_| attempt.credentials_sent) {
             Some(mut channel) => {
-                let stopped = channel
-                    .send(br#"{"op":"stop"}"#)
-                    .and_then(|()| receive_reply(&mut channel, Instant::now() + STOPPED_TIMEOUT));
+                let stopped = stop_instance(&mut channel);
                 if !matches!(stopped, Ok(Reply::Stopped {})) {
                     eprintln!("vpnt-tunneld: instance did not confirm Stop: {stopped:?}");
                 }
@@ -459,6 +496,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             }
             None => false,
         };
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
         if attempt.started && !stopped {
             self.stop_unit(attempt)?;
             attempt.started = false;
@@ -521,6 +559,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         backend: Backend,
         setup: Option<IpsecStart>,
         authorization: Option<File>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let generation = generation().map_err(|error| {
             eprintln!("vpnt-tunneld: could not draw a generation: {error}");
@@ -533,7 +572,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         } else {
             State::Starting
         };
-        match self.bring_up(&mut attempt, setup, authorization, &mut channel) {
+        match self.bring_up(&mut attempt, setup, authorization, &mut channel, cancel) {
             Ok(peer) => Ok(Box::new(Session {
                 launcher: self,
                 attempt,
@@ -542,7 +581,18 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 state,
             })),
             Err(failure) => {
-                eprintln!("vpnt-tunneld: admission failed: {}", failure.cause);
+                eprintln!("vpnt-tunneld: admission ended: {}", failure.cause);
+                if cancel.load(Ordering::Acquire) {
+                    let mut session = Session {
+                        launcher: self,
+                        attempt,
+                        channel,
+                        peer: None,
+                        state,
+                    };
+                    session.stop();
+                    return Ok(Box::new(session));
+                }
                 Err(if self.teardown(&mut attempt, channel) {
                     failure.code
                 } else {
@@ -550,6 +600,31 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 })
             }
         }
+    }
+}
+
+fn wait_setup_reply(
+    channel: &mut AuthenticatedChannel,
+    cancel: &Arc<AtomicBool>,
+) -> io::Result<Reply> {
+    let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
+    let budget = Budget::until(deadline, Some(Arc::clone(cancel)))?;
+    loop {
+        let wait = budget.poll_timeout()?;
+        if channel.wait_control(Duration::from_millis(wait as u64))? {
+            check_setup(cancel)?;
+            return receive_reply(channel, deadline);
+        }
+    }
+}
+
+fn stop_instance(channel: &mut AuthenticatedChannel) -> io::Result<Reply> {
+    channel.send(br#"{"op":"stop"}"#)?;
+    let deadline = Instant::now() + STOPPED_TIMEOUT;
+    match receive_reply(channel, deadline)? {
+        // The supervisor can establish just as Stop overtakes it.
+        Reply::Established { .. } => receive_reply(channel, deadline),
+        reply => Ok(reply),
     }
 }
 
@@ -572,9 +647,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let Prepare::Ipsec(request) = offer else {
-            return self.launch_backend(offer.backend(), None, Some(authorization));
+            return self.launch_backend(offer.backend(), None, Some(authorization), cancel);
         };
         let grant: IpsecGrant = serde_json::to_value(grant)
             .and_then(serde_json::from_value)
@@ -585,9 +661,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             .map(|r| parse_cidr(r))
             .collect::<io::Result<_>>()
             .map_err(|_| ErrorCode::PermissionDenied)?;
-        if !(1..=64).contains(&remote_ts.len()) || grant.port != 500 {
+        if !(1..=MAX_IPSEC_ROUTES).contains(&remote_ts.len()) || grant.port != 500 {
             return Err(ErrorCode::PermissionDenied);
         }
+        check_setup(cancel).map_err(|_| ErrorCode::Backend)?;
         let remote_ipv4 = self
             .xfrm
             .resolve(&grant.hostname, &grant.transport_ipv4)
@@ -595,6 +672,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
                 eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
                 ErrorCode::Backend
             })?;
+        check_setup(cancel).map_err(|_| ErrorCode::Backend)?;
         let frame = encode_credentials(&credentials)?;
         drop(credentials);
         let setup = IpsecStart {
@@ -611,7 +689,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             approved: grant.transport_ipv4,
             credentials: frame,
         };
-        self.launch_backend(Backend::Ipsec, Some(setup), Some(authorization))
+        self.launch_backend(Backend::Ipsec, Some(setup), Some(authorization), cancel)
     }
 }
 
@@ -746,7 +824,7 @@ fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
-        self.launch_backend(backend, None, None)
+        self.launch_backend(backend, None, None, &Arc::default())
     }
 
     fn for_test(
@@ -1442,7 +1520,7 @@ mod tests {
         use std::{
             io::Write,
             os::unix::net::UnixStream,
-            sync::{Arc, Mutex},
+            sync::{Mutex, mpsc},
         };
 
         const CHILD: &str = "VPNT_XFRM_FIXTURE_CHILD";
@@ -1458,6 +1536,7 @@ mod tests {
             ignore_delete: bool,
             refuse_delete: bool,
             leftover_policy: bool,
+            before_install: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         }
 
         fn fake_network(runtime: PathBuf, kernel: Arc<Mutex<Kernel>>) -> Network {
@@ -1487,6 +1566,12 @@ mod tests {
                     {"dev":"eth-fixture","prefsrc":"192.0.2.2","gateway":"192.0.2.1"}
                 ]),
                 ["-j", "-d", "link", "show"] => {
+                    // Plan and install each read egress and then inventory.
+                    let link_reads = k.ops.iter().filter(|op| op.as_str() == "-j -d link show").count();
+                    if link_reads == 4 && let Some((entered, resume)) = k.before_install.take() {
+                        entered.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(4)).unwrap();
+                    }
                     let mut links = vec![serde_json::json!({"ifname":"eth-fixture","ifindex":2,"flags":["UP"]})];
                     if k.link {
                         links.push(serde_json::json!({
@@ -1520,7 +1605,10 @@ mod tests {
                     let intent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(intent["creating"], true);
                     assert_eq!(intent["vip"], "10.99.0.2");
-                    assert_eq!(intent["routes"].as_array().unwrap().len(), 2);
+                    if runtime.join("../negotiated-route").is_file() {
+                        let routes: Vec<CidrV4> = serde_json::from_value(intent["routes"].clone()).unwrap();
+                        assert_eq!(routes, [parse_cidr("10.20.0.0/16").unwrap()]);
+                    }
                     k.link = true;
                     return Ok(vec![]);
                 }
@@ -1529,7 +1617,7 @@ mod tests {
                 ["link", "set", "dev", "vpnti1", "up"] => { k.up = true; return Ok(vec![]); }
                 ["-4", "addr", "add", "10.99.0.2/32", "dev", "vpnti1", "noprefixroute"] => { k.address = true; return Ok(vec![]); }
                 ["-4", "route", "add", dst, "dev", "vpnti1", "table", "main", "proto", "boot", "scope", "link"] => {
-                    assert!(["10.20.0.0/15", "172.16.0.0/12"].contains(dst), "unapproved network command: {args:?}");
+                    assert!(["10.20.0.0/15", "10.20.0.0/16", "172.16.0.0/12"].contains(dst), "unapproved network command: {args:?}");
                     k.routes.push((*dst).into());
                         return Ok(vec![]);
                 }
@@ -1608,6 +1696,19 @@ mod tests {
                 fs::write(root.join("received-start"), b"").unwrap();
                 wait_for_file(&root.join("allow-established"));
             }
+            if root.join("cancel-negotiation").is_file() {
+                fs::write(root.join("negotiation-started"), b"").unwrap();
+                let bytes = channel
+                    .receive_until(Instant::now() + Duration::from_secs(3))
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<Order>(&bytes).unwrap(),
+                    Order::Stop {}
+                ));
+                fs::write(root.join("instance-stopped"), b"").unwrap();
+                channel.send(br#"{"op":"stopped"}"#).unwrap();
+                return;
+            }
             let delay = fs::read_to_string(root.join("setup-delay"))
                 .ok()
                 .map(|text| text.parse::<u64>().unwrap());
@@ -1619,7 +1720,14 @@ mod tests {
                     if_id: start.if_id,
                     reqid: start.reqid,
                     virtual_ipv4: Ipv4Addr::new(10, 99, 0, 2),
-                    remote_ts: vec![start.remote_ts[0]],
+                    remote_ts: vec![
+                        parse_cidr(if root.join("outside-selector").is_file() {
+                            "10.22.0.0/16"
+                        } else {
+                            "10.20.0.0/16"
+                        })
+                        .unwrap(),
+                    ],
                 })
                 .unwrap(),
             );
@@ -1723,6 +1831,7 @@ mod tests {
             let harness = Harness::new();
             let policy = PolicyFixture::new();
             policy.install();
+            harness.flag("negotiated-route", true);
             if exit {
                 fs::write(harness.root.join("exit-after-setup"), b"").unwrap();
             }
@@ -1738,7 +1847,7 @@ mod tests {
                 command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
                 {
                     let k = kernel.lock().unwrap();
-                    assert_eq!(k.routes, ["10.20.0.0/15", "172.16.0.0/12"]);
+                    assert_eq!(k.routes, ["10.20.0.0/16"]);
                     assert!(k.link && k.up && k.address);
                 }
                 if exit && unproven {
@@ -1806,6 +1915,186 @@ mod tests {
             assert!(harness.leases().is_empty());
         }
 
+        fn exercise_cancel_negotiation(name: &str, eof: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("cancel-negotiation", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                wait_for_file(&harness.root.join("negotiation-started"));
+                if !eof {
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                }
+                drop(client);
+                worker.join().unwrap().ok();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
+        }
+
+        struct ObservedLaunch<'a> {
+            launcher: &'a dyn Launch,
+            cancel: mpsc::Sender<Arc<AtomicBool>>,
+        }
+
+        impl Launch for ObservedLaunch<'_> {
+            fn launch<'a>(
+                &'a self,
+                offer: &Prepare,
+                grant: &Entry,
+                credentials: Credentials,
+                authorization: File,
+                cancel: &Arc<AtomicBool>,
+            ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+                self.cancel.send(Arc::clone(cancel)).unwrap();
+                self.launcher
+                    .launch(offer, grant, credentials, authorization, cancel)
+            }
+        }
+
+        fn exercise_cancel_before_install(name: &str, eof: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut process = supervisor(&harness);
+            let (entered, at_install) = mpsc::channel();
+            let (resume, release) = mpsc::channel();
+            let kernel = Arc::new(Mutex::new(Kernel {
+                before_install: Some((entered, release)),
+                ..Kernel::default()
+            }));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (observer, token) = mpsc::channel();
+            let launch = ObservedLaunch {
+                launcher: &launcher,
+                cancel: observer,
+            };
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launch));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                let cancel = token.recv_timeout(Duration::from_secs(3)).unwrap();
+                at_install.recv_timeout(Duration::from_secs(3)).unwrap();
+                if eof {
+                    client.shutdown(std::net::Shutdown::Both).unwrap();
+                } else {
+                    client.write_all(b"{\"op\":\"stop\"}\n").unwrap();
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !cancel.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "public cancel was not observed during the install preflight"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                resume.send(()).unwrap();
+                if !eof {
+                    assert!(matches!(
+                        response(&client),
+                        Response::Status {
+                            state: State::Stopped
+                        }
+                    ));
+                }
+                drop(client);
+                worker.join().unwrap().ok();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
+        }
+
+        #[test]
+        fn public_stop_after_established_prevents_network_install() {
+            exercise_cancel_before_install(
+                "public_stop_after_established_prevents_network_install",
+                false,
+            );
+        }
+
+        #[test]
+        fn public_eof_after_established_prevents_network_install() {
+            exercise_cancel_before_install(
+                "public_eof_after_established_prevents_network_install",
+                true,
+            );
+        }
+
+        fn assert_no_install(kernel: &Kernel) {
+            assert!(!kernel.link && !kernel.address && kernel.routes.is_empty());
+            assert!(
+                !kernel
+                    .ops
+                    .iter()
+                    .any(|operation| operation.starts_with("link add ")),
+                "{:?}",
+                kernel.ops
+            );
+        }
+
+        #[test]
+        fn public_stop_cancels_negotiation() {
+            exercise_cancel_negotiation("public_stop_cancels_negotiation", false);
+        }
+
+        #[test]
+        fn public_eof_cancels_negotiation() {
+            exercise_cancel_negotiation("public_eof_cancels_negotiation", true);
+        }
+
+        #[test]
+        fn negotiated_selector_outside_policy_is_rejected_and_cleaned() {
+            let name = "negotiated_selector_outside_policy_is_rejected_and_cleaned";
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("outside-selector", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                assert!(matches!(
+                    response(&client),
+                    Response::Error {
+                        code: ErrorCode::Backend
+                    }
+                ));
+                worker.join().unwrap().unwrap();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
+        }
+
         #[test]
         fn policy_routes_reach_network_ready_and_stop() {
             exercise("policy_routes_reach_network_ready_and_stop", false, false);
@@ -1828,6 +2117,40 @@ mod tests {
                 true,
                 true,
             );
+        }
+
+        #[test]
+        fn oversized_ipsec_grant_on_disk_is_refused_before_backend_setup() {
+            use crate::tunneld::{admin::IPSEC_SNAPSHOT, policy::canonical_snapshot};
+
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut snapshot: serde_json::Value = serde_json::from_slice(IPSEC_SNAPSHOT).unwrap();
+            let mut routes: Vec<_> = (0..64).map(|i| format!("10.25.0.{i}/32")).collect();
+            routes.push("10.20.0.0/15".into());
+            snapshot["entries"][0]["route_cidrs"] = serde_json::json!(routes);
+            let bytes = canonical_snapshot(snapshot.to_string().as_bytes()).unwrap();
+            fs::write(policy.path(), &bytes).unwrap();
+
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm =
+                Network::fake(|_, args| panic!("oversized grant reached backend setup: {args:?}"));
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                assert!(matches!(
+                    response(&client),
+                    Response::Error {
+                        code: ErrorCode::PermissionDenied
+                    }
+                ));
+                worker.join().unwrap().unwrap();
+            });
+            harness.assert_no_effect(&[]);
+            assert_eq!(fs::read(policy.path()).unwrap(), bytes);
         }
 
         #[test]

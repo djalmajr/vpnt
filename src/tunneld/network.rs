@@ -81,12 +81,17 @@ pub(super) fn valid_generation(name: &str) -> bool {
 }
 
 impl Receipt {
-    pub(super) fn permits_selectors(&self, selectors: &[CidrV4]) -> bool {
-        !selectors.is_empty()
-            && selectors.iter().enumerate().all(|(index, selected)| {
+    pub(super) fn select_routes(&mut self, selectors: Vec<CidrV4>) -> io::Result<()> {
+        if selectors.is_empty()
+            || !selectors.iter().enumerate().all(|(index, selected)| {
                 !selectors[..index].contains(selected)
                     && self.routes.iter().any(|r| contains(r, selected))
             })
+        {
+            return Err(invalid("negotiated selectors do not match the policy"));
+        }
+        self.routes = selectors;
+        Ok(())
     }
 
     fn name(&self) -> String {
@@ -504,6 +509,7 @@ impl Network {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn install(
         &self,
         guard: &NetworkGuard,
@@ -512,6 +518,19 @@ impl Network {
         vip: Ipv4Addr,
         approved: &[Ipv4Addr],
     ) -> io::Result<()> {
+        self.install_checked(guard, directory, receipt, vip, approved, || Ok(()))
+    }
+
+    pub(super) fn install_checked(
+        &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        receipt: &mut Receipt,
+        vip: Ipv4Addr,
+        approved: &[Ipv4Addr],
+        check: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        check()?;
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
         CidrV4::new(vip, 32).map_err(|_| invalid("invalid virtual IPv4"))?;
@@ -528,6 +547,7 @@ impl Network {
         // each address or route write. Unattempted keys cannot be removed.
         receipt.creating = true;
         receipt.save(directory, guard)?;
+        check()?;
         self.ip(&[
             "link",
             "add",
@@ -546,14 +566,18 @@ impl Network {
         if link.ifalias.is_some() {
             return Err(invalid("new XFRM link unexpectedly marked"));
         }
+        // Finish assigning ownership to a link whose creation already
+        // started. Cleanup requires the marker to delete it safely.
         self.ip(&["link", "set", "dev", &name, "alias", &receipt.marker()])?;
         receipt.ifindex = Some(link.ifindex);
         self.owned_link(receipt)?
             .ok_or_else(|| invalid("XFRM link missing after marking"))?;
         receipt.save(directory, guard)?;
+        check()?;
         self.ip(&["link", "set", "dev", &name, "addrgenmode", "none"])?;
         receipt.address_intended = true;
         receipt.save(directory, guard)?;
+        check()?;
         self.ip(&[
             "-4",
             "addr",
@@ -563,10 +587,12 @@ impl Network {
             &name,
             "noprefixroute",
         ])?;
+        check()?;
         self.ip(&["link", "set", "dev", &name, "up"])?;
         for (index, route) in receipt.routes.iter().enumerate() {
             receipt.routes_intended = index + 1;
             receipt.save(directory, guard)?;
+            check()?;
             self.route_change("add", route, &name)?;
         }
         let current = self
@@ -579,6 +605,7 @@ impl Network {
         {
             return Err(invalid("network configuration confirmation failed"));
         }
+        check()?;
         receipt.confirmed = true;
         receipt.save(directory, guard)
     }
