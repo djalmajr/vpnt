@@ -53,10 +53,234 @@ impl Signer for FixtureSigner {
 #[derive(Default)]
 struct Signers(Mutex<Vec<(String, u64)>>);
 impl OvpnSigners for Signers {
-    fn signer(&self, profile: &str, generation: u64) -> Box<dyn Signer> {
+    fn signer(&self, profile: &str, generation: u64, _: Arc<SignContext>) -> Box<dyn Signer> {
         self.0.lock().unwrap().push((profile.into(), generation));
         Box::new(FixtureSigner)
     }
+}
+
+#[test]
+fn production_factory_supports_ovpn() {
+    let root = Root::new();
+    let uid = unsafe { libc::geteuid() };
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.0.join(".controller.lock"))
+        .unwrap();
+    let controller = ControllerLock::fixture(&root.0, uid).unwrap();
+    let routes = Arc::new(Mutex::new(
+        Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+    ));
+    let store = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+    let (output, _replies) = std::sync::mpsc::sync_channel(1);
+    let (factory, _) = NativeFactory::production(routes, store, None, uid, output);
+    assert!(factory.supports(VpnKind::Ovpn));
+}
+
+#[test]
+fn remote_signing_round_trips_over_the_wire_while_awaiting_approval() {
+    use crate::{
+        connection::ovpn::signing::Hash,
+        helper::protocol::{SignFields, SignOperation, parse_request, read_message, write_message},
+    };
+    use std::{io::Cursor, os::unix::fs::PermissionsExt, sync::mpsc};
+
+    let root = Root::new();
+    let uid = unsafe { libc::geteuid() };
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.0.join(".controller.lock"))
+        .unwrap();
+    let controller = ControllerLock::fixture(&root.0, uid).unwrap();
+    let routes = Arc::new(Mutex::new(
+        Coordinator::new(NativeBackend::fixture(&controller).unwrap()).unwrap(),
+    ));
+    let store = Arc::new(Profiles::fixture(ProfileStore::open(&root.0, uid).unwrap()));
+    let (output, wire) = mpsc::sync_channel(8);
+    let (factory, replies) = NativeFactory::production(routes, store, None, uid, output.clone());
+    let super::super::factory::AttemptKind::Ovpn(mut attempt) = factory.create(
+        profile(),
+        uid,
+        7,
+        serde_json::from_value(serde_json::json!({"password": "", "psk": ""})).unwrap(),
+        Arc::default(),
+    ) else {
+        panic!("production factory denied OVPN");
+    };
+
+    let executable = root.0.join("openvpn");
+    fs::write(
+        &executable,
+        r#"#!/usr/bin/python3
+import base64, socket, sys
+if '--version' in sys.argv:
+    print('OpenVPN 2.6.19')
+    sys.exit(0)
+with socket.socket(socket.AF_UNIX) as peer:
+    peer.settimeout(5)
+    peer.connect(sys.argv[sys.argv.index('--management') + 1])
+    with peer.makefile('rb') as commands:
+        assert commands.readline() == b'version 3\n'
+        assert commands.readline() == b'state on\n'
+        peer.sendall(b'>NEED-CERTIFICATE:vpnt\n')
+        for expected in (b'certificate', b'-----BEGIN CERTIFICATE-----',
+                         b'MAA=', b'-----END CERTIFICATE-----', b'END'):
+            assert commands.readline().strip() == expected
+        digest = base64.b64encode(bytes(range(32)))
+        peer.sendall(b'>PK_SIGN:' + digest + b',RSA_PKCS1_PSS_PADDING,hashalg=SHA256,saltlen=digest\n')
+        for expected in (b'pk-sig', b'AQID', b'END'):
+            assert commands.readline().strip() == expected
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    attempt.cycle.session.session = Some(
+        Session::start_with(
+            Launch {
+                openvpn: executable,
+                config: ConfigSource::private(b"dev tun\n"),
+                dev: None,
+                signatures: Signatures::Any,
+                extra: vec![],
+                env: vec![],
+            },
+            BoxedSigner(attempt.signer.take().unwrap()),
+            &std::env::temp_dir(),
+            RestartPolicy::CallerOrStop,
+        )
+        .unwrap(),
+    );
+
+    thread::scope(|scope| {
+        let (input, requests) = mpsc::sync_channel(8);
+        let engine = scope.spawn(move || {
+            engine::run_native(
+                factory,
+                uid,
+                vec![profile()],
+                requests,
+                output,
+                Timing::default(),
+                replies,
+            )
+        });
+        let receive = || wire.recv_timeout(Duration::from_secs(2)).unwrap();
+        let buffered = RefCell::new(VecDeque::new());
+        let request = || {
+            let mut bytes = Vec::new();
+            let message = buffered.borrow_mut().pop_front().unwrap_or_else(receive);
+            write_message(&mut bytes, &message).unwrap();
+            let Message::SignRequest {
+                id,
+                profile,
+                generation,
+                epoch,
+                op,
+            } = read_message(&mut Cursor::new(bytes)).unwrap().unwrap()
+            else {
+                panic!("expected a request on the signing wire");
+            };
+            assert_eq!(
+                (profile.as_str(), generation, epoch),
+                ("ovpn", 7, INITIAL_EPOCH)
+            );
+            (id, profile, generation, epoch, op)
+        };
+        let reply =
+            |id, profile: &str, generation, epoch, result: serde_json::Value, accepted: bool| {
+                let request = serde_json::json!({
+                    "id": format!("sign-reply-{id}"),
+                    "command": {
+                        "type": "sign_reply",
+                        "id": id, "profile": profile, "generation": generation, "epoch": epoch,
+                        "result": result,
+                    },
+                });
+                input
+                    .send(parse_request(request.to_string().as_bytes()).unwrap())
+                    .unwrap();
+                loop {
+                    match receive() {
+                        Message::Accepted { id: actual } => {
+                            assert!(accepted);
+                            assert_eq!(actual, format!("sign-reply-{id}"));
+                            break;
+                        }
+                        Message::Failed {
+                            id: actual,
+                            error: ErrorCode::InvalidRequest,
+                        } => {
+                            assert!(!accepted);
+                            assert_eq!(actual, format!("sign-reply-{id}"));
+                            break;
+                        }
+                        message @ Message::SignRequest { .. } => {
+                            buffered.borrow_mut().push_back(message)
+                        }
+                        message => panic!("unexpected signing acknowledgement: {message:?}"),
+                    }
+                }
+            };
+
+        let (cert_id, profile, generation, epoch, op) = request();
+        assert!(matches!(op, SignOperation::Certificate(_)));
+        reply(
+            cert_id,
+            &profile,
+            generation,
+            epoch,
+            serde_json::json!({"certificate": "MAA="}),
+            true,
+        );
+        let (sign_id, profile, generation, epoch, op) = request();
+        assert!(sign_id > cert_id);
+        let SignOperation::Sign(SignFields::Pss(fields)) = op else {
+            panic!("expected PSS")
+        };
+        assert!(Padding::Pss(Hash::Sha256).accepts(&fields.data.decode().unwrap()));
+        assert_eq!(fields.data.decode().unwrap(), (0..32).collect::<Vec<u8>>());
+        assert_eq!(attempt.phase(), Some(ConnectionState::AwaitingApproval));
+        for (id, profile, generation, epoch) in [
+            (sign_id + 1, profile.as_str(), generation, epoch),
+            (sign_id, "other", generation, epoch),
+            (sign_id, profile.as_str(), generation + 1, epoch),
+            (sign_id, profile.as_str(), generation, epoch + 1),
+        ] {
+            reply(
+                id,
+                profile,
+                generation,
+                epoch,
+                serde_json::json!({"signature": "BAUG"}),
+                false,
+            );
+        }
+        reply(
+            sign_id,
+            &profile,
+            generation,
+            epoch,
+            serde_json::json!({"signature": "AQID"}),
+            true,
+        );
+        reply(
+            sign_id,
+            &profile,
+            generation,
+            epoch,
+            serde_json::json!({"signature": "AQID"}),
+            false,
+        );
+
+        let session = attempt.cycle.session.session.take().unwrap();
+        assert!(session.wait().unwrap().status.success());
+        drop(input);
+        engine.join().unwrap().unwrap();
+    });
 }
 
 #[test]
@@ -197,7 +421,7 @@ fn with_launch_fixture(text: &str, run: impl FnOnce(&mut NativeOvpnAttempt<'_>, 
     let mut attempt = NativeOvpnAttempt::new(
         profile,
         profiles,
-        Box::new(FixtureSigner),
+        &Signers::default(),
         owner,
         routes,
         Arc::new(AtomicBool::new(false)),
@@ -303,6 +527,8 @@ struct FakeTunnel {
     effects: Effects,
     events: VecDeque<Progress>,
     on_up: Option<Box<dyn FnOnce()>>,
+    on_release: Option<Box<dyn FnOnce(u64)>>,
+    on_stop: Option<Box<dyn FnOnce()>>,
     pending: bool,
     hold_expired: bool,
     exit: Rc<Cell<Option<Option<OvpnReason>>>>,
@@ -333,6 +559,9 @@ impl Tunnel for FakeTunnel {
     }
 
     fn release_restart_hold(&mut self, epoch: u64) {
+        if let Some(observe) = self.on_release.take() {
+            observe(epoch);
+        }
         self.effects.borrow_mut().push(Effect::Release(epoch));
     }
 
@@ -341,6 +570,9 @@ impl Tunnel for FakeTunnel {
     }
 
     fn stop(&mut self) -> io::Result<()> {
+        if let Some(observe) = self.on_stop.take() {
+            observe();
+        }
         self.effects.borrow_mut().push(Effect::Stop);
         self.stop_error.map_or(Ok(()), |kind| Err(kind.into()))
     }
@@ -510,7 +742,11 @@ fn fixture() -> Cycle<FakeTunnel, FakeNetwork> {
         pending_withdrawals: 0,
         fail: None,
     };
-    let mut cycle = Cycle::new(session, network);
+    let mut cycle = Cycle::new(
+        session,
+        network,
+        Arc::new(SignContext::new(INITIAL_EPOCH, Arc::default())),
+    );
     cycle.before = fixture_interfaces(&[("utun7", 3)]);
     cycle
 }
@@ -939,6 +1175,29 @@ fn up_after_restart_reproves_and_reapplies_on_same_or_recreated_utun() {
 }
 
 #[test]
+fn renegotiation_on_a_live_tunnel_shows_approval_only_while_it_is_pending() {
+    let mut cycle = fixture();
+    cycle.open();
+    assert_eq!(cycle.phase(), None);
+    cycle.take_effects();
+
+    // TLS renegotiation: PK_SIGN on the live tunnel, no restart and no new UP.
+    cycle.session.pending = true;
+    cycle.push(Progress::AwaitingApproval);
+    cycle.poll(&profile()).unwrap();
+    assert_eq!(cycle.phase(), Some(ConnectionState::AwaitingApproval));
+
+    cycle.session.pending = false;
+    cycle.poll(&profile()).unwrap();
+    assert_eq!(
+        cycle.phase(),
+        None,
+        "a finished renegotiation must not leave the connected tunnel awaiting approval"
+    );
+    assert!(cycle.take_effects().is_empty());
+}
+
+#[test]
 fn phase_and_tunnel_failures_preserve_approval_and_authentication() {
     let mut cycle = fixture();
     cycle.session.pending = true;
@@ -986,6 +1245,46 @@ fn phase_and_tunnel_failures_preserve_approval_and_authentication() {
     cycle.push(Progress::Up(up(Some("utun40"))));
     assert_eq!(cycle.ready(&profile()).unwrap_err().step, Step::Tunnel);
     assert!(cycle.take_effects().is_empty());
+}
+
+#[test]
+fn restart_sets_the_signer_epoch_before_releasing_the_hold() {
+    let mut cycle = fixture();
+    let context = cycle.signing.clone();
+    cycle.session.on_release = Some(Box::new(move |released| {
+        assert_eq!(released, 7);
+        assert_eq!(context.epoch(), released);
+    }));
+    cycle.push(restart(7, None));
+    assert!(!cycle.ready(&profile()).unwrap());
+    assert!(cycle.take_effects().contains(&Effect::Release(7)));
+}
+
+#[test]
+fn cleanup_unblocks_a_remote_request_before_stopping_the_session() {
+    use super::super::remote_signer::RemoteSigners;
+    use std::sync::mpsc;
+
+    let mut cycle = fixture();
+    let (output, wire) = mpsc::sync_channel(1);
+    let signers = RemoteSigners::new(output);
+    let mut signer = signers.signer("ovpn", 7, cycle.signing.clone());
+    let (done, result) = mpsc::channel();
+    let worker = thread::spawn(move || done.send(signer.certificate()).unwrap());
+    let sent = wire.recv_timeout(Duration::from_secs(2));
+    let observed = Rc::new(Cell::new(None));
+    let in_stop = observed.clone();
+    cycle.session.on_stop = Some(Box::new(move || {
+        in_stop.set(Some(result.recv_timeout(Duration::from_millis(300))));
+    }));
+    cycle.session.exit.set(Some(None));
+    cycle.session.absent = true;
+    let cleaned = cycle.cleanup();
+    cycle.signing.cancel();
+    worker.join().unwrap();
+    assert!(matches!(sent, Ok(Message::SignRequest { .. })));
+    assert!(cleaned);
+    assert_eq!(observed.take(), Some(Ok(Err(SignError::Unavailable))));
 }
 
 #[test]
@@ -1280,7 +1579,11 @@ fn native_ovpn_cleanup_stops_child_and_preserves_fence_when_journal_write_fails(
         let tunnel = FakeTunnel::default();
         let effects = tunnel.effects.clone();
         tunnel.exit.set(Some(None));
-        let mut cycle = Cycle::new(tunnel, network);
+        let mut cycle = Cycle::new(
+            tunnel,
+            network,
+            Arc::new(SignContext::new(INITIAL_EPOCH, Arc::default())),
+        );
         cycle.network.journal.owner ^= 1;
 
         assert!(!cycle.cleanup(), "child absence has not been confirmed");

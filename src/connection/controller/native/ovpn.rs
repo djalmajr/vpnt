@@ -1,4 +1,5 @@
 //! OpenVPN session and network lifecycle for the native controller.
+use super::remote_signer::SignContext;
 use super::*;
 use crate::{
     connection::{
@@ -30,9 +31,10 @@ use std::{
 const RESTART_WITHDRAWAL_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_WAIT: Duration = Duration::from_secs(10);
 const RECONFIGURE_BUDGET: Duration = Duration::from_secs(10);
+const INITIAL_EPOCH: u64 = 0;
 
-pub(crate) trait OvpnSigners: Send + Sync {
-    fn signer(&self, profile: &str, generation: u64) -> Box<dyn Signer>;
+pub(super) trait OvpnSigners: Send + Sync {
+    fn signer(&self, profile: &str, generation: u64, context: Arc<SignContext>) -> Box<dyn Signer>;
 }
 
 // Session takes an owned implementation of Signer, while the factory does
@@ -116,6 +118,7 @@ trait Network {
 struct Cycle<T, N> {
     session: T,
     network: N,
+    signing: Arc<SignContext>,
     before: Interfaces,
     dns_service: Option<ServiceId>,
     last_up: Option<(OvpnUtun, NetworkConfig)>,
@@ -127,16 +130,17 @@ struct Cycle<T, N> {
 }
 
 impl<T: Tunnel, N: Network> Cycle<T, N> {
-    fn new(session: T, network: N) -> Self {
+    fn new(session: T, network: N, signing: Arc<SignContext>) -> Self {
         Self {
             session,
             network,
+            signing,
             before: Interfaces::default(),
             dns_service: None,
             last_up: None,
             network_active: false,
             phase: None,
-            restart_epoch: 0,
+            restart_epoch: INITIAL_EPOCH,
             stopped: false,
             initial_deadline: None,
         }
@@ -260,13 +264,20 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
                     return Err(rejected());
                 }
                 _ if exit.is_some() => {}
-                Progress::AwaitingApproval => self.phase = Some(ConnectionState::AwaitingApproval),
+                // A renegotiation signs on a live tunnel and sends no new UP to
+                // clear a stored phase, so there only the session's live flag
+                // shows the approval.
+                Progress::AwaitingApproval if !self.network_active => {
+                    self.phase = Some(ConnectionState::AwaitingApproval)
+                }
+                Progress::AwaitingApproval => {}
                 Progress::Restarting { epoch, .. } => {
                     self.phase = Some(ConnectionState::Reconnecting);
                     self.restart_epoch = epoch;
                     if !self.withdraw_config()? || !self.can_continue()? {
                         return Ok(());
                     }
+                    self.signing.set_epoch(epoch);
                     self.session.release_restart_hold(epoch);
                 }
                 Progress::Up(config) => {
@@ -335,6 +346,7 @@ impl<T: Tunnel, N: Network> Cycle<T, N> {
     }
 
     fn cleanup(&mut self) -> bool {
+        self.signing.cancel();
         self.network_active = false;
         let _ = self.network.journal_cleanup();
         let dns_closed = self.network.close_dns().is_ok();
@@ -824,12 +836,14 @@ impl<'a> NativeOvpnAttempt<'a> {
     pub(super) fn new(
         profile: Profile,
         profiles: Arc<Profiles>,
-        signer: Box<dyn Signer>,
+        signers: &dyn OvpnSigners,
         owner: Owner,
         routes: Routes<'a>,
         canceled: Arc<AtomicBool>,
         storage: (PathBuf, u32),
     ) -> Self {
+        let signing = Arc::new(SignContext::new(INITIAL_EPOCH, canceled.clone()));
+        let signer = signers.signer(&owner.profile, owner.generation, signing.clone());
         Self {
             profile,
             profiles,
@@ -847,6 +861,7 @@ impl<'a> NativeOvpnAttempt<'a> {
                     dns: None,
                     journal: Journal::new(storage),
                 },
+                signing,
             ),
             profile_use: None,
         }
@@ -1025,11 +1040,13 @@ impl Attempt for NativeOvpnAttempt<'_> {
         self.start_using(canceled, expires, |attempt, config, signatures| {
             attempt.start_session(canceled, expires, config, signatures)
         })
+        .inspect_err(|_| self.cycle.signing.cancel())
     }
 
     fn ready(&mut self) -> Result<bool, Failure> {
-        self.validate_profile_use()?;
-        self.cycle.ready(&self.profile)
+        self.validate_profile_use()
+            .and_then(|()| self.cycle.ready(&self.profile))
+            .inspect_err(|_| self.cycle.signing.cancel())
     }
 
     fn phase(&self) -> Option<ConnectionState> {
@@ -1041,14 +1058,16 @@ impl Attempt for NativeOvpnAttempt<'_> {
     }
 
     fn healthy(&mut self) -> Result<(), Failure> {
-        self.validate_profile_use()?;
-        self.cycle.poll(&self.profile)?;
-        self.cycle.validate_network()
+        self.validate_profile_use()
+            .and_then(|()| self.cycle.poll(&self.profile))
+            .and_then(|()| self.cycle.validate_network())
+            .inspect_err(|_| self.cycle.signing.cancel())
     }
 
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
-        self.validate_profile_use()?;
-        self.cycle.probe(&self.profile, canceled, timeout)
+        self.validate_profile_use()
+            .and_then(|()| self.cycle.probe(&self.profile, canceled, timeout))
+            .inspect_err(|_| self.cycle.signing.cancel())
     }
 
     fn cleanup(&mut self) -> bool {
@@ -1067,6 +1086,12 @@ impl Attempt for NativeOvpnAttempt<'_> {
             self.profile_use = None;
         }
         true
+    }
+}
+
+impl Drop for NativeOvpnAttempt<'_> {
+    fn drop(&mut self) {
+        self.cycle.signing.cancel();
     }
 }
 
