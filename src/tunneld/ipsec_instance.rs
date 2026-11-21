@@ -9,19 +9,21 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
-
 use super::{
-    handshake::AuthenticatedChannel,
+    handshake::{AuthenticatedChannel, Datagram},
     instance_protocol::{Order, Reply, Start, decode_credentials},
     protocol::{CidrV4, ErrorCode},
 };
 use crate::{
     connection::{ipsec::Config, routes::Network},
     helper::{
-        local_socket::{Budget, connect_deadline},
+        local_socket::{Budget, Canceled, connect_deadline},
         vici::{self, Client, CommandResult, Message},
     },
     secrets::Credentials,
@@ -35,6 +37,9 @@ const STARTUP_INTERVAL: Duration = Duration::from_millis(20);
 // Same manual reqid range as connection/ipsec/namespace.rs.
 const MAX_MANUAL_REQID: u16 = 0x3fff;
 const TERM_GRACE: Duration = Duration::from_secs(3);
+/// How often negotiation re-checks the control channel; also bounds how long
+/// a cancellation takes to reach a VICI exchange in progress.
+const CONTROL_POLL: Duration = Duration::from_millis(50);
 
 /// Local unit configuration. The directory comes from the service manager's
 /// RUNTIME_DIRECTORY and must be private and empty.
@@ -75,13 +80,17 @@ fn run_authenticated(
     run_with(&mut channel, params, program, owner)
 }
 
-trait InstanceChannel {
-    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>>;
+trait InstanceChannel: Send {
+    /// Datagrams may carry credentials and always arrive in a wiping buffer.
+    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Datagram>;
     fn send(&mut self, reply: &Reply) -> io::Result<()>;
+    /// Wait up to `timeout` for a pending datagram without consuming it. The
+    /// peer's exit is an UnexpectedEof error.
+    fn wait_control(&mut self, timeout: Duration) -> io::Result<bool>;
 }
 
 impl InstanceChannel for AuthenticatedChannel {
-    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>> {
+    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Datagram> {
         match child {
             Some(pidfd) => self.receive_while_running(pidfd),
             None => self.receive(),
@@ -91,13 +100,17 @@ impl InstanceChannel for AuthenticatedChannel {
     fn send(&mut self, reply: &Reply) -> io::Result<()> {
         self.send(&serde_json::to_vec(reply)?)
     }
+
+    fn wait_control(&mut self, timeout: Duration) -> io::Result<bool> {
+        AuthenticatedChannel::wait_control(self, timeout)
+    }
 }
 
 fn get_order(
     channel: &mut impl InstanceChannel,
     child: Option<BorrowedFd<'_>>,
 ) -> io::Result<Order> {
-    let bytes = Zeroizing::new(channel.receive(child)?);
+    let bytes = channel.receive(child)?;
     serde_json::from_slice(&bytes).map_err(|_| invalid("invalid IPsec instance order"))
 }
 
@@ -143,7 +156,7 @@ fn run_attempt(
     };
     let attempt = Attempt::new(start)?;
     let mut frame = match channel.receive(None) {
-        Ok(frame) => Zeroizing::new(frame),
+        Ok(frame) => frame,
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Exit::Eof),
         Err(error) => return Err(error),
     };
@@ -255,19 +268,126 @@ fn run_in_directory(
         pid: child.id(),
         owner,
         loaded: false,
+        cancel: Arc::default(),
     };
-    let result = vici
-        .establish(&attempt, credentials)
-        .and_then(|reply| channel.send(&reply))
-        .and_then(|()| match get_order(channel, Some(pidfd.as_fd())) {
-            Ok(Order::Stop {}) => Ok(Exit::Stopped),
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
-            Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
-            Err(error) => Err(error),
+    let result =
+        establish_watched(channel, &mut vici, &attempt, credentials).and_then(|settled| {
+            match settled {
+                Settled::Done(exit) => Ok(exit),
+                Settled::Publish(reply) => channel.send(&reply).and_then(|()| {
+                    match get_order(channel, Some(pidfd.as_fd())) {
+                        Ok(Order::Stop {}) => Ok(Exit::Stopped),
+                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
+                        Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
+                        Err(error) => Err(error),
+                    }
+                }),
+            }
         });
     let unload = vici.cleanup(&attempt.config);
     let stop = stop_child(&mut child, &pidfd);
     with_cleanup(result, with_cleanup(unload, stop))
+}
+
+enum Settled {
+    /// The negotiation finished with no order pending: publish its result.
+    Publish(Reply),
+    /// An order or the end of the channel arrived first: publish nothing.
+    Done(Exit),
+}
+
+struct Finished<'a>(&'a AtomicBool);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Run the negotiation while a second thread watches the control channel. A
+/// `Stop`, an error or the end of the channel cancels the VICI exchange in
+/// progress; cleanup then runs under its own budget in the caller.
+fn establish_watched(
+    channel: &mut impl InstanceChannel,
+    vici: &mut PrivateVici<'_>,
+    attempt: &Attempt,
+    credentials: Credentials,
+) -> io::Result<Settled> {
+    let cancel = Arc::clone(&vici.cancel);
+    let done = AtomicBool::new(false);
+    let (established, observed) = std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| watch_control(channel, &cancel, &done));
+        let established = {
+            let _finished = Finished(&done);
+            vici.establish(attempt, credentials)
+        };
+        let observed = watcher
+            .join()
+            .unwrap_or_else(|_| Some(Err(io::Error::other("IPsec control watcher panicked"))));
+        (established, observed)
+    });
+    settle(established, observed)
+}
+
+/// Returns what the channel delivered while the negotiation ran, if anything.
+/// After the negotiation ends it looks once more, so an order that arrived
+/// before the result was known is never overtaken by the result.
+fn watch_control(
+    channel: &mut impl InstanceChannel,
+    cancel: &AtomicBool,
+    done: &AtomicBool,
+) -> Option<io::Result<Order>> {
+    loop {
+        let finished = done.load(Ordering::Acquire);
+        let order = match channel.wait_control(if finished {
+            Duration::ZERO
+        } else {
+            CONTROL_POLL
+        }) {
+            Ok(false) if finished => return None,
+            Ok(false) => continue,
+            Ok(true) => get_order(channel, None),
+            Err(error) => Err(error),
+        };
+        cancel.store(true, Ordering::Release);
+        return Some(order);
+    }
+}
+
+fn settle(
+    established: io::Result<Reply>,
+    observed: Option<io::Result<Order>>,
+) -> io::Result<Settled> {
+    let Some(order) = observed else {
+        return established.map(Settled::Publish);
+    };
+    // A reply for a negotiation that an order has overtaken is never sent.
+    // A real failure of the negotiation still surfaces.
+    if let Err(error) = established
+        && !cancel_induced(&error)
+    {
+        return Err(error);
+    }
+    match order {
+        Ok(Order::Stop {}) => Ok(Settled::Done(Exit::Stopped)),
+        Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Settled::Done(Exit::Eof)),
+        Err(error) => Err(error),
+    }
+}
+
+fn cancel_induced(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
+}
+
+fn canceled(error: io::Error) -> io::Error {
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<Canceled>())
+    {
+        return io::Error::new(io::ErrorKind::Interrupted, "IPsec negotiation canceled");
+    }
+    error
 }
 
 struct Attempt {
@@ -421,6 +541,8 @@ struct PrivateVici<'a> {
     pid: u32,
     owner: (u32, u32),
     loaded: bool,
+    /// Observed by every exchange of the negotiation. Cleanup uses its own.
+    cancel: Arc<AtomicBool>,
 }
 
 impl PrivateVici<'_> {
@@ -438,7 +560,8 @@ impl PrivateVici<'_> {
                 "unsafe IPsec VICI socket",
             ));
         }
-        let stream = connect_deadline(self.path, &Budget::until(deadline, None)?)?;
+        let budget = Budget::until(deadline, Some(Arc::clone(&self.cancel))).map_err(canceled)?;
+        let stream = connect_deadline(self.path, &budget).map_err(canceled)?;
         // SAFETY: credential and len are writable buffers for SO_PEERCRED.
         let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
@@ -461,7 +584,7 @@ impl PrivateVici<'_> {
                 "unexpected IPsec VICI peer",
             ));
         }
-        Client::from_stream_until(stream, self.owner.0, deadline, Default::default())
+        Client::from_stream_until(stream, self.owner.0, deadline, Arc::clone(&self.cancel))
             .map_err(vici_error)
     }
 
@@ -523,15 +646,25 @@ impl PrivateVici<'_> {
         if !self.loaded || poll_until(self.child, Instant::now())? {
             return Ok(());
         }
+        // Cancellation of the negotiation must not cancel its own cleanup.
+        let this = Self {
+            path: self.path,
+            child: self.child,
+            pid: self.pid,
+            owner: self.owner,
+            loaded: self.loaded,
+            cancel: Arc::default(),
+        };
+        let this = &this;
         let deadline = Instant::now() + TERM_GRACE;
         let terminate = config
             .terminate(remaining(deadline)?)
             .map_err(|_| io::Error::other("invalid IPsec terminate deadline"))?;
-        let terminated = self.ack(deadline, "terminate", terminate);
-        let unloaded = self.ack(deadline, "unload-conn", config.unload_connection());
+        let terminated = this.ack(deadline, "terminate", terminate);
+        let unloaded = this.ack(deadline, "unload-conn", config.unload_connection());
         let mut result = with_cleanup(terminated, unloaded);
         for message in config.unload_shared() {
-            result = with_cleanup(result, self.ack(deadline, "unload-shared", message));
+            result = with_cleanup(result, this.ack(deadline, "unload-shared", message));
         }
         result
     }
@@ -569,6 +702,7 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 
 fn vici_error(error: vici::Error) -> io::Error {
     let kind = match error {
+        vici::Error::Canceled => io::ErrorKind::Interrupted,
         vici::Error::Timeout => io::ErrorKind::TimedOut,
         vici::Error::UntrustedPeer => io::ErrorKind::PermissionDenied,
         _ => io::ErrorKind::Other,
