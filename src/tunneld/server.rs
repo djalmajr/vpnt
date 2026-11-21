@@ -288,7 +288,10 @@ use super::protocol::VERSION;
 #[cfg(test)]
 mod policy_dialogue_tests {
     use super::*;
-    use crate::tunneld::{admin::PolicyFixture, protocol::Credentials};
+    use crate::tunneld::{
+        admin::{PolicyFixture, acquire_eventually},
+        protocol::Credentials,
+    };
     use std::{
         fs::{self, File, Permissions},
         io::{BufRead, BufReader, Read, Write},
@@ -362,7 +365,7 @@ mod policy_dialogue_tests {
         const FIXTURE_DIR: &str = "VPNT_TEST_POLICY_LOCK_DIRECTORY";
         if let Some(path) = std::env::var_os(FIXTURE_DIR) {
             let directory = File::open(path).unwrap();
-            directory.try_lock().unwrap();
+            acquire_eventually(|| directory.try_lock().map_err(io::Error::from)).unwrap();
             println!("fixture directory locked");
             io::stdout().flush().unwrap();
             io::stdin().read_to_end(&mut Vec::new()).unwrap();
@@ -404,6 +407,8 @@ mod policy_dialogue_tests {
         );
 
         fixture.install();
+        let policy_directory = fixture.store.open().unwrap();
+        drop(acquire_eventually(|| policy_directory.lock_shared()).unwrap());
         assert_eq!(
             run(&fixture, 500, "10.20.0.0", || {}),
             ErrorCode::MissingProgram
@@ -417,16 +422,7 @@ mod policy_dialogue_tests {
         let fixture = PolicyFixture::new();
         fixture.install();
         let lock = File::open(fixture.lock_path()).unwrap();
-        // A fork from another test thread can still hold the install's lock
-        // until its exec; wait for it instead of failing on that window.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while lock.try_lock().is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "install lock never released"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        acquire_eventually(|| lock.try_lock().map_err(io::Error::from)).unwrap();
         assert_eq!(
             run(&fixture, 500, "10.20.0.0", || panic!(
                 "reached Prepared with a contended lock"
@@ -434,6 +430,8 @@ mod policy_dialogue_tests {
             ErrorCode::PermissionDenied
         );
         drop(lock);
+        let directory = fixture.store.open().unwrap();
+        drop(acquire_eventually(|| directory.lock_shared()).unwrap());
         assert_eq!(
             run(&fixture, 500, "10.20.0.0", || {
                 fs::set_permissions(fixture.lock_path(), Permissions::from_mode(0o640)).unwrap();
@@ -458,6 +456,8 @@ mod policy_dialogue_tests {
         );
         std::fs::remove_file(fixture.path()).unwrap();
         fixture.install();
+        let directory = fixture.store.open().unwrap();
+        drop(acquire_eventually(|| directory.lock_shared()).unwrap());
         assert_eq!(
             run(&fixture, 501, "10.20.0.0", denied),
             ErrorCode::PermissionDenied
@@ -474,11 +474,15 @@ mod policy_dialogue_tests {
             run(&fixture, 500, "10.20.0.0", || {
                 fixture.revoke();
                 fixture.install();
+                drop(acquire_eventually(|| directory.lock_shared()).unwrap());
             }),
             ErrorCode::PermissionDenied
         );
         assert_eq!(
-            run(&fixture, 500, "10.20.0.0", || fixture.revoke()),
+            run(&fixture, 500, "10.20.0.0", || {
+                fixture.revoke();
+                drop(acquire_eventually(|| directory.lock_shared()).unwrap());
+            }),
             ErrorCode::PermissionDenied
         );
     }
