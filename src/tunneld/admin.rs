@@ -843,7 +843,22 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(admin);
-        directory.lock_shared().unwrap();
+        // A thread of another test that forks between our open and its exec
+        // briefly shares this open file description and its flock; the lock
+        // must become free once that child execs, not necessarily at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match directory.lock_shared() {
+                Ok(_) => break,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("lock not released after drop: {error}"),
+            }
+        }
     }
 
     #[test]

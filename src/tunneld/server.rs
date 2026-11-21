@@ -417,7 +417,16 @@ mod policy_dialogue_tests {
         let fixture = PolicyFixture::new();
         fixture.install();
         let lock = File::open(fixture.lock_path()).unwrap();
-        lock.try_lock().unwrap();
+        // A fork from another test thread can still hold the install's lock
+        // until its exec; wait for it instead of failing on that window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while lock.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "install lock never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
             run(&fixture, 500, "10.20.0.0", || panic!(
                 "reached Prepared with a contended lock"
