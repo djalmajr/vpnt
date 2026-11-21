@@ -1,31 +1,29 @@
-//! Admission of one tunnel session up to the authenticated backend instance.
-//!
-//! The order is fixed. Under the shared network lock the launcher refuses when
-//! the network backend reports an OVPN link or any lease exists, and otherwise
-//! registers the lease of this generation. Outside the lock it creates the
-//! private generation directory, publishes the handshake record and control
-//! socket, starts the instance unit and authenticates the instance through the
-//! system manager. Every failure, a stop and a closed client run the same
-//! teardown: stop the unit, remove the directory, then withdraw the lease
-//! under the lock. A lease is withdrawn only after the unit stop is proven, so
-//! an unproven stop keeps the network reserved and reports `CleanupPending`.
-//!
-//! Tunnel configuration inside the instance (VICI, routes, DNS) is not part of
-//! this slice: the received credentials are dropped, zeroed, without being used.
+//! Admission, authenticated instance control, and lease recovery.
 use super::{
     attest::SystemdAttestor,
-    handshake::{AuthenticatedChannel, Backend, UnitAttestor, Writer},
-    protocol::{ErrorCode, State},
+    handshake::{
+        AuthenticatedChannel, Backend, CONTROL_SOCKET_NAME, RECORD_NAME, UnitAttestor,
+        UnitIdentity, Writer,
+    },
+    instance_protocol::{Order, Reply, Start, encode_credentials},
+    network::{Network, Receipt, parse_cidr, valid_generation},
+    policy::Entry,
+    protocol::{CidrV4, Credentials, ErrorCode, Prepare, State},
 };
 use crate::{
     netd::{iproute::Backend as NetworkBackend, server::ovpn_present},
     netlease::{NetworkGuard, NetworkLock},
 };
+use serde::Deserialize;
 use std::{
     ffi::OsStr,
     fs::{self, DirBuilder, File},
     io,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    net::Ipv4Addr,
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -37,9 +35,6 @@ pub(super) const RUNTIME_DIRECTORY: &str = "/run/vpnt";
 /// Per-generation private directories live in `<runtime>/tunneld/<generation>`.
 /// The unit templates bind that directory read-only into the instance.
 pub(super) const INSTANCE_DIRECTORY: &str = "tunneld";
-/// Control socket basename inside the generation directory. The handshake
-/// record is published next to it under the generation as its basename.
-pub(super) const CONTROL_SOCKET: &str = "control.sock";
 /// The instance units run as root with group 0.
 pub(super) const INSTANCE_GID: libc::gid_t = 0;
 
@@ -50,12 +45,21 @@ const STOP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Admit a session and return its running handle.
 pub(super) trait Launch: Send + Sync {
-    fn launch<'a>(&'a self, backend: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode>;
+    fn launch<'a>(
+        &'a self,
+        offer: &Prepare,
+        grant: &Entry,
+        credentials: Credentials,
+        authorization: File,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode>;
 }
 
 /// One admitted session. Dropping it stops it.
 pub(super) trait Running {
     fn state(&self) -> State;
+    fn peer(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
     /// Stop and clean up. A `CleanupPending` result may be retried.
     fn stop(&mut self) -> State;
 }
@@ -84,6 +88,7 @@ pub(super) struct Launcher<N, A> {
     systemctl: PathBuf,
     network: N,
     attestor: A,
+    xfrm: Network,
     lock: AcquireLock,
     limits: Limits,
 }
@@ -95,6 +100,7 @@ impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
             systemctl: PathBuf::from(SYSTEMCTL),
             network,
             attestor: SystemdAttestor,
+            xfrm: Network::default(),
             lock: Box::new(NetworkLock::acquire),
             limits: Limits::default(),
         }
@@ -109,6 +115,7 @@ struct Attempt {
     registered: bool,
     directory: bool,
     started: bool,
+    receipt: Option<Receipt>,
 }
 
 impl Attempt {
@@ -125,6 +132,7 @@ impl Attempt {
             registered: false,
             directory: false,
             started: false,
+            receipt: None,
         }
     }
 }
@@ -152,58 +160,201 @@ impl Failure {
     }
 }
 
-impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
-    fn bring_up(&self, attempt: &mut Attempt) -> Result<AuthenticatedChannel, Failure> {
-        {
-            // The checks and the registration share this one acquisition, so
-            // a competing admission cannot slip between them.
-            let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    Failure::new(ErrorCode::Busy, "network write lock is contended")
-                } else {
-                    Failure::io("network write lock", &error)
-                }
-            })?;
-            if ovpn_present(&self.network).map_err(|e| Failure::io("network inventory", &e))? {
-                return Err(Failure::new(ErrorCode::Busy, "an OVPN tunnel is present"));
-            }
-            if guard
-                .tunnels_present()
-                .map_err(|e| Failure::io("lease registry", &e))?
-            {
-                return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
-            }
-            // A sync error after creation leaves the marker, so mark first.
-            attempt.registered = true;
-            guard
-                .register(&attempt.generation)
-                .map_err(|e| Failure::io("lease registration", &e))?;
-        }
+// Projection of the canonical policy entry. The offer only supplies a username.
+#[derive(Deserialize)]
+struct IpsecGrant {
+    hostname: String,
+    peer_identity: String,
+    transport_ipv4: Vec<Ipv4Addr>,
+    port: u16,
+    route_cidrs: Vec<String>,
+}
 
-        attempt.directory = true;
+struct IpsecStart {
+    order: Start,
+    approved: Vec<Ipv4Addr>,
+    credentials: zeroize::Zeroizing<Vec<u8>>,
+}
+
+struct CapturePeer<'a, A> {
+    attestor: &'a A,
+    peer: std::cell::RefCell<Option<OwnedFd>>,
+}
+
+impl<A: UnitAttestor> UnitAttestor for CapturePeer<'_, A> {
+    fn attest(&self, fd: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
+        self.attest_until(fd, Instant::now() + START_DEADLINE)
+    }
+
+    fn attest_until(&self, fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<UnitIdentity> {
+        let identity = self.attestor.attest_until(fd, deadline)?;
+        self.peer.replace(Some(fd.try_clone_to_owned()?));
+        Ok(identity)
+    }
+}
+
+impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
+    fn bring_up(
+        &self,
+        attempt: &mut Attempt,
+        setup: Option<IpsecStart>,
+        authorization: Option<File>,
+        channel: &mut Option<AuthenticatedChannel>,
+    ) -> Result<OwnedFd, Failure> {
+        let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                Failure::new(ErrorCode::Busy, "network write lock is contended")
+            } else {
+                Failure::io("network write lock", &error)
+            }
+        })?;
+        if ovpn_present(&self.network).map_err(|e| Failure::io("network inventory", &e))? {
+            return Err(Failure::new(ErrorCode::Busy, "an OVPN tunnel is present"));
+        }
+        if guard
+            .tunnels_present()
+            .map_err(|e| Failure::io("lease registry", &e))?
+        {
+            return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
+        }
         let directory = self
             .create_directory(&attempt.generation)
             .map_err(|e| Failure::io("generation directory", &e))?;
+        attempt.directory = true;
+        if let Some(setup) = setup.as_ref() {
+            let receipt = self
+                .xfrm
+                .plan(
+                    &guard,
+                    &attempt.generation,
+                    setup.order.remote_ipv4,
+                    &setup.approved,
+                    setup.order.remote_ts.clone(),
+                )
+                .map_err(|e| Failure::io("network admission", &e))?;
+            receipt
+                .save(&directory, &guard)
+                .map_err(|e| Failure::io("network receipt", &e))?;
+            // Ensure the generation directory entry itself is durable before spawn.
+            File::open(self.runtime.join(INSTANCE_DIRECTORY))
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| Failure::io("generation directory sync", &e))?;
+            attempt.receipt = Some(receipt);
+        }
+        // A sync error after creation can still leave the marker.
+        attempt.registered = true;
+        guard
+            .register(&attempt.generation)
+            .map_err(|e| Failure::io("lease registration", &e))?;
+        drop(authorization);
+        drop(guard);
+
         let writer = Writer::publish(
             &directory,
-            OsStr::new(CONTROL_SOCKET),
+            OsStr::new(CONTROL_SOCKET_NAME),
             &attempt.generation,
             attempt.backend,
             INSTANCE_GID,
         )
         .map_err(|e| Failure::io("handshake publication", &e))?;
+        // Writer creates the file exclusively in this private directory. Its
+        // current API fixes the initial basename; the unit binds RECORD_NAME.
+        fs::rename(
+            directory.join(&attempt.generation),
+            directory.join(RECORD_NAME),
+        )
+        .map_err(|e| Failure::io("handshake record basename", &e))?;
 
-        // An attempt that failed to run may still have queued the job.
-        attempt.started = true;
+        attempt.started = true; // A failed call may still have queued the job.
         run_systemctl(
             &self.systemctl,
             &["start", "--no-block", "--", &attempt.unit],
             self.limits.start,
         )
         .map_err(|e| Failure::io("systemctl start", &e))?;
-        writer
-            .authenticate(&self.attestor)
-            .map_err(|e| Failure::io("instance authentication", &e))
+        let attestor = CapturePeer {
+            attestor: &self.attestor,
+            peer: Default::default(),
+        };
+        let authenticated = channel.insert(
+            writer
+                .authenticate(&attestor)
+                .map_err(|e| Failure::io("instance authentication", &e))?,
+        );
+        if let Some(setup) = setup {
+            self.establish(attempt, setup, authenticated, &directory)?;
+        }
+        let peer = attestor
+            .peer
+            .into_inner()
+            .ok_or_else(|| Failure::new(ErrorCode::Backend, "missing attested peer"))?;
+        let mut pollfd = libc::pollfd {
+            fd: peer.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll updates one initialized entry for a live descriptor.
+        match unsafe { libc::poll(&mut pollfd, 1, 0) } {
+            0 => Ok(peer),
+            -1 => Err(Failure::io(
+                "instance liveness check",
+                &io::Error::last_os_error(),
+            )),
+            _ => Err(Failure::new(
+                ErrorCode::Backend,
+                "instance exited before publication",
+            )),
+        }
+    }
+
+    fn establish(
+        &self,
+        attempt: &mut Attempt,
+        mut setup: IpsecStart,
+        channel: &mut AuthenticatedChannel,
+        directory: &Path,
+    ) -> Result<(), Failure> {
+        let receipt = attempt
+            .receipt
+            .as_mut()
+            .expect("IPsec receipt precedes start");
+        setup.order.if_id = receipt.if_id;
+        setup.order.reqid = receipt.reqid;
+        channel
+            .send(
+                &serde_json::to_vec(&Order::Start(setup.order))
+                    .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
+            )
+            .map_err(|e| Failure::io("instance Start", &e))?;
+        let sent = channel.send(&setup.credentials);
+        zeroize::Zeroize::zeroize(&mut setup.credentials);
+        sent.map_err(|e| Failure::io("instance credentials", &e))?;
+        let reply = receive_reply(channel).map_err(|e| Failure::io("instance setup reply", &e))?;
+        let vip = match reply {
+            Reply::Established {
+                if_id,
+                reqid,
+                virtual_ipv4,
+                remote_ts,
+            } if if_id == receipt.if_id
+                && reqid == receipt.reqid
+                && receipt.permits_selectors(&remote_ts) =>
+            {
+                virtual_ipv4
+            }
+            Reply::Failed { code } => return Err(Failure::new(code, "instance failed setup")),
+            _ => {
+                return Err(Failure::new(
+                    ErrorCode::Backend,
+                    "unexpected instance setup reply",
+                ));
+            }
+        };
+        let guard = (self.lock)(Instant::now() + self.limits.lock)
+            .map_err(|e| Failure::io("network write lock", &e))?;
+        self.xfrm
+            .install(&guard, directory, receipt, vip, &setup.approved)
+            .map_err(|e| Failure::io("configure XFRM network", &e))
     }
 
     fn create_directory(&self, generation: &str) -> io::Result<PathBuf> {
@@ -222,60 +373,168 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         Ok(directory)
     }
 
-    /// Reverse what the attempt did. True when every step is proven.
-    fn teardown(&self, attempt: &Attempt) -> bool {
-        if attempt.started {
-            let stop = ["stop", "--", &attempt.unit];
-            if let Err(error) = run_systemctl(&self.systemctl, &stop, self.limits.stop) {
-                // The instance may still run: keep its directory and lease.
-                eprintln!("vpnt-tunneld: unit stop is unproven: {error}");
-                return false;
-            }
+    pub(super) fn recover(&self) -> io::Result<()> {
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
+        let parent = self.runtime.join(INSTANCE_DIRECTORY);
+        match require_private(&parent) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         }
-        let mut proven = true;
-        if attempt.directory {
-            let path = self
-                .runtime
-                .join(INSTANCE_DIRECTORY)
-                .join(&attempt.generation);
-            match fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    eprintln!("vpnt-tunneld: generation directory removal failed: {error}");
-                    proven = false;
-                }
+        for entry in fs::read_dir(&parent)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let Some(generation) = filename.to_str().filter(|name| valid_generation(name)) else {
+                continue;
+            };
+            let directory = entry.path();
+            require_private(&directory)?;
+            let mut receipt = match Receipt::load(&directory, &guard) {
+                Ok(receipt) => receipt,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if !receipt.complete {
+                let attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
+                self.stop_unit(&attempt)?;
+                self.xfrm.clean(&guard, &directory, &receipt)?;
+                receipt.complete = true;
+                receipt.save(&directory, &guard)?;
             }
+            guard.withdraw(generation)?;
         }
-        if attempt.registered {
-            let withdrawn = (self.lock)(Instant::now() + self.limits.lock)
-                .and_then(|guard| guard.withdraw(&attempt.generation));
-            if let Err(error) = withdrawn {
-                eprintln!("vpnt-tunneld: lease withdrawal failed: {error}");
-                proven = false;
-            }
-        }
-        proven
+        Ok(())
     }
-}
 
-impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A> {
-    fn launch<'a>(&'a self, backend: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+    fn stop_unit(&self, attempt: &Attempt) -> io::Result<()> {
+        run_systemctl(
+            &self.systemctl,
+            &["stop", "--", &attempt.unit],
+            self.limits.stop,
+        )
+    }
+
+    fn teardown(&self, attempt: &mut Attempt, channel: Option<AuthenticatedChannel>) -> bool {
+        let result = if attempt.receipt.is_some() {
+            self.teardown_ipsec(attempt, channel)
+        } else {
+            drop(channel);
+            self.teardown_before_ipsec(attempt)
+        };
+        if let Err(error) = result {
+            eprintln!("vpnt-tunneld: cleanup is unproven: {error}");
+            return false;
+        }
+        true
+    }
+
+    fn teardown_ipsec(
+        &self,
+        attempt: &mut Attempt,
+        channel: Option<AuthenticatedChannel>,
+    ) -> io::Result<()> {
+        let directory = self
+            .runtime
+            .join(INSTANCE_DIRECTORY)
+            .join(&attempt.generation);
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
+        let stopped = match channel {
+            Some(mut channel) => {
+                let stopped = channel
+                    .send(br#"{"op":"stop"}"#)
+                    .and_then(|()| receive_reply(&mut channel));
+                if !matches!(stopped, Ok(Reply::Stopped {})) {
+                    eprintln!("vpnt-tunneld: instance did not confirm Stop: {stopped:?}");
+                }
+                matches!(stopped, Ok(Reply::Stopped {}))
+            }
+            None => false,
+        };
+        if attempt.started && !stopped {
+            self.stop_unit(attempt)?;
+            attempt.started = false;
+        }
+        let receipt = attempt
+            .receipt
+            .as_mut()
+            .expect("IPsec cleanup has a receipt");
+        let clean = if receipt.complete {
+            Ok(())
+        } else {
+            self.xfrm.clean(&guard, &directory, receipt)
+        };
+        // Even when a network read or delete failed, stop the producer.
+        if attempt.started {
+            self.stop_unit(attempt)?;
+            attempt.started = false;
+        }
+        clean?;
+        let receipt = attempt
+            .receipt
+            .as_mut()
+            .expect("IPsec cleanup has a receipt");
+        if !receipt.complete {
+            self.xfrm.verify_xfrm_clear(receipt)?;
+            receipt.complete = true;
+            if let Err(error) = receipt.save(&directory, &guard) {
+                receipt.complete = false;
+                return Err(error);
+            }
+        }
+        guard.withdraw(&attempt.generation)
+    }
+
+    fn teardown_before_ipsec(&self, attempt: &Attempt) -> io::Result<()> {
+        if attempt.started {
+            self.stop_unit(attempt)?;
+        }
+        let removed = if attempt.directory {
+            match fs::remove_dir_all(
+                self.runtime
+                    .join(INSTANCE_DIRECTORY)
+                    .join(&attempt.generation),
+            ) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            }
+        } else {
+            Ok(())
+        };
+        if attempt.registered {
+            let guard = (self.lock)(Instant::now() + self.limits.lock)?;
+            guard.withdraw(&attempt.generation)?;
+        }
+        removed
+    }
+
+    fn launch_backend<'a>(
+        &'a self,
+        backend: Backend,
+        setup: Option<IpsecStart>,
+        authorization: Option<File>,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let generation = generation().map_err(|error| {
             eprintln!("vpnt-tunneld: could not draw a generation: {error}");
             ErrorCode::Backend
         })?;
         let mut attempt = Attempt::new(backend, generation);
-        match self.bring_up(&mut attempt) {
-            Ok(channel) => Ok(Box::new(Session {
+        let mut channel = None;
+        let state = if setup.is_some() {
+            State::NetworkReady
+        } else {
+            State::Starting
+        };
+        match self.bring_up(&mut attempt, setup, authorization, &mut channel) {
+            Ok(peer) => Ok(Box::new(Session {
                 launcher: self,
                 attempt,
-                channel: Some(channel),
-                state: State::Starting,
+                channel,
+                peer: Some(peer),
+                state,
             })),
             Err(failure) => {
                 eprintln!("vpnt-tunneld: admission failed: {}", failure.cause);
-                Err(if self.teardown(&attempt) {
+                Err(if self.teardown(&mut attempt, channel) {
                     failure.code
                 } else {
                     ErrorCode::CleanupPending
@@ -285,10 +544,73 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
     }
 }
 
+fn receive_reply(channel: &mut AuthenticatedChannel) -> io::Result<Reply> {
+    let bytes = channel.receive()?;
+    if bytes.first() != Some(&b'{') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected instance reply object",
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid instance reply"))
+}
+
+impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A> {
+    fn launch<'a>(
+        &'a self,
+        offer: &Prepare,
+        grant: &Entry,
+        credentials: Credentials,
+        authorization: File,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        let Prepare::Ipsec(request) = offer else {
+            return self.launch_backend(offer.backend(), None, Some(authorization));
+        };
+        let grant: IpsecGrant = serde_json::to_value(grant)
+            .and_then(serde_json::from_value)
+            .map_err(|_| ErrorCode::Backend)?;
+        let remote_ts: Vec<CidrV4> = grant
+            .route_cidrs
+            .iter()
+            .map(|r| parse_cidr(r))
+            .collect::<io::Result<_>>()
+            .map_err(|_| ErrorCode::PermissionDenied)?;
+        if !(1..=64).contains(&remote_ts.len()) || grant.port != 500 {
+            return Err(ErrorCode::PermissionDenied);
+        }
+        let remote_ipv4 = self
+            .xfrm
+            .resolve(&grant.hostname, &grant.transport_ipv4)
+            .map_err(|error| {
+                eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
+                ErrorCode::Backend
+            })?;
+        let frame = encode_credentials(&credentials)?;
+        drop(credentials);
+        let setup = IpsecStart {
+            order: Start {
+                remote_ipv4,
+                port: grant.port,
+                peer_identity: grant.peer_identity,
+                username: request.username().into(),
+                if_id: 0,
+                reqid: 0,
+                local_ts: vec!["dynamic".into()],
+                remote_ts,
+            },
+            approved: grant.transport_ipv4,
+            credentials: frame,
+        };
+        self.launch_backend(Backend::Ipsec, Some(setup), Some(authorization))
+    }
+}
+
 struct Session<'a, N: NetworkBackend, A: UnitAttestor + Send + Sync> {
     launcher: &'a Launcher<N, A>,
     attempt: Attempt,
     channel: Option<AuthenticatedChannel>,
+    peer: Option<OwnedFd>,
     state: State,
 }
 
@@ -297,13 +619,20 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
         self.state
     }
 
+    fn peer(&self) -> Option<BorrowedFd<'_>> {
+        self.peer.as_ref().map(AsFd::as_fd)
+    }
+
     fn stop(&mut self) -> State {
         if self.state == State::Stopped {
             return self.state;
         }
         self.state = State::Stopping;
-        drop(self.channel.take());
-        self.state = if self.launcher.teardown(&self.attempt) {
+        self.peer.take();
+        self.state = if self
+            .launcher
+            .teardown(&mut self.attempt, self.channel.take())
+        {
             State::Stopped
         } else {
             State::CleanupPending
@@ -401,6 +730,10 @@ fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()
 
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
+    fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
+        self.launch_backend(backend, None, None)
+    }
+
     fn for_test(
         runtime: PathBuf,
         systemctl: PathBuf,
@@ -414,6 +747,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             systemctl,
             network,
             attestor,
+            xfrm: Network::default(),
             lock,
             limits,
         }
@@ -428,10 +762,9 @@ mod tests {
             iproute::Existing,
             protocol::{Config, TunName},
         },
-        tunneld::handshake::{UnitIdentity, connect_instance},
+        tunneld::handshake::connect_instance,
     };
     use std::{
-        os::fd::BorrowedFd,
         process::Command,
         sync::{
             Arc,
@@ -447,6 +780,10 @@ mod tests {
     /// each case re-runs itself as root of a private user and mount namespace.
     /// Returns true inside that namespace, where the case body must run.
     fn namespaced(name: &str) -> bool {
+        namespaced_in(name, "tests")
+    }
+
+    fn namespaced_in(name: &str, module: &str) -> bool {
         if std::env::var_os(NAMESPACE).is_some() {
             return true;
         }
@@ -471,7 +808,7 @@ mod tests {
         }
         let output = unshare()
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("tunneld::backend::tests::{name}")])
+            .args(["--exact", &format!("tunneld::backend::{module}::{name}")])
             .arg("--nocapture")
             .env_clear()
             .env(NAMESPACE, "1")
@@ -526,16 +863,17 @@ mod tests {
     }
 
     impl UnitAttestor for FakeAttestor {
-        fn attest(&self, _: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
+        fn attest(&self, fd: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
             if self.fail {
                 return Err(io::Error::from(io::ErrorKind::PermissionDenied));
             }
             Ok(UnitIdentity {
                 name: started_unit(&self.log).ok_or(io::ErrorKind::NotFound)?,
                 invocation: INVOCATION.to_owned(),
-                // The fake instance is a thread of this process.
-                // SAFETY: getpid has no preconditions.
-                main_pid: unsafe { libc::getpid() },
+                main_pid: fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:")?.trim().parse().ok())
+                    .ok_or(io::ErrorKind::InvalidData)?,
             })
         }
     }
@@ -650,8 +988,8 @@ mod tests {
                 let generation = generation_of(&unit);
                 let directory = runtime.join(INSTANCE_DIRECTORY).join(&generation);
                 connect_instance(
-                    &directory.join(CONTROL_SOCKET),
-                    &directory.join(&generation),
+                    &directory.join(CONTROL_SOCKET_NAME),
+                    &directory.join(RECORD_NAME),
                     &generation,
                     backend,
                     INVOCATION,
@@ -733,9 +1071,14 @@ mod tests {
         assert_eq!(harness.log(), [format!("start --no-block -- {unit}")]);
         assert_eq!(harness.leases(), [generation.as_str()]);
         let directory = harness.directory(&generation);
-        assert!(directory.join(&generation).is_file(), "handshake record");
         assert!(
-            !directory.join(CONTROL_SOCKET).exists(),
+            directory
+                .join(super::super::handshake::RECORD_NAME)
+                .is_file(),
+            "fixed handshake record"
+        );
+        assert!(
+            !directory.join(CONTROL_SOCKET_NAME).exists(),
             "listener consumed"
         );
 
@@ -1072,5 +1415,378 @@ mod tests {
         let error = run(&slow, Duration::from_millis(100)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    mod xfrm_tests {
+        use super::*;
+        use crate::tunneld::{
+            admin::PolicyFixture,
+            protocol::{Response, decode_response, read_control, timed},
+            server::serve_fixture,
+        };
+        use std::{
+            io::Write,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex},
+        };
+
+        const CHILD: &str = "VPNT_XFRM_FIXTURE_CHILD";
+
+        #[derive(Default)]
+        struct Kernel {
+            ops: Vec<String>,
+            link: bool,
+            alias: Option<String>,
+            address: bool,
+            up: bool,
+            routes: Vec<String>,
+            ignore_delete: bool,
+            refuse_delete: bool,
+            leftover_policy: bool,
+        }
+
+        fn fake_network(runtime: PathBuf, kernel: Arc<Mutex<Kernel>>) -> Network {
+            Network::fake(move |program, args| {
+                if program == "/usr/bin/busctl" {
+                    assert!(args.contains(&"vpn.example"));
+                    return Ok(br#"{"type":"a(iiay)st","data":[[[2,2,[192,0,2,99]],[2,2,[192,0,2,20]]],"vpn.example",1]}"#.to_vec());
+                }
+                assert_eq!(program, "/usr/bin/ip");
+                assert_eq!(
+                    NetworkLock::acquire_test(&runtime, Instant::now() + Duration::from_millis(12))
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::TimedOut,
+                    "network operation outside the writer lock: {args:?}",
+                );
+                let mut k = kernel.lock().unwrap();
+                k.ops.push(args.join(" "));
+                let json = match args {
+                ["-4", "-j", "rule", "show"] => serde_json::json!([
+                    {"priority": 0, "src":"all","table":"local"},
+                    {"priority":32766,"src":"all","table":"main"},
+                    {"priority":32767,"src":"all","table":"default"}
+                ]),
+                ["-4", "-j", "route", "get", "192.0.2.20"] => serde_json::json!([
+                    {"dev":"eth-fixture","prefsrc":"192.0.2.2","gateway":"192.0.2.1"}
+                ]),
+                ["-j", "-d", "link", "show"] => {
+                    let mut links = vec![serde_json::json!({"ifname":"eth-fixture","ifindex":2,"flags":["UP"]})];
+                    if k.link {
+                        links.push(serde_json::json!({
+                            "ifname":"vpnti1","ifindex":7,"flags":if k.up { vec!["UP"] } else { vec![] },
+                            "link":"eth-fixture","ifalias":k.alias,
+                            "linkinfo":{"info_kind":"xfrm","info_data":{"if_id":"0x1"}}
+                        }));
+                    }
+                    serde_json::json!(links)
+                }
+                ["-4", "-j", "-d", "route", "show", "table", "all"] => serde_json::json!(
+                    k.routes.iter().map(|dst| serde_json::json!({
+                        "dst":dst,"dev":"vpnti1","type":"unicast","table":"main","protocol":"boot","scope":"link"
+                    })).collect::<Vec<_>>()
+                ),
+                ["-6", "-j", "-d", "route", "show", "table", "all"] => serde_json::json!([]),
+                ["-j", "addr", "show", "dev", "vpnti1"] => serde_json::json!([{
+                    "ifindex":7,"addr_info":if k.address {
+                        vec![serde_json::json!({"family":"inet","local":"10.99.0.2","prefixlen":32})]
+                    } else { vec![] }
+                }]),
+                ["xfrm", "state", "list", "nokeys"] => return Ok(vec![]),
+                ["xfrm", "policy", "list"] if k.leftover_policy => return Ok(
+                    b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out priority 1\n\tif_id 0x1\n".to_vec()
+                ),
+                ["xfrm", "policy", "list"] => return Ok(vec![]),
+                ["link", "add", "name", "vpnti1", "type", "xfrm", "dev", "eth-fixture", "if_id", "1"] => {
+                    let receipt = fs::read_dir(runtime.join(INSTANCE_DIRECTORY)).unwrap().next().unwrap().unwrap()
+                        .path().join(crate::tunneld::network::RECEIPT);
+                    let bytes = fs::read(receipt).unwrap();
+                    let intent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(intent["creating"], true);
+                    assert_eq!(intent["vip"], "10.99.0.2");
+                    assert_eq!(intent["routes"].as_array().unwrap().len(), 2);
+                    k.link = true;
+                    return Ok(vec![]);
+                }
+                ["link", "set", "dev", "vpnti1", "alias", alias] => { k.alias = Some((*alias).into()); return Ok(vec![]); }
+                ["link", "set", "dev", "vpnti1", "addrgenmode", "none"] => return Ok(vec![]),
+                ["link", "set", "dev", "vpnti1", "up"] => { k.up = true; return Ok(vec![]); }
+                ["-4", "addr", "add", "10.99.0.2/32", "dev", "vpnti1", "noprefixroute"] => { k.address = true; return Ok(vec![]); }
+                ["-4", "route", "add", dst, "dev", "vpnti1", "table", "main", "proto", "boot", "scope", "link"] => {
+                    assert!(["10.20.0.0/15", "172.16.0.0/12"].contains(dst), "unapproved network command: {args:?}");
+                    k.routes.push((*dst).into());
+                        return Ok(vec![]);
+                }
+                ["-4", "route", "del", dst, "dev", "vpnti1", "table", "main", "proto", "boot", "scope", "link"] => {
+                    if k.refuse_delete {
+                        return Err(io::Error::other("fixture refused delete"));
+                    }
+                    assert_eq!(k.routes.pop().as_deref(), Some(*dst));
+                        return Ok(vec![]);
+                }
+                ["-4", "addr", "del", "10.99.0.2/32", "dev", "vpnti1"] => {
+                        k.address = false;
+                        return Ok(vec![]);
+                    }
+                ["link", "del", "dev", "vpnti1"] => {
+                    assert!(k.routes.is_empty() && !k.address, "delete order");
+                    if !k.ignore_delete {
+                        k.link = false;
+                    }
+                    return Ok(vec![]);
+                }
+                _ => panic!("unexpected network operation: {args:?}"),
+            };
+                Ok(serde_json::to_vec(&json).unwrap())
+            })
+        }
+
+        #[test]
+        fn fixture_supervisor() {
+            let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) else {
+                return;
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let unit = loop {
+                if let Some(unit) = started_unit(&root.join("systemctl.log")) {
+                    break unit;
+                }
+                assert!(Instant::now() < deadline, "instance unit never queued");
+                thread::sleep(Duration::from_millis(5));
+            };
+            let generation = generation_of(&unit);
+            let directory = root.join("run").join(INSTANCE_DIRECTORY).join(&generation);
+            let mut channel = connect_instance(
+                &directory.join(CONTROL_SOCKET_NAME),
+                &directory.join(RECORD_NAME),
+                &generation,
+                Backend::Ipsec,
+                INVOCATION,
+                INSTANCE_GID,
+            )
+            .unwrap();
+            let Order::Start(start) = serde_json::from_slice(&channel.receive().unwrap()).unwrap()
+            else {
+                panic!("expected Start");
+            };
+            assert_eq!(start.local_ts, ["dynamic"]);
+            assert_eq!(start.port, 500);
+            assert_eq!(start.peer_identity, "fqdn:vpn.example");
+            assert_eq!(start.username, "fixture");
+            assert_eq!(start.remote_ipv4, Ipv4Addr::new(192, 0, 2, 20));
+            assert_eq!(
+                start
+                    .remote_ts
+                    .iter()
+                    .map(crate::tunneld::network::cidr_text)
+                    .collect::<Vec<_>>(),
+                ["10.20.0.0/15", "172.16.0.0/12"]
+            );
+            let mut frame = zeroize::Zeroizing::new(channel.receive().unwrap());
+            let credentials =
+                crate::tunneld::instance_protocol::decode_credentials(&mut frame).unwrap();
+            assert!(credentials.password.expose() == "fixture-password");
+            assert!(credentials.psk.expose() == "fixture-psk");
+            drop(credentials);
+            channel
+                .send(
+                    &serde_json::to_vec(&Reply::Established {
+                        if_id: start.if_id,
+                        reqid: start.reqid,
+                        virtual_ipv4: Ipv4Addr::new(10, 99, 0, 2),
+                        remote_ts: vec![start.remote_ts[0]],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            if root.join("exit-after-setup").exists() {
+                while !root.join("exit-now").exists() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture never allowed supervisor exit"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                return;
+            }
+            assert!(matches!(
+                serde_json::from_slice::<Order>(&channel.receive().unwrap()).unwrap(),
+                Order::Stop {}
+            ));
+            fs::write(root.join("instance-stopped"), b"").unwrap();
+            channel.send(br#"{"op":"stopped"}"#).unwrap();
+        }
+
+        fn response(socket: &UnixStream) -> Response {
+            let mut socket = timed(socket, Instant::now() + Duration::from_secs(8)).unwrap();
+            read_control(&mut socket, decode_response).unwrap()
+        }
+
+        fn client_prepare(client: &mut UnixStream) {
+            client
+                .write_all(b"{\"op\":\"hello\",\"version\":1}\n")
+                .unwrap();
+            assert!(matches!(response(client), Response::Version { .. }));
+            client.write_all(b"{\"op\":\"prepare_ipsec\",\"endpoint\":{\"host\":\"vpn.example\",\"port\":500},\"username\":\"fixture\",\"networks\":[{\"network\":\"10.20.1.0\",\"prefix\":24}]}\n").unwrap();
+            assert!(matches!(response(client), Response::Prepared {}));
+            Credentials::ipsec("fixture-password", "fixture-psk")
+                .unwrap()
+                .write(client)
+                .unwrap();
+        }
+
+        fn command(client: &mut UnixStream, command: &[u8], expected: State) {
+            client.write_all(command).unwrap();
+            let reply = response(client);
+            assert!(
+                matches!(reply, Response::Status { state } if state == expected),
+                "{reply:?}"
+            );
+        }
+
+        fn exercise(name: &str, exit: bool, unproven: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            if exit {
+                fs::write(harness.root.join("exit-after-setup"), b"").unwrap();
+            }
+            let mut process = Reaper(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tunneld::backend::tests::xfrm_tests::fixture_supervisor",
+                        "--nocapture",
+                    ])
+                    .env_clear()
+                    .env(CHILD, &harness.root)
+                    .spawn()
+                    .unwrap(),
+            );
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                {
+                    let k = kernel.lock().unwrap();
+                    assert_eq!(k.routes, ["10.20.0.0/15", "172.16.0.0/12"]);
+                    assert!(k.link && k.up && k.address);
+                }
+                if exit {
+                    fs::write(harness.root.join("exit-now"), b"").unwrap();
+                    assert!(process.0.wait().unwrap().success());
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !harness.leases().is_empty() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "idle client retained lease after instance death"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    command(&mut client, b"{\"op\":\"status\"}\n", State::Stopped);
+                } else if unproven {
+                    kernel.lock().unwrap().refuse_delete = true;
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        k.refuse_delete = false;
+                        k.ignore_delete = true;
+                    }
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        k.ignore_delete = false;
+                        k.leftover_policy = true;
+                    }
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    kernel.lock().unwrap().leftover_policy = false;
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                } else {
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                    assert!(harness.root.join("instance-stopped").is_file());
+                }
+                drop(client);
+                assert!(worker.join().is_ok());
+            });
+            assert!(process.0.wait().unwrap().success());
+            let k = kernel.lock().unwrap();
+            assert!(!k.link && !k.address && k.routes.is_empty());
+            assert!(harness.leases().is_empty());
+        }
+
+        #[test]
+        fn policy_routes_reach_network_ready_and_stop() {
+            exercise("policy_routes_reach_network_ready_and_stop", false, false);
+        }
+
+        #[test]
+        fn cleanup_pending_until_absence_is_proven() {
+            exercise("cleanup_pending_until_absence_is_proven", false, true);
+        }
+
+        #[test]
+        fn instance_death_cleans_while_client_is_idle() {
+            exercise("instance_death_cleans_while_client_is_idle", true, false);
+        }
+
+        #[test]
+        fn orphan_is_reconciled_before_admission() {
+            let harness = Harness::new();
+            let mut launcher = harness.launcher(false);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let generation = generation().unwrap();
+            let directory = launcher.create_directory(&generation).unwrap();
+            {
+                let guard = NetworkLock::acquire_test(
+                    &harness.runtime,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+                let remote = Ipv4Addr::new(192, 0, 2, 20);
+                let routes = ["10.20.0.0/15", "172.16.0.0/12"]
+                    .into_iter()
+                    .map(parse_cidr)
+                    .collect::<io::Result<_>>()
+                    .unwrap();
+                let mut receipt = launcher
+                    .xfrm
+                    .plan(&guard, &generation, remote, &[remote], routes)
+                    .unwrap();
+                receipt.save(&directory, &guard).unwrap();
+                guard.register(&generation).unwrap();
+                launcher
+                    .xfrm
+                    .install(
+                        &guard,
+                        &directory,
+                        &mut receipt,
+                        Ipv4Addr::new(10, 99, 0, 2),
+                        &[remote],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(harness.leases(), [generation.as_str()]);
+            launcher.recover().unwrap();
+            assert!(harness.leases().is_empty());
+            assert!(!kernel.lock().unwrap().link);
+            assert_eq!(
+                harness.log(),
+                [format!("stop -- vpnt-tunneld-ipsec@{generation}.service")]
+            );
+            launcher.recover().unwrap();
+            assert_eq!(harness.log().len(), 1);
+        }
     }
 }

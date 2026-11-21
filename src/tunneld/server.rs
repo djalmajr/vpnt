@@ -1,6 +1,8 @@
 //! Linux socket activation, bounded admission, and the v1 dialogue.
 use super::admin::PolicyStore;
 use super::backend::{Launch, Launcher, Running};
+#[cfg(test)]
+use super::protocol::Prepare;
 use super::protocol::{
     Command, ErrorCode, FrameError, Request, Response, ServerDecoder, decode_request, read_control,
     timed, write_control,
@@ -9,9 +11,10 @@ use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
     collections::HashMap,
     ffi::OsString,
+    fs::File,
     io,
     os::{
-        fd::{FromRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
     sync::{Arc, Mutex},
@@ -20,9 +23,7 @@ use std::{
 };
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-/// An admitted session waits for the client's commands for as long as the
-/// tunnel lives. A closed client ends the wait at once.
-const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+const SESSION_IDLE_MS: libc::c_int = 24 * 60 * 60 * 1000;
 const MAX_PER_UID: usize = 2;
 const MAX_CONNECTIONS: usize = 8;
 const LISTEN_FD: RawFd = 3;
@@ -76,8 +77,10 @@ impl Default for Server {
 }
 
 impl Server {
-    fn new(policy: PolicyStore) -> Self {
-        Self::with_launcher(policy, Box::new(Launcher::system(IpRoute::system())))
+    fn new(policy: PolicyStore) -> io::Result<Self> {
+        let launcher = Launcher::system(IpRoute::system());
+        launcher.recover()?;
+        Ok(Self::with_launcher(policy, Box::new(launcher)))
     }
 
     fn with_launcher(policy: PolicyStore, launcher: Box<dyn Launch>) -> Self {
@@ -199,42 +202,90 @@ fn serve(
 
     let credential_deadline = Instant::now() + FRAME_TIMEOUT;
     let credentials = decoder.credentials(credential_deadline)?;
-    let current = (|| -> io::Result<bool> {
+    let current = (|| -> io::Result<Option<File>> {
         let directory = policy.open()?;
-        let _lock = directory.lock_shared()?;
+        let lock = directory.lock_shared()?;
         let current = directory.read()?;
-        // An atomic replacement is a new version even when the same grant
-        // was revoked and then restored before this phase.
-        Ok(previous.unchanged(&current)? && current.policy().authorize(uid, &offer) == Some(grant))
+        // Hold this lock until the network reservation commits the admission.
+        Ok((previous.unchanged(&current)?
+            && current.policy().authorize(uid, &offer) == Some(grant))
+        .then_some(lock))
     })();
-    // The credentials are zeroed here, unused: configuring the tunnel inside
-    // the instance is not part of this admission.
-    drop(credentials);
-    if !matches!(current, Ok(true)) {
+    let Ok(Some(authorization)) = current else {
         return decoder.reject(ErrorCode::PermissionDenied, credential_deadline);
-    }
-    let session = match launcher.launch(offer.backend()) {
+    };
+    let session = match launcher.launch(&offer, grant, credentials, authorization) {
         Ok(session) => session,
         Err(code) => return decoder.reject(code, Instant::now() + FRAME_TIMEOUT),
     };
-    dialogue(decoder, session)
+    dialogue(&stream, decoder, session)
 }
 
 /// Answer the client's commands for one admitted session. A stop, a closed
 /// client, a malformed command or a failed reply all end in the same teardown,
 /// which dropping the session runs when no stop already did.
 fn dialogue(
+    stream: &UnixStream,
     mut decoder: ServerDecoder,
     mut session: Box<dyn Running + '_>,
 ) -> Result<(), FrameError> {
     loop {
-        let state = match decoder.command(Instant::now() + SESSION_IDLE) {
+        // Wait on the authenticated supervisor pidfd as well as client
+        // traffic. A silent client must not keep a dead instance's network.
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: session.peer().map_or(-1, |peer| peer.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: poll uses these two live descriptors and initializes revents.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, SESSION_IDLE_MS) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if ready == 0 {
+                return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+            }
+            if fds[1].revents != 0 {
+                session.stop();
+            }
+            if fds[0].revents != 0 {
+                break;
+            }
+        }
+        let state = match decoder.command(Instant::now() + FRAME_TIMEOUT) {
             Ok(Command::Status) => session.state(),
             Ok(Command::Stop) => session.stop(),
             Err(error) => return Err(error),
         };
         decoder.reply_status(state, Instant::now() + FRAME_TIMEOUT)?;
     }
+}
+
+#[cfg(test)]
+pub(super) fn serve_fixture(
+    stream: UnixStream,
+    policy: &PolicyStore,
+    launcher: &dyn Launch,
+) -> Result<(), FrameError> {
+    serve(
+        stream,
+        &Admission::Session(1000),
+        policy,
+        launcher,
+        Instant::now(),
+    )
 }
 
 fn reply_error(stream: &UnixStream, code: ErrorCode, deadline: Instant) -> Result<(), FrameError> {
@@ -304,7 +355,13 @@ pub unsafe fn run_linux(args: &[OsString]) -> i32 {
         return 1;
     }
 
-    let server = Arc::new(Server::new(PolicyStore::default()));
+    let server = match Server::new(PolicyStore::default()) {
+        Ok(server) => Arc::new(server),
+        Err(error) => {
+            eprintln!("vpnt-tunneld: startup recovery is unproven: {error}");
+            return 1;
+        }
+    };
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
@@ -348,7 +405,13 @@ mod policy_dialogue_tests {
     pub(super) struct Unavailable;
 
     impl Launch for Unavailable {
-        fn launch<'a>(&'a self, _: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        fn launch<'a>(
+            &'a self,
+            _: &Prepare,
+            _: &super::super::policy::Entry,
+            _: super::super::protocol::Credentials,
+            _: File,
+        ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
             Err(ErrorCode::Backend)
         }
     }
@@ -558,7 +621,14 @@ mod policy_dialogue_tests {
     }
 
     impl Launch for Fake {
-        fn launch<'a>(&'a self, backend: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        fn launch<'a>(
+            &'a self,
+            offer: &Prepare,
+            _: &super::super::policy::Entry,
+            _: super::super::protocol::Credentials,
+            _: File,
+        ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            let backend = offer.backend();
             self.counters.launches.fetch_add(1, Ordering::SeqCst);
             self.counters.backends.lock().unwrap().push(backend);
             match self.refuse {
