@@ -843,6 +843,18 @@ impl AuthenticatedChannel {
         Ok(bytes)
     }
 
+    /// Wait without an idle deadline for a datagram or for either process to
+    /// exit. The caller supplies the pidfd of its supervised backend process.
+    /// Child exit returns BrokenPipe, peer exit returns UnexpectedEof, and
+    /// every error closes the channel.
+    pub fn receive_while_running(&mut self, child: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
+        let transport = self.transport.take().ok_or(io::ErrorKind::NotConnected)?;
+        pidfs(child)?;
+        let (bytes, _) = transport.receive_when(|| transport.wait_for_session(child))?;
+        self.transport = Some(transport);
+        Ok(bytes)
+    }
+
     /// Send one application datagram to the authenticated peer. An error
     /// closes the channel.
     pub fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -889,13 +901,55 @@ impl Transport {
     }
 
     fn receive(&self, deadline: Instant) -> io::Result<(Vec<u8>, libc::pid_t)> {
+        let received =
+            self.receive_when(|| wait_ready(self.socket.as_fd(), libc::POLLIN, deadline))?;
+        remaining(deadline)?;
+        Ok(received)
+    }
+
+    fn wait_for_session(&self, child: BorrowedFd<'_>) -> io::Result<()> {
+        let mut entries = [
+            poll_entry(child),
+            poll_entry(self.peer.fd.as_fd()),
+            poll_entry(self.socket.as_fd()),
+        ];
+        loop {
+            // SAFETY: entries contains all three writable poll descriptors.
+            let ready = unsafe { libc::poll(entries.as_mut_ptr(), entries.len() as _, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if entries[0].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "backend process exited",
+                ));
+            }
+            if entries[1].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "authenticated peer exited",
+                ));
+            }
+            return Ok(());
+        }
+    }
+
+    fn receive_when(
+        &self,
+        mut wait: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<(Vec<u8>, libc::pid_t)> {
         let mut bytes = vec![0; MAX_FRAME];
         let mut vector = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
         };
         loop {
-            wait_ready(self.socket.as_fd(), libc::POLLIN, deadline)?;
+            wait()?;
             // Word alignment satisfies cmsghdr. Linux closes any SCM_RIGHTS
             // descriptors that do not fit in the ancillary buffer.
             let mut control = [0_usize; 16];
@@ -931,7 +985,6 @@ impl Transport {
             }
             let (credentials, pidfd) = ancillary?;
             self.peer.check_sender(credentials, pidfd.as_fd())?;
-            remaining(deadline)?;
             bytes.truncate(count as usize);
             return Ok((bytes, credentials.pid));
         }
@@ -946,6 +999,14 @@ impl Transport {
         let frame = decode_frame(&bytes)?;
         remaining(deadline)?;
         Ok((frame, sender))
+    }
+}
+
+fn poll_entry(fd: BorrowedFd<'_>) -> libc::pollfd {
+    libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
     }
 }
 
@@ -997,3 +1058,120 @@ fn collect_ancillary(message: &libc::msghdr) -> io::Result<(libc::ucred, OwnedFd
 #[cfg(test)]
 #[path = "handshake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::process::{Command, Stdio};
+    use std::thread;
+
+    const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+    const INVOCATION: &str = "fedcba9876543210fedcba9876543210";
+    const ATTEMPT: Attempt<'static> = Attempt {
+        generation: GENERATION,
+        backend: Backend::Ipsec,
+    };
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove this fixture's handshake directory");
+        }
+    }
+
+    impl UnitAttestor for Fixture {
+        fn attest(&self, _: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
+            Ok(UnitIdentity {
+                name: ATTEMPT.unit_name(),
+                invocation: INVOCATION.to_owned(),
+                main_pid: std::process::id() as libc::pid_t,
+            })
+        }
+    }
+
+    fn pidfd_for(pid: u32) -> OwnedFd {
+        // SAFETY: pidfd_open takes a PID and flags and returns a new FD.
+        new_fd(unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as RawFd)
+            .unwrap()
+    }
+
+    #[test]
+    fn session_waits_past_handshake_deadline_and_observes_child_exit() {
+        let path =
+            std::env::temp_dir().join(format!("vpnt-session-{}", &challenge().unwrap()[..16]));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let fixture = Fixture(path);
+        // SAFETY: these credential queries take no arguments.
+        let expected = unsafe {
+            Credentials {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        };
+        let writer = Writer::publish_as(
+            &fixture.0,
+            OsStr::new("control"),
+            ATTEMPT,
+            expected,
+            PHASE_TIMEOUT,
+        )
+        .unwrap();
+
+        thread::scope(|scope| {
+            let instance = scope.spawn(|| {
+                let mut channel = connect_as(
+                    &fixture.0.join("control"),
+                    &fixture.0.join(GENERATION),
+                    ATTEMPT,
+                    INVOCATION,
+                    expected,
+                    PHASE_TIMEOUT,
+                )
+                .unwrap();
+                // Start the idle interval only after the receiver has the channel.
+                assert_eq!(channel.receive().unwrap(), b"ready");
+                thread::sleep(PHASE_TIMEOUT + Duration::from_millis(250));
+                channel.send(b"stop").unwrap();
+                assert_eq!(
+                    channel.receive().unwrap_err().kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+            });
+            let mut channel = writer.authenticate(&fixture).unwrap();
+            let own_pidfd = pidfd_for(std::process::id());
+            channel.send(b"ready").unwrap();
+            assert_eq!(
+                channel.receive_while_running(own_pidfd.as_fd()).unwrap(),
+                b"stop"
+            );
+
+            let mut child = Command::new("/usr/bin/cat")
+                .env_clear()
+                .env("HOME", &fixture.0)
+                .env("USERPROFILE", &fixture.0)
+                .env("XDG_CONFIG_HOME", &fixture.0)
+                .env("TMPDIR", &fixture.0)
+                .env("PATH", &fixture.0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let child_pidfd = pidfd_for(child.id());
+            let input = child.stdin.take().unwrap();
+            let result = thread::scope(|scope| {
+                scope.spawn(move || drop(input));
+                channel.receive_while_running(child_pidfd.as_fd())
+            });
+            let status = child.wait().unwrap();
+            assert!(status.success());
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(
+                channel.send(b"closed").unwrap_err().kind(),
+                io::ErrorKind::NotConnected
+            );
+            instance.join().unwrap();
+        });
+    }
+}
