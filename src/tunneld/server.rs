@@ -249,13 +249,17 @@ fn serve(
     if stop && matches!(session.state(), State::Starting | State::NetworkReady) {
         session.stop();
     }
-    let deadline = Instant::now() + FRAME_TIMEOUT;
+    let mut deadline = None;
     for _ in 0..statuses + usize::from(stop) {
         let (_, ended) = poll_session(None, &*session, 0)?;
         if ended {
+            let cleanup_started = Instant::now();
             session.stop();
+            // Preserve the remaining write budget if earlier statuses were sent.
+            deadline = deadline.map(|deadline| deadline + cleanup_started.elapsed());
         }
-        decoder.reply_status(session.state(), deadline)?;
+        let write_deadline = *deadline.get_or_insert_with(|| Instant::now() + FRAME_TIMEOUT);
+        decoder.reply_status(session.state(), write_deadline)?;
     }
     dialogue(&stream, decoder, session)
 }
@@ -727,6 +731,7 @@ mod policy_dialogue_tests {
         counters: Counters,
         refuse: Option<ErrorCode>,
         stop_result: State,
+        stop_delay: Duration,
         ended: Option<(UnixStream, bool)>,
     }
 
@@ -734,6 +739,7 @@ mod policy_dialogue_tests {
         counters: Counters,
         state: State,
         stop_result: State,
+        stop_delay: Duration,
         ended: Option<(UnixStream, bool)>,
     }
 
@@ -759,6 +765,7 @@ mod policy_dialogue_tests {
                         State::Starting
                     },
                     stop_result: self.stop_result,
+                    stop_delay: self.stop_delay,
                     ended: self
                         .ended
                         .as_ref()
@@ -789,6 +796,7 @@ mod policy_dialogue_tests {
         fn stop(&mut self) -> State {
             self.ended.take();
             self.counters.stops.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(self.stop_delay);
             self.state = self.stop_result;
             self.state
         }
@@ -850,6 +858,7 @@ mod policy_dialogue_tests {
             counters: counters.clone(),
             refuse,
             stop_result,
+            stop_delay: Duration::ZERO,
             ended: None,
         };
         (fake, counters)
@@ -879,6 +888,34 @@ mod policy_dialogue_tests {
             );
             assert_eq!(counters.stops.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn queued_status_survives_cleanup_longer_than_the_write_timeout() {
+        let fixture = installed();
+        let (mut fake, counters) = fake(None, State::Stopped);
+        let (channel, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        fake.ended = Some((channel, false));
+        fake.stop_delay = FRAME_TIMEOUT + Duration::from_millis(100);
+
+        let (client, worker) = admitted_client_with_queued_status(&fixture, fake, true);
+        let response = timed(&client, Instant::now() + FRAME_TIMEOUT * 3).and_then(|mut stream| {
+            read_control(&mut stream, super::super::protocol::decode_response)
+        });
+        drop(client);
+        worker.join().unwrap();
+
+        assert_eq!(counters.stops.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                response,
+                Ok(Response::Status {
+                    state: State::Stopped
+                })
+            ),
+            "expected Stopped after slow cleanup, got {response:?}"
+        );
     }
 
     #[test]
