@@ -1,5 +1,5 @@
-//! Native routes for owned PPP and retained IPsec UTUN scopes, including
-//! the scoped default used by a full tunnel’s physical transport.
+//! Native routes for owned PPP, retained IPsec and observed OpenVPN scopes,
+//! including the scoped default used by a full tunnel’s physical transport.
 mod ppp;
 mod registry;
 mod retained;
@@ -10,14 +10,14 @@ use super::{AddWriter, Error, Key, Record, Route, Snapshot, TransportDefault, Tu
 use crate::{
     connection::{
         macos::{ppp::OwnedPpp, ppp_attachment::PppAttachment, sink::OwnedSink},
-        routes::{Backend, NextHop, Owner, Presence},
+        routes::{Backend, Coordinator, NextHop, Owner, Presence},
     },
     helper::controller_lock::ControllerLock,
 };
 use ppp::NativeScope;
 use registry::{Attempt, Registry, Scope, Table};
 pub use registry::{InterfaceToken, NativeReceipt};
-use retained::{UtunQueue, UtunScope};
+use retained::UtunQueue;
 use retirement::Guard;
 use std::{
     sync::{
@@ -43,6 +43,8 @@ impl<'a> NativeBackend<'a> {
             registry: Registry::new(NativeTable {
                 controller,
                 writer: None,
+                observe_cleanup_only: false,
+                fixture: None,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -81,6 +83,9 @@ impl<'a> NativeBackend<'a> {
             registry: Registry::new(NativeTable {
                 controller,
                 writer: None,
+                observe_cleanup_only: false,
+                #[cfg(test)]
+                fixture: None,
             })?,
             retired: Arc::new(Mutex::new(Vec::new())),
             utun_retired: Lifecycle::new(),
@@ -97,6 +102,22 @@ impl<'a> NativeBackend<'a> {
     pub fn finish_cleanup(&mut self, token: &InterfaceToken) -> Result<(), Error> {
         self.registry.finish_cleanup(token)
     }
+    /// Observe stale receipts without delegating any scoped-default DELETE to
+    /// this retry. The coordinator can also hold claims from SSL attempts.
+    pub(crate) fn retry_observed_cleanup(routes: &mut Coordinator<Self>) {
+        routes
+            .backend_mut()
+            .registry
+            .table_mut()
+            .observe_cleanup_only = true;
+        routes.retry_cleanup();
+        routes
+            .backend_mut()
+            .registry
+            .table_mut()
+            .observe_cleanup_only = false;
+    }
+
     pub fn has_resources(&self) -> bool {
         !self.registry.is_empty()
             || self.retired.lock().map_or(true, |queue| !queue.is_empty())
@@ -141,13 +162,24 @@ impl Backend for NativeBackend<'_> {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep the PPP registry representation unchanged"
+)]
 enum RegisteredScope<'a> {
     Ppp(NativeScope<'a>),
-    Utun(UtunScope<'a>),
+    Utun(Box<dyn Scope + Send + 'a>),
     #[cfg(test)]
     Fixture(u16),
 }
 impl Scope for RegisteredScope<'_> {
+    fn bind_work(&mut self, owner: &Owner) -> Result<(), Error> {
+        match self {
+            Self::Utun(scope) => scope.bind_work(owner),
+            _ => Ok(()),
+        }
+    }
+
     fn index(&self) -> u16 {
         match self {
             Self::Ppp(scope) => scope.index(),
@@ -209,8 +241,18 @@ impl Scope for RegisteredScope<'_> {
 struct NativeTable<'a> {
     controller: &'a ControllerLock,
     writer: Option<AddWriter<'a>>,
+    observe_cleanup_only: bool,
+    #[cfg(test)]
+    fixture: Option<Arc<Mutex<FixtureRouteIo>>>,
 }
 impl<'a> NativeTable<'a> {
+    fn check_cleanup_write(&self) -> Result<(), Error> {
+        if self.observe_cleanup_only {
+            return Err(Error::Busy);
+        }
+        Ok(())
+    }
+
     fn writer(&mut self) -> Result<&mut AddWriter<'a>, Error> {
         if self.writer.is_none() {
             self.writer = Some(AddWriter::open(self.controller)?);
@@ -220,6 +262,10 @@ impl<'a> NativeTable<'a> {
 }
 impl Table for NativeTable<'_> {
     fn exact(&mut self, key: Key) -> Result<Option<Route>, Error> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return Ok(fixture.lock().unwrap().rows.get(&key).copied());
+        }
         self.controller.validate().map_err(|_| Error::Unavailable)?;
         Snapshot::read()?
             .exact(key)?
@@ -231,16 +277,142 @@ impl Table for NativeTable<'_> {
         route: TransportDefault,
         canceled: &AtomicBool,
     ) -> Result<Attempt, Error> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return Ok(fixture.lock().unwrap().add(route.route()));
+        }
         self.writer()?
             .add_transport_default(route, canceled)
             .map(|confirmation| Attempt { confirmation })
     }
     fn get_default(&mut self, route: TransportDefault) -> Result<Option<Record>, Error> {
+        self.check_cleanup_write()?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            let fixture = fixture.lock().unwrap();
+            if !fixture.allow_default_delete {
+                return Err(Error::Busy);
+            }
+            let expected = route.route();
+            return Ok(fixture.rows.get(&expected.key).map(|row| Record {
+                key: row.key,
+                interface: row.interface,
+                flags: libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_STATIC | libc::RTF_IFSCOPE,
+                gateway: match row.next_hop {
+                    NextHop::Gateway(address) => Some(super::Gateway::Address(address)),
+                    _ => None,
+                },
+                source: None,
+            }));
+        }
         self.writer()?.get_transport_default(route)
     }
     fn delete_default(&mut self, route: TransportDefault) -> Result<Attempt, Error> {
+        self.check_cleanup_write()?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.default_deletes += 1;
+            fixture.rows.remove(&route.route().key);
+            return Ok(Attempt {
+                confirmation: Ok(()),
+            });
+        }
         self.writer()?
             .delete_transport_default(route)
             .map(|confirmation| Attempt { confirmation })
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FixtureRouteIo {
+    rows: std::collections::BTreeMap<Key, Route>,
+    allow_default_delete: bool,
+    default_deletes: usize,
+}
+
+#[cfg(test)]
+impl FixtureRouteIo {
+    fn add(&mut self, route: Route) -> Attempt {
+        assert!(self.rows.insert(route.key, route).is_none());
+        Attempt {
+            confirmation: Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+struct FixtureDefault {
+    route: TransportDefault,
+    canceled: AtomicBool,
+}
+
+#[cfg(test)]
+impl Scope for FixtureDefault {
+    fn index(&self) -> u16 {
+        30
+    }
+
+    fn transport_default(&self) -> Option<(TransportDefault, &AtomicBool)> {
+        Some((self.route, &self.canceled))
+    }
+
+    fn active(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn add(&mut self, _: Route) -> Result<Attempt, Error> {
+        unreachable!("fixture owns only the transport default")
+    }
+
+    fn detach_if_stopped(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn cleanup_complete(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+impl NativeBackend<'_> {
+    pub(crate) fn fixture_route_io(&mut self) {
+        self.registry.table_mut().fixture = Some(Arc::default());
+    }
+
+    pub(crate) fn fixture_default(&mut self, owner: Owner, route: Route) -> InterfaceToken {
+        self.registry
+            .register(
+                RegisteredScope::Utun(Box::new(FixtureDefault {
+                    route: TransportDefault::try_from(route).unwrap(),
+                    canceled: AtomicBool::new(false),
+                })),
+                owner,
+                vec![route],
+            )
+            .unwrap()
+    }
+
+    pub(crate) fn fixture_remove_route(&mut self, route: Route) {
+        assert_eq!(self.fixture_io().rows.remove(&route.key), Some(route));
+    }
+
+    pub(crate) fn fixture_allow_default_delete(&mut self) {
+        self.fixture_io().allow_default_delete = true;
+    }
+
+    pub(crate) fn fixture_default_deletes(&mut self) -> usize {
+        self.fixture_io().default_deletes
+    }
+
+    fn fixture_io(&mut self) -> std::sync::MutexGuard<'_, FixtureRouteIo> {
+        self.registry
+            .table_mut()
+            .fixture
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
     }
 }

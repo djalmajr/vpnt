@@ -25,6 +25,10 @@ pub(super) struct Attempt {
     pub confirmation: Result<(), Error>,
 }
 pub(super) trait Scope {
+    fn bind_work(&mut self, _owner: &Owner) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn index(&self) -> u16;
     fn owns(&self, index: u16) -> bool {
         self.index() == index
@@ -104,6 +108,10 @@ impl<S: Scope, K: Table> Registry<S, K> {
             table,
         })
     }
+    pub(super) fn table_mut(&mut self) -> &mut K {
+        &mut self.table
+    }
+
     pub(super) fn has_owner_or_index(&self, owner: &Owner, index: u16) -> bool {
         self.entries.contains_key(&index)
             || self
@@ -113,7 +121,7 @@ impl<S: Scope, K: Table> Registry<S, K> {
     }
     pub fn register(
         &mut self,
-        scope: S,
+        mut scope: S,
         owner: Owner,
         plan: Vec<Route>,
     ) -> Result<InterfaceToken, Error> {
@@ -179,6 +187,7 @@ impl<S: Scope, K: Table> Registry<S, K> {
         scope.active()?;
         self.next = self.next.checked_add(1).ok_or(Error::Limit)?;
         let serial = self.next;
+        scope.bind_work(&owner)?;
         self.entries.insert(
             index,
             Entry {

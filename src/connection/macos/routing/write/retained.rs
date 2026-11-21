@@ -1,6 +1,7 @@
 //! Typed retained-UTUN ADD path for the future Driver.
 use super::*;
-use crate::connection::macos::vip::{ConfiguredUtun, Family};
+use crate::connection::macos::vip::{ConfiguredUtun, Family, ovpn_link::OvpnUtun};
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Private seam: the ADD core only needs the opaque pin's controller,
 /// validity, index and exact family VIP. Implemented by `ConfiguredUtun` in
@@ -27,6 +28,34 @@ impl Source for ConfiguredUtun<'_> {
     }
 }
 
+struct OvpnSource<'a> {
+    controller: &'a ControllerLock,
+    link: &'a OvpnUtun,
+    address: Ipv4Addr,
+}
+
+impl Source for OvpnSource<'_> {
+    fn controller(&self) -> &ControllerLock {
+        self.controller
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        self.controller.validate().map_err(|_| Error::Unavailable)?;
+        if !self.link.address_current(self.address) {
+            return Err(Error::Changed);
+        }
+        Ok(())
+    }
+
+    fn index(&self) -> u32 {
+        self.link.index()
+    }
+
+    fn vip(&self, family: Family) -> Option<IpAddr> {
+        (family == Family::V4).then_some(self.address.into())
+    }
+}
+
 impl<'a> AddWriter<'a> {
     /// Crate-private typed method: index/VIP/source come only from the opaque
     /// configured UTUN, never IPC or a caller string. No DELETE/CHANGE exists.
@@ -38,6 +67,26 @@ impl<'a> AddWriter<'a> {
         canceled: &AtomicBool,
     ) -> Result<AddReceipt, Error> {
         self.add_retained(link, network, timeout, canceled)
+    }
+
+    pub(crate) fn add_ovpn_utun(
+        &mut self,
+        link: &OvpnUtun,
+        address: Ipv4Addr,
+        network: Network,
+        timeout: Duration,
+        canceled: &AtomicBool,
+    ) -> Result<AddReceipt, Error> {
+        self.add_retained(
+            &OvpnSource {
+                controller: self.controller,
+                link,
+                address,
+            },
+            network,
+            timeout,
+            canceled,
+        )
     }
 
     /// The single ADD implementation shared by the opaque adapter and the
