@@ -175,7 +175,7 @@ impl ProfileStore {
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn read_ovpn_config(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    pub(crate) fn read_ovpn_config(&self, id: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let name = ovpn_name(id)?;
         let Some(dir) = self.ovpn_directory(false)? else {
             return Ok(None);

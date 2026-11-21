@@ -3,6 +3,9 @@
 pub(crate) mod caller;
 mod io;
 #[cfg(target_os = "macos")]
+#[path = "ovpn_recovery.rs"]
+mod ovpn_recovery;
+#[cfg(target_os = "macos")]
 use super::controller_lock::ControllerLock;
 use super::{
     ppp_supervisor::signals,
@@ -29,6 +32,10 @@ use std::{
 // implies that cleanup succeeded.
 const PREVIOUS_SESSION_WAIT: Duration = Duration::from_secs(35);
 const LOCK_POLL: Duration = Duration::from_millis(20);
+#[cfg(target_os = "macos")]
+const OVPN_RECOVERY_WITH_NOTICE: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const OVPN_RECOVERY_WITHOUT_NOTICE: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
@@ -105,11 +112,25 @@ fn supports_wait_notice(stream: &UnixStream, deadline: Instant) -> bool {
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn wait_for_mode_lock<L>(
     mode: Mode,
     stream: &mut UnixStream,
     budget: Duration,
     announced: &mut bool,
+    acquire: impl FnMut() -> Result<L, super::controller_lock::LockError>,
+) -> Result<Option<L>, ErrorCode> {
+    let mut notice = announced.then(Instant::now);
+    let result = wait_for_mode_lock_recording_notice(mode, stream, budget, &mut notice, acquire);
+    *announced = notice.is_some();
+    result
+}
+
+fn wait_for_mode_lock_recording_notice<L>(
+    mode: Mode,
+    stream: &mut UnixStream,
+    budget: Duration,
+    announced: &mut Option<Instant>,
     mut acquire: impl FnMut() -> Result<L, super::controller_lock::LockError>,
 ) -> Result<Option<L>, ErrorCode> {
     let deadline = Instant::now() + budget;
@@ -120,18 +141,11 @@ fn wait_for_mode_lock<L>(
         match mode_lock(mode, &mut acquire) {
             Ok(lock) => return Ok(lock),
             Err(ErrorCode::ProfileBusy) if mode == Mode::Runtime => {
-                if !*announced {
+                if announced.is_none() {
                     if !supports_wait_notice(stream, deadline.min(Instant::now() + io::DEADLINE)) {
                         return Err(ErrorCode::ProfileBusy);
                     }
-                    send(
-                        stream,
-                        &Message::PreviousSessionFinishing {
-                            protocol_version: protocol::VERSION,
-                            version: env!("CARGO_PKG_VERSION").into(),
-                        },
-                    )?;
-                    *announced = true;
+                    *announced = Some(send_wait_notice(stream)?);
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -144,9 +158,166 @@ fn wait_for_mode_lock<L>(
     }
 }
 
+fn send_wait_notice(stream: &mut UnixStream) -> Result<Instant, ErrorCode> {
+    // Start the helper's budget before the broker can observe this frame.
+    let announced = Instant::now();
+    send(
+        stream,
+        &Message::PreviousSessionFinishing {
+            protocol_version: protocol::VERSION,
+            version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )?;
+    Ok(announced)
+}
+
 fn send_admission_error(stream: &mut UnixStream, announced: bool, error: ErrorCode) {
     if !(announced && error == ErrorCode::ProfileBusy) {
         let _ = send(stream, &Message::Fatal { error });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ovpn_startup_deadline(
+    stream: &mut UnixStream,
+    notice: &mut Option<Instant>,
+    has_fence: bool,
+    started: Instant,
+) -> Result<Instant, ErrorCode> {
+    if notice.is_none() && has_fence && supports_wait_notice(stream, started + io::DEADLINE) {
+        *notice = Some(send_wait_notice(stream)?);
+    }
+    // Include capability negotiation in the unannounced budget.
+    Ok(
+        notice.map_or(started + OVPN_RECOVERY_WITHOUT_NOTICE, |first| {
+            first + OVPN_RECOVERY_WITH_NOTICE
+        }),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn recover_ovpn_startup(
+    stream: &mut UnixStream,
+    notice: &mut Option<Instant>,
+    has_fence: impl FnOnce(Instant) -> bool,
+    recover: impl FnOnce(Instant),
+) -> Result<(), ErrorCode> {
+    let started = Instant::now();
+    let has_fence = notice.is_none() && has_fence(started + OVPN_RECOVERY_WITHOUT_NOTICE);
+    let deadline = ovpn_startup_deadline(stream, notice, has_fence, started)?;
+    if Instant::now() < deadline {
+        recover(deadline);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ovpn_startup_tests {
+    use super::*;
+    use std::io::{BufReader, Read};
+
+    fn snapshot(id: &str) -> (UnixStream, UnixStream) {
+        let (helper, mut peer) = UnixStream::pair().unwrap();
+        protocol::write_request(
+            &mut peer,
+            &Request {
+                id: id.into(),
+                command: protocol::Command::Snapshot {},
+            },
+        )
+        .unwrap();
+        (helper, peer)
+    }
+
+    fn read_notice(peer: UnixStream) -> BufReader<UnixStream> {
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut reader = BufReader::new(peer);
+        assert!(matches!(
+            protocol::read_message(&mut reader),
+            Ok(Some(Message::PreviousSessionFinishing { protocol_version, version }))
+                if protocol_version == protocol::VERSION && version == env!("CARGO_PKG_VERSION")
+        ));
+        reader
+    }
+
+    fn assert_silent(mut peer: UnixStream) {
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn ovpn_without_current_fence_or_capability_stays_silent() {
+        for (has_fence, id) in [
+            (false, protocol::WAIT_CAPABILITY_SNAPSHOT_ID),
+            (true, "legacy-snapshot"),
+        ] {
+            let (mut helper, peer) = snapshot(id);
+            let mut notice = None;
+            let started = Instant::now();
+            let deadline =
+                ovpn_startup_deadline(&mut helper, &mut notice, has_fence, started).unwrap();
+            assert_silent(peer);
+            assert!(notice.is_none());
+            assert_eq!(deadline, started + Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn ovpn_deadline_uses_first_notice_even_if_already_expired() {
+        for elapsed in [15, 31] {
+            let (mut helper, peer) = snapshot(protocol::WAIT_CAPABILITY_SNAPSHOT_ID);
+            let started = Instant::now();
+            let first = started - Duration::from_secs(elapsed);
+            let mut notice = Some(first);
+            let mut recovered = None;
+            recover_ovpn_startup(
+                &mut helper,
+                &mut notice,
+                |_| panic!("already announced during lock wait"),
+                |deadline| recovered = Some(deadline),
+            )
+            .unwrap();
+            assert_silent(peer);
+            assert_eq!(notice, Some(first));
+            assert_eq!(
+                recovered,
+                (elapsed < 30).then(|| first + Duration::from_secs(30))
+            );
+        }
+    }
+
+    #[test]
+    fn ovpn_reuses_the_notice_sent_during_the_mode_lock_wait() {
+        let (mut helper, peer) = snapshot(protocol::WAIT_CAPABILITY_SNAPSHOT_ID);
+        let mut notice = None;
+        let mut attempts = 0;
+        let lock = wait_for_mode_lock_recording_notice(
+            Mode::Runtime,
+            &mut helper,
+            PREVIOUS_SESSION_WAIT,
+            &mut notice,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(super::super::controller_lock::LockError::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(lock, Ok(Some(())));
+        let first = notice.unwrap();
+        assert_eq!(
+            ovpn_startup_deadline(&mut helper, &mut notice, true, Instant::now()).unwrap(),
+            first + Duration::from_secs(30)
+        );
+        assert_eq!(notice, Some(first));
+        let reader = read_notice(peer);
+        assert!(reader.buffer().is_empty());
+        assert_silent(reader.into_inner());
     }
 }
 
@@ -169,11 +340,11 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     let mut caller = Caller::from_fd(unsafe { OwnedFd::from_raw_fd(0) })
         .map_err(|_| ErrorCode::PermissionDenied)?;
     let _signals = signals::Guard::install().map_err(|_| ErrorCode::Unavailable)?;
-    let mut announced = false;
+    let mut announced = None;
     let admitted = (|| {
         let store = ProfileStore::for_user(caller.uid).map_err(store_error)?;
         store.load().map_err(store_error)?;
-        let lock = wait_for_mode_lock(
+        let lock = wait_for_mode_lock_recording_notice(
             mode,
             &mut caller.stream,
             PREVIOUS_SESSION_WAIT,
@@ -187,7 +358,7 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
     let (store, lock, build) = match admitted {
         Ok(value) => value,
         Err(error) => {
-            send_admission_error(&mut caller.stream, announced, error);
+            send_admission_error(&mut caller.stream, announced.is_some(), error);
             return Err(error);
         }
     };
@@ -195,6 +366,35 @@ pub unsafe fn inherited_run(mode: Mode) -> Result<(), ErrorCode> {
         && let Some(controller) = lock.as_ref()
     {
         crate::connection::ipsec::NativeContext::recover_orphans(controller, caller.uid);
+        // A wrong OVPN base blocks a later OVPN attempt; it never stops the
+        // helper. Log only the error kind: no user path or target is recorded.
+        if let Err(error) = crate::connection::controller::ensure_ovpn_base(
+            &crate::helper::paths::ovpn_sessions_directory(),
+            0,
+        ) {
+            // stderr of the helper goes nowhere in a normal start; syslog is
+            // where the other controller warnings go. The kind is a fixed
+            // identifier, never a path.
+            if let Ok(kind) = std::ffi::CString::new(format!("{:?}", error.kind())) {
+                // SAFETY: fixed format with one %s, matched by a NUL-terminated
+                // string that lives until the call returns.
+                unsafe {
+                    libc::syslog(
+                        libc::LOG_WARNING,
+                        c"vpnt: ovpn session base refused: %s".as_ptr(),
+                        kind.as_ptr(),
+                    )
+                };
+            }
+        } else {
+            let uid = caller.uid;
+            recover_ovpn_startup(
+                &mut caller.stream,
+                &mut announced,
+                |deadline| ovpn_recovery::has_user_fence(controller, uid, deadline),
+                |deadline| ovpn_recovery::recover(controller, uid, deadline),
+            )?;
+        }
     }
     match mode {
         Mode::Runtime => runtime_with_build(caller, Some(build), |uid, requests, output| {

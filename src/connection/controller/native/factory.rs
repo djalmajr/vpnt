@@ -1,12 +1,14 @@
-//! Native factory: SSL always, IPsec only through a real available domain.
+//! Native factory and admission for SSL, IPsec and injected OVPN.
 use super::NativeAttempt;
 use super::ipsec::{NativeDomain, NativeIpsecAttempt};
+use super::ovpn::{NativeOvpnAttempt, OvpnSigners};
 use super::*;
 
 pub(super) struct NativeFactory<'a> {
     routes: Routes<'a>,
     profiles: Arc<Profiles>,
     domain: Option<NativeDomain<'a>>,
+    ovpn_signers: Option<Arc<dyn OvpnSigners>>,
     fence_root: std::path::PathBuf,
     fence_owner: u32,
     recovery: Mutex<crate::connection::macos::fence_recovery::Recovery>,
@@ -15,6 +17,12 @@ pub(super) struct NativeFactory<'a> {
 }
 
 impl<'a> NativeFactory<'a> {
+    #[cfg(test)]
+    pub(super) fn with_ovpn_signers(mut self, signers: Arc<dyn OvpnSigners>) -> Self {
+        self.ovpn_signers = Some(signers);
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn fixture_fence_root(mut self, root: std::path::PathBuf, owner: u32) -> Self {
         self.recovery = Mutex::new(crate::connection::macos::fence_recovery::Recovery::new(
@@ -40,6 +48,7 @@ impl<'a> NativeFactory<'a> {
             routes,
             profiles,
             domain,
+            ovpn_signers: None,
             fence_root: crate::helper::paths::STATE.into(),
             fence_owner: 0,
             recovery: Mutex::new(crate::connection::macos::fence_recovery::Recovery::new(
@@ -55,6 +64,7 @@ impl<'a> NativeFactory<'a> {
 pub(super) enum AttemptKind<'a> {
     Ssl(NativeAttempt<'a>),
     Ipsec(NativeIpsecAttempt<'a>),
+    Ovpn(Box<NativeOvpnAttempt<'a>>),
     Denied(DeniedAttempt),
 }
 
@@ -63,6 +73,7 @@ impl Attempt for AttemptKind<'_> {
         match self {
             Self::Ssl(attempt) => attempt.start(canceled, expires),
             Self::Ipsec(attempt) => attempt.start(canceled, expires),
+            Self::Ovpn(attempt) => attempt.start(canceled, expires),
             Self::Denied(attempt) => attempt.start(canceled, expires),
         }
     }
@@ -70,6 +81,7 @@ impl Attempt for AttemptKind<'_> {
         match self {
             Self::Ssl(attempt) => attempt.ready(),
             Self::Ipsec(attempt) => attempt.ready(),
+            Self::Ovpn(attempt) => attempt.ready(),
             Self::Denied(attempt) => attempt.ready(),
         }
     }
@@ -77,6 +89,7 @@ impl Attempt for AttemptKind<'_> {
         match self {
             Self::Ssl(attempt) => attempt.healthy(),
             Self::Ipsec(attempt) => attempt.healthy(),
+            Self::Ovpn(attempt) => attempt.healthy(),
             Self::Denied(attempt) => attempt.healthy(),
         }
     }
@@ -84,6 +97,7 @@ impl Attempt for AttemptKind<'_> {
         match self {
             Self::Ssl(attempt) => attempt.probe(canceled, timeout),
             Self::Ipsec(attempt) => attempt.probe(canceled, timeout),
+            Self::Ovpn(attempt) => attempt.probe(canceled, timeout),
             Self::Denied(attempt) => attempt.probe(canceled, timeout),
         }
     }
@@ -91,13 +105,26 @@ impl Attempt for AttemptKind<'_> {
         match self {
             Self::Ssl(attempt) => attempt.cleanup(),
             Self::Ipsec(attempt) => attempt.cleanup(),
+            Self::Ovpn(attempt) => attempt.cleanup(),
             Self::Denied(attempt) => attempt.cleanup(),
+        }
+    }
+    fn phase(&self) -> Option<ConnectionState> {
+        match self {
+            Self::Ovpn(attempt) => attempt.phase(),
+            _ => None,
+        }
+    }
+    fn restart_epoch(&self) -> u64 {
+        match self {
+            Self::Ovpn(attempt) => attempt.restart_epoch(),
+            _ => 0,
         }
     }
     fn abandon(&mut self, reason: Reason) -> Result<(), AbandonError> {
         match self {
             Self::Ssl(attempt) => attempt.abandon(reason),
-            Self::Ipsec(_) => Err(AbandonError::Unsupported),
+            Self::Ipsec(_) | Self::Ovpn(_) => Err(AbandonError::Unsupported),
             Self::Denied(_) => Ok(()),
         }
     }
@@ -138,7 +165,11 @@ impl<'a> Factory for NativeFactory<'a> {
             .map_err(|_| ErrorCode::UntrustedConfiguration)
     }
     fn supports(&self, kind: VpnKind) -> bool {
-        kind == VpnKind::Ssl || (kind == VpnKind::Ipsec && self.domain.is_some())
+        match kind {
+            VpnKind::Ssl => true,
+            VpnKind::Ipsec => self.domain.is_some(),
+            VpnKind::Ovpn => self.ovpn_signers.is_some(),
+        }
     }
     fn cleanup_blocked(&self, profile: &Profile) -> bool {
         self.recovery
@@ -161,7 +192,24 @@ impl<'a> Factory for NativeFactory<'a> {
         canceled: Arc<AtomicBool>,
     ) -> Self::Attempt {
         if profile.kind == VpnKind::Ovpn {
-            return AttemptKind::Denied(DeniedAttempt);
+            let Some(signers) = &self.ovpn_signers else {
+                return AttemptKind::Denied(DeniedAttempt);
+            };
+            let owner = Owner {
+                uid,
+                profile: profile.id.clone(),
+                generation,
+            };
+            let signer = signers.signer(&profile.id, generation);
+            return AttemptKind::Ovpn(Box::new(NativeOvpnAttempt::new(
+                profile,
+                self.profiles.clone(),
+                signer,
+                owner,
+                self.routes.clone(),
+                canceled,
+                (self.fence_root.clone(), self.fence_owner),
+            )));
         }
         if profile.kind == VpnKind::Ipsec {
             return match self.domain.clone() {

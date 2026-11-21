@@ -871,6 +871,16 @@ fn cleanup_retries_back_off_and_cap_at_one_second() {
 struct Streak {
     probes: Arc<AtomicUsize>,
     outcomes: Arc<Mutex<VecDeque<bool>>>,
+    /// Change the epoch between iterations, after one failure was published:
+    /// changing it during a probe would look like a retry on Linux.
+    bump_epoch_after_first: bool,
+    healthy_calls: usize,
+    epoch: u64,
+    epoch_bumped: Arc<AtomicBool>,
+    /// Set by the test once it consumed the first publication. Until then
+    /// the epoch stays put, so the retry probe a new epoch starts on Linux
+    /// cannot publish before the first one was read.
+    first_read: Arc<AtomicBool>,
 }
 impl Attempt for Streak {
     fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
@@ -880,7 +890,22 @@ impl Attempt for Streak {
         Ok(true)
     }
     fn healthy(&mut self) -> Result<(), Failure> {
+        // #1 is the startup check and #2 the revalidation after the first
+        // probe; from #3 on, the call at the top of an iteration changes the
+        // epoch, before the comparison, once the test read the first result.
+        self.healthy_calls += 1;
+        if self.bump_epoch_after_first
+            && self.epoch == 0
+            && self.healthy_calls >= 3
+            && self.first_read.load(Ordering::Acquire)
+        {
+            self.epoch = 1;
+            self.epoch_bumped.store(true, Ordering::Release);
+        }
         Ok(())
+    }
+    fn restart_epoch(&self) -> u64 {
+        self.epoch
     }
     fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
         self.probes.fetch_add(1, Ordering::AcqRel);
@@ -905,6 +930,11 @@ fn streak(outcomes: impl IntoIterator<Item = bool>) -> (StreakSignal, Streak) {
     let attempt = Streak {
         probes: probes.clone(),
         outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+        bump_epoch_after_first: false,
+        healthy_calls: 0,
+        epoch: 0,
+        epoch_bumped: Arc::new(AtomicBool::new(false)),
+        first_read: Arc::new(AtomicBool::new(false)),
     };
     let signal = StreakSignal {
         canceled,
@@ -985,6 +1015,49 @@ fn failed_probes_saturate_at_three_and_a_responsive_probe_resets_the_streak() {
         "responsive probe must reset the streak"
     );
     canceled.store(true, Ordering::Release);
+    assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+}
+
+#[test]
+fn restart_epoch_resets_the_failure_streak() {
+    let (signal, mut attempt) = streak([false, false]);
+    attempt.bump_epoch_after_first = true;
+    let epoch_bumped = Arc::clone(&attempt.epoch_bumped);
+    let first_read = Arc::clone(&attempt.first_read);
+    let handle = thread::spawn({
+        let signals = signal.spend();
+        move || {
+            run(
+                attempt,
+                signals,
+                timing(Duration::from_secs(5)),
+                clock(3600),
+            )
+        }
+    });
+    let first = signal.progress(1, |p| p.state == ConnectionState::Unresponsive);
+    assert_eq!(first.failures, 1);
+    assert_eq!(
+        signal.probes.load(Ordering::Acquire),
+        1,
+        "the epoch changed before the first publication was read"
+    );
+    first_read.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !epoch_bumped.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the worker did not change epoch");
+        thread::sleep(Duration::from_millis(1));
+    }
+    // On Linux the new epoch schedules the retry probe by itself; asking for
+    // one there too would start a third probe that races the second.
+    #[cfg(not(target_os = "linux"))]
+    signal.probe.store(true, Ordering::Release);
+    let after_restart = signal.progress(2, |p| p.state == ConnectionState::Unresponsive);
+    assert_eq!(
+        after_restart.failures, 1,
+        "a new epoch must reset the streak"
+    );
+    signal.canceled.store(true, Ordering::Release);
     assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
 }
 

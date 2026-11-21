@@ -10,6 +10,7 @@ use crate::{
 };
 use std::{
     collections::BTreeSet,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -93,6 +94,29 @@ fn route_absent_in(table: &Snapshot, route: Route) -> Result<bool, ()> {
         Some(_) if super::routing::TransportDefault::try_from(route).is_ok() => Ok(false),
         Some(record) => Ok(record.route().map_err(|_| ())? != route),
     }
+}
+
+pub(crate) fn ovpn_network_absent(interface: &Interface) -> io::Result<bool> {
+    ovpn_network_absent_with(interface, Interfaces::read, Snapshot::read)
+}
+
+pub(crate) fn ovpn_network_absent_with(
+    interface: &Interface,
+    read_interfaces: impl FnOnce() -> io::Result<Interfaces>,
+    read_routes: impl FnOnce() -> Result<Snapshot, crate::connection::routes::Error>,
+) -> io::Result<bool> {
+    if read_interfaces()?
+        .entries
+        .values()
+        .any(|entry| entry.name == interface.name && entry.index == interface.index)
+    {
+        return Ok(false);
+    }
+    let routes = read_routes().map_err(|_| io::Error::other("route observation"))?;
+    Ok(routes
+        .records
+        .iter()
+        .all(|route| u32::from(route.interface) != interface.index))
 }
 
 fn interface_absent(observer: &mut impl Observer, interface: &Interface) -> Result<bool, ()> {
@@ -183,7 +207,10 @@ impl Recovery {
         result
     }
     pub fn blocked(&self, profile: &Profile) -> bool {
-        (self.global && profile.kind == VpnKind::Ssl) || self.blocked.contains(&profile.id)
+        // A failed journal scan withholds SSL and OVPN attempts; IPsec keeps
+        // its own recovery path. Per-profile blocks still apply to every kind.
+        (self.global && matches!(profile.kind, VpnKind::Ssl | VpnKind::Ovpn))
+            || self.blocked.contains(&profile.id)
     }
     pub fn verify(&mut self, profile: &Profile, live: &BTreeSet<(String, u64)>) -> bool {
         self.reconcile(Some(&profile.id), live, &mut NativeObserver);
@@ -208,9 +235,11 @@ impl Recovery {
                 blocked.insert(profile);
                 continue;
             }
-            let verified = record
-                .as_ref()
-                .is_ok_and(|record| absent(record, observer).unwrap_or(false));
+            let verified = record.as_ref().is_ok_and(|record| {
+                // Startup recovery also proves the private directory was
+                // removed. Observation of network state alone can't do so.
+                record.kind != fence::Kind::Ovpn && absent(record, observer).unwrap_or(false)
+            });
             if !verified
                 || fence::remove(&self.root, self.owner, self.uid, &profile, generation).is_err()
             {
@@ -232,7 +261,7 @@ pub(crate) mod tests {
     use std::{
         cell::RefCell,
         fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicU64, Ordering},
     };
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -326,6 +355,7 @@ pub(crate) mod tests {
             written_unix_ms: 1,
             service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
             dns_key: None,
+            session_dir: None,
             processes: vec![ProcessIdentity {
                 pid: 42,
                 start_sec: 123,
@@ -569,6 +599,42 @@ pub(crate) mod tests {
         assert!(!recovery.blocked(&profile("one")));
         assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_none());
         assert!(observer.destructive.borrow().is_empty());
+    }
+
+    #[test]
+    fn journal_scan_failure_globally_blocks_ovpn_but_not_ipsec() {
+        let (root, uid) = root();
+        // A symlinked fence directory makes `fence::scan` fail, which sets the
+        // fail-closed global block through the real reconciliation path.
+        symlink("missing", root.0.join("fences")).unwrap();
+        let mut recovery = Recovery {
+            root: root.0.clone(),
+            owner: uid,
+            uid,
+            global: false,
+            blocked: BTreeSet::new(),
+        };
+        recovery.reconcile(None, &BTreeSet::new(), &mut fake());
+        let ssl = profile("ssl-one");
+        let mut ovpn = ssl.clone();
+        ovpn.kind = VpnKind::Ovpn;
+        let mut ipsec = ssl.clone();
+        ipsec.kind = VpnKind::Ipsec;
+        assert!(recovery.blocked(&ssl));
+        assert!(recovery.blocked(&ovpn), "OVPN escaped the global block");
+        assert!(!recovery.blocked(&ipsec), "IPsec must stay outside");
+    }
+
+    #[test]
+    fn passive_verification_keeps_ovpn_for_startup_recovery() {
+        let (root, uid) = root();
+        let mut item = record(uid, "one");
+        item.kind = fence::Kind::Ovpn;
+        fence::write(&root.0, uid, &item).unwrap();
+        let mut recovery = Recovery::new(&root.0, uid, uid);
+        recovery.reconcile(Some("one"), &BTreeSet::new(), &mut fake());
+        assert!(recovery.blocked(&profile("one")));
+        assert!(fence::read(&root.0, uid, uid, "one", 1).unwrap().is_some());
     }
 
     #[test]

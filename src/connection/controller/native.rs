@@ -3,6 +3,9 @@ use super::*;
 mod cleanup;
 mod factory;
 mod ipsec;
+mod ovpn;
+#[cfg(target_os = "macos")]
+pub(crate) mod ovpn_base;
 use crate::{
     connection::{
         macos::{

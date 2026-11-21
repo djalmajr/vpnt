@@ -521,6 +521,28 @@ fn report_result(result: io::Result<()>, mut stderr: impl Write) -> i32 {
 }
 
 #[cfg(test)]
+const TEST_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+// A parallel test can fork while a lock is held. Its child keeps the open
+// file description (and the lock) alive until exec closes the descriptor.
+#[cfg(test)]
+pub(super) fn acquire_eventually<T>(mut acquire: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let deadline = Instant::now() + TEST_LOCK_TIMEOUT;
+    loop {
+        match acquire() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) const IPSEC_SNAPSHOT: &[u8] = br#"{
   "version":1,"entries":[{
     "backend":"ipsec","uid":1000,"hostname":"vpn.example",
@@ -819,7 +841,7 @@ mod tests {
         fixture.install();
         let directory = fixture.store.open().unwrap();
         let inode = File::open(fixture.lock_path()).unwrap();
-        let reader = directory.lock_shared().unwrap();
+        let reader = acquire_eventually(|| directory.lock_shared()).unwrap();
         assert!(same_file(&reader, &inode).unwrap());
         assert_eq!(
             flock(&inode, libc::LOCK_EX | libc::LOCK_NB)
@@ -828,9 +850,10 @@ mod tests {
             io::ErrorKind::WouldBlock,
         );
         drop(reader);
-        let admin = directory
-            .lock_exclusive(directory.open_existing_lock().unwrap(), LOCK_TIMEOUT)
-            .unwrap();
+        let admin = acquire_eventually(|| {
+            directory.lock_exclusive(directory.open_existing_lock()?, TEST_LOCK_TIMEOUT)
+        })
+        .unwrap();
         assert!(same_file(&admin, &inode).unwrap());
         assert_eq!(
             flock(&inode, libc::LOCK_SH | libc::LOCK_NB)
@@ -843,7 +866,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         drop(admin);
-        directory.lock_shared().unwrap();
+        acquire_eventually(|| directory.lock_shared()).unwrap();
     }
 
     #[test]
@@ -851,7 +874,8 @@ mod tests {
         let fixture = PolicyFixture::new();
         fixture.install();
         let previous = File::open(fixture.path()).unwrap();
-        let reader = fixture.store.open().unwrap().lock_shared().unwrap();
+        let directory = fixture.store.open().unwrap();
+        let reader = acquire_eventually(|| directory.lock_shared()).unwrap();
         let timeout = Duration::from_millis(50);
         let start = Instant::now();
         let error =

@@ -23,11 +23,16 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
+};
+#[cfg(target_os = "macos")]
+use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    ptr,
 };
 
 type Version = Option<(u64, u64)>;
@@ -51,7 +56,7 @@ fn version_for(path: &Path) -> io::Result<Version> {
     if let Some(version) = cache.get(path) {
         return Ok(*version);
     }
-    let mut child = Openvpn(
+    let mut child = Openvpn::new(
         Command::new(path)
             .arg("--version")
             .stdin(Stdio::null())
@@ -60,7 +65,7 @@ fn version_for(path: &Path) -> io::Result<Version> {
             .spawn()?,
     );
     let mut output = child
-        .0
+        .child
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("version output unavailable"))?;
@@ -86,7 +91,7 @@ fn version_for(path: &Path) -> io::Result<Version> {
                 Err(e) => return Err(e),
             }
         }
-        if let Some(status) = child.0.try_wait()? {
+        if let Some(status) = child.try_reap()? {
             if !status.success() {
                 return Err(io::Error::other("openvpn version check failed"));
             }
@@ -250,20 +255,26 @@ pub enum RestartPolicy {
     /// The controller withdraws the network and calls
     /// `Session::release_restart_hold(epoch)`; Linux uses this policy.
     Caller,
+    /// Stop the session if the caller does not acknowledge the withdrawal.
+    CallerOrStop,
 }
 
 const RESTART_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
+const MANAGEMENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct RestartHold {
     policy: RestartPolicy,
     state: Mutex<RestartHoldState>,
     changed: Condvar,
+    deadline_stop: OnceLock<io::Result<()>>,
 }
 
 #[derive(Default)]
 struct RestartHoldState {
     pending: Option<u64>,
     stopped: bool,
+    deadline: Option<Instant>,
+    timed_out: bool,
 }
 
 impl RestartHold {
@@ -272,6 +283,7 @@ impl RestartHold {
             policy,
             state: Mutex::new(RestartHoldState::default()),
             changed: Condvar::new(),
+            deadline_stop: OnceLock::new(),
         }
     }
 
@@ -292,26 +304,39 @@ impl RestartHold {
         // A notification from a retired session must not match a new session's hold.
         static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
         let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
-        lock(&self.state).pending = Some(epoch);
+        let mut state = lock(&self.state);
+        state.pending = Some(epoch);
+        state.deadline = None;
         epoch
     }
 
     fn release(&self, epoch: u64) {
         let mut state = lock(&self.state);
-        if state.pending == Some(epoch) {
+        if state.pending == Some(epoch)
+            && (self.policy != RestartPolicy::CallerOrStop
+                || !state.stopped
+                    && state
+                        .deadline
+                        .is_none_or(|deadline| Instant::now() < deadline))
+        {
             state.pending = None;
             self.changed.notify_one();
         }
     }
 
-    fn stop(&self) {
-        lock(&self.state).stopped = true;
+    fn stop(&self) -> bool {
+        let mut state = lock(&self.state);
+        state.stopped = true;
         self.changed.notify_one();
+        state.timed_out
     }
 
     /// Waits until the pending restart, if any, has its routes withdrawn.
     /// Returns false when the session is stopping.
-    fn await_withdrawal(&self) -> bool {
+    fn await_withdrawal(&self, control: &Mutex<UnixStream>) -> bool {
+        if self.policy == RestartPolicy::CallerOrStop {
+            return self.await_withdrawal_or_stop(control);
+        }
         let (mut state, _) = self
             .changed
             .wait_timeout_while(lock(&self.state), RESTART_HOLD_TIMEOUT, |state| {
@@ -326,8 +351,50 @@ impl RestartHold {
         true
     }
 
+    fn await_withdrawal_or_stop(&self, control: &Mutex<UnixStream>) -> bool {
+        let mut state = lock(&self.state);
+        loop {
+            if state.stopped || state.pending.is_none() {
+                return !state.stopped;
+            }
+            let deadline = *state
+                .deadline
+                .get_or_insert_with(|| Instant::now() + RESTART_HOLD_TIMEOUT);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Resolve the deadline and acknowledgements under the same lock.
+                state.stopped = true;
+                state.timed_out = true;
+                drop(state);
+                if let Err(error) =
+                    self.stop_after_timeout(control, Instant::now() + MANAGEMENT_STOP_TIMEOUT)
+                {
+                    eprintln!("ovpn_restart_stop_failed: {:?}", error.kind());
+                }
+                return false;
+            }
+            (state, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn stop_after_timeout(&self, control: &Mutex<UnixStream>, deadline: Instant) -> io::Result<()> {
+        // The management thread and any concurrent stop share one bounded write.
+        match self
+            .deadline_stop
+            .get_or_init(|| terminate_with_deadline(control, deadline))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error
+                .raw_os_error()
+                .map_or_else(|| error.kind().into(), io::Error::from_raw_os_error)),
+        }
+    }
+
     fn send_release(&self, control: &Mutex<UnixStream>) {
-        if !self.await_withdrawal() {
+        if !self.await_withdrawal(control) {
             return;
         }
         let mut writer = lock(control);
@@ -356,6 +423,8 @@ pub struct Outcome {
 
 pub struct Session {
     openvpn: Openvpn,
+    /// Child identity, zeroed as soon as this session reaps the child.
+    pid: Arc<AtomicU32>,
     control: Arc<Mutex<UnixStream>>,
     reason: Arc<Mutex<Option<Reason>>>,
     worker: JoinHandle<()>,
@@ -365,8 +434,82 @@ pub struct Session {
     approval_pending: Arc<AtomicBool>,
     restart_hold: RestartHoldOwner,
     _directory: PrivateDir,
-    #[cfg(target_os = "linux")]
     exit_observed: Mutex<Option<Instant>>,
+    #[cfg(target_os = "macos")]
+    exit_watch: Mutex<Option<ExitWatch>>,
+}
+
+/// macOS exit observation without a reap: a one-shot kqueue registration on
+/// the child's PID. `Session::wait` remains the only owner of the final status.
+#[cfg(target_os = "macos")]
+struct ExitWatch {
+    fd: OwnedFd,
+    pid: u32,
+    exited: bool,
+}
+#[cfg(target_os = "macos")]
+impl ExitWatch {
+    fn new(pid: u32) -> Option<Self> {
+        // SAFETY: kqueue creates a descriptor with no pointer arguments.
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: transfer the fresh descriptor to exactly one owner.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let event = libc::kevent {
+            ident: pid as usize,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: ptr::null_mut(),
+        };
+        // SAFETY: one valid registration, no output buffer or wait requested.
+        if unsafe { libc::kevent(fd.as_raw_fd(), &event, 1, ptr::null_mut(), 0, ptr::null()) } < 0 {
+            // This PID belongs to a child this session has not reaped: ESRCH
+            // means it is already a zombie, so its exit has happened.
+            return (io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)).then_some(
+                Self {
+                    fd,
+                    pid,
+                    exited: true,
+                },
+            );
+        }
+        Some(Self {
+            fd,
+            pid,
+            exited: false,
+        })
+    }
+    fn exited(&mut self) -> Option<bool> {
+        if self.exited {
+            return Some(true);
+        }
+        // SAFETY: an all-zero kevent is a valid output buffer.
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: one valid output event and a nonblocking timeout.
+        let count =
+            unsafe { libc::kevent(self.fd.as_raw_fd(), ptr::null(), 0, &mut event, 1, &timeout) };
+        if count < 0 {
+            return (io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+                .then_some(true);
+        }
+        if count == 1
+            && (event.ident != self.pid as usize
+                || event.flags & libc::EV_ERROR != 0
+                || event.fflags & libc::NOTE_EXIT == 0)
+        {
+            return None;
+        }
+        self.exited = count == 1;
+        Some(self.exited)
+    }
 }
 
 impl Session {
@@ -506,8 +649,9 @@ impl Session {
         }
         // No PDEATHSIG outside Linux: the macOS controller owns the Child and
         // supervises it; this session only spawns and keeps it (VPT-19).
-        let mut openvpn = Openvpn(command.spawn()?);
-        let stream = accept(&listener, &mut openvpn.0)?;
+        let mut openvpn = Openvpn::new(command.spawn()?);
+        let pid = Arc::clone(&openvpn.identity);
+        let stream = accept(&listener, &mut openvpn)?;
         drop(listener);
         let _ = fs::remove_file(&socket);
         let control_stream = stream.try_clone()?;
@@ -544,6 +688,7 @@ impl Session {
             })?;
         Ok(Self {
             openvpn,
+            pid,
             control,
             reason,
             worker,
@@ -552,9 +697,33 @@ impl Session {
             approval_pending,
             restart_hold,
             _directory: directory,
-            #[cfg(target_os = "linux")]
             exit_observed: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            exit_watch: Mutex::new(None),
         })
+    }
+
+    /// The private directory owned by this session, for the macOS journal.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn directory(&self) -> &Path {
+        &self._directory.path
+    }
+
+    /// Identity of the openvpn child until this session reaps it. Read it
+    /// only to identify the process (PID, start and executable) before the
+    /// reap: signalling and killing stay with `Session`, and no caller may
+    /// signal through this PID.
+    pub fn pid(&self) -> Option<u32> {
+        let pid = self.pid.load(Ordering::Acquire);
+        (pid != 0).then_some(pid)
+    }
+
+    fn exit_seen(&self) -> Option<Option<Reason>> {
+        let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
+        self.restart_hold.0.stop();
+        let remaining = (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now());
+        let _ = self.finished.recv_timeout(remaining);
+        Some(*lock(&self.reason))
     }
 
     /// Observe exit without reaping; `wait` still owns the final status.
@@ -564,20 +733,36 @@ impl Session {
         let result = unsafe {
             libc::waitid(
                 libc::P_PID,
-                self.openvpn.0.id(),
+                self.openvpn.child.id(),
                 &mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
         if result == 0 && unsafe { info.si_pid() } != 0 {
-            let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
-            self.restart_hold.0.stop();
-            let remaining = (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now());
-            let _ = self.finished.recv_timeout(remaining);
-            Some(*lock(&self.reason))
+            self.exit_seen()
         } else {
             None
         }
+    }
+
+    /// Observe exit without reaping; `wait` still owns the final status.
+    #[cfg(target_os = "macos")]
+    pub fn exited(&self) -> Option<Option<Reason>> {
+        let pid = self.pid()?;
+        let mut watch = lock(&self.exit_watch);
+        if watch.is_none() {
+            *watch = ExitWatch::new(pid);
+        }
+        match watch.as_mut()?.exited()? {
+            true => self.exit_seen(),
+            false => None,
+        }
+    }
+
+    /// Reap the child through its owner, which invalidates `pid()` on every
+    /// successful reap, including the ones in `accept` and `Drop`.
+    fn reap(&mut self) -> io::Result<ExitStatus> {
+        self.openvpn.reap()
     }
 
     pub fn progress(&self) -> &mpsc::Receiver<Progress> {
@@ -594,38 +779,23 @@ impl Session {
         self.restart_hold.0.release(epoch);
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restart_hold_expired(&self) -> bool {
+        lock(&self.restart_hold.0.state).timed_out
+    }
+
     /// Asks openvpn to leave, notifying the server.
     pub fn stop(&self) -> io::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + MANAGEMENT_STOP_TIMEOUT;
         // A pending withdrawal must not keep the management thread parked
         // while TERMINATE is written, on any platform.
-        self.restart_hold.0.stop();
-        loop {
-            let mut control = match self.control.try_lock() {
-                Ok(control) => control,
-                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    };
-                    if remaining.is_zero() {
-                        return Err(io::ErrorKind::TimedOut.into());
-                    }
-                    thread::sleep(remaining.min(Duration::from_millis(10)));
-                    continue;
-                }
-            };
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(io::ErrorKind::TimedOut.into());
-            };
-            if remaining.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            control.set_write_timeout(Some(remaining))?;
-            let result = control.write_all(management::TERMINATE.as_bytes());
-            drop(control);
-            return result;
+        if self.restart_hold.0.stop() {
+            return self
+                .restart_hold
+                .0
+                .stop_after_timeout(&self.control, deadline);
         }
+        terminate_with_deadline(&self.control, deadline)
     }
 
     /// Returns once openvpn has exited and its last lines were read, so a
@@ -634,17 +804,14 @@ impl Session {
     /// finishes on its own, while its C_Sign stays pending in the module until
     /// the token gives up (cryptoki exposes no C_SessionCancel).
     pub fn wait(mut self) -> io::Result<Outcome> {
-        let status = self.openvpn.0.wait()?;
+        let status = self.reap()?;
         // The drain budget counts from the first time the exit was seen, so an
         // exit already observed (and waited for) by `exited` is not waited
         // for again here.
-        #[cfg(target_os = "linux")]
         let drain = {
             let first = *lock(&self.exit_observed).get_or_insert_with(Instant::now);
             (first + DRAIN_TIMEOUT).saturating_duration_since(Instant::now())
         };
-        #[cfg(not(target_os = "linux"))]
-        let drain = DRAIN_TIMEOUT;
         self.restart_hold.0.stop();
         match self.finished.recv_timeout(drain) {
             Err(RecvTimeoutError::Timeout) => {
@@ -659,14 +826,42 @@ impl Session {
     }
 }
 
-/// Kills and reaps openvpn unless it already exited, on every early return.
-struct Openvpn(Child);
+/// Owns the openvpn child and the identity shared with `Session`. All reaps
+/// go through this owner so a collected PID is never left in `pid()`: the OS
+/// may reuse it, and identity reads must never act on a different process.
+struct Openvpn {
+    child: Child,
+    identity: Arc<AtomicU32>,
+}
 
+impl Openvpn {
+    fn new(child: Child) -> Self {
+        let identity = Arc::new(AtomicU32::new(child.id()));
+        Self { child, identity }
+    }
+
+    /// The single point that reaps the child and invalidates its identity.
+    fn reap(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.identity.store(0, Ordering::Release);
+        Ok(status)
+    }
+
+    fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.identity.store(0, Ordering::Release);
+        }
+        Ok(status)
+    }
+}
+
+/// Kills and reaps openvpn unless it already exited, on every early return.
 impl Drop for Openvpn {
     fn drop(&mut self) {
-        if let Ok(None) = self.0.try_wait() {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if let Ok(None) = self.try_reap() {
+            let _ = self.child.kill();
+            let _ = self.reap();
         }
     }
 }
@@ -758,7 +953,7 @@ fn verify_private_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn accept(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> {
+fn accept(listener: &UnixListener, openvpn: &mut Openvpn) -> io::Result<UnixStream> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
@@ -768,7 +963,7 @@ fn accept(listener: &UnixListener, child: &mut Child) -> io::Result<UnixStream> 
                 return Ok(stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(status) = child.try_wait()? {
+                if let Some(status) = openvpn.try_reap()? {
                     return Err(io::Error::other(format!(
                         "openvpn exited before connecting ({status})"
                     )));
@@ -896,7 +1091,7 @@ fn drive_with_approval(
                     // A HOLD may arrive before the restart state. The token is
                     // still called only after that restart's routes are withdrawn.
                     if let Some(hold) = restart_hold
-                        && !hold.await_withdrawal()
+                        && !hold.await_withdrawal(control)
                     {
                         continue;
                     }
@@ -953,6 +1148,35 @@ fn refuse(progress: &mpsc::Sender<Progress>, error: SignError) -> String {
 
 fn send(control: &Mutex<UnixStream>, text: &str) -> io::Result<()> {
     lock(control).write_all(text.as_bytes())
+}
+
+fn terminate_with_deadline(control: &Mutex<UnixStream>, deadline: Instant) -> io::Result<()> {
+    loop {
+        let mut control = match control.try_lock() {
+            Ok(control) => control,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(io::ErrorKind::TimedOut.into());
+                };
+                if remaining.is_zero() {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+                continue;
+            }
+        };
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(io::ErrorKind::TimedOut.into());
+        };
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        control.set_write_timeout(Some(remaining))?;
+        let result = control.write_all(management::TERMINATE.as_bytes());
+        drop(control);
+        return result;
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

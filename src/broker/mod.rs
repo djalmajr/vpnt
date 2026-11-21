@@ -24,6 +24,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::component;
 mod retry;
+mod signer;
 mod snapshot;
 use crate::{
     bridge::Command,
@@ -69,6 +70,7 @@ pub struct Broker<S: SecretStore> {
     retry: Option<retry::Retry>,
     secrets: S,
     connections: BTreeMap<String, Connection>,
+    signing: signer::Signing,
     helper: &'static str,
     expected_build: Option<String>,
     ready: bool,
@@ -145,6 +147,7 @@ impl<S: SecretStore> Broker<S> {
             retry: None,
             secrets,
             connections: BTreeMap::new(),
+            signing: signer::Signing::default(),
             helper: "missing",
             expected_build,
             ready: false,
@@ -222,6 +225,7 @@ impl<S: SecretStore> Broker<S> {
         {
             retry.defer();
         }
+        self.clear_signing();
         self.dead = true;
         self.ready = false;
         self.sent_interval = None;
@@ -275,7 +279,12 @@ impl<S: SecretStore> Broker<S> {
             self.poll_component();
             return;
         }
-        let result = self.client.as_mut().map(Client::poll);
+        self.reconcile_signing();
+        let result = if self.signing.may_read() {
+            self.client.as_mut().map(Client::poll)
+        } else {
+            None
+        };
         match result {
             Some(Ok(messages)) => {
                 for message in messages {
@@ -286,6 +295,7 @@ impl<S: SecretStore> Broker<S> {
                     if self.dead {
                         break;
                     }
+                    self.reconcile_signing();
                 }
             }
             Some(Err(error)) => {
@@ -295,6 +305,12 @@ impl<S: SecretStore> Broker<S> {
                 self.lost(error == Error::Incompatible);
             }
             None => {}
+        }
+        if !self.dead {
+            self.poll_signing();
+            if self.flush_signing().is_err() {
+                self.lost(false);
+            }
         }
         if !self.ready && self.client.is_some() && Instant::now() >= self.startup {
             self.lost(self.helper == "outdated");
@@ -347,6 +363,9 @@ impl<S: SecretStore> Broker<S> {
                 }
                 let c = self.connections.get_mut(&profile_id).ok_or(())?;
                 if generation < c.generation {
+                    if !state.active() {
+                        self.revoke_suspended_signing(&profile_id, generation);
+                    }
                     return Ok(());
                 }
                 if generation != c.generation {
@@ -364,6 +383,7 @@ impl<S: SecretStore> Broker<S> {
                 }
             }
             Message::Accepted { id } => {
+                self.accept_signing_operation(&id);
                 for c in self.connections.values_mut() {
                     if let Some(p) = &mut c.pending
                         && p.id == id
@@ -423,6 +443,22 @@ impl<S: SecretStore> Broker<S> {
                     self.request_cleanup_snapshot();
                 }
             }
+            #[cfg(unix)]
+            Message::SignRequest {
+                id,
+                profile,
+                generation,
+                epoch,
+                op,
+            } => self.receive_sign_request(
+                signer::Call {
+                    id,
+                    profile,
+                    generation,
+                    epoch,
+                },
+                op,
+            ),
             #[cfg(target_os = "macos")]
             Message::Diagnostics { id, status, logs } => {
                 if self.diagnostics.pending.as_deref() != Some(id.as_str()) {
@@ -510,6 +546,11 @@ fn transition(c: &mut Connection, state: State, failure: Option<FailureView>) {
 mod preferences_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+// The rest of the broker suite builds only on macOS; the app signer also runs
+// on Linux, so its tests run there with a minimal secret store.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/linux_signer.rs"]
+mod linux_signer_tests;
 
 #[cfg(all(test, feature = "desktop", target_os = "macos"))]
 impl<S: SecretStore> Broker<S> {

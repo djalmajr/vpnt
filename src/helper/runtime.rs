@@ -30,6 +30,7 @@ pub enum RuntimeError {
 pub enum Program {
     Charon,
     Fortinet,
+    Openvpn,
 }
 
 #[derive(Deserialize)]
@@ -281,6 +282,7 @@ impl Runtime {
         self.directory.join(match program {
             Program::Charon => "bin/charon",
             Program::Fortinet => "bin/openfortivpn",
+            Program::Openvpn => "bin/openvpn",
         })
     }
 

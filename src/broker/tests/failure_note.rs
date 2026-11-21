@@ -7,6 +7,9 @@ use crate::helper::protocol::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+#[path = "signer.rs"]
+mod signer;
+
 fn profile() -> crate::model::Profile {
     serde_json::from_value(serde_json::json!({"id":"one","name":"Example","kind":"ssl","gateway":"vpn.example.com","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap()
 }
@@ -283,4 +286,28 @@ fn losing_the_helper_forgets_the_capability_and_the_note() {
     let view = &wire.broker.connections["one"].view;
     assert_eq!(view.state, State::HelperMissing);
     assert_eq!(view.failure, None);
+}
+
+#[test]
+fn unrequested_sign_request_gets_unavailable_without_losing_the_helper() {
+    let mut wire = Wire::new(false);
+    let frame = b"{\"type\":\"sign_request\",\"id\":1,\"profile\":\"one\",\"generation\":1,\"epoch\":9,\"op\":{\"op\":\"certificate\"}}\n";
+    wire.send(protocol::read_message(&mut &frame[..]).unwrap().unwrap());
+    assert!(
+        wire.broker.ready,
+        "a refused signing request leaves the helper ready"
+    );
+    assert_eq!(wire.broker.secrets.loads.load(Ordering::Relaxed), 0);
+    assert!(matches!(
+        wire.requests.try_recv().unwrap().command,
+        protocol::Command::SignReply {
+            id: 1,
+            generation: 1,
+            epoch: 9,
+            profile,
+            result: protocol::SignReplyResult::Error(protocol::ErrorReply {
+                error: protocol::SignReplyError::Unavailable,
+            }),
+        } if profile == "one"
+    ));
 }

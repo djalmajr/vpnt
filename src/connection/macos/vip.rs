@@ -21,6 +21,8 @@ use std::{
 };
 
 mod native;
+#[path = "ovpn_link.rs"]
+pub(crate) mod ovpn_link;
 mod preflight;
 use preflight::assign;
 #[cfg(test)]
@@ -157,14 +159,17 @@ impl<'a> ConfiguredUtun<'a> {
             name: retained.name().to_owned(),
             index: retained.index(),
         };
-        let mut api = native::Native;
-        let outcome = {
-            let mut current = || {
+        let outcome = assign(
+            &mut LinkAliases(None),
+            &target,
+            &vips,
+            expires,
+            cancel,
+            &mut || {
                 controller.validate().map_err(|_| Error::Changed)?;
                 retained.validate().map_err(|_| Error::Changed)
-            };
-            assign(&mut api, &target, &vips, expires, cancel, &mut current)
-        };
+            },
+        );
         match outcome {
             Ok(()) => Ok(Self {
                 retained,
@@ -211,6 +216,23 @@ impl<'a> ConfiguredUtun<'a> {
             .interfaces()
             .map_err(|_| Error::Unavailable)?;
         preflight::verify(&interfaces, &self.target, &self.vips)
+    }
+}
+
+/// Native IPsec uses the existing host mask. OpenVPN supplies its negotiated
+/// IPv4 prefix through the same alias operation.
+struct LinkAliases(Option<u8>);
+
+impl Api for LinkAliases {
+    fn interfaces(&mut self) -> io::Result<Interfaces> {
+        Interfaces::read()
+    }
+
+    fn assign(&mut self, name: &str, address: IpAddr) -> io::Result<()> {
+        match self.0 {
+            Some(prefix) if prefix != 32 => ovpn_link::assign_ipv4_alias(name, address, prefix),
+            _ => native::Native.assign(name, address),
+        }
     }
 }
 

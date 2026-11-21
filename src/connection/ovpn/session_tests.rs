@@ -1036,6 +1036,113 @@ fn restart_policy_caller_waits_for_the_acknowledgement_and_times_out() {
 }
 
 #[test]
+fn restart_policy_caller_or_stop_terminates_without_releasing_the_hold() {
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::CallerOrStop);
+    let acknowledged = peer.reconnect();
+    peer.say(RestartPeer::HOLD);
+    peer.expect_held();
+    peer.session.release_restart_hold(acknowledged);
+    assert_eq!(
+        peer.reply(Duration::from_secs(2)).unwrap(),
+        management::HOLD_RELEASE
+    );
+
+    let epoch = peer.reconnect();
+    let started = Instant::now();
+    peer.say(RestartPeer::HOLD);
+    assert_eq!(
+        peer.reply(RESTART_HOLD_TIMEOUT + Duration::from_secs(2))
+            .unwrap(),
+        management::TERMINATE
+    );
+    assert!(started.elapsed() >= RESTART_HOLD_TIMEOUT);
+    peer.session.stop().unwrap();
+    peer.session.release_restart_hold(epoch);
+    peer.say(RestartPeer::HOLD);
+    peer.expect_held();
+    assert!(peer.finish().status.success());
+}
+
+#[test]
+fn restart_policy_caller_or_stop_rejects_acknowledgement_at_the_deadline() {
+    let hold = RestartHold::new(RestartPolicy::CallerOrStop);
+    let epoch = hold.begin();
+    let (peer, management) = UnixStream::pair().unwrap();
+    let mut peer = BufReader::new(peer);
+    peer.get_ref()
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
+    let control = Mutex::new(management);
+
+    // Let the acknowledgement get the state lock first, just as the
+    // management wait is due to wake. The expired deadline must still win.
+    lock(&hold.state).deadline = Some(Instant::now());
+    hold.release(epoch);
+    hold.send_release(&control);
+    let mut reply = String::new();
+    peer.read_line(&mut reply).unwrap();
+    assert_eq!(reply, management::TERMINATE);
+
+    hold.release(epoch);
+    hold.send_release(&control);
+    assert!(peer.read_line(&mut reply).is_err());
+
+    let hold = RestartHold::new(RestartPolicy::CallerOrStop);
+    let epoch = hold.begin();
+    let mut state = lock(&hold.state);
+    state.deadline = Some(Instant::now());
+    thread::scope(|threads| {
+        let (ready, contenders) = mpsc::channel();
+        let caller = ready.clone();
+        let hold = &hold;
+        let control = &control;
+        threads.spawn(move || {
+            caller.send(()).unwrap();
+            hold.release(epoch);
+        });
+        threads.spawn(move || {
+            ready.send(()).unwrap();
+            hold.send_release(control);
+        });
+        contenders.recv().unwrap();
+        contenders.recv().unwrap();
+        drop(state);
+    });
+    reply.clear();
+    peer.read_line(&mut reply).unwrap();
+    assert_eq!(reply, management::TERMINATE);
+    assert!(peer.read_line(&mut reply).is_err());
+}
+
+#[test]
+fn restart_policy_caller_or_stop_preserves_the_failed_timeout_stop() {
+    let mut peer = RestartPeer::start_with(FakeToken::default(), RestartPolicy::CallerOrStop);
+    peer.reconnect();
+    let (broken, disconnected) = UnixStream::pair().unwrap();
+    drop(disconnected);
+    let writer = std::mem::replace(&mut *lock(&peer.session.control), broken);
+    lock(&peer.session.restart_hold.0.state).deadline = Some(Instant::now());
+    peer.say(RestartPeer::HOLD);
+    peer.say(">UPDOWN:DOWN\n");
+    assert_eq!(
+        peer.session
+            .progress()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Progress::Down
+    );
+    assert!(lock(&peer.session.restart_hold.0.state).timed_out);
+    *lock(&peer.session.control) = writer;
+
+    let error = peer.session.stop().unwrap_err();
+    let repeated = peer.session.stop().unwrap_err();
+    assert_eq!(repeated.kind(), error.kind());
+    assert_eq!(repeated.raw_os_error(), error.raw_os_error());
+    peer.expect_held();
+    assert!(peer.finish().status.success());
+}
+
+#[test]
 fn signature_waits_for_withdrawal_after_request_validation() {
     // Validation, then withdrawal, then the signer: each boundary has its own
     // assertion so a mutant that moves any of them is caught.
@@ -1395,4 +1502,73 @@ fn reply_block_ends_at_eof() {
     peer.wire.get_mut().shutdown(Shutdown::Both).unwrap();
     let error = peer.reply_block(Duration::from_secs(2)).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+}
+
+#[test]
+fn pid_identity_is_available_only_before_the_reap() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 2.0);
+    let mut session = start_scripted(&executable, FakeToken::default());
+    assert_eq!(session.pid(), Some(session.openvpn.child.id()));
+    // `wait` consumes the session; this is the same reap path it calls.
+    let status = session.reap().unwrap();
+    assert!(status.success());
+    assert_eq!(session.pid(), None);
+    let _ = session.stop();
+}
+
+#[test]
+fn wait_clears_the_pid_identity_it_owned() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let identity = Arc::clone(&session.pid);
+    assert!(session.pid().is_some());
+    let outcome = session.wait().unwrap();
+    assert!(outcome.status.success());
+    assert_eq!(identity.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn drop_reaps_and_invalidates_the_shared_identity() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.0);
+    let session = start_scripted(&executable, FakeToken::default());
+    let identity = Arc::clone(&session.pid);
+    let pid = session.pid().unwrap();
+    drop(session);
+    let result = unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+    assert_eq!(result, -1, "drop did not reap the child");
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert_eq!(
+        identity.load(Ordering::Acquire),
+        0,
+        "drop reaped PID {pid} but retained the identity"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_exited_observes_the_exit_without_reaping_it() {
+    let scratch = PrivateDir::create(&std::env::temp_dir()).unwrap();
+    let executable = scripted_openvpn(&scratch.path, "", 0.5);
+    let session = start_scripted(&executable, FakeToken::default());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = None;
+    while observed.is_none() && Instant::now() < deadline {
+        observed = session.exited();
+        if observed.is_none() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(
+        observed.is_some(),
+        "the child exited without being observed"
+    );
+    assert!(session.pid().is_some(), "exited must not reap the child");
+    let outcome = session.wait().unwrap();
+    assert!(outcome.status.success(), "wait lost the child status");
 }
