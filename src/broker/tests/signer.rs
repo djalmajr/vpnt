@@ -337,6 +337,8 @@ fn error(name: &str) -> serde_json::Value {
     serde_json::json!({"error":name})
 }
 
+// The closable MissingProgram warning exists only on macOS (`broker/mod.rs`).
+#[cfg(target_os = "macos")]
 #[test]
 fn ovpn_component_missing_program_sets_the_card_state() {
     let mut wire = Wire::new(None, None, None);
@@ -364,6 +366,7 @@ fn ovpn_component_missing_program_sets_the_card_state() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn ovpn_reconnect_missing_program_sets_the_card_state() {
     let mut wire = Wire::new(None, None, None);
@@ -393,6 +396,8 @@ fn ovpn_reconnect_missing_program_sets_the_card_state() {
     assert_eq!(restored.generation, before);
 }
 
+// The contrast case for the macOS-only warning above.
+#[cfg(target_os = "macos")]
 #[test]
 fn ssl_component_missing_program_restores_previous_state() {
     let mut wire = Wire::new(None, None, None);
