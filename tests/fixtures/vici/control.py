@@ -182,11 +182,25 @@ def sas():
     return [{name: ike}]
 
 
-PLUGINS = [
-    'kernel-libipsec', 'kernel-pfroute', 'socket-default', 'vici',
+# The fixture is an independent peer on the same host as the test: answer
+# with the stock plugin set of that platform (patched macOS charon vs Arch's
+# strongswan). Version replies can be driven explicitly by a `version-*` mode.
+MACOS = sys.platform == 'darwin'
+KERNEL = ['kernel-libipsec', 'kernel-pfroute'] if MACOS else ['kernel-netlink']
+PLUGINS = KERNEL + [
+    'socket-default', 'vici',
     'aes', 'des', 'sha1', 'sha2', 'hmac', 'kdf', 'random', 'nonce',
     'openssl', 'eap-identity', 'eap-mschapv2',
 ]
+
+
+def version_reply():
+    if mode == 'incompatible':
+        return '9.0'
+    if mode.startswith('version-'):
+        value = mode[len('version-'):]
+        return '' if value == 'empty' else value
+    return '6.1.0'
 
 
 def stats():
@@ -202,7 +216,7 @@ def stats():
     if mode == 'stats-duplicate':
         plugins.append('vici')
     elif mode == 'stats-uppercase':
-        plugins[0] = 'Kernel-Libipsec'
+        plugins[0] = plugins[0].upper()
     elif mode == 'stats-underscore':
         plugins.append('bad_name')
     elif mode == 'stats-long':
@@ -219,6 +233,10 @@ def stats():
         plugins.remove('socket-default')
     elif mode == 'stats-no-vici':
         plugins.remove('vici')
+    elif mode.startswith('stats-foreign-'):
+        plugins.append(mode[len('stats-foreign-'):])
+    elif mode.startswith('stats-drop-'):
+        plugins.remove(mode[len('stats-drop-'):])
     elif mode == 'stats-128':
         plugins = plugins + [f'x{number}' for number in range(128 - len(PLUGINS))]
     elif mode == 'stats-129':
@@ -263,7 +281,7 @@ while time.monotonic() < expires:
     with open(audit, 'a', encoding='ascii') as output:
         output.write(command + '\n')
     if command == 'version':
-        send(wire, {'daemon': 'foreign' if mode == 'incompatible-daemon' else 'charon', 'version': '9.0' if mode == 'incompatible' else '6.1.0'})
+        send(wire, {'daemon': 'foreign' if mode == 'incompatible-daemon' else 'charon', 'version': version_reply()})
     elif command == 'stats':
         send(wire, stats())
     elif command == 'list-sas':

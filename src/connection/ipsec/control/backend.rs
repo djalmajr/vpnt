@@ -9,20 +9,25 @@ use super::Error;
 use crate::helper::vici::Message;
 use std::collections::BTreeSet;
 
-/// The userspace backend this client is built to drive.
+/// The userspace backend this client is built to drive. The patched macOS
+/// charon uses libipsec/pfroute; the stock Arch charon uses netlink.
+#[cfg(target_os = "macos")]
 const REQUIRED: [&str; 4] = [
     "kernel-libipsec",
     "kernel-pfroute",
     "socket-default",
     "vici",
 ];
+#[cfg(not(target_os = "macos"))]
+const REQUIRED: [&str; 3] = ["kernel-netlink", "socket-default", "vici"];
 const MAX_ENTRIES: usize = 128;
 const MAX_NAME: usize = 64;
 
 /// A missing, empty, oversized, duplicated or malformed list is incompatible.
-/// Any `kernel-*` name outside the required set is refused, so a PF_KEY or
-/// netlink backend can never be driven by this configuration. Ordinary plugin
-/// names and their order are irrelevant.
+/// Any `kernel-*` name outside the platform's required set is refused, so a
+/// foreign backend (PF_KEY, pfroute, libipsec or netlink, depending on the
+/// platform) can never be driven by this configuration. Ordinary plugin names
+/// and their order are irrelevant.
 pub(super) fn admit(response: &Message) -> Result<(), Error> {
     let plugins = response.get_list("plugins").ok_or(Error::Incompatible)?;
     if plugins.is_empty() || plugins.len() > MAX_ENTRIES {

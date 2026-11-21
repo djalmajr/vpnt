@@ -284,3 +284,23 @@ fn losing_the_helper_forgets_the_capability_and_the_note() {
     assert_eq!(view.state, State::HelperMissing);
     assert_eq!(view.failure, None);
 }
+
+#[test]
+fn sign_request_is_dropped_without_a_reply_or_a_credential_load() {
+    let mut wire = Wire::new(false);
+    assert!(wire.broker.ready);
+    let frame = b"{\"type\":\"sign_request\",\"id\":1,\"profile\":\"one\",\"generation\":1,\"epoch\":1,\"op\":{\"op\":\"certificate\"}}\n";
+    let message = protocol::read_message(&mut &frame[..]).unwrap().unwrap();
+    wire.replies.send(message).unwrap();
+    wire.broker.poll();
+    assert!(!wire.broker.ready);
+    assert!(wire.broker.dead);
+    assert!(
+        wire.broker
+            .connections
+            .values()
+            .all(|c| c.view.state == State::HelperMissing)
+    );
+    assert_eq!(wire.broker.secrets.loads.load(Ordering::Relaxed), 0);
+    assert!(wire.requests.try_recv().is_err());
+}
