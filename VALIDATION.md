@@ -149,8 +149,9 @@ anteriores, passou os passos 1 a 5 e o `ping-restart` do passo 6. A segunda, em
 por domínio, a rota e o TCP 443 até o host interno, a desconexão com o diff, o
 `SIGKILL` no app, a ausência de sudoers e o `ping-restart`, e o passo 7 passou.
 As notas "Em 20/11" em cada passo dizem o que foi repetido. A queda da
-interface física e suspender e retomar ficam como acompanhamento: não fazem
-parte do aceite. Execute somente
+interface física e suspender e retomar passaram em 20/11 num pacote local da
+`main` posterior (com a portabilidade da sessão OVPN e o predicado do diretório
+privado). Execute somente
 no host autorizado, com servidor de VPN, domínio interno e host interno
 próprios. Guarde o estado de rede antes. O `resolvectl` lista os links em ordem
 variável, então a função ordena os blocos por link:
@@ -239,8 +240,20 @@ read -r pid && kill -USR1 "$pid"
      iguais em todas as amostras, e o helper reconfigurou a tun duas vezes. Antes da correção, a sessão travava: o módulo do token
      chamava o serviço do fornecedor por um endereço coberto pelas rotas
      empurradas, e o pedido entrava no túnel parado.
-   - Queda da interface física com retorno: **[NOT RUN]**.
-   - Suspender e retomar: **[NOT RUN]**.
+   - Queda da interface física com retorno: **[PASS]** em 20/11, com a máquina
+     só no Wi-Fi (a interface cabeada foi desligada antes de conectar). O Wi-Fi
+     ficou bloqueado com `rfkill` por cerca de 80 s. A tun e o PID do `openvpn`
+     se mantiveram, e 15 s depois de liberar o Wi-Fi o túnel voltou, com
+     endereço novo, rotas, TCP 443 e HTTP pelo túnel. O roteiro não registra se
+     houve aprovação no celular.
+   - Suspender e retomar: **[PASS]** em 20/11, com uma suspensão curta
+     (`s2idle`, cerca de 14 s entre `PM: suspend entry` e `PM: suspend exit` no
+     kernel). O túnel voltou cerca de 10 s depois de acordar, com o mesmo
+     `openvpn`. Uma suspensão longa, em que a sessão TLS expira e o token pede
+     assinatura nova, ainda não foi exercitada.
+   - Os dois cenários rodaram em sequência na mesma conexão. Depois deles, o
+     diff de rede ficou vazio após a desconexão, contra o estado só no Wi-Fi, e
+     após religar a interface cabeada, contra o estado inicial.
 7. Se o host tinha outro cliente OVPN do provedor, remova-o, com as units, a
    tun persistente e as regras de sudoers que ele instalou. Guarde de novo o
    estado de rede e reconecte pelo vpnt. Confira a rota e o TCP 443 até o host
