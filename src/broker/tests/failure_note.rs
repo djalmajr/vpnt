@@ -7,6 +7,9 @@ use crate::helper::protocol::{
 };
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+#[path = "signer.rs"]
+mod signer;
+
 fn profile() -> crate::model::Profile {
     serde_json::from_value(serde_json::json!({"id":"one","name":"Example","kind":"ssl","gateway":"vpn.example.com","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap()
 }
@@ -286,21 +289,25 @@ fn losing_the_helper_forgets_the_capability_and_the_note() {
 }
 
 #[test]
-fn sign_request_is_dropped_without_a_reply_or_a_credential_load() {
+fn unrequested_sign_request_gets_unavailable_without_losing_the_helper() {
     let mut wire = Wire::new(false);
-    assert!(wire.broker.ready);
-    let frame = b"{\"type\":\"sign_request\",\"id\":1,\"profile\":\"one\",\"generation\":1,\"epoch\":1,\"op\":{\"op\":\"certificate\"}}\n";
-    let message = protocol::read_message(&mut &frame[..]).unwrap().unwrap();
-    wire.replies.send(message).unwrap();
-    wire.broker.poll();
-    assert!(!wire.broker.ready);
-    assert!(wire.broker.dead);
+    let frame = b"{\"type\":\"sign_request\",\"id\":1,\"profile\":\"one\",\"generation\":1,\"epoch\":9,\"op\":{\"op\":\"certificate\"}}\n";
+    wire.send(protocol::read_message(&mut &frame[..]).unwrap().unwrap());
     assert!(
-        wire.broker
-            .connections
-            .values()
-            .all(|c| c.view.state == State::HelperMissing)
+        wire.broker.ready,
+        "a refused signing request leaves the helper ready"
     );
     assert_eq!(wire.broker.secrets.loads.load(Ordering::Relaxed), 0);
-    assert!(wire.requests.try_recv().is_err());
+    assert!(matches!(
+        wire.requests.try_recv().unwrap().command,
+        protocol::Command::SignReply {
+            id: 1,
+            generation: 1,
+            epoch: 9,
+            profile,
+            result: protocol::SignReplyResult::Error(protocol::ErrorReply {
+                error: protocol::SignReplyError::Unavailable,
+            }),
+        } if profile == "one"
+    ));
 }
