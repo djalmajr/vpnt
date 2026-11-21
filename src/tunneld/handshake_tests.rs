@@ -285,6 +285,24 @@ fn real_process_completes_handshake() {
 
 #[test]
 fn private_pid_namespace_observes_writer_pid_zero() {
+    // Some hosts forbid unprivileged user namespaces (Ubuntu 24.04 runners
+    // restrict them through AppArmor). Without one the instance never starts,
+    // so the case is reported as skipped instead of timing out.
+    let probe = Command::new("/usr/bin/unshare")
+        .args([
+            "--map-current-user",
+            "--pid",
+            "--kill-child",
+            "--",
+            "/bin/true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: unprivileged user and PID namespaces are unavailable here");
+        return;
+    }
     let fixture = Fixture::new();
     let writer = fixture.publish(ids(), PHASE_TIMEOUT).unwrap();
     let mut instance = child(&fixture, "success", true, 0);
