@@ -197,8 +197,9 @@ impl Channel for Seq {
         Ok(self.0.as_fd())
     }
 
-    fn receive(&mut self) -> io::Result<Vec<u8>> {
+    fn receive(&mut self) -> io::Result<Datagram> {
         self.take(Duration::ZERO)?
+            .map(Datagram::from_vec)
             .ok_or_else(|| io::ErrorKind::WouldBlock.into())
     }
 
@@ -1244,18 +1245,15 @@ fn credential_datagram_is_zeroed_on_every_path() {
         vec![7; 40],
     ];
     for case in cases {
-        let mut bytes = Vec::with_capacity(512);
-        bytes.extend_from_slice(&case);
-        let pointer = bytes.as_ptr();
-        let capacity = bytes.capacity();
+        // The datagram arrives in the wiping buffer of the channel: `decode`
+        // wipes the whole message, and the buffer wipes its capacity on release.
+        let mut bytes = Datagram::from_vec(case.clone());
         let message = decode(&mut bytes);
-        // SAFETY: `bytes` is alive; zeroize wrote zeros over its whole capacity.
-        let memory = unsafe { std::slice::from_raw_parts(pointer, capacity) };
+        assert_eq!(bytes.len(), case.len());
         assert!(
-            memory.iter().all(|&byte| byte == 0),
+            bytes.iter().all(|&byte| byte == 0),
             "{case:?} left bytes behind"
         );
-        assert!(bytes.is_empty());
         if case[0] == MESSAGE_CREDENTIAL && case.len() == 3 + PASSWORD.len() {
             let Ok(Message::Credential(secret)) = message else {
                 panic!("good frame refused")
@@ -1864,4 +1862,247 @@ fn the_sweep_reports_a_kill_of_a_live_process_and_only_then() {
     // Reaped here, as `terminate` does after its sweep.
     assert!(client.child.poll().unwrap().is_some());
     client.reaped = true;
+}
+
+fn start_order() -> Start {
+    Start {
+        host: "vpn.example.test".into(),
+        port: 10443,
+        username: "alice".into(),
+        certificate_sha256: "ab".repeat(32),
+        interface: "eth0".into(),
+        index: 7,
+        gateway: Ipv4Addr::new(192, 0, 2, 10),
+        ppp_ifname: "vpntp1".into(),
+    }
+}
+
+/// `serve` against fixtures; returns the supervisor's result and the events.
+fn serve_fixture(
+    scratch: &Scratch,
+    first: &[u8],
+    then_credential: bool,
+) -> (io::Result<Exit>, Seq) {
+    let (client, pinentry) = fixtures(scratch, "put('done', {})\nidle()\n");
+    let (mut instance, writer) = Seq::pair();
+    writer.put(first);
+    if then_credential {
+        writer.credential(PASSWORD);
+        // A build that runs the client ends here instead of hanging.
+        writer.stop();
+    }
+    let result = serve_with(
+        &mut instance,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: Limits {
+                credential_wait: Duration::from_millis(300),
+                ..limits(Duration::from_secs(1))
+            },
+            own_process: false,
+        },
+    );
+    (result, writer)
+}
+
+#[test]
+fn the_start_order_becomes_exactly_the_parameters_the_supervisor_runs_with() {
+    let params = start_order().params().unwrap();
+    assert_eq!(params.endpoint.host(), "vpn.example.test");
+    assert_eq!(params.endpoint.port(), 10443);
+    assert_eq!(params.username, "alice");
+    assert_eq!(params.certificate_sha256, Some([0xab; 32]));
+    assert_eq!(
+        params.binding,
+        Binding {
+            interface: "eth0".into(),
+            index: 7,
+            gateway: Ipv4Addr::new(192, 0, 2, 10),
+        }
+    );
+    assert_eq!(params.pppd_ifname, "vpntp1");
+    let wire = serde_json::to_string(&start_order()).unwrap();
+    assert!(!wire.contains(PASSWORD));
+}
+
+#[test]
+fn hostile_start_orders_are_refused_before_anything_starts() {
+    type Change = fn(&mut Start);
+    let hostile: [(&str, Change); 14] = [
+        ("short pin", |s| s.certificate_sha256 = "ab".repeat(31)),
+        ("long pin", |s| s.certificate_sha256 = "ab".repeat(33)),
+        ("upper-case pin", |s| s.certificate_sha256 = "AB".repeat(32)),
+        ("non-hex pin", |s| s.certificate_sha256 = "zz".repeat(32)),
+        ("zero pin", |s| s.certificate_sha256 = "00".repeat(32)),
+        ("empty pin", |s| s.certificate_sha256 = String::new()),
+        ("flag as host", |s| s.host = "--ca-file=/x".into()),
+        ("host with a slash", |s| s.host = "a/b".into()),
+        ("empty user", |s| s.username = String::new()),
+        ("control in user", |s| s.username = "a\nb".into()),
+        ("path as interface", |s| s.interface = "../eth0".into()),
+        ("zero index", |s| s.index = 0),
+        ("multicast gateway", |s| {
+            s.gateway = Ipv4Addr::new(224, 0, 0, 1)
+        }),
+        ("foreign ppp name", |s| s.ppp_ifname = "ppp0;x".into()),
+    ];
+    for (label, change) in hostile {
+        let mut start = start_order();
+        change(&mut start);
+        let scratch = Scratch::new();
+        let (result, _) = serve_fixture(&scratch, &serde_json::to_vec(&start).unwrap(), true);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "{label}"
+        );
+        assert!(
+            !scratch.path("client").exists(),
+            "{label}: the client must not start"
+        );
+    }
+    // Control: the same path with the good order does start the client.
+    let scratch = Scratch::new();
+    let (result, writer) =
+        serve_fixture(&scratch, &serde_json::to_vec(&start_order()).unwrap(), true);
+    let exit = result.unwrap();
+    assert_eq!(exit.reason, Reason::Stop);
+    // `started` is sent only after the client was spawned.
+    let events = writer.events();
+    assert_eq!(events.first().unwrap(), &json!({"event": "started"}));
+    assert_eq!(events.last().unwrap()["event"], "exited");
+}
+
+#[test]
+fn only_a_well_formed_start_object_is_accepted_as_the_first_datagram() {
+    let scratch = Scratch::new();
+    let good = serde_json::to_value(start_order()).unwrap();
+    let mut extra = good.clone();
+    extra["extra"] = json!(1);
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("gateway");
+    for (label, bytes) in [
+        ("unknown field", serde_json::to_vec(&extra).unwrap()),
+        ("missing field", serde_json::to_vec(&missing).unwrap()),
+        ("a credential frame first", credential_frame_of(PASSWORD)),
+        ("garbage", b"{not json".to_vec()),
+        ("not an object", b"[1]".to_vec()),
+    ] {
+        let (result, _) = serve_fixture(&scratch, &bytes, false);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "{label}"
+        );
+    }
+    assert!(!scratch.path("client").exists());
+}
+
+fn credential_frame_of(password: &str) -> Vec<u8> {
+    super::credential_frame(password).unwrap().to_vec()
+}
+
+#[test]
+fn stop_or_eof_before_the_start_order_ends_without_a_client() {
+    let scratch = Scratch::new();
+    let (result, _) = serve_fixture(&scratch, &[MESSAGE_STOP], false);
+    let exit = result.unwrap();
+    assert_eq!((exit.reason, exit.status.is_none()), (Reason::Stop, true));
+    // EOF: the writer goes away before sending anything.
+    let (client, pinentry) = fixtures(&scratch, "idle()\n");
+    let (mut instance, writer) = Seq::pair();
+    drop(writer);
+    let exit = serve_with(
+        &mut instance,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: limits(Duration::from_secs(1)),
+            own_process: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(exit.reason, Reason::ChannelClosed);
+    // Silence ends in a timeout, not a hang.
+    let (_instance_end, writer) = Seq::pair();
+    let mut silent = _instance_end;
+    let error = serve_with(
+        &mut silent,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: Limits {
+                credential_wait: Duration::from_millis(150),
+                ..limits(Duration::from_secs(1))
+            },
+            own_process: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    drop(writer);
+    assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn the_writers_credential_frame_is_what_the_supervisor_decodes() {
+    let mut frame = Datagram::from_vec(credential_frame_of(PASSWORD));
+    let Ok(Message::Credential(secret)) = decode(&mut frame) else {
+        panic!("the writer's frame was refused");
+    };
+    assert_eq!(secret.expose(), PASSWORD);
+    for bad in ["", &"p".repeat(257)] {
+        assert!(super::credential_frame(bad).is_err(), "{} bytes", bad.len());
+    }
+    assert!(super::credential_frame(&"p".repeat(256)).is_ok());
+}
+
+#[test]
+fn events_round_trip_and_unknown_ones_are_refused() {
+    for event in [
+        Event::Started,
+        Event::Interface {
+            name: "vpntp1".into(),
+        },
+        Event::Failure {
+            kind: Failure::GatewayTimeout,
+        },
+        Event::SplitRoute {
+            network: Ipv4Addr::new(10, 0, 0, 0),
+            prefix: 8,
+        },
+        Event::SplitRoutes { count: 1 },
+        Event::SplitInvalid,
+        Event::InterfaceMismatch,
+        Event::DnsServer {
+            address: Ipv4Addr::new(10, 1, 1, 1),
+        },
+        Event::DnsDomain {
+            name: "corp.example.test".into(),
+        },
+        Event::DnsCount {
+            servers: 1,
+            domains: 1,
+        },
+        Event::DnsInvalid,
+        Event::Exited {
+            code: Some(1),
+            signal: None,
+        },
+    ] {
+        let wire = serde_json::to_vec(&event).unwrap();
+        assert_eq!(serde_json::from_slice::<Event>(&wire).unwrap(), event);
+    }
+    for bad in [
+        r#"{"event":"interface","name":"vpntp1","extra":1}"#,
+        r#"{"event":"unknown"}"#,
+        r#"{"event":"failure","kind":"nope"}"#,
+        r#"{"name":"vpntp1"}"#,
+    ] {
+        assert!(serde_json::from_str::<Event>(bad).is_err(), "{bad}");
+    }
 }

@@ -4,6 +4,7 @@ pub mod attest;
 mod backend;
 pub mod client;
 pub mod fortinet_instance;
+mod fortinet_network;
 pub mod handshake;
 pub mod instance_protocol;
 pub mod ipsec_instance;

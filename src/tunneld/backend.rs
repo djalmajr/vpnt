@@ -1,6 +1,8 @@
 //! Admission, authenticated instance control, and lease recovery.
 use super::{
     attest::SystemdAttestor,
+    fortinet_instance::{self, Event},
+    fortinet_network::{self, FortinetNetwork},
     handshake::{
         AuthenticatedChannel, Backend, CONTROL_SOCKET_NAME, RECORD_NAME, UnitAttestor,
         UnitIdentity, Writer,
@@ -8,7 +10,7 @@ use super::{
     instance_protocol::{Order, Reply, Start, encode_credentials},
     network::{Network, Receipt, parse_cidr, valid_generation},
     policy::Entry,
-    protocol::{CidrV4, Credentials, ErrorCode, Prepare, State},
+    protocol::{self, CidrV4, Credentials, ErrorCode, FortinetRequest, Prepare, State},
 };
 use crate::{
     netd::{iproute::Backend as NetworkBackend, server::ovpn_present},
@@ -95,6 +97,7 @@ pub(super) struct Launcher<N, A> {
     network: N,
     attestor: A,
     xfrm: Network,
+    fortinet: FortinetNetwork,
     lock: AcquireLock,
     limits: Limits,
 }
@@ -107,6 +110,7 @@ impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
             network,
             attestor: SystemdAttestor,
             xfrm: Network::default(),
+            fortinet: FortinetNetwork::default(),
             lock: Box::new(NetworkLock::acquire),
             limits: Limits::default(),
         }
@@ -122,6 +126,7 @@ struct Attempt {
     directory: bool,
     started: bool,
     receipt: Option<Receipt>,
+    fortinet: Option<fortinet_network::Receipt>,
 }
 
 impl Attempt {
@@ -139,6 +144,7 @@ impl Attempt {
             directory: false,
             started: false,
             receipt: None,
+            fortinet: None,
         }
     }
 }
@@ -182,6 +188,35 @@ struct IpsecStart {
     credentials: zeroize::Zeroizing<Vec<u8>>,
 }
 
+/// Everything the writer needs to admit a Fortinet attempt, from the policy
+/// entry and the user's password. The user's request supplied only the username.
+struct FortinetStart {
+    host: String,
+    port: u16,
+    username: String,
+    certificate_sha256: String,
+    remote: Ipv4Addr,
+    approved: Vec<Ipv4Addr>,
+    grant: fortinet_network::Grant,
+    credentials: zeroize::Zeroizing<Vec<u8>>,
+}
+
+enum Setup {
+    Ipsec(IpsecStart),
+    Fortinet(FortinetStart),
+}
+
+/// What an attempt ended with, in the codes the writer's clients know.
+fn fatal_code(fatal: &fortinet_network::Fatal) -> ErrorCode {
+    use fortinet_instance::Failure as Reported;
+    use fortinet_network::Fatal;
+    match fatal {
+        Fatal::Failure(Reported::CredentialsRejected) => ErrorCode::PermissionDenied,
+        Fatal::Failure(Reported::GatewayTimeout) => ErrorCode::Timeout,
+        Fatal::InterfaceMismatch | Fatal::Exited | Fatal::Invalid => ErrorCode::Backend,
+    }
+}
+
 struct CapturePeer<'a, A> {
     attestor: &'a A,
     peer: std::cell::RefCell<Option<OwnedFd>>,
@@ -203,7 +238,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn bring_up(
         &self,
         attempt: &mut Attempt,
-        setup: Option<IpsecStart>,
+        setup: Option<Setup>,
+        entry: Option<&Entry>,
         authorization: Option<File>,
         channel: &mut Option<AuthenticatedChannel>,
     ) -> Result<OwnedFd, Failure> {
@@ -227,25 +263,41 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .create_directory(&attempt.generation)
             .map_err(|e| Failure::io("generation directory", &e))?;
         attempt.directory = true;
-        if let Some(setup) = setup.as_ref() {
-            let receipt = self
-                .xfrm
-                .plan(
-                    &guard,
-                    &attempt.generation,
-                    setup.order.remote_ipv4,
-                    &setup.approved,
-                    setup.order.remote_ts.clone(),
-                )
-                .map_err(|e| Failure::io("network admission", &e))?;
-            receipt
-                .save(&directory, &guard)
-                .map_err(|e| Failure::io("network receipt", &e))?;
-            // Ensure the generation directory entry itself is durable before spawn.
-            File::open(self.runtime.join(INSTANCE_DIRECTORY))
-                .and_then(|dir| dir.sync_all())
-                .map_err(|e| Failure::io("generation directory sync", &e))?;
-            attempt.receipt = Some(receipt);
+        match setup.as_ref() {
+            Some(Setup::Ipsec(setup)) => {
+                let receipt = self
+                    .xfrm
+                    .plan(
+                        &guard,
+                        &attempt.generation,
+                        setup.order.remote_ipv4,
+                        &setup.approved,
+                        setup.order.remote_ts.clone(),
+                    )
+                    .map_err(|e| Failure::io("network admission", &e))?;
+                receipt
+                    .save(&directory, &guard)
+                    .map_err(|e| Failure::io("network receipt", &e))?;
+                // Ensure the generation directory entry itself is durable before spawn.
+                File::open(self.runtime.join(INSTANCE_DIRECTORY))
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|e| Failure::io("generation directory sync", &e))?;
+                attempt.receipt = Some(receipt);
+            }
+            Some(Setup::Fortinet(setup)) => {
+                let receipt = self
+                    .fortinet
+                    .plan(&guard, &attempt.generation, setup.remote, &setup.approved)
+                    .map_err(|e| Failure::io("network admission", &e))?;
+                receipt
+                    .save(&directory, &guard)
+                    .map_err(|e| Failure::io("network receipt", &e))?;
+                File::open(self.runtime.join(INSTANCE_DIRECTORY))
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|e| Failure::io("generation directory sync", &e))?;
+                attempt.fortinet = Some(receipt);
+            }
+            None => {}
         }
         // A sync error after creation can still leave the marker.
         attempt.registered = true;
@@ -289,8 +341,15 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 .authenticate(&attestor)
                 .map_err(|e| Failure::io("instance authentication", &e))?,
         );
-        if let Some(setup) = setup {
-            self.establish(attempt, setup, authenticated, &directory)?;
+        match setup {
+            Some(Setup::Ipsec(setup)) => {
+                self.establish(attempt, setup, authenticated, &directory)?;
+            }
+            Some(Setup::Fortinet(setup)) => {
+                let entry = entry.expect("a Fortinet setup comes with its policy entry");
+                self.establish_fortinet(attempt, setup, entry, authenticated, &directory)?;
+            }
+            None => {}
         }
         let peer = attestor
             .peer
@@ -366,6 +425,92 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .map_err(|e| Failure::io("configure XFRM network", &e))
     }
 
+    /// Start the instance, wait until it observes the PPP link with the routes
+    /// and DNS the gateway delivered, then apply what policy accepts.
+    fn establish_fortinet(
+        &self,
+        attempt: &mut Attempt,
+        mut setup: FortinetStart,
+        entry: &Entry,
+        channel: &mut AuthenticatedChannel,
+        directory: &Path,
+    ) -> Result<(), Failure> {
+        let receipt = attempt
+            .fortinet
+            .as_mut()
+            .expect("Fortinet receipt precedes start");
+        let (interface, index, gateway) = receipt.binding();
+        let start = fortinet_instance::Start {
+            host: setup.host.clone(),
+            port: setup.port,
+            username: setup.username.clone(),
+            certificate_sha256: setup.certificate_sha256.clone(),
+            interface: interface.to_owned(),
+            index,
+            gateway,
+            ppp_ifname: receipt.ifname.clone(),
+        };
+        channel
+            .send(
+                &serde_json::to_vec(&start)
+                    .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
+            )
+            .map_err(|e| Failure::io("instance Start", &e))?;
+        let sent = channel.send(&setup.credentials);
+        zeroize::Zeroize::zeroize(&mut setup.credentials);
+        sent.map_err(|e| Failure::io("instance credentials", &e))?;
+
+        let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
+        let mut delivered = fortinet_network::Delivered::default();
+        loop {
+            let event = receive_event(channel, deadline)
+                .map_err(|e| Failure::io("instance setup event", &e))?;
+            delivered.absorb(event);
+            if let Some(fatal) = delivered.fatal() {
+                return Err(Failure::new(
+                    fatal_code(&fatal),
+                    format_args!("instance reported {fatal:?}"),
+                ));
+            }
+            if delivered.ready() {
+                break;
+            }
+        }
+        // Whatever is already queued behind the last event counts too: a late
+        // `interface_mismatch` must stop the attempt before anything is applied.
+        while channel
+            .wait_control(Duration::ZERO)
+            .map_err(|e| Failure::io("instance setup event", &e))?
+        {
+            let event = receive_event(channel, deadline)
+                .map_err(|e| Failure::io("instance setup event", &e))?;
+            delivered.absorb(event);
+        }
+        if let Some(fatal) = delivered.fatal() {
+            return Err(Failure::new(
+                fatal_code(&fatal),
+                format_args!("instance reported {fatal:?}"),
+            ));
+        }
+        let guard = (self.lock)(Instant::now() + self.limits.lock)
+            .map_err(|e| Failure::io("network write lock", &e))?;
+        let scope = fortinet_network::Scope {
+            entry,
+            grant: &setup.grant,
+        };
+        self.fortinet
+            .apply(&guard, directory, receipt, &delivered, &scope)
+            .map_err(|e| Failure::io("configure PPP network", &e))?;
+        let report = receipt.report();
+        // Counts only: nothing the gateway printed is logged.
+        eprintln!(
+            "vpnt-tunneld: fortinet network ready: routes accepted {} refused {}, \
+             DNS servers {} refused {}",
+            report.accepted_routes, report.refused_routes, report.dns_servers, report.refused_dns
+        );
+        Ok(())
+    }
+
     fn create_directory(&self, generation: &str) -> io::Result<PathBuf> {
         let parent = self.runtime.join(INSTANCE_DIRECTORY);
         match DirBuilder::new().mode(0o700).create(&parent) {
@@ -400,7 +545,24 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             require_private(&directory)?;
             let mut receipt = match Receipt::load(&directory, &guard) {
                 Ok(receipt) => receipt,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    match fortinet_network::Receipt::load(&directory, &guard) {
+                        Ok(mut receipt) => {
+                            if !receipt.complete {
+                                let attempt =
+                                    Attempt::new(Backend::Fortinet, generation.to_owned());
+                                self.stop_unit(&attempt)?;
+                                self.fortinet.clean(&guard, &directory, &receipt)?;
+                                receipt.complete = true;
+                                receipt.save(&directory, &guard)?;
+                            }
+                            guard.withdraw(generation)?;
+                            continue;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
                 Err(e) => return Err(e),
             };
             if !receipt.complete {
@@ -426,6 +588,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn teardown(&self, attempt: &mut Attempt, channel: Option<AuthenticatedChannel>) -> bool {
         let result = if attempt.receipt.is_some() {
             self.teardown_ipsec(attempt, channel)
+        } else if attempt.fortinet.is_some() {
+            self.teardown_fortinet(attempt, channel)
         } else {
             drop(channel);
             self.teardown_before_ipsec(attempt)
@@ -493,6 +657,48 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         guard.withdraw(&attempt.generation)
     }
 
+    /// Stop the instance (it stops the client and reports `exited`), stop the
+    /// unit whatever it answered, remove what the receipt says was attempted,
+    /// prove it is gone, and only then withdraw the lease.
+    fn teardown_fortinet(
+        &self,
+        attempt: &mut Attempt,
+        channel: Option<AuthenticatedChannel>,
+    ) -> io::Result<()> {
+        let directory = self
+            .runtime
+            .join(INSTANCE_DIRECTORY)
+            .join(&attempt.generation);
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
+        if let Some(mut channel) = channel {
+            let stopped = channel
+                .send(&[fortinet_instance::MESSAGE_STOP])
+                .and_then(|()| wait_exited(&mut channel, Instant::now() + STOPPED_TIMEOUT));
+            if let Err(error) = stopped {
+                eprintln!("vpnt-tunneld: instance did not confirm Stop: {error}");
+            }
+        }
+        // The unit is stopped even when the instance confirmed: that is what
+        // proves no client or pppd outlives the attempt.
+        if attempt.started {
+            self.stop_unit(attempt)?;
+            attempt.started = false;
+        }
+        let receipt = attempt
+            .fortinet
+            .as_mut()
+            .expect("Fortinet cleanup has a receipt");
+        if !receipt.complete {
+            self.fortinet.clean(&guard, &directory, receipt)?;
+            receipt.complete = true;
+            if let Err(error) = receipt.save(&directory, &guard) {
+                receipt.complete = false;
+                return Err(error);
+            }
+        }
+        guard.withdraw(&attempt.generation)
+    }
+
     fn teardown_before_ipsec(&self, attempt: &Attempt) -> io::Result<()> {
         if attempt.started {
             self.stop_unit(attempt)?;
@@ -519,7 +725,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch_backend<'a>(
         &'a self,
         backend: Backend,
-        setup: Option<IpsecStart>,
+        setup: Option<Setup>,
+        entry: Option<&Entry>,
         authorization: Option<File>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let generation = generation().map_err(|error| {
@@ -533,7 +740,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         } else {
             State::Starting
         };
-        match self.bring_up(&mut attempt, setup, authorization, &mut channel) {
+        match self.bring_up(&mut attempt, setup, entry, authorization, &mut channel) {
             Ok(peer) => Ok(Box::new(Session {
                 launcher: self,
                 attempt,
@@ -549,6 +756,27 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     ErrorCode::CleanupPending
                 })
             }
+        }
+    }
+}
+
+fn receive_event(channel: &mut AuthenticatedChannel, deadline: Instant) -> io::Result<Event> {
+    let bytes = channel.receive_until(deadline)?;
+    if bytes.first() != Some(&b'{') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected instance event object",
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid instance event"))
+}
+
+/// Read events until the instance says it exited.
+fn wait_exited(channel: &mut AuthenticatedChannel, deadline: Instant) -> io::Result<()> {
+    loop {
+        if matches!(receive_event(channel, deadline)?, Event::Exited { .. }) {
+            return Ok(());
         }
     }
 }
@@ -573,8 +801,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         credentials: Credentials,
         authorization: File,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
-        let Prepare::Ipsec(request) = offer else {
-            return self.launch_backend(offer.backend(), None, Some(authorization));
+        let request = match offer {
+            Prepare::Ipsec(request) => request,
+            Prepare::Fortinet(request) => {
+                return self.launch_fortinet(request, grant, &credentials, authorization);
+            }
         };
         let grant: IpsecGrant = serde_json::to_value(grant)
             .and_then(serde_json::from_value)
@@ -611,7 +842,55 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             approved: grant.transport_ipv4,
             credentials: frame,
         };
-        self.launch_backend(Backend::Ipsec, Some(setup), Some(authorization))
+        self.launch_backend(
+            Backend::Ipsec,
+            Some(Setup::Ipsec(setup)),
+            None,
+            Some(authorization),
+        )
+    }
+}
+
+impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
+    fn launch_fortinet<'a>(
+        &'a self,
+        request: &FortinetRequest,
+        grant: &Entry,
+        credentials: &Credentials,
+        authorization: File,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        if credentials.backend() != protocol::Backend::Fortinet {
+            return Err(ErrorCode::BadRequest);
+        }
+        let projection =
+            fortinet_network::Grant::from_entry(grant).map_err(|_| ErrorCode::Backend)?;
+        // The pin and the endpoint come from the policy entry, which the offer
+        // matched exactly; the offer supplies only the username.
+        let remote = self
+            .xfrm
+            .resolve(&projection.hostname, &projection.transport_ipv4)
+            .map_err(|error| {
+                eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
+                ErrorCode::Backend
+            })?;
+        let credentials = fortinet_instance::credential_frame(credentials.password())
+            .map_err(|_| ErrorCode::BadRequest)?;
+        let setup = FortinetStart {
+            host: projection.hostname.clone(),
+            port: projection.port,
+            username: request.username().into(),
+            certificate_sha256: projection.certificate_sha256.clone(),
+            remote,
+            approved: projection.transport_ipv4.clone(),
+            grant: projection,
+            credentials,
+        };
+        self.launch_backend(
+            Backend::Fortinet,
+            Some(Setup::Fortinet(setup)),
+            Some(grant),
+            Some(authorization),
+        )
     }
 }
 
@@ -746,7 +1025,13 @@ fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
-        self.launch_backend(backend, None, None)
+        self.launch_backend(backend, None, None, None)
+    }
+
+    fn with_fortinet(mut self, network: FortinetNetwork, xfrm: Network) -> Self {
+        self.fortinet = network;
+        self.xfrm = xfrm;
+        self
     }
 
     fn for_test(
@@ -763,6 +1048,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             network,
             attestor,
             xfrm: Network::default(),
+            fortinet: FortinetNetwork::default(),
             lock,
             limits,
         }
@@ -1430,6 +1716,519 @@ mod tests {
         let error = run(&slow, Duration::from_millis(100)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    mod fortinet_tests {
+        use super::*;
+        use crate::tunneld::{
+            fortinet_instance::Failure as Reported,
+            fortinet_network::fixture::{self, Kernel},
+            protocol::{Endpoint, FortinetRequest},
+        };
+        use std::sync::Mutex;
+
+        const PIN: [u8; 32] = [0xab; 32];
+        const PASSWORD: &str = "fixture-password";
+
+        /// What the fake openfortivpn does once it has the order and password.
+        #[derive(Clone)]
+        enum Script {
+            /// The link comes up with these events, then it waits for Stop.
+            Ready(Vec<Event>),
+            /// Same, but the link outlives the instance after Stop.
+            ReadyAndLeaveTheLink(Vec<Event>),
+            Report(Vec<Event>),
+        }
+
+        #[derive(Default)]
+        struct Seen {
+            start: Option<fortinet_instance::Start>,
+            password: Option<String>,
+            stop_frames: usize,
+        }
+
+        fn event_bytes(event: &Event) -> Vec<u8> {
+            serde_json::to_vec(event).unwrap()
+        }
+
+        fn standard_events() -> Vec<Event> {
+            vec![
+                Event::Started,
+                Event::Interface {
+                    name: "vpntp1".into(),
+                },
+                Event::SplitRoute {
+                    network: Ipv4Addr::new(10, 20, 0, 0),
+                    prefix: 16,
+                },
+                Event::SplitRoute {
+                    network: Ipv4Addr::new(172, 16, 0, 0),
+                    prefix: 12,
+                },
+                Event::SplitRoutes { count: 2 },
+                Event::DnsServer {
+                    address: Ipv4Addr::new(10, 20, 1, 53),
+                },
+                Event::DnsServer {
+                    address: Ipv4Addr::new(8, 8, 8, 8),
+                },
+                Event::DnsCount {
+                    servers: 2,
+                    domains: 0,
+                },
+            ]
+        }
+
+        struct Rig {
+            harness: Harness,
+            kernel: Arc<Mutex<Kernel>>,
+            seen: Arc<Mutex<Seen>>,
+            instance: Mutex<Option<JoinHandle<()>>>,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                Self {
+                    harness: Harness::new(),
+                    kernel: Arc::default(),
+                    seen: Arc::default(),
+                    instance: Mutex::new(None),
+                }
+            }
+
+            fn launcher(&self, ovpn: bool) -> Launcher<FakeNetwork, FakeAttestor> {
+                let network = FakeNetwork::default();
+                network.ovpn.store(ovpn, Ordering::SeqCst);
+                self.harness
+                    .launcher_with(network, false, self.harness.lock(), Limits::default())
+                    .with_fortinet(
+                        fixture::network(self.kernel.clone(), Some(self.harness.runtime.clone())),
+                        Network::fake(|program, args| {
+                            assert_eq!(program, "/usr/bin/busctl");
+                            assert!(args.contains(&"vpn.example"));
+                            Ok(br#"{"type":"a(iiay)st","data":[[[2,2,[192,0,2,20]]],"vpn.example",1]}"#.to_vec())
+                        }),
+                    )
+            }
+
+            /// The fake instance runs the real handshake once its unit is started.
+            fn instance(&self, script: Script) {
+                let (log, runtime, stop) = (
+                    self.harness.log.clone(),
+                    self.harness.runtime.clone(),
+                    self.harness.stop.clone(),
+                );
+                let (kernel, seen) = (self.kernel.clone(), self.seen.clone());
+                *self.instance.lock().unwrap() = Some(thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    let unit = loop {
+                        if stop.load(Ordering::SeqCst) || Instant::now() > deadline {
+                            return;
+                        }
+                        if let Some(unit) = started_unit(&log) {
+                            break unit;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    };
+                    let generation = generation_of(&unit);
+                    let directory = runtime.join(INSTANCE_DIRECTORY).join(&generation);
+                    let Ok(mut channel) = connect_instance(
+                        &directory.join(CONTROL_SOCKET_NAME),
+                        &directory.join(RECORD_NAME),
+                        &generation,
+                        Backend::Fortinet,
+                        INVOCATION,
+                        INSTANCE_GID,
+                    ) else {
+                        return;
+                    };
+                    let start: fortinet_instance::Start =
+                        serde_json::from_slice(&channel.receive().unwrap()).unwrap();
+                    let frame = channel.receive().unwrap();
+                    let length = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+                    assert_eq!((frame[0], frame.len()), (1, 3 + length));
+                    {
+                        let mut seen = seen.lock().unwrap();
+                        seen.password = Some(String::from_utf8(frame[3..].to_vec()).unwrap());
+                        seen.start = Some(start);
+                    }
+                    let (events, leave_link) = match script {
+                        Script::Ready(events) | Script::Report(events) => (events, false),
+                        Script::ReadyAndLeaveTheLink(events) => (events, true),
+                    };
+                    // Events that report the link up make pppd's interface appear.
+                    if events
+                        .iter()
+                        .any(|event| matches!(event, Event::Interface { .. }))
+                    {
+                        kernel.lock().unwrap().ppp = true;
+                    }
+                    for event in &events {
+                        channel.send(&event_bytes(event)).unwrap();
+                    }
+                    loop {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match channel.wait_control(Duration::from_millis(50)) {
+                            Ok(false) => continue,
+                            Ok(true) => {}
+                            Err(_) => return,
+                        }
+                        let frame = channel.receive().unwrap();
+                        if *frame == [fortinet_instance::MESSAGE_STOP] {
+                            seen.lock().unwrap().stop_frames += 1;
+                            if !leave_link {
+                                // pppd removes its link, and the kernel and the
+                                // resolver forget what hung on it.
+                                let mut k = kernel.lock().unwrap();
+                                k.ppp = false;
+                                k.routes.clear();
+                                k.dns.clear();
+                                k.domains.clear();
+                            }
+                            let _ = channel.send(&event_bytes(&Event::Exited {
+                                code: None,
+                                signal: Some(15),
+                            }));
+                            return;
+                        }
+                    }
+                }));
+            }
+
+            fn launch<'a>(
+                &self,
+                launcher: &'a Launcher<FakeNetwork, FakeAttestor>,
+                entry: &Entry,
+            ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+                let offer = Prepare::Fortinet(
+                    FortinetRequest::new(
+                        Endpoint::new("vpn.example".into(), 443).unwrap(),
+                        "alice".into(),
+                        PIN,
+                    )
+                    .unwrap(),
+                );
+                Launch::launch(
+                    launcher,
+                    &offer,
+                    entry,
+                    Credentials::fortinet(PASSWORD).unwrap(),
+                    File::open("/dev/null").unwrap(),
+                )
+            }
+
+            fn routes(&self) -> Vec<String> {
+                self.kernel.lock().unwrap().routes.clone()
+            }
+
+            fn dns(&self) -> Vec<String> {
+                self.kernel.lock().unwrap().dns.clone()
+            }
+
+            fn receipt(&self, generation: &str) -> serde_json::Value {
+                serde_json::from_slice(
+                    &fs::read(
+                        self.harness
+                            .directory(generation)
+                            .join(fortinet_network::RECEIPT),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            }
+        }
+
+        impl Drop for Rig {
+            fn drop(&mut self) {
+                self.harness.stop.store(true, Ordering::SeqCst);
+                drop(self.instance.lock().unwrap().take().map(JoinHandle::join));
+            }
+        }
+
+        fn policy(dns_servers: &[&str]) -> Entry {
+            fixture::entry(&["10.20.0.0/15"], dns_servers, &["corp.example"])
+        }
+
+        #[test]
+        fn a_fortinet_attempt_reaches_network_ready_with_the_accepted_network_and_stops_clean() {
+            if !namespaced_in(
+                "a_fortinet_attempt_reaches_network_ready_with_the_accepted_network_and_stops_clean",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.instance(Script::Ready(standard_events()));
+            let launcher = rig.launcher(false);
+            let mut running = rig.launch(&launcher, &policy(&[])).unwrap();
+            assert_eq!(running.state(), State::NetworkReady);
+
+            // The order carries the policy's endpoint and pin and the planned
+            // egress; the password arrived on the instance channel only.
+            let seen = rig.seen.lock().unwrap();
+            let start = seen.start.as_ref().unwrap();
+            assert_eq!(
+                (
+                    start.host.as_str(),
+                    start.port,
+                    start.username.as_str(),
+                    start.certificate_sha256.as_str(),
+                    start.interface.as_str(),
+                    start.index,
+                    start.gateway,
+                    start.ppp_ifname.as_str()
+                ),
+                (
+                    "vpn.example",
+                    443,
+                    "alice",
+                    "ab".repeat(32).as_str(),
+                    "eth-fixture",
+                    2,
+                    Ipv4Addr::new(192, 0, 2, 20),
+                    "vpntp1"
+                )
+            );
+            assert_eq!(seen.password.as_deref(), Some(PASSWORD));
+            drop(seen);
+            assert!(
+                !serde_json::to_string(&start_json(&rig))
+                    .unwrap()
+                    .contains(PASSWORD)
+            );
+
+            // Inside the ceiling only; the rest refused and counted.
+            assert_eq!(rig.routes(), ["10.20.0.0/16"]);
+            assert_eq!(rig.dns(), ["10.20.1.53"]);
+            let unit = started_unit(&rig.harness.log).unwrap();
+            let generation = generation_of(&unit);
+            let receipt = rig.receipt(&generation);
+            assert_eq!(receipt["refused_routes"], 1);
+            assert_eq!(receipt["refused_dns"], 1);
+            assert_eq!(receipt["confirmed"], true);
+            assert_eq!(rig.harness.leases(), [generation.as_str()]);
+            assert_eq!(rig.harness.log(), [format!("start --no-block -- {unit}")]);
+
+            assert_eq!(running.stop(), State::Stopped);
+            assert_eq!(rig.seen.lock().unwrap().stop_frames, 1);
+            assert_eq!(
+                rig.harness.log(),
+                [
+                    format!("start --no-block -- {unit}"),
+                    format!("stop -- {unit}")
+                ]
+            );
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation)["complete"], true);
+            // A repeated stop does not repeat any mutation.
+            let ops = rig.kernel.lock().unwrap().ops.len();
+            assert_eq!(running.stop(), State::Stopped);
+            assert_eq!(rig.harness.log().len(), 2);
+            assert_eq!(rig.kernel.lock().unwrap().ops.len(), ops);
+        }
+
+        fn start_json(rig: &Rig) -> serde_json::Value {
+            serde_json::to_value(rig.seen.lock().unwrap().start.as_ref().unwrap()).unwrap()
+        }
+
+        #[test]
+        fn a_policy_that_fixes_the_dns_servers_prevails_over_the_gateway() {
+            if !namespaced_in(
+                "a_policy_that_fixes_the_dns_servers_prevails_over_the_gateway",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.instance(Script::Ready(standard_events()));
+            let launcher = rig.launcher(false);
+            let mut running = rig.launch(&launcher, &policy(&["10.20.9.9"])).unwrap();
+            assert_eq!(running.state(), State::NetworkReady);
+            assert_eq!(rig.dns(), ["10.20.9.9"]);
+            assert_eq!(running.stop(), State::Stopped);
+        }
+
+        #[test]
+        fn an_interface_mismatch_is_fatal_and_leaves_nothing_behind() {
+            if !namespaced_in(
+                "an_interface_mismatch_is_fatal_and_leaves_nothing_behind",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            let mut events = standard_events();
+            events.push(Event::InterfaceMismatch);
+            rig.instance(Script::ReadyAndLeaveTheLink(events));
+            let launcher = rig.launcher(false);
+            assert_eq!(
+                rig.launch(&launcher, &policy(&[])).err(),
+                Some(ErrorCode::Backend)
+            );
+            // Nothing was applied, the unit was stopped, the lease is gone.
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            let unit = started_unit(&rig.harness.log).unwrap();
+            assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
+        }
+
+        #[test]
+        fn a_rejected_password_or_a_gateway_timeout_ends_the_attempt_with_its_code() {
+            if !namespaced_in(
+                "a_rejected_password_or_a_gateway_timeout_ends_the_attempt_with_its_code",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            for (kind, code) in [
+                (Reported::CredentialsRejected, ErrorCode::PermissionDenied),
+                (Reported::GatewayTimeout, ErrorCode::Timeout),
+            ] {
+                let rig = Rig::new();
+                rig.instance(Script::Report(vec![
+                    Event::Started,
+                    Event::Failure { kind },
+                ]));
+                let launcher = rig.launcher(false);
+                assert_eq!(rig.launch(&launcher, &policy(&[])).err(), Some(code));
+                assert!(rig.harness.leases().is_empty());
+                assert!(rig.routes().is_empty());
+                let unit = started_unit(&rig.harness.log).unwrap();
+                assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            }
+        }
+
+        #[test]
+        fn the_death_of_the_instance_is_cleaned_by_the_receipt() {
+            if !namespaced_in(
+                "the_death_of_the_instance_is_cleaned_by_the_receipt",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            // Ready, then the instance vanishes without cleaning: the link, the
+            // routes and the DNS it left are the writer's to remove.
+            let mut events = standard_events();
+            events.push(Event::Started);
+            rig.instance(Script::ReadyAndLeaveTheLink(events));
+            let launcher = rig.launcher(false);
+            let mut running = rig.launch(&launcher, &policy(&[])).unwrap();
+            assert_eq!(rig.routes(), ["10.20.0.0/16"]);
+            assert_eq!(rig.dns(), ["10.20.1.53"]);
+            // The instance process exits; the server's reaction is a stop.
+            rig.harness.stop.store(true, Ordering::SeqCst);
+            drop(rig.instance.lock().unwrap().take().map(JoinHandle::join));
+            assert_eq!(running.stop(), State::Stopped);
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            let unit = started_unit(&rig.harness.log).unwrap();
+            assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
+        }
+
+        #[test]
+        fn a_stop_that_cannot_be_proven_keeps_the_lease_and_a_retry_converges() {
+            if !namespaced_in(
+                "a_stop_that_cannot_be_proven_keeps_the_lease_and_a_retry_converges",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.instance(Script::ReadyAndLeaveTheLink(standard_events()));
+            let launcher = rig.launcher(false);
+            let mut running = rig.launch(&launcher, &policy(&[])).unwrap();
+            let unit = started_unit(&rig.harness.log).unwrap();
+            let generation = generation_of(&unit);
+            rig.kernel.lock().unwrap().refuse_delete = true;
+            assert_eq!(running.stop(), State::CleanupPending);
+            assert_eq!(rig.harness.leases(), [generation.as_str()]);
+            assert_eq!(rig.receipt(&generation)["complete"], false);
+            rig.kernel.lock().unwrap().refuse_delete = false;
+            assert_eq!(running.stop(), State::Stopped);
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation)["complete"], true);
+        }
+
+        #[test]
+        fn exclusion_v1_refuses_a_fortinet_attempt_while_an_ovpn_tunnel_is_present() {
+            if !namespaced_in(
+                "exclusion_v1_refuses_a_fortinet_attempt_while_an_ovpn_tunnel_is_present",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            let launcher = rig.launcher(true);
+            assert_eq!(
+                rig.launch(&launcher, &policy(&[])).err(),
+                Some(ErrorCode::Busy)
+            );
+            rig.harness.assert_no_effect(&[]);
+            assert!(rig.kernel.lock().unwrap().ops.is_empty());
+        }
+
+        #[test]
+        fn a_present_lease_blocks_a_fortinet_attempt_before_any_effect() {
+            if !namespaced_in(
+                "a_present_lease_blocks_a_fortinet_attempt_before_any_effect",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            NetworkLock::acquire_test(
+                &rig.harness.runtime,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap()
+            .register("0123456789abcdef0123456789abcdef")
+            .unwrap();
+            let launcher = rig.launcher(false);
+            assert_eq!(
+                rig.launch(&launcher, &policy(&[])).err(),
+                Some(ErrorCode::Busy)
+            );
+            assert!(rig.harness.log().is_empty());
+            assert_eq!(rig.harness.leases(), ["0123456789abcdef0123456789abcdef"]);
+            assert!(rig.kernel.lock().unwrap().ops.is_empty());
+        }
+
+        #[test]
+        fn recovery_cleans_a_fortinet_generation_left_by_a_dead_writer() {
+            if !namespaced_in(
+                "recovery_cleans_a_fortinet_generation_left_by_a_dead_writer",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.instance(Script::ReadyAndLeaveTheLink(standard_events()));
+            let launcher = rig.launcher(false);
+            let running = rig.launch(&launcher, &policy(&[])).unwrap();
+            let unit = started_unit(&rig.harness.log).unwrap();
+            let generation = generation_of(&unit);
+            assert_eq!(rig.routes(), ["10.20.0.0/16"]);
+            // The writer dies: nothing of the session's teardown runs.
+            std::mem::forget(running);
+            launcher.recover().unwrap();
+            assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation)["complete"], true);
+            // A second recovery finds a complete receipt and does nothing.
+            let ops = rig.kernel.lock().unwrap().ops.len();
+            let log = rig.harness.log().len();
+            launcher.recover().unwrap();
+            assert_eq!(rig.kernel.lock().unwrap().ops.len(), ops);
+            assert_eq!(rig.harness.log().len(), log);
+        }
     }
 
     mod xfrm_tests {
