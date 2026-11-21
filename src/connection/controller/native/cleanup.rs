@@ -113,6 +113,7 @@ impl<'a> NativeAttempt<'a> {
             written_unix_ms,
             service_id,
             dns_key: self.dns.as_ref().map(|dns| dns.key()),
+            session_dir: None,
             processes,
             interface,
             sink: routes
@@ -842,6 +843,7 @@ mod abandon_tests {
             written_unix_ms: 1,
             service_id: None,
             dns_key: None,
+            session_dir: None,
             processes: Vec::new(),
             interface: None,
             sink: None,
@@ -1121,6 +1123,7 @@ mod abandon_tests {
             written_unix_ms: 123,
             service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
             dns_key: None,
+            session_dir: None,
             processes: vec![fence::ProcessIdentity {
                 pid: 42,
                 start_sec: 123,

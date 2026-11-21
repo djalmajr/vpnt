@@ -34,6 +34,8 @@ pub struct Fence {
     pub service_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<String>,
     pub processes: Vec<ProcessIdentity>,
     pub interface: Option<Interface>,
     pub sink: Option<Sink>,
@@ -111,6 +113,35 @@ fn parse_name(value: &CStr) -> Result<(String, u64), Error> {
 fn value_with_suffix(value: &str) -> String {
     format!("{value}.json")
 }
+pub(crate) fn is_ovpn_session_name(name: &str) -> bool {
+    let Some((pid, rest)) = name
+        .strip_prefix("vpnt-ovpn-")
+        .and_then(|s| s.split_once('-'))
+    else {
+        return false;
+    };
+    let Some((salt, attempt)) = rest.split_once('-') else {
+        return false;
+    };
+    let Ok((pid_value, salt_value, attempt_value)) = pid.parse::<u32>().and_then(|pid| {
+        u32::from_str_radix(salt, 16)
+            .and_then(|salt| attempt.parse::<u8>().map(|attempt| (pid, salt, attempt)))
+    }) else {
+        return false;
+    };
+    pid_value != 0
+        && salt_value < 1_000_000_000
+        && attempt_value < 16
+        && name == format!("vpnt-ovpn-{pid_value}-{salt_value:x}-{attempt_value}")
+}
+
+pub(crate) fn ovpn_session_dir_name(path: &str) -> Option<&str> {
+    // Match the wire string before Path can normalize redundant components.
+    let base = crate::helper::paths::ovpn_sessions_directory();
+    let name = path.strip_prefix(base.to_str()?)?.strip_prefix('/')?;
+    is_ovpn_session_name(name).then_some(name)
+}
+
 fn validate_fence(fence: &Fence, uid: u32, profile: &str, generation: u64) -> Result<(), Error> {
     if fence.version != 1
         || uid == 0
@@ -118,6 +149,10 @@ fn validate_fence(fence: &Fence, uid: u32, profile: &str, generation: u64) -> Re
         || fence.profile != profile
         || fence.generation != generation
         || name(profile, generation).is_err()
+        || fence
+            .session_dir
+            .as_deref()
+            .is_some_and(|path| fence.kind != Kind::Ovpn || ovpn_session_dir_name(path).is_none())
     {
         return Err(Error::Invalid);
     }
@@ -589,6 +624,7 @@ mod tests {
                 written_unix_ms: 123456,
                 service_id: Some("12345678-1234-4123-8123-123456789ABC".into()),
                 dns_key: None,
+                session_dir: None,
                 processes: vec![ProcessIdentity {
                     pid: 123,
                     start_sec: 456,
@@ -627,6 +663,59 @@ mod tests {
         fn overwrite(&self, contents: &[u8]) {
             fs::write(self.target(), contents).unwrap();
         }
+    }
+
+    #[test]
+    fn ovpn_session_dir_must_be_an_exact_private_child() {
+        let fixture = Fixture::new();
+        let base = crate::helper::paths::ovpn_sessions_directory();
+        let valid = base.join("vpnt-ovpn-123-1ab-15");
+        let mut data = serde_json::to_value(fixture.fence()).unwrap();
+        data["kind"] = "ovpn".into();
+        let mut write = |path: &Path| {
+            data["session_dir"] = path.to_str().unwrap().into();
+            fs::write(fixture.target(), serde_json::to_vec(&data).unwrap()).unwrap();
+            read(&fixture.root, fixture.owner, fixture.uid, "a-b", 3)
+        };
+        super::write(&fixture.root, fixture.owner, &fixture.fence()).unwrap();
+        assert!(
+            write(&valid).unwrap().is_some(),
+            "valid private child refused"
+        );
+        for path in [
+            Path::new("/tmp").join(valid.file_name().unwrap()),
+            base.join("nested").join("../vpnt-ovpn-123-1ab-15"),
+            base.join("./vpnt-ovpn-123-1ab-15"),
+            base.join("vpnt-ovpn-123-01ab-15"),
+            base.join("vpnt-ovpn-123-1ab-16"),
+            base.join("vpnt-ovpn-123-3b9aca00-0"),
+            base.join("vpnt-ovpn-0-1ab-0"),
+        ] {
+            assert!(matches!(write(&path), Err(Error::Invalid)), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn ovpn_session_dir_does_not_admit_unknown_fields_or_versions() {
+        let fixture = Fixture::new();
+        write(&fixture.root, fixture.owner, &fixture.fence()).unwrap();
+        let mut data = serde_json::to_value(fixture.fence()).unwrap();
+        data["kind"] = "ovpn".into();
+        data["session_dir"] = crate::helper::paths::ovpn_sessions_directory()
+            .join("vpnt-ovpn-123-1ab-0")
+            .to_str()
+            .unwrap()
+            .into();
+        let load = |value: &serde_json::Value| {
+            fs::write(fixture.target(), serde_json::to_vec(value).unwrap()).unwrap();
+            read(&fixture.root, fixture.owner, fixture.uid, "a-b", 3)
+        };
+        assert!(load(&data).unwrap().is_some());
+        let mut unknown = data.clone();
+        unknown["unknown"] = true.into();
+        assert!(matches!(load(&unknown), Err(Error::Invalid)));
+        data["version"] = 0.into();
+        assert!(matches!(load(&data), Err(Error::Invalid)));
     }
     impl Drop for Fixture {
         fn drop(&mut self) {

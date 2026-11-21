@@ -615,6 +615,154 @@ fn pdeathsig_stops_openvpn_when_starting_process_exits() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn management_disconnect_stops_openvpn_after_starting_process_is_killed() {
+    use std::{
+        mem,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::process::ExitStatusExt,
+        },
+        process::{Child, Command, Stdio},
+        ptr, thread,
+    };
+
+    const CHILD: &str = "VPNT_MANAGEMENT_DISCONNECT_CHILD";
+    const BASE: &str = "VPNT_MANAGEMENT_DISCONNECT_BASE";
+    const PORT: &str = "VPNT_MANAGEMENT_DISCONNECT_PORT";
+    if let Some(directory) = std::env::var_os(CHILD) {
+        let fixture = mem::ManuallyDrop::new(Fixture {
+            directory: directory.into(),
+            openvpn: std::env::var_os("VPNT_TEST_OPENVPN").unwrap().into(),
+        });
+        let base = PathBuf::from(std::env::var_os(BASE).unwrap());
+        let port = std::env::var(PORT).unwrap().parse().unwrap();
+        let launch = Launch {
+            openvpn: fixture.openvpn.clone(),
+            config: config_source(&fixture.path("client.ovpn")),
+            dev: None,
+            signatures: Signatures::Any,
+            extra: fixture.client_extra((0, port), ""),
+            env: Vec::new(),
+        };
+        let session =
+            Session::start_with(launch, fixture.signer(), &base, restart_policy()).unwrap();
+        wait_for_connected(&session, Duration::from_secs(20));
+        let pid = session.pid().unwrap();
+        fs::write(fixture.path("pid.tmp"), pid.to_string()).unwrap();
+        fs::rename(fixture.path("pid.tmp"), fixture.path("pid")).unwrap();
+        // The parent keeps stdin open until after SIGKILL. EOF lets Session
+        // clean up its own openvpn if the parent fails before sending it.
+        io::copy(&mut io::stdin().lock(), &mut io::sink()).unwrap();
+        drop(session);
+        return;
+    }
+
+    struct Starter(Child);
+    impl Drop for Starter {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(fixture) = Fixture::new("management-disconnect") else {
+        return;
+    };
+    let ports = free_udp_ports();
+    let _server = fixture.server(ports);
+    fixture.client_config(ports, "");
+    // Keep the leaf short enough for the macOS management socket. Choose a
+    // fresh base so cleanup owns every entry even if the starter is killed.
+    let temp = std::env::temp_dir();
+    let base = ('a'..='z')
+        .filter(|&letter| letter != 's')
+        .find_map(|letter| {
+            let path = temp.join(letter.to_string());
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => Some(Scratch(path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => panic!("couldn't make a private session base: {error}"),
+            }
+        })
+        .expect("no free short session base");
+    let mut starter = Starter(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "management_disconnect_stops_openvpn_after_starting_process_is_killed",
+                "--nocapture",
+            ])
+            .env(CHILD, &fixture.directory)
+            .env(BASE, base.path())
+            .env(PORT, ports.1.to_string())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let pid: u32 = loop {
+        match fs::read_to_string(fixture.path("pid")) {
+            Ok(value) => break value.parse().unwrap(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("couldn't read startup receipt: {error}"),
+        }
+        assert!(
+            starter.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "starter did not report a connected OpenVPN process"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    // Register before killing the starter. The kernel associates NOTE_EXIT
+    // with the original process, even if its numeric PID is later reused.
+    let fd = unsafe { libc::kqueue() };
+    assert!(fd >= 0, "kqueue: {}", io::Error::last_os_error());
+    let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+    let watch = libc::kevent {
+        ident: pid as usize,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ONESHOT,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: ptr::null_mut(),
+    };
+    assert_eq!(
+        unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &watch,
+                1,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+            )
+        },
+        0,
+        "OpenVPN exited before the starter was killed: {}",
+        io::Error::last_os_error()
+    );
+    let observe = |seconds| {
+        let timeout = libc::timespec {
+            tv_sec: seconds,
+            tv_nsec: 0,
+        };
+        let mut event: libc::kevent = unsafe { mem::zeroed() };
+        let count =
+            unsafe { libc::kevent(queue.as_raw_fd(), ptr::null(), 0, &mut event, 1, &timeout) };
+        assert!(count >= 0, "kevent: {}", io::Error::last_os_error());
+        (count == 1).then_some(event)
+    };
+    assert!(observe(0).is_none(), "OpenVPN exited before SIGKILL");
+    starter.0.kill().unwrap();
+    assert_eq!(starter.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let event = observe(10).expect("OpenVPN did not exit within ten seconds of management EOF");
+    assert!(event.ident == pid as usize && event.fflags & libc::NOTE_EXIT != 0);
+    assert_eq!(event.flags & libc::EV_ERROR, 0);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn pdeathsig_stops_peer_that_ignores_management_disconnect() {
