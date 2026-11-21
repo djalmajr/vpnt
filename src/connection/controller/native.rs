@@ -6,6 +6,7 @@ mod ipsec;
 mod ovpn;
 #[cfg(target_os = "macos")]
 pub(crate) mod ovpn_base;
+pub(super) mod remote_signer;
 use crate::{
     connection::{
         macos::{
@@ -140,13 +141,16 @@ pub fn run_ssl(
     ));
     // A missing IPsec domain is a real unsupported capability; SSL still runs.
     let domain = NativeDomain::new(controller).ok();
-    engine::run(
-        NativeFactory::new(routes, store, domain, uid),
+    let (factory, sign_replies) =
+        NativeFactory::production(routes, store, domain, uid, output.clone());
+    engine::run_native(
+        factory,
         uid,
         profiles,
         requests,
         output,
         Timing::default(),
+        sign_replies,
     )
 }
 struct NativeAttempt<'a> {

@@ -2,6 +2,7 @@
 use super::NativeAttempt;
 use super::ipsec::{NativeDomain, NativeIpsecAttempt};
 use super::ovpn::{NativeOvpnAttempt, OvpnSigners};
+use super::remote_signer::RemoteSigners;
 use super::*;
 
 pub(super) struct NativeFactory<'a> {
@@ -17,6 +18,19 @@ pub(super) struct NativeFactory<'a> {
 }
 
 impl<'a> NativeFactory<'a> {
+    pub(super) fn production(
+        routes: Routes<'a>,
+        profiles: Arc<Profiles>,
+        domain: Option<NativeDomain<'a>>,
+        uid: u32,
+        output: SyncSender<Message>,
+    ) -> (Self, Arc<RemoteSigners>) {
+        let signers = Arc::new(RemoteSigners::new(output));
+        let mut factory = Self::new(routes, profiles, domain, uid);
+        factory.ovpn_signers = Some(signers.clone());
+        (factory, signers)
+    }
+
     #[cfg(test)]
     pub(super) fn with_ovpn_signers(mut self, signers: Arc<dyn OvpnSigners>) -> Self {
         self.ovpn_signers = Some(signers);
@@ -200,11 +214,10 @@ impl<'a> Factory for NativeFactory<'a> {
                 profile: profile.id.clone(),
                 generation,
             };
-            let signer = signers.signer(&profile.id, generation);
             return AttemptKind::Ovpn(Box::new(NativeOvpnAttempt::new(
                 profile,
                 self.profiles.clone(),
-                signer,
+                signers.as_ref(),
                 owner,
                 self.routes.clone(),
                 canceled,

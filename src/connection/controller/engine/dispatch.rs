@@ -1,5 +1,34 @@
 use super::*;
 
+#[cfg(target_os = "macos")]
+pub(super) fn dispatch_sign_reply(
+    request: Request,
+    signers: Option<&RemoteSigners>,
+    output: &mut VecDeque<Message>,
+) -> Option<Request> {
+    let Command::SignReply {
+        id,
+        profile,
+        generation,
+        epoch,
+        result,
+    } = request.command
+    else {
+        return Some(request);
+    };
+    let accepted = valid_profile_id(&request.id)
+        && signers.is_some_and(|signers| signers.deliver(id, &profile, generation, epoch, result));
+    output.push_back(if accepted {
+        Message::Accepted { id: request.id }
+    } else {
+        Message::Failed {
+            id: request.id,
+            error: ErrorCode::InvalidRequest,
+        }
+    });
+    None
+}
+
 pub(super) fn dispatch<F: Factory>(
     request: Request,
     factory: &F,
@@ -69,8 +98,7 @@ pub(super) fn dispatch<F: Factory>(
         }
         #[cfg(unix)]
         Command::SignReply { .. } => {
-            // No signature request can be pending in this slice: a reply is
-            // an invalid command for the current state.
+            // Platforms without a remote signer reject replies.
             fail(output, ErrorCode::InvalidRequest);
             return;
         }
