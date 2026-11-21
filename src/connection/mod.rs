@@ -9,4 +9,4 @@ pub mod macos;
 pub mod ovpn;
 pub mod routes;
 pub mod ssl;
-mod ssl_output;
+pub(crate) mod ssl_output;
