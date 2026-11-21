@@ -142,3 +142,99 @@ fn expired_request_does_not_change_choices() {
     );
     assert_eq!(broker.snapshot().preferences, baseline);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn previous_session_notice_keeps_the_helper_during_a_thirty_second_recovery() {
+    for announced in [false, true] {
+        let (send_request, requests) = std::sync::mpsc::sync_channel(8);
+        let (send_reply, replies) = std::sync::mpsc::sync_channel(8);
+        let mut broker = Broker::new(
+            Some(Client::fixture_channels(send_request, replies)),
+            NoSecrets,
+        );
+        let initial = requests.try_recv().unwrap();
+        assert_eq!(initial.id, protocol::WAIT_CAPABILITY_SNAPSHOT_ID);
+        assert!(matches!(initial.command, protocol::Command::Snapshot {}));
+        if announced {
+            send_reply
+                .send(Message::PreviousSessionFinishing {
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                })
+                .unwrap();
+            broker.poll();
+            assert_eq!(broker.helper, "previous_session_finishing");
+        }
+        // Advance only the admission clock. The fixture stays connected and
+        // withholds the first Snapshot throughout the simulated cleanup.
+        broker.startup -= Duration::from_secs(30);
+        broker.poll();
+        assert_eq!(broker.dead, !announced);
+        assert!(!broker.ready);
+        if announced {
+            send_reply
+                .send(Message::Snapshot {
+                    id: initial.id,
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build: None,
+                    profiles: vec![],
+                    connections: vec![],
+                })
+                .unwrap();
+            broker.poll();
+            assert!(broker.ready);
+            assert!(!broker.dead);
+            assert!(!broker.waiting_previous);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn review_startup_deadline_without_a_wait_notice_retires_the_helper() {
+    use std::sync::mpsc::sync_channel;
+
+    for announced in [false, true] {
+        let (requests, requests_rx) = sync_channel(4);
+        let (replies, replies_rx) = sync_channel(4);
+        let mut broker = Broker::new(
+            Some(Client::fixture_channels(requests, replies_rx)),
+            NoSecrets,
+        );
+        assert_eq!(
+            requests_rx.try_recv().unwrap().id,
+            protocol::WAIT_CAPABILITY_SNAPSHOT_ID
+        );
+        assert!(broker.starting());
+        broker.startup = Instant::now();
+        if announced {
+            replies
+                .try_send(Message::PreviousSessionFinishing {
+                    protocol_version: protocol::VERSION,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                })
+                .unwrap();
+        }
+        broker.poll();
+        if announced {
+            assert_eq!(broker.helper, "previous_session_finishing");
+            assert!(!broker.dead);
+        } else {
+            assert_eq!(broker.helper, "missing");
+            assert!(broker.dead);
+            assert!(
+                broker
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .send(Request {
+                        id: protocol::WAIT_CAPABILITY_SNAPSHOT_ID.into(),
+                        command: protocol::Command::Snapshot {},
+                    })
+                    .is_err()
+            );
+        }
+    }
+}

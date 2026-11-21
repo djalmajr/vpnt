@@ -116,7 +116,6 @@ fn stale_dispatch_is_rejected_when_open_or_hide_interleaves() {
 
 #[test]
 fn timeout_kills_and_reaps_the_fake_executable() {
-    use std::os::unix::fs::PermissionsExt;
     struct TempRoot(std::path::PathBuf);
     impl Drop for TempRoot {
         fn drop(&mut self) {
@@ -132,12 +131,10 @@ fn timeout_kills_and_reaps_the_fake_executable() {
     let root = TempRoot(path);
     let script = root.0.join("fake hyprctl");
     let pid_file = root.0.join("pid file");
-    std::fs::write(
+    crate::test_support::write_script(
         &script,
         "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nexec /usr/bin/sleep 5\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let start = Instant::now();
     let result = placement::command_at(&script, &[pid_file.to_str().unwrap()]);
     let elapsed = start.elapsed();

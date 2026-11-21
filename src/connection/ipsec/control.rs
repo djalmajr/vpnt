@@ -9,6 +9,37 @@ mod backend;
 mod io;
 use io::Call;
 
+/// The patched macOS charon is pinned to one build; the stock Linux charon is
+/// admitted across the tested 6.1 patch range, with no pre-release suffix,
+/// distribution separator or extra component.
+#[cfg(target_os = "macos")]
+fn version_supported(version: &Message) -> Result<(), Error> {
+    if version.get_text("version") != Some("6.1.0") {
+        Err(Error::Incompatible)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn version_supported(version: &Message) -> Result<(), Error> {
+    let Some(value) = version.get_text("version") else {
+        return Err(Error::Incompatible);
+    };
+    let mut parts = value.split('.');
+    let supported = parts.next() == Some("6")
+        && parts.next() == Some("1")
+        && parts.next().is_some_and(|patch| {
+            !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && parts.next().is_none();
+    if supported {
+        Ok(())
+    } else {
+        Err(Error::Incompatible)
+    }
+}
+
 /// Implementations must admit the original owned producer and its private
 /// socket on every open. UID alone is insufficient. Retirement targets only
 /// that producer, is idempotent, and returns true only after its observed exit.
@@ -104,11 +135,10 @@ impl<N: Observer, P: Peer> Control<N, P> {
         let version = self
             .exchange(&call, "version", Message::new(), &[])?
             .response;
-        if version.get_text("daemon") != Some("charon")
-            || version.get_text("version") != Some("6.1.0")
-        {
+        if version.get_text("daemon") != Some("charon") {
             return Err(Error::Incompatible);
         }
+        version_supported(&version)?;
         self.version_verified = true;
         // Real constructor evidence before any connection or shared secret is
         // serialized: a stale or foreign backend is refused here.
