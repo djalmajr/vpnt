@@ -1,0 +1,36 @@
+[Unit]
+Description=VPN Tray tunnel provider
+Documentation=https://github.com/djalmajr/vpnt
+Requires=vpnt-tunneld.socket
+After=vpnt-tunneld.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/vpnt/vpnt-tunneld
+# Closed skeleton. I2 and S2 will revise the sandbox using measurements.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+LimitCORE=0

@@ -560,6 +560,11 @@ fn transition(c: &mut Connection, state: State, failure: Option<FailureView>) {
 mod preferences_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+// The rest of the broker suite builds only on macOS; the app signer also runs
+// on Linux, so its tests run there with a minimal secret store.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/linux_signer.rs"]
+mod linux_signer_tests;
 
 #[cfg(all(test, feature = "desktop", target_os = "macos"))]
 impl<S: SecretStore> Broker<S> {

@@ -69,7 +69,7 @@ impl Client {
         client.fixture_build = Some("a".repeat(64));
         Ok(client)
     }
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn fixture_channels(
         requests: SyncSender<Request>,
         output: Receiver<Message>,
@@ -83,6 +83,7 @@ impl Client {
                 finished: AtomicBool::new(false),
             }),
             failed: false,
+            #[cfg(target_os = "macos")]
             fixture_build: None,
         }
     }

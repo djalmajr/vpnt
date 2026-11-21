@@ -1,5 +1,5 @@
-use super::super::super::signer::AppSigner;
 use super::*;
+use crate::broker::signer::AppSigner;
 use crate::{
     connection::ovpn::{
         session::SignError,
@@ -1069,7 +1069,7 @@ fn disconnect_releases_the_production_opener_while_the_module_gate_is_held() {
         }
     }
 
-    let path = std::env::temp_dir()
+    let path = crate::connection::ovpn::pkcs11::tests::admitted_fixture_base()
         .canonicalize()
         .unwrap()
         .join(format!("vpnt-opener-gate-{}.dylib", std::process::id()));
@@ -1092,7 +1092,7 @@ fn disconnect_releases_the_production_opener_while_the_module_gate_is_held() {
         .view
         .profile
         .ovpn = Some(settings);
-    let opener = Arc::clone(&super::super::super::signer::Signing::default().open);
+    let opener = Arc::clone(&crate::broker::signer::Signing::default().open);
     let (started, starting) = mpsc::channel();
     let (finished, finishing) = mpsc::channel();
     wire.broker.signing.open = Arc::new(move |settings, canceled, expires| {
