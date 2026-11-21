@@ -5,7 +5,10 @@ use super::{
         ErrorCode, Request, Response, TunName, VERSION, encode_response, parse_request, read_line,
     },
 };
-use crate::helper::local_socket::peer_uid;
+use crate::{
+    helper::local_socket::peer_uid,
+    netlease::{NetworkGuard, NetworkLock},
+};
 use std::{
     collections::{HashMap, HashSet},
     ffi::{CString, OsString},
@@ -21,7 +24,10 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -30,6 +36,17 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const NETWORK_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
+const RETRY_BUDGET: Duration = Duration::from_secs(2);
+const RETRY_ITEM_PAUSE: Duration = Duration::from_millis(50);
+
+fn retry_delays() -> impl Iterator<Item = Duration> {
+    [250, 500, 1000, 2000]
+        .into_iter()
+        .chain(std::iter::repeat(5000))
+        .map(Duration::from_millis)
+}
 
 fn admit(uid: u32) -> Result<(), ErrorCode> {
     if uid == 0 {
@@ -55,10 +72,10 @@ pub fn cleanup_startup(backend: &impl Backend) -> io::Result<Vec<TunName>> {
     Ok(pending)
 }
 
-#[derive(Default)]
-struct RetryPass {
-    done: Mutex<bool>,
-    finished: Condvar,
+/// Check kernel ownership under the shared network lock before admitting a
+/// new tunnel. An owned link remains a receipt even across a netd restart.
+pub fn ovpn_present(backend: &impl Backend) -> io::Result<bool> {
+    Ok(backend.existing()?.iter().any(|entry| entry.owned))
 }
 
 #[derive(Clone, Copy)]
@@ -77,12 +94,23 @@ impl CleanupProof {
     }
 }
 
+enum RetryOutcome {
+    Deadline,
+    Unattempted,
+    NoDeletion,
+    Deleted,
+}
+
 pub(super) struct Server<B> {
     backend: B,
     reserved: Mutex<HashSet<TunName>>,
     active: Mutex<HashMap<u32, usize>>,
     pending: Mutex<HashMap<TunName, CleanupProof>>,
-    retry: Mutex<Option<Arc<RetryPass>>>,
+    retry_running: AtomicBool,
+    lock_timeout: Duration,
+    open_lock_timeout: Duration,
+    #[cfg(test)]
+    network_directory: Option<PathBuf>,
     hello_timeout: Duration,
     idle_timeout: Duration,
     frame_timeout: Duration,
@@ -94,13 +122,35 @@ impl<B: Backend + 'static> Server<B> {
             reserved: Mutex::new(HashSet::new()),
             active: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            retry: Mutex::new(None),
+            retry_running: AtomicBool::new(false),
+            lock_timeout: NETWORK_LOCK_TIMEOUT,
+            open_lock_timeout: OPEN_LOCK_TIMEOUT,
+            #[cfg(test)]
+            network_directory: None,
             hello_timeout,
             idle_timeout: IDLE_TIMEOUT,
             frame_timeout: FRAME_TIMEOUT,
         }
     }
+    fn network_lock(&self, deadline: Instant) -> io::Result<NetworkGuard> {
+        #[cfg(test)]
+        if let Some(directory) = &self.network_directory {
+            return NetworkLock::acquire_test(directory, deadline);
+        }
+        NetworkLock::acquire(deadline)
+    }
+
+    fn lock_deadline(&self) -> Instant {
+        Instant::now() + self.lock_timeout
+    }
+
+    fn request_lock(&self, deadline: Instant) -> Result<NetworkGuard, ErrorCode> {
+        self.network_lock(deadline)
+            .map_err(|error| network_error("network_lock_failed", error))
+    }
+
     fn startup(&self) -> io::Result<()> {
+        let _lock = self.network_lock(self.lock_deadline())?;
         let pending = cleanup_startup(&self.backend)?;
         self.reserved
             .lock()
@@ -112,64 +162,154 @@ impl<B: Backend + 'static> Server<B> {
             .extend(pending.into_iter().map(|name| (name, CleanupProof::Marked)));
         Ok(())
     }
-    fn retry_pending(self: &Arc<Self>, wait: bool) {
-        let pass = {
-            let mut running = self.retry.lock().expect("retry mutex");
-            if let Some(pass) = running.as_ref() {
-                Arc::clone(pass)
-            } else {
-                if self.pending.lock().expect("pending mutex").is_empty() {
-                    return;
-                }
-                let pass = Arc::new(RetryPass::default());
-                *running = Some(Arc::clone(&pass));
-                let server = Arc::clone(self);
-                let worker_pass = Arc::clone(&pass);
-                if thread::Builder::new()
-                    .spawn(move || {
-                        server.retry_pass();
-                        let mut running = server.retry.lock().expect("retry mutex");
-                        *running = None;
-                        *worker_pass.done.lock().expect("retry pass mutex") = true;
-                        worker_pass.finished.notify_all();
-                    })
-                    .is_err()
-                {
-                    *running = None;
-                    return;
-                }
-                pass
+    fn retry_pending(self: &Arc<Self>) {
+        {
+            let pending = self.pending.lock().expect("pending mutex");
+            if pending.is_empty() || self.retry_running.swap(true, Ordering::Relaxed) {
+                return;
             }
-        };
-        if wait {
-            let done = pass.done.lock().expect("retry pass mutex");
-            let _result =
-                pass.finished
-                    .wait_timeout_while(done, self.backend.retry_wait(), |done| !*done);
+        }
+        let server = Arc::downgrade(self);
+        if let Err(error) = thread::Builder::new().spawn(move || {
+            let mut resume = None;
+            let mut delays = retry_delays();
+            loop {
+                thread::sleep(delays.next().expect("retry delays never end"));
+                let Some(server) = server.upgrade() else {
+                    break;
+                };
+                if !server.retry_needed() {
+                    break;
+                }
+                if server.retry_background_pass(&mut resume) {
+                    delays = retry_delays();
+                }
+                if !server.retry_needed() {
+                    break;
+                }
+            }
+        }) {
+            let _pending = self.pending.lock().expect("pending mutex");
+            self.retry_running.store(false, Ordering::Relaxed);
+            network_error("cleanup_worker_failed", error);
         }
     }
-    fn retry_pass(&self) {
-        let names = self.pending.lock().expect("pending mutex").clone();
-        for (name, proof) in names {
-            // Refresh for each deletion. A pass can outlast one backend deadline.
-            let Ok(existing) = self.backend.existing() else {
-                log_tun("cleanup_inventory_failed", 0, &name);
-                continue;
+
+    fn retry_needed(&self) -> bool {
+        let pending = self.pending.lock().expect("pending mutex");
+        if pending.is_empty() {
+            // Serialize relinquishing the worker with enqueue and startup so a
+            // concurrent deferral either has a worker or starts a new one.
+            self.retry_running.store(false, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn pending_names(&self) -> Vec<TunName> {
+        let mut names: Vec<_> = self
+            .pending
+            .lock()
+            .expect("pending mutex")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        names
+    }
+
+    fn retry_background_pass(&self, resume: &mut Option<TunName>) -> bool {
+        let names = self.pending_names();
+        let mut unattempted = None;
+        let mut deleted = false;
+        for remaining in (0..names.len()).rev() {
+            // If the cursor was cleared by inline cleanup, use its successor.
+            let index = resume.as_ref().map_or(0, |name| {
+                names.partition_point(|pending| pending.as_str() < name.as_str())
+            }) % names.len();
+            let name = &names[index];
+            let Ok(lock) = self.request_lock(Instant::now() + self.open_lock_timeout) else {
+                *resume = Some(name.clone());
+                return false;
             };
-            match existing.iter().find(|entry| entry.name == name) {
-                Some(entry) if !proof.matches(entry) => {
-                    log_tun("cleanup_name_conflict", 0, &name);
-                    continue;
+            // Hold the guard for one item: inventory, DNS revert and link
+            // deletion, each bounded by the backend's command timeout.
+            let outcome = self.retry_item(&lock, name, None);
+            drop(lock);
+
+            match outcome {
+                RetryOutcome::Deleted => deleted = true,
+                RetryOutcome::Unattempted => {
+                    unattempted.get_or_insert(name);
                 }
-                Some(_) if self.backend.delete_tun(&name).is_err() => {
-                    log_tun("cleanup_retry_failed", 0, &name);
-                    continue;
-                }
-                _ => {}
+                RetryOutcome::NoDeletion | RetryOutcome::Deadline => {}
             }
-            self.pending.lock().expect("pending mutex").remove(&name);
-            self.release(&name);
-            log_tun("cleanup_released", 0, &name);
+            *resume = Some(names[(index + 1) % names.len()].clone());
+            if remaining > 0 {
+                thread::sleep(RETRY_ITEM_PAUSE);
+            }
+        }
+        if let Some(name) = unattempted {
+            *resume = Some(name.clone());
+        }
+        deleted
+    }
+
+    fn retry_inline(&self, lock: &NetworkGuard, deadline: Instant) {
+        let deadline = deadline.min(Instant::now() + self.backend.retry_wait());
+        for name in self.pending_names() {
+            if let RetryOutcome::Deadline = self.retry_item(lock, &name, Some(deadline)) {
+                break;
+            }
+        }
+    }
+
+    fn retry_item(
+        &self,
+        _lock: &NetworkGuard,
+        name: &TunName,
+        deadline: Option<Instant>,
+    ) -> RetryOutcome {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            return RetryOutcome::Deadline;
+        }
+        let Some(proof) = self
+            .pending
+            .lock()
+            .expect("pending mutex")
+            .get(name)
+            .copied()
+        else {
+            return RetryOutcome::NoDeletion;
+        };
+        let Ok(existing) = self.backend.existing() else {
+            log_tun("cleanup_inventory_failed", 0, name);
+            return RetryOutcome::Unattempted;
+        };
+        let deleted = match existing.iter().find(|entry| entry.name == *name) {
+            Some(entry) if !proof.matches(entry) => {
+                log_tun("cleanup_name_conflict", 0, name);
+                return RetryOutcome::Unattempted;
+            }
+            Some(_) if deadline.is_some_and(|end| Instant::now() >= end) => {
+                return RetryOutcome::Deadline;
+            }
+            Some(_) => {
+                if self.backend.delete_tun(name).is_err() {
+                    log_tun("cleanup_retry_failed", 0, name);
+                    return RetryOutcome::NoDeletion;
+                }
+                true
+            }
+            None => false,
+        };
+        self.pending.lock().expect("pending mutex").remove(name);
+        self.release(name);
+        log_tun("cleanup_released", 0, name);
+        if deleted {
+            RetryOutcome::Deleted
+        } else {
+            RetryOutcome::NoDeletion
         }
     }
     pub(super) fn dispatch(
@@ -193,7 +333,7 @@ impl<B: Backend + 'static> Server<B> {
         thread::Builder::new()
             .spawn(move || {
                 if admit(uid).is_ok() {
-                    slot.server.retry_pending(false);
+                    slot.server.retry_pending();
                 }
                 let _ = slot.server.session(&stream, uid, accepted);
             })
@@ -252,8 +392,8 @@ impl<B: Backend + 'static> Server<B> {
         }
     }
     fn create(&self, uid: u32) -> Result<TunName, ErrorCode> {
-        let mut reserved = self.reserved.lock().expect("reservation mutex");
         let existing = self.backend.existing().map_err(|_| ErrorCode::Backend)?;
+        let mut reserved = self.reserved.lock().expect("reservation mutex");
         let name = (0..100)
             .map(|index| TunName::parse(&format!("vpnt{index}")).expect("generated name"))
             .find(|name| {
@@ -370,6 +510,11 @@ fn log_tun(event: &str, uid: u32, name: &TunName) {
     let _ = writeln!(io::stderr().lock(), "{event} uid={uid} tun={name}");
 }
 
+fn network_error(event: &str, error: io::Error) -> ErrorCode {
+    let _ = writeln!(io::stderr().lock(), "{event}: {error}");
+    ErrorCode::Backend
+}
+
 struct Session<'a, B: Backend + 'static> {
     server: &'a Arc<Server<B>>,
     uid: u32,
@@ -392,7 +537,18 @@ impl<B: Backend + 'static> Session<'_, B> {
                 if self.owned.len() >= 2 {
                     return Err(ErrorCode::Limit);
                 }
-                self.server.retry_pending(true);
+                let deadline = Instant::now() + self.server.open_lock_timeout;
+                let lock = self.server.request_lock(deadline)?;
+                // Reject an occupied or unsafe registry before any backend write,
+                // including a retry. The guard keeps that decision current.
+                if lock
+                    .tunnels_present()
+                    .map_err(|error| network_error("lease_registry_failed", error))?
+                {
+                    return Err(ErrorCode::RouteConflict);
+                }
+                self.server
+                    .retry_inline(&lock, Instant::now() + RETRY_BUDGET);
                 let name = self.server.create(self.uid)?;
                 self.owned.push(name.clone());
                 Ok(Response::Opened(name))
@@ -403,6 +559,7 @@ impl<B: Backend + 'static> Session<'_, B> {
                     return Err(ErrorCode::NotOwned);
                 }
                 let config = request.validate()?;
+                let _lock = self.server.request_lock(self.server.lock_deadline())?;
                 self.server.backend.configure(&config).map_err(|error| {
                     log_tun("configure_failed", self.uid, &name);
                     if error.kind() == io::ErrorKind::AlreadyExists {
@@ -419,6 +576,7 @@ impl<B: Backend + 'static> Session<'_, B> {
                 if !self.owned.contains(&name) {
                     return Err(ErrorCode::NotOwned);
                 }
+                let _lock = self.server.request_lock(self.server.lock_deadline())?;
                 if let Err(error) = self.delete_marked(&name) {
                     if !self.close_failed.contains(&name) {
                         self.close_failed.push(name);
@@ -469,6 +627,18 @@ impl<B: Backend + 'static> Session<'_, B> {
 }
 impl<B: Backend + 'static> Drop for Session<'_, B> {
     fn drop(&mut self) {
+        if self.owned.is_empty() {
+            return;
+        }
+        let Ok(lock) = self.server.request_lock(self.server.lock_deadline()) else {
+            // The kernel marks remain the ownership proof for a later retry.
+            for name in &self.owned {
+                self.server.defer(name, CleanupProof::Marked);
+                log_tun("cleanup_lock_pending", self.uid, name);
+            }
+            self.server.retry_pending();
+            return;
+        };
         for name in &self.owned {
             if !self.close_failed.contains(name) {
                 let _ = self.delete(name);
@@ -479,6 +649,8 @@ impl<B: Backend + 'static> Drop for Session<'_, B> {
                 self.server.defer(name, CleanupProof::Marked);
             }
         }
+        drop(lock);
+        self.server.retry_pending();
     }
 }
 
