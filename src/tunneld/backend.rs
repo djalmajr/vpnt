@@ -246,7 +246,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         guard
             .register(&attempt.generation)
             .map_err(|e| Failure::io("lease registration", &e))?;
-        drop(authorization);
+        // The lease now excludes other network writers. Keep the policy
+        // lock until the manager has accepted the unit start request.
         drop(guard);
 
         let writer = Writer::publish(
@@ -272,6 +273,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             self.limits.start,
         )
         .map_err(|e| Failure::io("systemctl start", &e))?;
+        drop(authorization);
         let attestor = CapturePeer {
             attestor: &self.attestor,
             peer: Default::default(),
@@ -1589,6 +1591,10 @@ mod tests {
             assert!(credentials.password.expose() == "fixture-password");
             assert!(credentials.psk.expose() == "fixture-psk");
             drop(credentials);
+            if root.join("pause-before-established").is_file() {
+                fs::write(root.join("received-start"), b"").unwrap();
+                wait_for_file(&root.join("allow-established"));
+            }
             channel
                 .send(
                     &serde_json::to_vec(&Reply::Established {
@@ -1630,6 +1636,9 @@ mod tests {
             assert!(matches!(response(client), Response::Version { .. }));
             client.write_all(b"{\"op\":\"prepare_ipsec\",\"endpoint\":{\"host\":\"vpn.example\",\"port\":500},\"username\":\"fixture\",\"networks\":[{\"network\":\"10.20.1.0\",\"prefix\":24}]}\n").unwrap();
             assert!(matches!(response(client), Response::Prepared {}));
+        }
+
+        fn client_credentials(client: &mut UnixStream) {
             Credentials::ipsec("fixture-password", "fixture-psk")
                 .unwrap()
                 .write(client)
@@ -1645,17 +1654,8 @@ mod tests {
             );
         }
 
-        fn exercise(name: &str, exit: bool, unproven: bool) {
-            if !namespaced_in(name, "tests::xfrm_tests") {
-                return;
-            }
-            let harness = Harness::new();
-            let policy = PolicyFixture::new();
-            policy.install();
-            if exit {
-                fs::write(harness.root.join("exit-after-setup"), b"").unwrap();
-            }
-            let mut process = Reaper(
+        fn supervisor(harness: &Harness) -> Reaper {
+            Reaper(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -1666,7 +1666,31 @@ mod tests {
                     .env(CHILD, &harness.root)
                     .spawn()
                     .unwrap(),
-            );
+            )
+        }
+
+        fn wait_for_file(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while !path.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture barrier not reached: {path:?}"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn exercise(name: &str, exit: bool, unproven: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            if exit {
+                fs::write(harness.root.join("exit-after-setup"), b"").unwrap();
+            }
+            let mut process = supervisor(&harness);
             let kernel = Arc::new(Mutex::new(Kernel::default()));
             let mut launcher = harness.launcher(false);
             launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
@@ -1674,13 +1698,34 @@ mod tests {
             thread::scope(|scope| {
                 let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
                 client_prepare(&mut client);
+                client_credentials(&mut client);
                 command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
                 {
                     let k = kernel.lock().unwrap();
                     assert_eq!(k.routes, ["10.20.0.0/15", "172.16.0.0/12"]);
                     assert!(k.link && k.up && k.address);
                 }
-                if exit {
+                if exit && unproven {
+                    kernel.lock().unwrap().refuse_delete = true;
+                    fs::write(harness.root.join("exit-now"), b"").unwrap();
+                    assert!(process.0.wait().unwrap().success());
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !harness
+                        .log()
+                        .iter()
+                        .any(|line| line.starts_with("stop -- "))
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "idle client did not trigger unit stop"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    command(&mut client, b"{\"op\":\"status\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    kernel.lock().unwrap().refuse_delete = false;
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                } else if exit {
                     fs::write(harness.root.join("exit-now"), b"").unwrap();
                     assert!(process.0.wait().unwrap().success());
                     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1738,6 +1783,112 @@ mod tests {
         #[test]
         fn instance_death_cleans_while_client_is_idle() {
             exercise("instance_death_cleans_while_client_is_idle", true, false);
+        }
+
+        #[test]
+        fn instance_death_preserves_lease_when_cleanup_is_unproven() {
+            exercise(
+                "instance_death_preserves_lease_when_cleanup_is_unproven",
+                true,
+                true,
+            );
+        }
+
+        #[test]
+        fn revocation_before_commit_prevents_lease_and_unit_request() {
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm =
+                Network::fake(|_, args| panic!("network operation after revoke: {args:?}"));
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                policy.revoke();
+                client_credentials(&mut client);
+                let reply = response(&client);
+                assert!(
+                    matches!(
+                        reply,
+                        Response::Error {
+                            code: ErrorCode::PermissionDenied
+                        }
+                    ),
+                    "{reply:?}"
+                );
+                drop(client);
+                assert!(worker.join().unwrap().is_ok());
+            });
+            harness.assert_no_effect(&[]);
+        }
+
+        #[test]
+        fn policy_lock_orders_revocation_after_unit_request() {
+            if !namespaced_in(
+                "policy_lock_orders_revocation_after_unit_request",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let script = format!(
+                r#"#!/bin/sh
+if [ "$1" = start ]; then
+  : > '{root}/start-entered'
+  while [ ! -f '{root}/allow-start' ]; do /usr/bin/sleep 0.01; done
+fi
+printf '%s\n' "$*" >> '{log}'
+"#,
+                root = harness.root.display(),
+                log = harness.log.display(),
+            );
+            fs::write(harness.root.join("systemctl"), script).unwrap();
+            fs::write(harness.root.join("pause-before-established"), b"").unwrap();
+
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel);
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                wait_for_file(&harness.root.join("start-entered"));
+                assert_eq!(harness.leases().len(), 1);
+                assert!(
+                    harness.log().is_empty(),
+                    "the fake manager has not accepted the request"
+                );
+
+                let contender = File::open(policy.lock_path()).unwrap();
+                // SAFETY: the descriptor exclusively belongs to this contender.
+                let locked =
+                    unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                let lock_result = io::Error::last_os_error().kind();
+                drop(contender);
+                // Unblock the fixture even if the assertion below fails.
+                fs::write(harness.root.join("allow-start"), b"").unwrap();
+                assert_eq!(
+                    locked, -1,
+                    "revocation could commit before unit start was accepted"
+                );
+                assert_eq!(lock_result, io::ErrorKind::WouldBlock);
+                wait_for_file(&harness.root.join("received-start"));
+                policy.revoke();
+                assert_eq!(harness.leases().len(), 1);
+                fs::write(harness.root.join("allow-established"), b"").unwrap();
+                command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                drop(client);
+                assert!(worker.join().is_ok());
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.leases().is_empty());
         }
 
         #[test]

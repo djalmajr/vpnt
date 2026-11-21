@@ -206,7 +206,9 @@ fn serve(
         let directory = policy.open()?;
         let lock = directory.lock_shared()?;
         let current = directory.read()?;
-        // Hold this lock until the network reservation commits the admission.
+        // Lock order is policy, then network. The launcher retains the
+        // policy guard through lease registration and the unit start request.
+        // Administrative changes take only the policy lock.
         Ok((previous.unchanged(&current)?
             && current.policy().authorize(uid, &offer) == Some(grant))
         .then_some(lock))
