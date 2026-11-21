@@ -1,5 +1,6 @@
 //! Version-one administrative tunnel grants and canonical snapshots.
 use super::protocol::{self, CidrV4, Endpoint, Prepare};
+use crate::connection::ipsec::Config;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{fmt, io, net::Ipv4Addr, str::FromStr};
 
@@ -152,16 +153,12 @@ fn validate_addresses(addresses: &mut [Ipv4Addr], maximum: usize) -> io::Result<
     Ok(())
 }
 
-fn literal_ike_identity(identity: &str) -> bool {
-    let Some((kind, text)) = identity.split_once(':') else {
-        return false;
-    };
-    matches!(kind, "fqdn" | "email")
-        && !text.is_empty()
-        && !text.starts_with('#')
-        && !(text.starts_with('^') && text.ends_with('$'))
-        && !text.contains('*')
-        && !text.chars().any(char::is_control)
+fn literal_ike_identity(identity: &str, transport_ipv4: &[Ipv4Addr]) -> bool {
+    Config::literal_peer_identity(identity)
+        && identity.strip_prefix("ipv4:").is_none_or(|text| {
+            text.parse::<Ipv4Addr>()
+                .is_ok_and(|address| transport_ipv4.contains(&address))
+        })
 }
 
 impl Entry {
@@ -180,7 +177,7 @@ impl Entry {
             (Backend::Ipsec, None)
                 if self.dns_domains.is_empty()
                     && self.dns_servers.is_empty()
-                    && literal_ike_identity(&self.peer_identity) => {}
+                    && literal_ike_identity(&self.peer_identity, &self.transport_ipv4) => {}
             (Backend::Fortinet, Some(pin))
                 if self.peer_identity == self.hostname
                     && pin.len() == 64
@@ -414,6 +411,50 @@ mod tests {
 
     fn snapshot(entry: Value) -> io::Result<Vec<u8>> {
         canonical_snapshot(&document(vec![entry]))
+    }
+
+    #[test]
+    fn policy_and_config_share_literal_ike_identity() {
+        use crate::connection::ipsec::Config;
+        let too_long = format!("fqdn:{}", "a".repeat(249));
+        for (identity, expected) in [
+            ("fqdn:vpn.example", true),
+            ("email:user@example.test", true),
+            ("ipv4:192.0.2.20", true),
+            ("ipv4:192.0.2.22", true),
+            ("ipv4:192.0.02.20", false),
+            ("ipv4:0.0.0.0", false),
+            ("fqdn:", false),
+            ("fqdn:vpn.éxample", false),
+            ("fqdn:vpn\nexample", false),
+            ("fqdn:*", false),
+            ("email:#hex", false),
+            ("email:^user@example.test$", false),
+            ("vpn.example", false),
+            (&too_long, false),
+        ] {
+            let config = Config::linux(
+                "192.0.2.20:500".parse().unwrap(),
+                identity,
+                "fixture",
+                1,
+                1,
+                vec!["dynamic".into()],
+                vec!["10.20.0.0/15".into()],
+            );
+            assert_eq!(config.is_ok(), expected, "config {identity:?}");
+            let mut grant = ipsec();
+            grant["peer_identity"] = json!(identity);
+            assert_eq!(snapshot(grant).is_ok(), expected, "policy {identity:?}");
+        }
+
+        let mut grant = ipsec();
+        grant["peer_identity"] = json!("ipv4:192.0.2.21");
+        assert!(Config::literal_peer_identity("ipv4:192.0.2.21"));
+        assert!(
+            snapshot(grant).is_err(),
+            "policy must bind IPv4 identity to approved transport"
+        );
     }
 
     #[test]
