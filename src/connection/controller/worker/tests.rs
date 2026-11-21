@@ -1048,10 +1048,8 @@ fn restart_epoch_resets_the_failure_streak() {
         assert!(Instant::now() < deadline, "the worker did not change epoch");
         thread::sleep(Duration::from_millis(1));
     }
-    // On Linux the new epoch schedules the retry probe by itself; asking for
-    // one there too would start a third probe that races the second.
-    #[cfg(not(target_os = "linux"))]
-    signal.probe.store(true, Ordering::Release);
+    // The new epoch schedules the retry probe by itself on both systems;
+    // asking for one too would start a third probe that races the second.
     let after_restart = signal.progress(2, |p| p.state == ConnectionState::Unresponsive);
     assert_eq!(
         after_restart.failures, 1,
@@ -1059,6 +1057,292 @@ fn restart_epoch_resets_the_failure_streak() {
     );
     signal.canceled.store(true, Ordering::Release);
     assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+}
+
+#[cfg(not(target_os = "linux"))]
+mod connected_phase {
+    use super::*;
+
+    #[derive(Default)]
+    struct Tick {
+        phase: Option<ConnectionState>,
+        request: bool,
+        timer_due: bool,
+        responsive: bool,
+        restart_during_probe: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Observation(usize, Option<(ConnectionState, u32)>);
+
+    struct AttemptScript<'a> {
+        ticks: std::vec::IntoIter<Tick>,
+        current: Tick,
+        observations: &'a mut Vec<Observation>,
+        signals: &'a Signals,
+        clock: ProbeClock,
+        probes: usize,
+        epoch: u64,
+        revalidating: bool,
+    }
+
+    impl Attempt for AttemptScript<'_> {
+        fn start(&mut self, _: &AtomicBool, _: Instant) -> Result<(), Failure> {
+            Ok(())
+        }
+
+        fn ready(&mut self) -> Result<bool, Failure> {
+            Ok(true)
+        }
+
+        fn healthy(&mut self) -> Result<(), Failure> {
+            if std::mem::take(&mut self.revalidating) {
+                return Ok(());
+            }
+            let publication = self.signals.state.lock().unwrap().take();
+            if let Some(progress) = publication {
+                assert!(!progress.cleaning);
+                assert_eq!(progress.failure, None);
+            }
+            self.observations.push(Observation(
+                std::mem::take(&mut self.probes),
+                publication.map(|p| (p.state, p.failures)),
+            ));
+            if let Some(tick) = self.ticks.next() {
+                self.clock.set(if tick.timer_due {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(3600)
+                });
+                self.signals.probe.store(tick.request, Ordering::Release);
+                self.current = tick;
+            } else {
+                self.signals.canceled.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
+
+        fn phase(&self) -> Option<ConnectionState> {
+            self.current.phase
+        }
+
+        fn restart_epoch(&self) -> u64 {
+            self.epoch
+        }
+
+        fn probe(&mut self, _: &AtomicBool, _: Duration) -> Result<bool, Failure> {
+            self.probes += 1;
+            self.revalidating = true;
+            if self.current.restart_during_probe {
+                self.epoch += 1;
+            }
+            Ok(self.current.responsive)
+        }
+
+        fn cleanup(&mut self) -> bool {
+            true
+        }
+    }
+
+    fn observe(ticks: Vec<Tick>) -> Vec<Observation> {
+        let fixture = signals(Arc::new(AtomicBool::new(false)));
+        let mut observations = Vec::new();
+        let cadence = clock(3600);
+        let attempt = AttemptScript {
+            ticks: ticks.into_iter(),
+            current: Tick::default(),
+            observations: &mut observations,
+            signals: &fixture,
+            clock: cadence.clone(),
+            probes: 0,
+            epoch: 0,
+            revalidating: false,
+        };
+        let mut timing = timing(Duration::from_secs(1));
+        timing.health = Duration::ZERO;
+        let finished = run(
+            attempt,
+            Signals {
+                canceled: fixture.canceled.clone(),
+                probe: fixture.probe.clone(),
+                state: fixture.state.clone(),
+                exit: fixture.exit.clone(),
+            },
+            timing,
+            cadence,
+        );
+        assert_eq!(finished.state, ConnectionState::Off);
+        let mut observations = observations.into_iter();
+        assert_eq!(
+            observations.next(),
+            Some(Observation(0, Some((ConnectionState::Verifying, 0))))
+        );
+        observations.collect()
+    }
+
+    #[test]
+    fn connected_approval_and_reconnecting_suspend_probes_and_resume_cadence() {
+        use ConnectionState::{AwaitingApproval, Connected, Reconnecting, Unresponsive};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(AwaitingApproval),
+                request: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(AwaitingApproval),
+                timer_due: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(Reconnecting),
+                timer_due: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(Reconnecting),
+                request: true,
+                ..Tick::default()
+            },
+            Tick::default(),
+            Tick {
+                timer_due: true,
+                responsive: true,
+                ..Tick::default()
+            },
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(0, Some((AwaitingApproval, 0))),
+                Observation(0, None),
+                Observation(0, Some((Reconnecting, 0))),
+                Observation(0, None),
+                // Leaving the phase probes at once, without a timer or request,
+                // and publishes the result in place of the stale phase.
+                Observation(1, Some((Unresponsive, 1))),
+                Observation(1, Some((Connected, 0))),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_phase_exit_probes_at_once_and_then_keeps_the_cadence() {
+        use ConnectionState::{AwaitingApproval, Connected};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(AwaitingApproval),
+                ..Tick::default()
+            },
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick::default(),
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(0, Some((AwaitingApproval, 0))),
+                Observation(1, Some((Connected, 0))),
+                Observation(0, None),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_probe_crossing_a_restart_is_retried_once_without_a_request() {
+        use ConnectionState::{Connected, Unresponsive};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                restart_during_probe: true,
+                ..Tick::default()
+            },
+            Tick::default(),
+            Tick::default(),
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(1, None),
+                Observation(1, Some((Unresponsive, 1))),
+                Observation(0, None),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_approval_clears_existing_failures_without_an_epoch_change() {
+        use ConnectionState::{AwaitingApproval, Unresponsive};
+
+        let observations = observe(vec![
+            Tick::default(),
+            Tick {
+                phase: Some(AwaitingApproval),
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                ..Tick::default()
+            },
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Unresponsive, 1))),
+                Observation(0, Some((AwaitingApproval, 0))),
+                Observation(1, Some((Unresponsive, 1))),
+            ],
+        );
+    }
+
+    #[test]
+    fn connected_probe_crossing_a_restart_cannot_publish_its_stale_failure() {
+        use ConnectionState::{Connected, Unresponsive};
+
+        let observations = observe(vec![
+            Tick {
+                responsive: true,
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                restart_during_probe: true,
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                ..Tick::default()
+            },
+        ]);
+        assert_eq!(
+            observations,
+            [
+                Observation(1, Some((Connected, 0))),
+                Observation(1, None),
+                Observation(1, Some((Unresponsive, 1))),
+            ],
+        );
+    }
 }
 
 #[test]

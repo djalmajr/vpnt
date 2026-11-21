@@ -214,11 +214,6 @@ impl<S: SecretStore> Broker<S> {
         if c.view.state == State::CleanupUnconfirmed {
             return Err("profile_busy");
         }
-        #[cfg(target_os = "macos")]
-        if c.view.profile.kind == VpnKind::Ovpn {
-            set_state(c, State::MissingProgram);
-            return Ok(());
-        }
         let credentials = if needs_credentials(c.view.profile.kind) {
             match self.secrets.load(id, c.view.profile.kind) {
                 Ok(credentials) => credentials,
