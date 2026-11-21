@@ -423,6 +423,12 @@ impl<S: SecretStore> Broker<S> {
                     self.request_cleanup_snapshot();
                 }
             }
+            #[cfg(unix)]
+            Message::SignRequest { .. } => {
+                // No app-side signer exists in this slice: drop the frame
+                // without retaining id, profile, generation or payload.
+                return Err(());
+            }
             #[cfg(target_os = "macos")]
             Message::Diagnostics { id, status, logs } => {
                 if self.diagnostics.pending.as_deref() != Some(id.as_str()) {

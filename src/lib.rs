@@ -36,6 +36,8 @@ pub mod secrets;
 pub mod session;
 #[cfg(unix)]
 pub mod storage;
+#[cfg(target_os = "linux")]
+pub mod tunneld;
 // Its only callers are Linux fixtures; elsewhere it would be dead code.
 #[cfg(all(test, target_os = "linux"))]
 mod test_support;

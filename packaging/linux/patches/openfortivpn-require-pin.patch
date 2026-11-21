@@ -1,0 +1,44 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -484,8 +484,11 @@
+ 			}
+ 			if (strcmp(long_options[option_index].name,
+ 			           "trusted-cert") == 0) {
+-				if (add_trusted_cert(&cli_cfg, optarg))
+-					log_warn("Could not add certificate digest to whitelist.\n");
++				// vpnt: a pin that cannot be stored must not fall back to PKI only.
++				if (add_trusted_cert(&cli_cfg, optarg)) {
++					log_error("Could not add certificate digest to whitelist.\n");
++					goto exit;
++				}
+ 				break;
+ 			}
+ 			if (strcmp(long_options[option_index].name,
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -985,14 +985,18 @@
+ 	// 1. Validate using local PKI
+ 	// 2. Compare against gateway_host and correctly check return value
+ 	//    to fix prior incorrect use of X509_check_host
+-	if (SSL_get_verify_result(tunnel->ssl_handle) == X509_V_OK
+-	    && X509_check_host(cert, tunnel->config->gateway_host,
+-	                       0, 0, NULL) == 1) {
+-		log_debug("Gateway certificate validation succeeded.\n");
+-		ret = 0;
+-		goto free_cert;
++	// vpnt: when a trusted-cert pin is configured, the PKI result cannot
++	// replace it: only the leaf digest comparison below may accept the gateway.
++	if (tunnel->config->cert_whitelist == NULL) {
++		if (SSL_get_verify_result(tunnel->ssl_handle) == X509_V_OK
++		    && X509_check_host(cert, tunnel->config->gateway_host,
++		                       0, 0, NULL) == 1) {
++			log_debug("Gateway certificate validation succeeded.\n");
++			ret = 0;
++			goto free_cert;
++		}
++		log_debug("Gateway certificate validation failed.\n");
+ 	}
+-	log_debug("Gateway certificate validation failed.\n");
+ 
+ 	// If validation failed, check if cert is in the white list
+ 	if (X509_digest(cert, EVP_sha256(), digest, &len) <= 0

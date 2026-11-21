@@ -124,12 +124,19 @@ fn verify(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Pure ownership decision for the entry we may remove: a real directory owned
+/// by the expected effective user. The caller supplies the EUID so this stays
+/// free of syscalls and can be tested with a foreign identity.
+fn owned_directory(metadata: &fs::Metadata, euid: u32) -> bool {
+    metadata.is_dir() && metadata.uid() == euid
+}
+
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         // Only a directory of this effective user is ours to remove; an entry
         // swapped in by someone else is left alone.
         match fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() } => {}
+            Ok(metadata) if owned_directory(&metadata, unsafe { libc::geteuid() }) => {}
             _ => return,
         }
         // A restrictive umask can leave the rejected directory unreadable.
@@ -138,8 +145,7 @@ impl Drop for PrivateDir {
         // itself even if it was replaced by a link after the check; a 0000
         // directory cannot be opened for fchmod.
         if let Ok(metadata) = fs::symlink_metadata(&self.path)
-            && metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
+            && owned_directory(&metadata, unsafe { libc::geteuid() })
             && metadata.mode() & 0o700 != 0o700
             && let Ok(path) = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(
                 self.path.as_os_str(),
@@ -165,7 +171,7 @@ impl Drop for PrivateDir {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrivateDir, verify};
+    use super::{PrivateDir, owned_directory, verify};
     use std::{
         fs, io,
         os::unix::fs::PermissionsExt,
@@ -288,6 +294,49 @@ mod tests {
             );
             assert_eq!(verify(&good).is_ok(), accepted, "mode {mode:o}");
         }
+    }
+
+    #[test]
+    fn owned_directory_accepts_an_own_directory() {
+        let base = unique_base();
+        let _cleanup = RemoveTree(base.clone());
+        let euid = unsafe { libc::geteuid() };
+        assert!(owned_directory(&fs::symlink_metadata(&base).unwrap(), euid));
+    }
+
+    #[test]
+    fn owned_directory_refuses_a_foreign_uid() {
+        let base = unique_base();
+        let _cleanup = RemoveTree(base.clone());
+        let euid = unsafe { libc::geteuid() };
+        assert!(!owned_directory(
+            &fs::symlink_metadata(&base).unwrap(),
+            euid.wrapping_add(1)
+        ));
+    }
+
+    #[test]
+    fn owned_directory_refuses_a_file_and_a_symlink() {
+        let base = unique_base();
+        let _cleanup = RemoveTree(base.clone());
+        let file = base.join("file");
+        fs::write(&file, b"").unwrap();
+        // The link points at a directory of this user, so only metadata that
+        // does not follow it is refused.
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        assert!(owned_directory(&fs::metadata(&link).unwrap(), euid));
+        assert!(
+            !owned_directory(&fs::symlink_metadata(&file).unwrap(), euid),
+            "a regular file was accepted"
+        );
+        assert!(
+            !owned_directory(&fs::symlink_metadata(&link).unwrap(), euid),
+            "a symlink was accepted"
+        );
     }
 
     #[test]
