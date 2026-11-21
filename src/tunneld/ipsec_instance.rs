@@ -1,35 +1,45 @@
 //! Lifecycle of the stock charon inside an authenticated Linux IPsec unit.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
-use super::handshake::AuthenticatedChannel;
+use super::{
+    handshake::AuthenticatedChannel,
+    instance_protocol::{Order, Reply, Start, decode_credentials},
+    protocol::{CidrV4, ErrorCode},
+};
+use crate::{
+    connection::{ipsec::Config, routes::Network},
+    helper::{
+        local_socket::{Budget, connect_deadline},
+        vici::{self, Client, CommandResult, Message},
+    },
+    secrets::Credentials,
+};
 
 const CHARON: &str = "/usr/lib/strongswan/charon";
 const CONFIG_NAME: &str = "strongswan.conf";
 const VICI_SOCKET_NAME: &str = "vici.sock";
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_INTERVAL: Duration = Duration::from_millis(20);
+// Same manual reqid range as connection/ipsec/namespace.rs.
+const MAX_MANUAL_REQID: u16 = 0x3fff;
 const TERM_GRACE: Duration = Duration::from_secs(3);
 
 /// Local unit configuration. The directory comes from the service manager's
 /// RUNTIME_DIRECTORY and must be private and empty.
 pub struct Params {
     pub directory: PathBuf,
-}
-
-/// One command per authenticated datagram. No parameters cross this channel.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Order {
-    Start,
-    Stop,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -62,26 +72,37 @@ fn run_authenticated(
     program: &Path,
     owner: (u32, u32),
 ) -> io::Result<Exit> {
-    run_with(
-        |child| {
-            let bytes = match child {
-                Some(pidfd) => channel.receive_while_running(pidfd)?,
-                None => channel.receive()?,
-            };
-            decode_order(&bytes)
-        },
-        params,
-        program,
-        owner,
-    )
+    run_with(&mut channel, params, program, owner)
 }
 
-fn decode_order(bytes: &[u8]) -> io::Result<Order> {
-    serde_json::from_slice(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+trait InstanceChannel {
+    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>>;
+    fn send(&mut self, reply: &Reply) -> io::Result<()>;
+}
+
+impl InstanceChannel for AuthenticatedChannel {
+    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>> {
+        match child {
+            Some(pidfd) => self.receive_while_running(pidfd),
+            None => self.receive(),
+        }
+    }
+
+    fn send(&mut self, reply: &Reply) -> io::Result<()> {
+        self.send(&serde_json::to_vec(reply)?)
+    }
+}
+
+fn get_order(
+    channel: &mut impl InstanceChannel,
+    child: Option<BorrowedFd<'_>>,
+) -> io::Result<Order> {
+    let bytes = Zeroizing::new(channel.receive(child)?);
+    serde_json::from_slice(&bytes).map_err(|_| invalid("invalid IPsec instance order"))
 }
 
 fn run_with(
-    mut receive: impl FnMut(Option<BorrowedFd<'_>>) -> io::Result<Order>,
+    channel: &mut impl InstanceChannel,
     params: &Params,
     program: &Path,
     owner: (u32, u32),
@@ -89,12 +110,46 @@ fn run_with(
     // SAFETY: PR_SET_DUMPABLE takes an integer value. The handshake applies
     // the same protection before it opens the channel.
     checked(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) })?;
-    match receive(None) {
-        Ok(Order::Start) => {}
-        Ok(Order::Stop) => return Err(invalid("expected IPsec start")),
+    let result = run_attempt(channel, params, program, owner);
+    match result {
+        Ok(Exit::Stopped) => channel.send(&Reply::Stopped {})?,
+        Ok(Exit::Eof) => {}
+        Err(ref error) => {
+            let code = match error.kind() {
+                io::ErrorKind::InvalidData => ErrorCode::BadRequest,
+                io::ErrorKind::TimedOut => ErrorCode::Timeout,
+                io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+                io::ErrorKind::NotFound => ErrorCode::MissingProgram,
+                _ => ErrorCode::Backend,
+            };
+            let notify = channel.send(&Reply::Failed { code });
+            return with_cleanup(result, notify);
+        }
+    }
+    result
+}
+
+fn run_attempt(
+    channel: &mut impl InstanceChannel,
+    params: &Params,
+    program: &Path,
+    owner: (u32, u32),
+) -> io::Result<Exit> {
+    let start = match get_order(channel, None) {
+        Ok(Order::Start(start)) => start,
+        Ok(Order::Stop {}) => return Err(invalid("expected IPsec start")),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Exit::Eof),
         Err(error) => return Err(error),
-    }
+    };
+    let attempt = Attempt::new(start)?;
+    let mut frame = match channel.receive(None) {
+        Ok(frame) => Zeroizing::new(frame),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Exit::Eof),
+        Err(error) => return Err(error),
+    };
+    let credentials =
+        decode_credentials(&mut frame).map_err(|_| invalid("invalid IPsec credentials"))?;
+    drop(frame);
 
     let directory = &params.directory;
     let socket = validate_path(directory)?;
@@ -118,7 +173,15 @@ fn run_with(
         return Err(invalid("IPsec runtime directory must be empty"));
     }
 
-    let result = run_in_directory(receive, directory, &socket, program);
+    let result = run_in_directory(
+        channel,
+        directory,
+        &socket,
+        program,
+        attempt,
+        credentials,
+        owner,
+    );
     let cleanup = with_cleanup(
         remove_if_present(&directory.join(VICI_SOCKET_NAME)),
         remove_if_present(&directory.join(CONFIG_NAME)),
@@ -134,10 +197,13 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 fn run_in_directory(
-    mut receive: impl FnMut(Option<BorrowedFd<'_>>) -> io::Result<Order>,
+    channel: &mut impl InstanceChannel,
     directory: &Path,
     socket: &str,
     program: &Path,
+    attempt: Attempt,
+    credentials: Credentials,
+    owner: (u32, u32),
 ) -> io::Result<Exit> {
     let path = directory.join(CONFIG_NAME);
     let mut config = OpenOptions::new()
@@ -183,14 +249,331 @@ fn run_in_directory(
         }
     };
 
-    let result = match receive(Some(pidfd.as_fd())) {
-        Ok(Order::Stop) => Ok(Exit::Stopped),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
-        Ok(Order::Start) => Err(invalid("IPsec instance already started")),
-        Err(error) => Err(error),
+    let mut vici = PrivateVici {
+        path: Path::new(socket),
+        child: &pidfd,
+        pid: child.id(),
+        owner,
+        loaded: false,
     };
-    let cleanup = stop_child(&mut child, &pidfd);
-    with_cleanup(result, cleanup)
+    let result = vici
+        .establish(&attempt, credentials)
+        .and_then(|reply| channel.send(&reply))
+        .and_then(|()| match get_order(channel, Some(pidfd.as_fd())) {
+            Ok(Order::Stop {}) => Ok(Exit::Stopped),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
+            Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
+            Err(error) => Err(error),
+        });
+    let unload = vici.cleanup(&attempt.config);
+    let stop = stop_child(&mut child, &pidfd);
+    with_cleanup(result, with_cleanup(unload, stop))
+}
+
+struct Attempt {
+    start: Start,
+    config: Config,
+}
+
+impl Attempt {
+    fn new(start: Start) -> io::Result<Self> {
+        let locals = &start.local_ts;
+        let remotes = &start.remote_ts;
+        if start.if_id == 0
+            || !(1..=MAX_MANUAL_REQID).contains(&start.reqid)
+            || CidrV4::new(start.remote_ipv4, 32).is_err()
+            // D0r2 requires a native proof before admitting custom IKE ports.
+            || start.port != 500
+            || !(1..=64).contains(&locals.len())
+            || !(1..=64).contains(&remotes.len())
+            || (locals != &["dynamic"]
+                && locals.iter().any(|ts| {
+                    ts.parse::<Network>().map_or(true, |net| {
+                        !net.address().is_ipv4()
+                            || *ts != format!("{}/{}", net.address(), net.prefix())
+                    })
+                }))
+        {
+            return Err(invalid("invalid IPsec instance parameters"));
+        }
+        let remote_ts = remotes
+            .iter()
+            .map(|net| format!("{}/{}", net.network(), net.prefix()))
+            .collect();
+        let config = Config::linux(
+            SocketAddrV4::new(start.remote_ipv4, start.port),
+            &start.peer_identity,
+            &start.username,
+            start.if_id,
+            start.reqid,
+            start.local_ts.clone(),
+            remote_ts,
+        )
+        .map_err(|_| invalid("invalid IPsec identity"))?;
+        Ok(Self { start, config })
+    }
+
+    fn established(&self, list: CommandResult) -> io::Result<Reply> {
+        let invalid_sa = || io::Error::other("unexpected IPsec SA metadata");
+        if !list.response.is_empty() || list.events.len() != 1 {
+            return Err(invalid_sa());
+        }
+        let (event, root) = &list.events[0];
+        let ike = root
+            .get_section(self.config.name())
+            .ok_or_else(invalid_sa)?;
+        if event != "list-sa"
+            || root.len() != 1
+            || ike.get_text("state") != Some("ESTABLISHED")
+            || ike.get_text("version") != Some("2")
+            || ike.get_text("initiator") != Some("yes")
+            || ike.get_text("remote-host").and_then(|ip| ip.parse().ok())
+                != Some(self.start.remote_ipv4)
+            || !matches!(ike.get_text("remote-port"), Some("500" | "4500"))
+        {
+            return Err(invalid_sa());
+        }
+        let [vip] = ike.get_list("local-vips").ok_or_else(invalid_sa)? else {
+            return Err(invalid_sa());
+        };
+        let virtual_ipv4 = parse_vici::<Ipv4Addr>(vip).ok_or_else(invalid_sa)?;
+        CidrV4::new(virtual_ipv4, 32).map_err(|_| invalid_sa())?;
+
+        let children = ike.get_section("child-sas").ok_or_else(invalid_sa)?;
+        let (key, child) = children.sections().next().ok_or_else(invalid_sa)?;
+        let child_id = child
+            .get_text("uniqueid")
+            .and_then(|value| value.parse::<u32>().ok());
+        let if_id = |field| {
+            child.get_text(field).and_then(|value| {
+                u32::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16).ok()
+            })
+        };
+        if children.len() != 1
+            || !child_id
+                .is_some_and(|id| id != 0 && key == format!("{}-{id}", self.config.child_name()))
+            || child.get_text("name") != Some(self.config.child_name())
+            || child.get_text("state") != Some("INSTALLED")
+            || child.get_text("mode") != Some("TUNNEL")
+            || child.get_text("protocol") != Some("ESP")
+            || child.get_text("reqid").and_then(|value| value.parse().ok())
+                != Some(self.start.reqid)
+            || if_id("if-id-in") != Some(self.start.if_id)
+            || if_id("if-id-out") != Some(self.start.if_id)
+        {
+            return Err(invalid_sa());
+        }
+
+        let [local] = child.get_list("local-ts").ok_or_else(invalid_sa)? else {
+            return Err(invalid_sa());
+        };
+        if selector(local) != Some(Network::host(IpAddr::V4(virtual_ipv4)))
+            || (self.start.local_ts != ["dynamic"]
+                && !self.start.local_ts.iter().any(|ts| {
+                    ts.parse::<Network>()
+                        .is_ok_and(|net| net.contains(IpAddr::V4(virtual_ipv4)))
+                }))
+        {
+            return Err(invalid_sa());
+        }
+        let selectors = child.get_list("remote-ts").ok_or_else(invalid_sa)?;
+        if !(1..=64).contains(&selectors.len()) {
+            return Err(invalid_sa());
+        }
+        let mut seen = BTreeSet::new();
+        let mut remote_ts = Vec::with_capacity(selectors.len());
+        for item in selectors {
+            let net = selector(item).ok_or_else(invalid_sa)?;
+            let IpAddr::V4(address) = net.address() else {
+                return Err(invalid_sa());
+            };
+            if !seen.insert(net)
+                || !self.start.remote_ts.iter().any(|allowed| {
+                    allowed.prefix() <= net.prefix()
+                        && Network::new(allowed.network().into(), allowed.prefix())
+                            .is_ok_and(|allowed| allowed.contains(net.address()))
+                })
+            {
+                return Err(invalid_sa());
+            }
+            remote_ts.push(CidrV4::new(address, net.prefix()).map_err(|_| invalid_sa())?);
+        }
+        Ok(Reply::Established {
+            if_id: self.start.if_id,
+            reqid: self.start.reqid,
+            virtual_ipv4,
+            remote_ts,
+        })
+    }
+}
+
+fn parse_vici<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn selector(bytes: &[u8]) -> Option<Network> {
+    parse_vici(bytes).or_else(|| parse_vici(bytes).map(Network::host))
+}
+
+struct PrivateVici<'a> {
+    path: &'a Path,
+    child: &'a OwnedFd,
+    pid: u32,
+    owner: (u32, u32),
+    loaded: bool,
+}
+
+impl PrivateVici<'_> {
+    fn open(&self, deadline: Instant) -> io::Result<Client> {
+        if poll_until(self.child, Instant::now())? {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "charon exited"));
+        }
+        let metadata = fs::symlink_metadata(self.path)?;
+        if !metadata.file_type().is_socket()
+            || (metadata.uid(), metadata.gid()) != self.owner
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe IPsec VICI socket",
+            ));
+        }
+        let stream = connect_deadline(self.path, &Budget::until(deadline, None)?)?;
+        // SAFETY: credential and len are writable buffers for SO_PEERCRED.
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+        checked(unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut peer as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        })?;
+        if len as usize != std::mem::size_of_val(&peer)
+            || u32::try_from(peer.pid).ok() != Some(self.pid)
+            || (peer.uid, peer.gid) != self.owner
+            || poll_until(self.child, Instant::now())?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unexpected IPsec VICI peer",
+            ));
+        }
+        Client::from_stream_until(stream, self.owner.0, deadline, Default::default())
+            .map_err(vici_error)
+    }
+
+    fn establish(&mut self, attempt: &Attempt, credentials: Credentials) -> io::Result<Reply> {
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let version = loop {
+            match self.open(deadline) {
+                Ok(client) => {
+                    break client
+                        .command("version", Message::new(), &[])
+                        .map_err(vici_error)?
+                        .response;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    if poll_until(
+                        self.child,
+                        (Instant::now() + STARTUP_INTERVAL).min(deadline),
+                    )? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "charon exited before VICI readiness",
+                        ));
+                    }
+                    remaining(deadline)?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let stats = self
+            .exchange(deadline, "stats", Message::new(), &[])?
+            .response;
+        Config::admit_linux(&version, &stats)
+            .map_err(|_| io::Error::other("incompatible IPsec VICI backend"))?;
+        let config = &attempt.config;
+        let shared = config
+            .shared(credentials)
+            .map_err(|_| invalid("invalid IPsec credentials"))?;
+        // A lost ACK leaves the load uncertain. Clean up even if it failed.
+        self.loaded = true;
+        self.ack(deadline, "load-conn", config.connection())?;
+        for message in shared {
+            self.ack(deadline, "load-shared", message)?;
+        }
+        let initiate = config
+            .initiate(remaining(deadline)?)
+            .map_err(|_| io::Error::other("invalid IPsec initiate deadline"))?;
+        self.ack(deadline, "initiate", initiate)?;
+        let mut request = Message::new();
+        request.value("ike", config.name().as_bytes());
+        attempt.established(self.exchange(deadline, "list-sas", request, &["list-sa"])?)
+    }
+
+    fn cleanup(&self, config: &Config) -> io::Result<()> {
+        if !self.loaded || poll_until(self.child, Instant::now())? {
+            return Ok(());
+        }
+        let deadline = Instant::now() + TERM_GRACE;
+        let terminate = config
+            .terminate(remaining(deadline)?)
+            .map_err(|_| io::Error::other("invalid IPsec terminate deadline"))?;
+        let terminated = self.ack(deadline, "terminate", terminate);
+        let unloaded = self.ack(deadline, "unload-conn", config.unload_connection());
+        let mut result = with_cleanup(terminated, unloaded);
+        for message in config.unload_shared() {
+            result = with_cleanup(result, self.ack(deadline, "unload-shared", message));
+        }
+        result
+    }
+
+    fn ack(&self, deadline: Instant, name: &'static str, request: Message) -> io::Result<()> {
+        let response = self.exchange(deadline, name, request, &[])?.response;
+        if response.get_text("success") != Some("yes") {
+            return Err(io::Error::other(format!(
+                "IPsec VICI {name} did not succeed"
+            )));
+        }
+        Ok(())
+    }
+
+    fn exchange(
+        &self,
+        deadline: Instant,
+        name: &'static str,
+        request: Message,
+        events: &[&str],
+    ) -> io::Result<CommandResult> {
+        self.open(deadline)?
+            .command(name, request, events)
+            .map_err(vici_error)
+    }
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(remaining)
+}
+
+fn vici_error(error: vici::Error) -> io::Error {
+    let kind = match error {
+        vici::Error::Timeout => io::ErrorKind::TimedOut,
+        vici::Error::UntrustedPeer => io::ErrorKind::PermissionDenied,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("IPsec VICI: {error:?}"))
 }
 
 fn validate_path(directory: &Path) -> io::Result<String> {

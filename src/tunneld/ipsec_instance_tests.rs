@@ -1,5 +1,8 @@
 use super::*;
-use crate::test_support::write_script;
+use crate::{
+    test_support::write_script,
+    tunneld::{instance_protocol::encode_credentials, protocol},
+};
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
@@ -11,7 +14,7 @@ const FIXTURE: &str = "VPNT_IPSEC_INSTANCE_FIXTURE";
 const SENTINEL: &str = "vpnt synthetic supervisor memory marker";
 
 const FAKE: &str = r#"#!/usr/bin/python3
-import json, os, pathlib, re, signal, socket
+import json, os, pathlib, re, signal, socket, struct
 import sys
 
 conf = pathlib.Path(os.environ['STRONGSWAN_CONF'])
@@ -48,15 +51,173 @@ tmp.write_text(json.dumps(dict(pid=os.getpid(), pgid=os.getpgrp(),
         for entry in pathlib.Path('/proc/self/environ').read_bytes().split(b'\0') if entry),
     fds=fds, mem=mem, cwd=os.getcwd())))
 tmp.rename(root / 'ready')
+def read_exact(conn, size):
+    result = bytearray()
+    while len(result) < size:
+        part = conn.recv(size - len(result))
+        if not part:
+            raise EOFError
+        result.extend(part)
+    return result
+
+def short(value):
+    return bytes([len(value)]) + value
+
+def blob(value):
+    return struct.pack('!H', len(value)) + value
+
+def encode(message):
+    result = bytearray()
+    for key, value in message.items():
+        name = short(key.encode())
+        if isinstance(value, dict):
+            result += b'\x01' + name + encode(value) + b'\x02'
+        elif isinstance(value, list):
+            result += b'\x04' + name
+            for item in value:
+                result += b'\x05' + blob(item.encode())
+            result += b'\x06'
+        else:
+            result += b'\x03' + name + blob(value.encode())
+    return result
+
+def decode(data):
+    index = 0
+    def number(size):
+        nonlocal index
+        value = int.from_bytes(data[index:index + size], 'big')
+        index += size
+        return value
+    def text(size):
+        nonlocal index
+        length = number(size)
+        value = data[index:index + length].decode()
+        index += length
+        return value
+    def message():
+        fields = {}
+        while index < len(data):
+            tag = number(1)
+            if tag == 2:
+                break
+            key = text(1)
+            if tag == 1:
+                fields[key] = message()
+            elif tag == 3:
+                fields[key] = text(2)
+            elif tag == 4:
+                items = []
+                while number(1) == 5:
+                    items.append(text(2))
+                fields[key] = items
+            else:
+                raise ValueError('unexpected VICI field')
+        return fields
+    return message()
+
+def reply(conn, kind, message=None, event=None):
+    frame = bytes([kind])
+    if event:
+        frame += short(event.encode())
+    if message:
+        frame += encode(message)
+    conn.sendall(struct.pack('!I', len(frame)) + frame)
+
 while True:
-    signal.pause()
+    conn, _ = vici.accept()
+    with conn:
+        try:
+            packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
+            if packet[0] == 3:
+                reply(conn, 5)
+                packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
+            assert packet[0] == 0
+            end = packet[1] + 2
+            command = packet[2:end].decode()
+            request = decode(packet[end:])
+            if command == 'load-shared':
+                request['credential_matches'] = request.pop('data') == {
+                    'EAP': 'synthetic-password', 'IKE': 'synthetic-psk'
+                }.get(request['type'])
+            with (root / 'vici-commands').open('a') as log:
+                log.write(json.dumps([command, request]) + '\n')
+            if command == 'version':
+                reply(conn, 1, {'daemon': 'charon', 'version': '6.1.0'})
+            elif command == 'stats':
+                plugins = ['kernel-netlink', 'socket-default', 'vici']
+                if (root / 'foreign-backend').exists():
+                    plugins.append('kernel-libipsec')
+                reply(conn, 1, {'plugins': plugins})
+            elif command == 'list-sas':
+                reply(conn, 7, {request['ike']: {
+                    'state': 'ESTABLISHED', 'version': '2', 'initiator': 'yes',
+                    'remote-host': '192.0.2.10', 'remote-port': '4500',
+                    'local-vips': ['198.51.100.17'],
+                    'child-sas': {request['ike'] + '-child-1': {
+                        'name': request['ike'] + '-child', 'uniqueid': '1',
+                        'state': 'INSTALLED', 'mode': 'TUNNEL', 'protocol': 'ESP',
+                        'reqid': '567', 'if-id-in': '00001234',
+                        'if-id-out': '00005678' if (root / 'wrong-if-id').exists() else '00001234',
+                        'local-ts': ['198.51.100.17/32'], 'remote-ts': ['198.51.100.128/25'],
+                    }},
+                }}, 'list-sa')
+                reply(conn, 1)
+            elif command == 'initiate' and (root / 'fail-initiate').exists():
+                reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-psk'})
+            else:
+                reply(conn, 1, {'success': 'yes'})
+        except (EOFError, BrokenPipeError):
+            pass
 "#;
+
+fn fixture_start(identity: &str) -> Start {
+    Start {
+        remote_ipv4: "192.0.2.10".parse().unwrap(),
+        port: 500,
+        peer_identity: identity.into(),
+        username: "fixture-user".into(),
+        if_id: 0x1234,
+        reqid: 567,
+        local_ts: vec!["dynamic".into()],
+        remote_ts: vec![CidrV4::new("198.51.100.0".parse().unwrap(), 24).unwrap()],
+    }
+}
+
+fn fixture_credentials() -> Zeroizing<Vec<u8>> {
+    encode_credentials(
+        &protocol::Credentials::ipsec("synthetic-password", "synthetic-psk").unwrap(),
+    )
+    .unwrap()
+}
+
+fn send_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+    stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    stream.write_all(bytes)
+}
+
+struct FixtureChannel(UnixStream);
+
+impl InstanceChannel for FixtureChannel {
+    fn receive(&mut self, _: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>> {
+        let mut size = [0; 4];
+        self.0.read_exact(&mut size)?;
+        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+        self.0.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn send(&mut self, reply: &Reply) -> io::Result<()> {
+        serde_json::to_writer(&mut self.0, reply)?;
+        self.0.write_all(b"\n")
+    }
+}
 
 struct Fixture {
     root: PathBuf,
     writer: UnixStream,
     supervisor: Child,
     backend_pidfd: Option<OwnedFd>,
+    replies: Vec<Reply>,
 }
 
 impl Fixture {
@@ -84,6 +245,8 @@ impl Fixture {
             .env(FIXTURE, &root)
             .env("RUNTIME_DIRECTORY", root.join("instance"))
             .stdin(Stdio::from(reader))
+            .stdout(fs::File::create(root.join("supervisor.stdout")).unwrap())
+            .stderr(fs::File::create(root.join("supervisor.stderr")).unwrap())
             .spawn()
             .unwrap();
         writer
@@ -94,11 +257,17 @@ impl Fixture {
             writer,
             supervisor,
             backend_pidfd: None,
+            replies: Vec::new(),
         }
     }
 
     fn start(&mut self) -> serde_json::Value {
-        self.writer.write_all(b"S").unwrap();
+        self.start_with(fixture_start("fqdn:fixture.example"))
+    }
+
+    fn start_with(&mut self, start: Start) -> serde_json::Value {
+        self.send_bytes(&serde_json::to_vec(&Order::Start(start)).unwrap());
+        self.send_bytes(&fixture_credentials());
         let deadline = Instant::now() + Duration::from_secs(5);
         let ready = loop {
             match fs::read(self.root.join("ready")) {
@@ -119,9 +288,14 @@ impl Fixture {
         ready
     }
 
+    fn send_bytes(&mut self, bytes: &[u8]) {
+        send_frame(&mut self.writer, bytes).unwrap();
+    }
+
     fn finish(&mut self, action: Option<&[u8]>) -> String {
         match action {
-            Some(bytes) => self.writer.write_all(bytes).unwrap(),
+            Some(b"T") => self.send_bytes(br#"{"op":"stop"}"#),
+            Some(bytes) => self.send_bytes(bytes),
             None => self.writer.shutdown(std::net::Shutdown::Write).unwrap(),
         }
         let mut answer = String::new();
@@ -136,7 +310,26 @@ impl Fixture {
         if let Some(fd) = &self.backend_pidfd {
             assert!(poll_until(fd, Instant::now()).unwrap());
         }
-        answer
+        let mut output = answer.lines();
+        let status = output.next_back().expect("supervisor outcome").to_owned();
+        self.replies = output
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for log in ["supervisor.stdout", "supervisor.stderr"] {
+            let content = fs::read_to_string(self.root.join(log)).unwrap();
+            for secret in ["synthetic-password", "synthetic-psk"] {
+                assert!(!content.contains(secret), "credential in {log}");
+            }
+        }
+        status
+    }
+
+    fn commands(&self) -> Vec<serde_json::Value> {
+        fs::read_to_string(self.root.join("vici-commands"))
+            .expect("expected private VICI exchanges before shutdown")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 }
 
@@ -164,17 +357,9 @@ fn supervisor_process() {
     let raw = unsafe { libc::fcntl(0, libc::F_DUPFD, 3) };
     assert!(raw >= 3);
     // SAFETY: fcntl returned a new owned FD.
-    let mut channel = UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    let mut channel = FixtureChannel(UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) }));
     let result = run_with(
-        |_| {
-            let mut byte = [0];
-            channel.read_exact(&mut byte)?;
-            match byte {
-                [b'S'] => decode_order(br#""start""#),
-                [b'T'] => decode_order(br#""stop""#),
-                _ => decode_order(br#""invalid""#),
-            }
-        },
+        &mut channel,
         &Params {
             directory: std::env::var_os("RUNTIME_DIRECTORY").unwrap().into(),
         },
@@ -186,7 +371,7 @@ fn supervisor_process() {
         Ok(exit) => format!("{exit:?}"),
         Err(error) => format!("error: {:?}", error.kind()),
     };
-    channel.write_all(answer.as_bytes()).unwrap();
+    channel.0.write_all(answer.as_bytes()).unwrap();
 }
 
 #[test]
@@ -241,6 +426,224 @@ fn exec_is_private_and_stop_cleans_up() {
     assert!(!config.contains("/etc/"));
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
     assert!(fixture.root.join("term").exists());
+}
+
+#[test]
+fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
+    let mut fixture = Fixture::launch(false);
+    fixture.start();
+    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    let commands = fixture.commands();
+    assert_eq!(
+        fixture.replies,
+        [
+            Reply::Established {
+                if_id: 0x1234,
+                reqid: 567,
+                virtual_ipv4: "198.51.100.17".parse().unwrap(),
+                remote_ts: vec![CidrV4::new("198.51.100.128".parse().unwrap(), 25).unwrap()],
+            },
+            Reply::Stopped {},
+        ]
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .map(|entry| entry[0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "version",
+            "stats",
+            "load-conn",
+            "load-shared",
+            "load-shared",
+            "initiate",
+            "list-sas",
+            "terminate",
+            "unload-conn",
+            "unload-shared",
+            "unload-shared"
+        ]
+    );
+    let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
+    assert_eq!(
+        connection["remote_addrs"],
+        serde_json::json!(["192.0.2.10"])
+    );
+    assert_eq!(connection["version"], "2");
+    assert_eq!(connection["mobike"], "no");
+    assert_eq!(connection["remote"]["id"], "fqdn:fixture.example");
+    let child = connection["children"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(child["reqid"], "567");
+    assert_eq!(child["if_id_in"], "4660");
+    assert_eq!(child["if_id_out"], "4660");
+    assert_eq!(commands[3][1]["credential_matches"], true);
+    assert_eq!(commands[4][1]["credential_matches"], true);
+    assert_eq!(connection["vips"], serde_json::json!(["0.0.0.0"]));
+    assert_eq!(connection["local"]["auth"], "eap-mschapv2");
+    assert_eq!(connection["remote"]["auth"], "psk");
+    assert_eq!(child["local_ts"], serde_json::json!(["dynamic"]));
+    assert_eq!(child["remote_ts"], serde_json::json!(["198.51.100.0/24"]));
+    assert_eq!(
+        commands[3][1]["owners"],
+        serde_json::json!(["fqdn:fixture-user"])
+    );
+    assert_eq!(
+        commands[4][1]["owners"],
+        serde_json::json!(["fqdn:fixture.example"])
+    );
+    assert!(!commands[3][1].as_object().unwrap().contains_key("data"));
+    assert!(!commands[4][1].as_object().unwrap().contains_key("data"));
+    assert!(
+        commands[5][1]["timeout"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok_and(|ms| (1..=30_000).contains(&ms))
+    );
+}
+
+#[test]
+fn sends_typed_ipv4_identity_without_using_it_as_the_transport_address() {
+    let mut fixture = Fixture::launch(false);
+    fixture.start_with(fixture_start("ipv4:192.0.2.99"));
+    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    let commands = fixture.commands();
+    let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
+    assert_eq!(connection["remote"]["id"], "ipv4:192.0.2.99");
+    assert_eq!(
+        connection["remote_addrs"],
+        serde_json::json!(["192.0.2.10"])
+    );
+    assert_eq!(
+        commands[4][1]["owners"],
+        serde_json::json!(["ipv4:192.0.2.99"])
+    );
+}
+
+#[test]
+fn failure_and_mismatched_sa_clean_up_before_the_terminal_reply() {
+    for failure in ["fail-initiate", "wrong-if-id"] {
+        let mut fixture = Fixture::launch(false);
+        fs::write(fixture.root.join(failure), []).unwrap();
+        fixture.start();
+        assert_eq!(fixture.finish(None), "error: Other");
+        assert_eq!(
+            fixture.replies,
+            [Reply::Failed {
+                code: ErrorCode::Backend
+            }]
+        );
+        let commands = fixture.commands();
+        let names: Vec<_> = commands
+            .iter()
+            .map(|entry| entry[0].as_str().unwrap())
+            .collect();
+        assert_eq!(names.contains(&"list-sas"), failure == "wrong-if-id");
+        assert!(names.ends_with(&["terminate", "unload-conn", "unload-shared", "unload-shared"]));
+        assert!(fixture.root.join("term").exists());
+    }
+}
+
+#[test]
+fn foreign_backend_is_refused_before_load_and_receives_no_credentials() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("foreign-backend"), []).unwrap();
+    fixture.start();
+    assert_eq!(fixture.finish(None), "error: Other");
+    assert_eq!(
+        fixture.replies,
+        [Reply::Failed {
+            code: ErrorCode::Backend
+        }]
+    );
+    let commands = fixture.commands();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|entry| entry[0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["version", "stats"]
+    );
+}
+
+#[test]
+fn bad_start_and_bad_credential_frames_do_not_spawn_charon() {
+    let mut bad_starts = Vec::new();
+    for edit in [
+        ("if_id", serde_json::json!(0)),
+        ("reqid", serde_json::json!(0)),
+        ("reqid", serde_json::json!(0x4000)),
+        ("port", serde_json::json!(4501)),
+        ("peer_identity", serde_json::json!("fqdn:*")),
+        ("peer_identity", serde_json::json!("fqdn:#0102")),
+        ("peer_identity", serde_json::json!("fqdn:^fixture$")),
+        ("peer_identity", serde_json::json!("fixture.example")),
+        ("remote_ipv4", serde_json::json!("fixture.example")),
+        ("local_ts", serde_json::json!(["::/0"])),
+        (
+            "local_ts",
+            serde_json::json!(["dynamic", "198.51.100.0/24"]),
+        ),
+        ("unexpected", serde_json::json!(true)),
+    ] {
+        let mut start =
+            serde_json::to_value(Order::Start(fixture_start("fqdn:fixture.example"))).unwrap();
+        start[edit.0] = edit.1;
+        bad_starts.push(start);
+    }
+    for start in bad_starts {
+        let mut fixture = Fixture::launch(false);
+        fixture.send_bytes(&serde_json::to_vec(&start).unwrap());
+        assert_eq!(fixture.finish(None), "error: InvalidData", "{start}");
+        assert_eq!(
+            fixture.replies,
+            [Reply::Failed {
+                code: ErrorCode::BadRequest
+            }]
+        );
+        assert!(!fixture.root.join("ready").exists());
+    }
+    let mut fixture = Fixture::launch(false);
+    fixture.send_bytes(
+        &serde_json::to_vec(&Order::Start(fixture_start("fqdn:fixture.example"))).unwrap(),
+    );
+    fixture.send_bytes(br#"{"op":"stop"}"#);
+    assert_eq!(fixture.finish(None), "error: InvalidData");
+    assert_eq!(
+        fixture.replies,
+        [Reply::Failed {
+            code: ErrorCode::BadRequest
+        }]
+    );
+    assert!(!fixture.root.join("ready").exists());
+}
+
+#[test]
+fn credential_datagram_is_wiped_after_success_and_rejection() {
+    let mut valid = fixture_credentials();
+    let credentials = decode_credentials(&mut valid).unwrap();
+    assert_eq!(credentials.password.expose(), "synthetic-password");
+    assert_eq!(credentials.psk.expose(), "synthetic-psk");
+    assert!(valid.iter().all(|byte| *byte == 0));
+
+    for mut invalid in [
+        Zeroizing::new(vec![0, 8, b'x']),
+        Zeroizing::new(vec![0, 1, b'x', 0, 1, b'y', b'z']),
+        Zeroizing::new(vec![0, 1, 0xff, 0, 1, b'y']),
+        Zeroizing::new(vec![0, 1, b'x', 0, 1, b'\n']),
+    ] {
+        assert_eq!(
+            decode_credentials(&mut invalid).unwrap_err(),
+            ErrorCode::BadRequest
+        );
+        assert!(invalid.iter().all(|byte| *byte == 0));
+    }
 }
 
 #[test]
@@ -359,7 +762,16 @@ fn authenticated_supervisor_survives_idle_and_observes_charon_exit() {
             )
         });
         let mut client = writer.authenticate(&Attestor).unwrap();
-        client.send(br#""start""#).unwrap();
+        client
+            .send(
+                &serde_json::to_vec(&Order::Start(fixture_start("fqdn:fixture.example"))).unwrap(),
+            )
+            .unwrap();
+        client.send(&fixture_credentials()).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&client.receive().unwrap()).unwrap(),
+            Reply::Established { .. }
+        ));
         let deadline = Instant::now() + PHASE_TIMEOUT;
         let ready = loop {
             match fs::read(root.join("ready")) {

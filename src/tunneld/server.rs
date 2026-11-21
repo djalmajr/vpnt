@@ -1,10 +1,11 @@
 //! Linux socket activation, bounded admission, and the v1 dialogue.
 use super::admin::PolicyStore;
+use super::backend::{Launch, Launcher, Running};
 use super::protocol::{
-    ErrorCode, FrameError, Request, Response, ServerDecoder, decode_request, read_control, timed,
-    write_control,
+    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, decode_request, read_control,
+    timed, write_control,
 };
-use crate::helper::local_socket::peer_uid;
+use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -19,6 +20,9 @@ use std::{
 };
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// An admitted session waits for the client's commands for as long as the
+/// tunnel lives. A closed client ends the wait at once.
+const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PER_UID: usize = 2;
 const MAX_CONNECTIONS: usize = 8;
 const LISTEN_FD: RawFd = 3;
@@ -26,6 +30,7 @@ const LISTEN_FD: RawFd = 3;
 struct Server {
     connections: Mutex<Connections>,
     policy: PolicyStore,
+    launcher: Box<dyn Launch>,
 }
 
 #[derive(Default)]
@@ -63,15 +68,23 @@ impl Drop for Slot {
 #[cfg(test)]
 impl Default for Server {
     fn default() -> Self {
-        Self::new(PolicyStore::unavailable_for_test())
+        Self::with_launcher(
+            PolicyStore::unavailable_for_test(),
+            Box::new(policy_dialogue_tests::Unavailable),
+        )
     }
 }
 
 impl Server {
     fn new(policy: PolicyStore) -> Self {
+        Self::with_launcher(policy, Box::new(Launcher::system(IpRoute::system())))
+    }
+
+    fn with_launcher(policy: PolicyStore, launcher: Box<dyn Launch>) -> Self {
         Self {
             connections: Mutex::default(),
             policy,
+            launcher,
         }
     }
 
@@ -111,7 +124,13 @@ impl Server {
         let slot = self.reserve(uid)?;
         match thread::Builder::new().spawn(move || {
             // Peers can close either phase or fail to send a complete frame.
-            let _ = serve(stream, &slot.admission, &slot.server.policy, accepted);
+            let _ = serve(
+                stream,
+                &slot.admission,
+                &slot.server.policy,
+                &*slot.server.launcher,
+                accepted,
+            );
             drop(slot);
         }) {
             Ok(worker) => Some(worker),
@@ -127,6 +146,7 @@ fn serve(
     stream: UnixStream,
     admission: &Admission,
     policy: &PolicyStore,
+    launcher: &dyn Launch,
     accepted: Instant,
 ) -> Result<(), FrameError> {
     let hello_deadline = accepted + FRAME_TIMEOUT;
@@ -187,12 +207,34 @@ fn serve(
         // was revoked and then restored before this phase.
         Ok(previous.unchanged(&current)? && current.policy().authorize(uid, &offer) == Some(grant))
     })();
+    // The credentials are zeroed here, unused: configuring the tunnel inside
+    // the instance is not part of this admission.
     drop(credentials);
-    let code = match current {
-        Ok(true) => ErrorCode::MissingProgram,
-        _ => ErrorCode::PermissionDenied,
+    if !matches!(current, Ok(true)) {
+        return decoder.reject(ErrorCode::PermissionDenied, credential_deadline);
+    }
+    let session = match launcher.launch(offer.backend()) {
+        Ok(session) => session,
+        Err(code) => return decoder.reject(code, Instant::now() + FRAME_TIMEOUT),
     };
-    decoder.reject(code, credential_deadline)
+    dialogue(decoder, session)
+}
+
+/// Answer the client's commands for one admitted session. A stop, a closed
+/// client, a malformed command or a failed reply all end in the same teardown,
+/// which dropping the session runs when no stop already did.
+fn dialogue(
+    mut decoder: ServerDecoder,
+    mut session: Box<dyn Running + '_>,
+) -> Result<(), FrameError> {
+    loop {
+        let state = match decoder.command(Instant::now() + SESSION_IDLE) {
+            Ok(Command::Status) => session.state(),
+            Ok(Command::Stop) => session.stop(),
+            Err(error) => return Err(error),
+        };
+        decoder.reply_status(state, Instant::now() + FRAME_TIMEOUT)?;
+    }
 }
 
 fn reply_error(stream: &UnixStream, code: ErrorCode, deadline: Instant) -> Result<(), FrameError> {
@@ -290,14 +332,26 @@ mod policy_dialogue_tests {
     use super::*;
     use crate::tunneld::{
         admin::{PolicyFixture, acquire_eventually},
-        protocol::Credentials,
+        handshake::Backend,
+        protocol::{Credentials, State},
     };
     use std::{
         fs::{self, File, Permissions},
         io::{BufRead, BufReader, Read, Write},
         os::unix::fs::PermissionsExt,
-        process::{Child, Command, Stdio},
+        process::{Child, Command as Process, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    /// A launcher that refuses with `Backend`: reaching it means admission
+    /// was authorized by the policy.
+    pub(super) struct Unavailable;
+
+    impl Launch for Unavailable {
+        fn launch<'a>(&'a self, _: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            Err(ErrorCode::Backend)
+        }
+    }
 
     fn run(
         policy: &PolicyFixture,
@@ -305,7 +359,10 @@ mod policy_dialogue_tests {
         network: &str,
         after_prepared: impl FnOnce(),
     ) -> ErrorCode {
-        let server = Arc::new(Server::new(policy.store.clone()));
+        let server = Arc::new(Server::with_launcher(
+            policy.store.clone(),
+            Box::new(Unavailable),
+        ));
         let (mut client, stream) = UnixStream::pair().unwrap();
         let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
         client
@@ -385,7 +442,7 @@ mod policy_dialogue_tests {
         let directory = path.parent().unwrap();
         fs::set_permissions(directory, Permissions::from_mode(0o755)).unwrap();
         let mut holder = DirectoryLockProcess(
-            Command::new(std::env::current_exe().unwrap())
+            Process::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "tunneld::server::policy_dialogue_tests::directory_lock_in_another_process_does_not_block_policy",
@@ -409,10 +466,7 @@ mod policy_dialogue_tests {
         fixture.install();
         let policy_directory = fixture.store.open().unwrap();
         drop(acquire_eventually(|| policy_directory.lock_shared()).unwrap());
-        assert_eq!(
-            run(&fixture, 500, "10.20.0.0", || {}),
-            ErrorCode::MissingProgram
-        );
+        assert_eq!(run(&fixture, 500, "10.20.0.0", || {}), ErrorCode::Backend);
         drop(holder.0.stdin.take());
         assert!(holder.0.wait().unwrap().success());
     }
@@ -466,10 +520,7 @@ mod policy_dialogue_tests {
             run(&fixture, 500, "10.22.0.0", denied),
             ErrorCode::PermissionDenied
         );
-        assert_eq!(
-            run(&fixture, 500, "10.20.0.0", || {}),
-            ErrorCode::MissingProgram
-        );
+        assert_eq!(run(&fixture, 500, "10.20.0.0", || {}), ErrorCode::Backend);
         assert_eq!(
             run(&fixture, 500, "10.20.0.0", || {
                 fixture.revoke();
@@ -485,5 +536,240 @@ mod policy_dialogue_tests {
             }),
             ErrorCode::PermissionDenied
         );
+    }
+    #[derive(Clone, Default)]
+    struct Counters {
+        launches: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        backends: Arc<Mutex<Vec<Backend>>>,
+    }
+
+    struct Fake {
+        counters: Counters,
+        refuse: Option<ErrorCode>,
+        stop_result: State,
+    }
+
+    struct FakeSession {
+        counters: Counters,
+        state: State,
+        stop_result: State,
+    }
+
+    impl Launch for Fake {
+        fn launch<'a>(&'a self, backend: Backend) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            self.counters.launches.fetch_add(1, Ordering::SeqCst);
+            self.counters.backends.lock().unwrap().push(backend);
+            match self.refuse {
+                Some(code) => Err(code),
+                None => Ok(Box::new(FakeSession {
+                    counters: self.counters.clone(),
+                    state: State::Starting,
+                    stop_result: self.stop_result,
+                })),
+            }
+        }
+    }
+
+    impl Running for FakeSession {
+        fn state(&self) -> State {
+            self.state
+        }
+        fn stop(&mut self) -> State {
+            self.counters.stops.fetch_add(1, Ordering::SeqCst);
+            self.state = self.stop_result;
+            self.state
+        }
+    }
+
+    impl Drop for FakeSession {
+        fn drop(&mut self) {
+            self.counters.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Run the dialogue through the credentials and return the open client.
+    fn admitted_client(policy: &PolicyFixture, fake: Fake) -> (UnixStream, thread::JoinHandle<()>) {
+        let server = Arc::new(Server::with_launcher(policy.store.clone(), Box::new(fake)));
+        let (mut client, stream) = UnixStream::pair().unwrap();
+        let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
+        client
+            .write_all(b"{\"op\":\"hello\",\"version\":1}\n")
+            .unwrap();
+        assert!(matches!(tests_receive(&client), Response::Version { .. }));
+        writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
+        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        Credentials::ipsec("fixture-password", "fixture-psk")
+            .unwrap()
+            .write(&mut client)
+            .unwrap();
+        (client, worker)
+    }
+
+    fn installed() -> PolicyFixture {
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        let directory = fixture.store.open().unwrap();
+        drop(acquire_eventually(|| directory.lock_shared()).unwrap());
+        fixture
+    }
+
+    fn command(client: &mut UnixStream, op: &str) -> Response {
+        writeln!(client, r#"{{"op":"{op}"}}"#).unwrap();
+        tests_receive(client)
+    }
+
+    fn fake(refuse: Option<ErrorCode>, stop_result: State) -> (Fake, Counters) {
+        let counters = Counters::default();
+        let fake = Fake {
+            counters: counters.clone(),
+            refuse,
+            stop_result,
+        };
+        (fake, counters)
+    }
+
+    #[test]
+    fn admitted_session_reports_starting_and_stops_once() {
+        let fixture = installed();
+        let (fake, counters) = fake(None, State::Stopped);
+        let (mut client, worker) = admitted_client(&fixture, fake);
+        assert!(matches!(
+            command(&mut client, "status"),
+            Response::Status {
+                state: State::Starting
+            }
+        ));
+        assert_eq!(counters.stops.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            command(&mut client, "stop"),
+            Response::Status {
+                state: State::Stopped
+            }
+        ));
+        assert!(matches!(
+            command(&mut client, "status"),
+            Response::Status {
+                state: State::Stopped
+            }
+        ));
+        drop(client);
+        worker.join().unwrap();
+        assert_eq!(counters.launches.load(Ordering::SeqCst), 1);
+        assert_eq!(*counters.backends.lock().unwrap(), [Backend::Ipsec]);
+        assert_eq!(counters.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_reports_cleanup_pending_when_removal_is_unproven() {
+        let fixture = installed();
+        let (fake, counters) = fake(None, State::CleanupPending);
+        let (mut client, worker) = admitted_client(&fixture, fake);
+        for _ in 0..2 {
+            assert!(matches!(
+                command(&mut client, "stop"),
+                Response::Status {
+                    state: State::CleanupPending
+                }
+            ));
+        }
+        drop(client);
+        worker.join().unwrap();
+        // Each stop is a retry of the cleanup.
+        assert_eq!(counters.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_closed_client_ends_the_session() {
+        let fixture = installed();
+        let (fake, counters) = fake(None, State::Stopped);
+        let (mut client, worker) = admitted_client(&fixture, fake);
+        assert!(matches!(
+            command(&mut client, "status"),
+            Response::Status {
+                state: State::Starting
+            }
+        ));
+        drop(client);
+        worker.join().unwrap();
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_malformed_command_ends_the_session() {
+        let fixture = installed();
+        let (fake, counters) = fake(None, State::Stopped);
+        let (mut client, worker) = admitted_client(&fixture, fake);
+        writeln!(client, r#"{{"op":"hello","version":1}}"#).unwrap();
+        worker.join().unwrap();
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            timed(&client, Instant::now() + FRAME_TIMEOUT)
+                .unwrap()
+                .read(&mut [0])
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_refused_admission_replies_with_its_code_and_closes() {
+        for code in [
+            ErrorCode::Busy,
+            ErrorCode::Timeout,
+            ErrorCode::Backend,
+            ErrorCode::CleanupPending,
+        ] {
+            let fixture = installed();
+            let (fake, counters) = fake(Some(code), State::Stopped);
+            let (client, worker) = admitted_client(&fixture, fake);
+            let Response::Error { code: replied } = tests_receive(&client) else {
+                panic!("expected an error")
+            };
+            assert_eq!(replied, code);
+            assert_eq!(
+                timed(&client, Instant::now() + FRAME_TIMEOUT)
+                    .unwrap()
+                    .read(&mut [0])
+                    .unwrap(),
+                0
+            );
+            worker.join().unwrap();
+            assert_eq!(counters.launches.load(Ordering::SeqCst), 1);
+            assert_eq!(counters.drops.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn a_revoked_grant_never_reaches_the_launcher() {
+        let fixture = installed();
+        let (fake, counters) = fake(None, State::Stopped);
+        let server = Arc::new(Server::with_launcher(fixture.store.clone(), Box::new(fake)));
+        let (mut client, stream) = UnixStream::pair().unwrap();
+        let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
+        client
+            .write_all(b"{\"op\":\"hello\",\"version\":1}\n")
+            .unwrap();
+        tests_receive(&client);
+        writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
+        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        fixture.revoke();
+        let directory = fixture.store.open().unwrap();
+        drop(acquire_eventually(|| directory.lock_shared()).unwrap());
+        Credentials::ipsec("fixture-password", "fixture-psk")
+            .unwrap()
+            .write(&mut client)
+            .unwrap();
+        assert!(matches!(
+            tests_receive(&client),
+            Response::Error {
+                code: ErrorCode::PermissionDenied
+            }
+        ));
+        worker.join().unwrap();
+        assert_eq!(counters.launches.load(Ordering::SeqCst), 0);
     }
 }
