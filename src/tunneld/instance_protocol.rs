@@ -4,7 +4,10 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use super::protocol::{self, CidrV4, ErrorCode};
+use super::{
+    handshake::MAX_FRAME,
+    protocol::{self, CidrV4, ErrorCode},
+};
 use crate::{model::VpnKind, secrets::Credentials};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -45,8 +48,8 @@ pub enum Reply {
 
 // Same credential representation as the public writer protocol: two
 // big-endian u16 lengths, each immediately followed by its UTF-8 bytes.
-// The authenticated transport currently caps all datagrams at 4096 bytes.
-const MAX_CREDENTIAL_FRAME: usize = 4096;
+// The frame limit of the authenticated transport, one constant for both
+// directions, covers two 4096-byte secrets and their lengths.
 
 /// Encode a separate credential datagram. The caller must keep the returned
 /// buffer owned through send so it is wiped on both success and failure.
@@ -55,7 +58,7 @@ pub fn encode_credentials(
 ) -> Result<Zeroizing<Vec<u8>>, ErrorCode> {
     let psk = credentials.psk().ok_or(ErrorCode::BadRequest)?;
     let size = 4 + credentials.password().len() + psk.len();
-    if size > MAX_CREDENTIAL_FRAME {
+    if size > MAX_FRAME {
         return Err(ErrorCode::BadRequest);
     }
     let mut frame = Zeroizing::new(Vec::with_capacity(size));
@@ -75,7 +78,7 @@ pub(super) fn decode_credentials(frame: &mut [u8]) -> Result<Credentials, ErrorC
     }
 
     let result = (|| {
-        if frame.len() > MAX_CREDENTIAL_FRAME {
+        if frame.len() > MAX_FRAME {
             return Err(ErrorCode::BadRequest);
         }
         let mut input = &*frame;

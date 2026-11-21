@@ -8,6 +8,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zeroize::Zeroizing;
 
 const REEXEC: &str = "tunneld::ipsec_instance::tests::supervisor_process";
 const FIXTURE: &str = "VPNT_IPSEC_INSTANCE_FIXTURE";
@@ -15,7 +16,7 @@ const SENTINEL: &str = "vpnt synthetic supervisor memory marker";
 
 const FAKE: &str = r#"#!/usr/bin/python3
 import json, os, pathlib, re, signal, socket, struct
-import sys
+import sys, threading, time
 
 conf = pathlib.Path(os.environ['STRONGSWAN_CONF'])
 instance = conf.parent
@@ -123,8 +124,7 @@ def reply(conn, kind, message=None, event=None):
         frame += encode(message)
     conn.sendall(struct.pack('!I', len(frame)) + frame)
 
-while True:
-    conn, _ = vici.accept()
+def serve(conn):
     with conn:
         try:
             packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
@@ -149,6 +149,11 @@ while True:
                     plugins.append('kernel-libipsec')
                 reply(conn, 1, {'plugins': plugins})
             elif command == 'list-sas':
+                if (root / 'slow-list-sas').exists():
+                    (root / 'negotiating').touch()
+                    patience = time.time() + 6
+                    while not (root / 'release').exists() and time.time() < patience:
+                        time.sleep(0.05)
                 reply(conn, 7, {request['ike']: {
                     'state': 'ESTABLISHED', 'version': '2', 'initiator': 'yes',
                     'remote-host': '192.0.2.10', 'remote-port': '4500',
@@ -166,8 +171,12 @@ while True:
                 reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-psk'})
             else:
                 reply(conn, 1, {'success': 'yes'})
-        except (EOFError, BrokenPipeError):
+        except (EOFError, OSError):
             pass
+
+while True:
+    conn, _ = vici.accept()
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()
 "#;
 
 fn fixture_start(identity: &str) -> Start {
@@ -198,12 +207,49 @@ fn send_frame(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
 struct FixtureChannel(UnixStream);
 
 impl InstanceChannel for FixtureChannel {
-    fn receive(&mut self, _: Option<BorrowedFd<'_>>) -> io::Result<Vec<u8>> {
+    fn receive(&mut self, child: Option<BorrowedFd<'_>>) -> io::Result<Datagram> {
+        // Like the real channel, a backend exit is reported first and leaves
+        // the channel usable for one terminal reply.
+        if let Some(child) = child {
+            let mut entries = [
+                libc::pollfd {
+                    fd: child.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.0.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: poll updates just the two supplied entries.
+            checked(unsafe { libc::poll(entries.as_mut_ptr(), 2, -1) })?;
+            if entries[0].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "backend process exited",
+                ));
+            }
+        }
         let mut size = [0; 4];
         self.0.read_exact(&mut size)?;
         let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
         self.0.read_exact(&mut bytes)?;
-        Ok(bytes)
+        Ok(Datagram::from_vec(bytes))
+    }
+
+    fn wait_control(&mut self, timeout: Duration) -> io::Result<bool> {
+        let mut entry = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = timeout.as_millis() as libc::c_int;
+        // SAFETY: poll updates just the supplied entry.
+        let ready = unsafe { libc::poll(&mut entry, 1, millis) };
+        checked(ready)?;
+        Ok(ready > 0)
     }
 
     fn send(&mut self, reply: &Reply) -> io::Result<()> {
@@ -218,6 +264,8 @@ struct Fixture {
     supervisor: Child,
     backend_pidfd: Option<OwnedFd>,
     replies: Vec<Reply>,
+    /// Output already read from the supervisor while waiting for `Established`.
+    early: Vec<u8>,
 }
 
 impl Fixture {
@@ -258,14 +306,28 @@ impl Fixture {
             supervisor,
             backend_pidfd: None,
             replies: Vec::new(),
+            early: Vec::new(),
         }
     }
 
+    /// Start and wait until the supervisor has published `Established`, so
+    /// that a later order cannot overtake the negotiation.
     fn start(&mut self) -> serde_json::Value {
         self.start_with(fixture_start("fqdn:fixture.example"))
     }
 
     fn start_with(&mut self, start: Start) -> serde_json::Value {
+        let ready = self.begin(start);
+        let mut byte = [0];
+        while self.early.last() != Some(&b'\n') {
+            self.writer.read_exact(&mut byte).unwrap();
+            self.early.push(byte[0]);
+        }
+        ready
+    }
+
+    /// Start without waiting: the negotiation may still be in progress.
+    fn begin(&mut self, start: Start) -> serde_json::Value {
         self.send_bytes(&serde_json::to_vec(&Order::Start(start)).unwrap());
         self.send_bytes(&fixture_credentials());
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -292,13 +354,27 @@ impl Fixture {
         send_frame(&mut self.writer, bytes).unwrap();
     }
 
+    fn wait_for(&mut self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.root.join(marker).exists() {
+            assert!(self.supervisor.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "fake never reached {marker}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn finish(&mut self, action: Option<&[u8]>) -> String {
         match action {
             Some(b"T") => self.send_bytes(br#"{"op":"stop"}"#),
             Some(bytes) => self.send_bytes(bytes),
             None => self.writer.shutdown(std::net::Shutdown::Write).unwrap(),
         }
-        let mut answer = String::new();
+        self.collect()
+    }
+
+    /// Read what the supervisor says until it exits, without sending anything.
+    fn collect(&mut self) -> String {
+        let mut answer = String::from_utf8(std::mem::take(&mut self.early)).unwrap();
         self.writer.read_to_string(&mut answer).unwrap();
         assert!(self.supervisor.wait().unwrap().success());
         assert!(
@@ -531,8 +607,8 @@ fn failure_and_mismatched_sa_clean_up_before_the_terminal_reply() {
     for failure in ["fail-initiate", "wrong-if-id"] {
         let mut fixture = Fixture::launch(false);
         fs::write(fixture.root.join(failure), []).unwrap();
-        fixture.start();
-        assert_eq!(fixture.finish(None), "error: Other");
+        fixture.begin(fixture_start("fqdn:fixture.example"));
+        assert_eq!(fixture.collect(), "error: Other");
         assert_eq!(
             fixture.replies,
             [Reply::Failed {
@@ -550,12 +626,211 @@ fn failure_and_mismatched_sa_clean_up_before_the_terminal_reply() {
     }
 }
 
+fn names(commands: &[serde_json::Value]) -> Vec<&str> {
+    commands
+        .iter()
+        .map(|entry| entry[0].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn stop_during_negotiation_cancels_cleans_up_and_never_reports_established() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("slow-list-sas"), []).unwrap();
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    fixture.wait_for("negotiating");
+    let started = Instant::now();
+    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    // The slow fake would have answered after 6 s: the stop did not wait.
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(fixture.replies, [Reply::Stopped {}]);
+    let commands = fixture.commands();
+    let names = names(&commands);
+    assert!(names.contains(&"initiate") && names.contains(&"list-sas"));
+    assert!(names.ends_with(&["terminate", "unload-conn", "unload-shared", "unload-shared"]));
+    assert!(fixture.root.join("term").exists());
+}
+
+#[test]
+fn eof_during_negotiation_cancels_cleans_up_and_sends_nothing() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("slow-list-sas"), []).unwrap();
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    fixture.wait_for("negotiating");
+    let started = Instant::now();
+    assert_eq!(fixture.finish(None), "Eof");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(fixture.replies.is_empty());
+    let commands = fixture.commands();
+    assert!(names(&commands).ends_with(&[
+        "terminate",
+        "unload-conn",
+        "unload-shared",
+        "unload-shared"
+    ]));
+    assert!(fixture.root.join("term").exists());
+}
+
+#[test]
+fn an_order_that_overtook_the_negotiation_is_never_followed_by_its_result() {
+    let established = || {
+        Ok(Reply::Established {
+            if_id: 1,
+            reqid: 1,
+            virtual_ipv4: "198.51.100.17".parse().unwrap(),
+            remote_ts: Vec::new(),
+        })
+    };
+    let canceled = || Err(io::Error::from(io::ErrorKind::Interrupted));
+    let stop = || Some(Ok(Order::Stop {}));
+    let eof = || Some(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+
+    // Control: with no order pending the result is published.
+    assert!(matches!(
+        settle(established(), None).unwrap(),
+        Settled::Publish(Reply::Established { .. })
+    ));
+    // The negotiation finished first, but the order is already pending.
+    assert!(matches!(
+        settle(established(), stop()).unwrap(),
+        Settled::Done(Exit::Stopped)
+    ));
+    assert!(matches!(
+        settle(established(), eof()).unwrap(),
+        Settled::Done(Exit::Eof)
+    ));
+    // The cancellation the order caused is not reported as a failure.
+    assert!(matches!(
+        settle(canceled(), stop()).unwrap(),
+        Settled::Done(Exit::Stopped)
+    ));
+    assert!(matches!(
+        settle(canceled(), eof()).unwrap(),
+        Settled::Done(Exit::Eof)
+    ));
+    // A real failure still surfaces, and so does a bad order.
+    let failed = settle(Err(io::Error::other("charon refused")), stop());
+    assert!(matches!(failed, Err(error) if error.kind() == io::ErrorKind::Other));
+    let second_start = Some(Ok(Order::Start(fixture_start("fqdn:fixture.example"))));
+    assert!(matches!(
+        settle(established(), second_start),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData
+    ));
+    let garbled = Some(Err(invalid("invalid IPsec instance order")));
+    assert!(matches!(
+        settle(canceled(), garbled),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData
+    ));
+}
+
+#[test]
+fn backend_death_after_established_is_reported_before_the_channel_ends() {
+    let mut fixture = Fixture::launch(false);
+    fixture.start();
+    let fd = fixture.backend_pidfd.as_ref().unwrap();
+    pidfd_signal(fd, libc::SIGKILL).unwrap();
+    assert!(poll_until(fd, Instant::now() + TERM_GRACE).unwrap());
+    assert_eq!(fixture.collect(), "error: BrokenPipe");
+    assert_eq!(
+        fixture.replies.last(),
+        Some(&Reply::Failed {
+            code: ErrorCode::Backend
+        })
+    );
+    assert!(matches!(
+        fixture.replies.as_slice(),
+        [Reply::Established { .. }, Reply::Failed { .. }]
+    ));
+}
+
+#[test]
+fn largest_public_credentials_and_start_fit_the_instance_frame() {
+    use crate::tunneld::handshake::MAX_FRAME;
+
+    let secret = "p".repeat(4096);
+    let psk = "k".repeat(4096);
+    let frame = encode_credentials(&protocol::Credentials::ipsec(&secret, &psk).unwrap()).unwrap();
+    assert_eq!(frame.len(), 4 + 4096 + 4096);
+    assert!(frame.len() <= MAX_FRAME);
+    let mut frame = frame;
+    let credentials = decode_credentials(&mut frame).unwrap();
+    assert_eq!(credentials.password.expose(), secret);
+    assert_eq!(credentials.psk.expose(), psk);
+
+    // The first byte past the limit is refused, and still wiped.
+    let mut oversized = Zeroizing::new(vec![b'x'; MAX_FRAME + 1]);
+    assert_eq!(
+        decode_credentials(&mut oversized).unwrap_err(),
+        ErrorCode::BadRequest
+    );
+    assert!(oversized.iter().all(|byte| *byte == 0));
+
+    let start = largest_start();
+    let bytes = serde_json::to_vec(&Order::Start(start)).unwrap();
+    assert!(bytes.len() > 4096, "{}", bytes.len());
+    assert!(bytes.len() <= MAX_FRAME, "{}", bytes.len());
+    let Order::Start(start) = serde_json::from_slice(&bytes).unwrap() else {
+        panic!("expected a start order");
+    };
+    Attempt::new(start).unwrap();
+}
+
+fn largest_start() -> Start {
+    // The most the instance admits: 64 selectors each way, a long identity
+    // and a long username.
+    let mut start = fixture_start(&format!("fqdn:{}", "a".repeat(200)));
+    start.username = "u".repeat(200);
+    start.local_ts = (0..64)
+        .map(|index| match index {
+            0 => "198.51.100.0/24".to_owned(),
+            _ => format!("100.{}.100.200/32", 64 + index),
+        })
+        .collect();
+    start.remote_ts = (0..64)
+        .map(|index| match index {
+            0 => CidrV4::new("198.51.100.0".parse().unwrap(), 24).unwrap(),
+            _ => CidrV4::new(format!("203.{}.200.100", 100 + index).parse().unwrap(), 32).unwrap(),
+        })
+        .collect();
+    start
+}
+
+#[test]
+fn peer_identity_rule_is_the_one_policy_applies() {
+    for accepted in [
+        "fqdn:vpn.example",
+        "email:user@example.test",
+        "ipv4:192.0.2.99",
+        &format!("fqdn:{}", "a".repeat(253 - 5)),
+    ] {
+        assert!(Config::literal_peer_identity(accepted), "{accepted}");
+        Attempt::new(fixture_start(accepted)).unwrap();
+    }
+    for refused in [
+        "fqdn:vpn.example\n",
+        "fqdn:vpn.exämple",
+        "email:usér@example.test",
+        "fqdn:*.example",
+        "fqdn:#0102",
+        "fqdn:^vpn$",
+        "fqdn:",
+        "ipv4:0.0.0.0",
+        "ipv4:224.0.0.1",
+        "ipv6:2001:db8::1",
+        "vpn.example",
+        &format!("fqdn:{}", "a".repeat(253 - 4)),
+    ] {
+        assert!(!Config::literal_peer_identity(refused), "{refused}");
+        assert!(Attempt::new(fixture_start(refused)).is_err(), "{refused}");
+    }
+}
+
 #[test]
 fn foreign_backend_is_refused_before_load_and_receives_no_credentials() {
     let mut fixture = Fixture::launch(false);
     fs::write(fixture.root.join("foreign-backend"), []).unwrap();
-    fixture.start();
-    assert_eq!(fixture.finish(None), "error: Other");
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
     assert_eq!(
         fixture.replies,
         [Reply::Failed {
@@ -762,12 +1037,19 @@ fn authenticated_supervisor_survives_idle_and_observes_charon_exit() {
             )
         });
         let mut client = writer.authenticate(&Attestor).unwrap();
+        // The largest Start the instance admits and the largest public
+        // credentials both cross the real authenticated channel.
+        client
+            .send(&serde_json::to_vec(&Order::Start(largest_start())).unwrap())
+            .unwrap();
         client
             .send(
-                &serde_json::to_vec(&Order::Start(fixture_start("fqdn:fixture.example"))).unwrap(),
+                &encode_credentials(
+                    &protocol::Credentials::ipsec(&"p".repeat(4096), &"k".repeat(4096)).unwrap(),
+                )
+                .unwrap(),
             )
             .unwrap();
-        client.send(&fixture_credentials()).unwrap();
         assert!(matches!(
             serde_json::from_slice::<Reply>(&client.receive().unwrap()).unwrap(),
             Reply::Established { .. }
@@ -796,6 +1078,13 @@ fn authenticated_supervisor_survives_idle_and_observes_charon_exit() {
         assert!(!poll_until(&child, Instant::now()).unwrap());
         let exit = Instant::now();
         pidfd_signal(&child, libc::SIGKILL).unwrap();
+        // The authenticated peer is told why the instance ends.
+        assert_eq!(
+            serde_json::from_slice::<Reply>(&client.receive().unwrap()).unwrap(),
+            Reply::Failed {
+                code: ErrorCode::Backend
+            }
+        );
         assert_eq!(
             supervisor.join().unwrap().unwrap_err().kind(),
             io::ErrorKind::BrokenPipe

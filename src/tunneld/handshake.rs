@@ -1,5 +1,6 @@
 //! Single-generation authentication for the Linux backend control channel.
 
+use std::cell::Cell;
 use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs::{self, File};
@@ -12,6 +13,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de};
+use zeroize::Zeroizing;
 
 pub use super::protocol::Backend;
 
@@ -22,7 +24,11 @@ pub const CONTROL_SOCKET_NAME: &str = "control.sock";
 
 const VERSION: u32 = 1;
 pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_FRAME: usize = 4096;
+/// Largest datagram in either direction on an authenticated channel. It covers
+/// two 4096-byte IPsec secrets with their lengths, and the largest instance
+/// `Start` that its validation admits.
+pub(super) const MAX_FRAME: usize = 16 * 1024;
+const MAX_RECORD: usize = 4096;
 const SCM_PIDFD: libc::c_int = 4;
 const PID_FS_MAGIC: libc::c_long = 0x5049_4446;
 
@@ -410,9 +416,9 @@ fn open_record(path: &Path, owner: libc::uid_t) -> io::Result<Record> {
     check_mode(fd.as_fd(), owner, libc::S_IFREG, 0o600)?;
     let mut data = Vec::new();
     File::from(fd)
-        .take((MAX_FRAME + 1) as u64)
+        .take((MAX_RECORD + 1) as u64)
         .read_to_end(&mut data)?;
-    if data.len() > MAX_FRAME {
+    if data.len() > MAX_RECORD {
         return Err(invalid("oversized writer record"));
     }
     decode_object(&data)
@@ -827,6 +833,43 @@ fn connect_as(
     })
 }
 
+/// One received application datagram. It may carry credentials, so its bytes
+/// are wiped when it is released and its `Debug` shows only the length.
+pub struct Datagram(Zeroizing<Vec<u8>>);
+
+impl std::ops::Deref for Datagram {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Datagram {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl fmt::Debug for Datagram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Datagram({} bytes)", self.0.len())
+    }
+}
+
+impl Datagram {
+    #[cfg(test)]
+    pub(super) fn from_vec(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for Datagram {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.0.as_slice() == other.as_slice()
+    }
+}
+
 /// An established channel keeps the connected socket and the peer's pidfd.
 /// The socket stays private so callers cannot bypass per-datagram checks.
 pub struct AuthenticatedChannel {
@@ -841,7 +884,9 @@ impl AuthenticatedChannel {
 
     /// Receive one application datagram from the authenticated peer. An error
     /// closes the channel. Application message schemas are checked by callers.
-    pub fn receive(&mut self) -> io::Result<Vec<u8>> {
+    /// The datagram may carry credentials: every buffer that held received
+    /// bytes is wiped when it is released, on success and on every error.
+    pub fn receive(&mut self) -> io::Result<Datagram> {
         let transport = self.transport.take().ok_or(io::ErrorKind::NotConnected)?;
         let (bytes, _) = transport.receive(Instant::now() + PHASE_TIMEOUT)?;
         self.transport = Some(transport);
@@ -850,14 +895,39 @@ impl AuthenticatedChannel {
 
     /// Wait without an idle deadline for a datagram or for either process to
     /// exit. The caller supplies the pidfd of its supervised backend process.
-    /// Child exit returns BrokenPipe, peer exit returns UnexpectedEof, and
-    /// every error closes the channel.
-    pub fn receive_while_running(&mut self, child: BorrowedFd<'_>) -> io::Result<Vec<u8>> {
+    /// Child exit returns BrokenPipe and leaves the channel open so the caller
+    /// can still send one terminal reply to a live peer. Peer exit returns
+    /// UnexpectedEof and every other error closes the channel.
+    pub fn receive_while_running(&mut self, child: BorrowedFd<'_>) -> io::Result<Datagram> {
         let transport = self.transport.take().ok_or(io::ErrorKind::NotConnected)?;
         pidfs(child)?;
-        let (bytes, _) = transport.receive_when(|| transport.wait_for_session(child))?;
-        self.transport = Some(transport);
-        Ok(bytes)
+        let child_exited = Cell::new(false);
+        let received = transport.receive_when(|| {
+            transport.wait_for_session(child).inspect_err(|error| {
+                child_exited.set(error.kind() == io::ErrorKind::BrokenPipe);
+            })
+        });
+        match received {
+            Ok((bytes, _)) => {
+                self.transport = Some(transport);
+                Ok(bytes)
+            }
+            Err(error) => {
+                if child_exited.get() {
+                    self.transport = Some(transport);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Wait up to `timeout` until a datagram is pending, without consuming it.
+    /// Peer exit returns UnexpectedEof. Use `receive` to read what is pending.
+    pub fn wait_control(&self, timeout: Duration) -> io::Result<bool> {
+        self.transport
+            .as_ref()
+            .ok_or(io::ErrorKind::NotConnected)?
+            .wait_control(timeout)
     }
 
     /// Send one application datagram to the authenticated peer. An error
@@ -905,11 +975,49 @@ impl Transport {
         }
     }
 
-    fn receive(&self, deadline: Instant) -> io::Result<(Vec<u8>, libc::pid_t)> {
-        let received =
-            self.receive_when(|| wait_ready(self.socket.as_fd(), libc::POLLIN, deadline))?;
+    fn receive(&self, deadline: Instant) -> io::Result<(Datagram, libc::pid_t)> {
+        self.receive_by(
+            || wait_ready(self.socket.as_fd(), libc::POLLIN, deadline),
+            deadline,
+        )
+    }
+
+    /// The deadline is checked again after reception. The bytes stay in a
+    /// wiping buffer, so a late datagram is released zeroed.
+    fn receive_by(
+        &self,
+        wait: impl FnMut() -> io::Result<()>,
+        deadline: Instant,
+    ) -> io::Result<(Datagram, libc::pid_t)> {
+        let received = self.receive_when(wait)?;
         remaining(deadline)?;
         Ok(received)
+    }
+
+    fn wait_control(&self, timeout: Duration) -> io::Result<bool> {
+        let mut entries = [
+            poll_entry(self.peer.fd.as_fd()),
+            poll_entry(self.socket.as_fd()),
+        ];
+        let millis = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+        loop {
+            // SAFETY: entries contains both writable poll descriptors.
+            let ready = unsafe { libc::poll(entries.as_mut_ptr(), entries.len() as _, millis) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if entries[0].revents != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "authenticated peer exited",
+                ));
+            }
+            return Ok(entries[1].revents != 0);
+        }
     }
 
     fn wait_for_session(&self, child: BorrowedFd<'_>) -> io::Result<()> {
@@ -947,8 +1055,9 @@ impl Transport {
     fn receive_when(
         &self,
         mut wait: impl FnMut() -> io::Result<()>,
-    ) -> io::Result<(Vec<u8>, libc::pid_t)> {
-        let mut bytes = vec![0; MAX_FRAME];
+    ) -> io::Result<(Datagram, libc::pid_t)> {
+        // Wiped on drop, so no exit below can release received bytes unwiped.
+        let mut bytes = Zeroizing::new(vec![0; MAX_FRAME]);
         let mut vector = libc::iovec {
             iov_base: bytes.as_mut_ptr().cast(),
             iov_len: bytes.len(),
@@ -991,7 +1100,7 @@ impl Transport {
             let (credentials, pidfd) = ancillary?;
             self.peer.check_sender(credentials, pidfd.as_fd())?;
             bytes.truncate(count as usize);
-            return Ok((bytes, credentials.pid));
+            return Ok((Datagram(bytes), credentials.pid));
         }
     }
 
@@ -1139,6 +1248,8 @@ mod session_tests {
                 assert_eq!(channel.receive().unwrap(), b"ready");
                 thread::sleep(PHASE_TIMEOUT + Duration::from_millis(250));
                 channel.send(b"stop").unwrap();
+                // A backend exit leaves the live peer able to answer once.
+                assert_eq!(channel.receive().unwrap(), b"closed");
                 assert_eq!(
                     channel.receive().unwrap_err().kind(),
                     io::ErrorKind::UnexpectedEof
@@ -1172,11 +1283,312 @@ mod session_tests {
             let status = child.wait().unwrap();
             assert!(status.success());
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            channel.send(b"closed").unwrap();
+            // Only a backend exit keeps the channel: the next error closes it.
+            drop(channel);
+            instance.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn datagrams_up_to_the_frame_limit_pass_both_ways_and_the_next_byte_is_refused() {
+        let path = std::env::temp_dir().join(format!("vpnt-limit-{}", &challenge().unwrap()[..16]));
+        fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+        let fixture = Fixture(path);
+        // SAFETY: these credential queries take no arguments.
+        let expected = unsafe {
+            Credentials {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        };
+        let writer = Writer::publish_as(
+            &fixture.0,
+            OsStr::new("control"),
+            ATTEMPT,
+            expected,
+            PHASE_TIMEOUT,
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            let instance = scope.spawn(|| {
+                let mut channel = connect_as(
+                    &fixture.0.join("control"),
+                    &fixture.0.join(GENERATION),
+                    ATTEMPT,
+                    INVOCATION,
+                    expected,
+                    PHASE_TIMEOUT,
+                )
+                .unwrap();
+                let largest = channel.receive().unwrap();
+                assert_eq!(largest.len(), MAX_FRAME);
+                assert!(largest.iter().all(|byte| *byte == 7));
+                channel.send(&vec![9; MAX_FRAME]).unwrap();
+                assert_eq!(
+                    channel.send(&vec![9; MAX_FRAME + 1]).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData
+                );
+            });
+            let mut channel = writer.authenticate(&fixture).unwrap();
+            assert_eq!(MAX_FRAME, 16 * 1024);
+            channel.send(&vec![7; MAX_FRAME]).unwrap();
+            let largest = channel.receive().unwrap();
+            assert_eq!(largest.len(), MAX_FRAME);
+            assert!(largest.iter().all(|byte| *byte == 9));
             assert_eq!(
-                channel.send(b"closed").unwrap_err().kind(),
-                io::ErrorKind::NotConnected
+                channel.send(&vec![7; MAX_FRAME + 1]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
             );
             instance.join().unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::os::fd::AsFd;
+
+    thread_local! {
+        static WATCH: Cell<bool> = const { Cell::new(false) };
+        static FREED: Cell<usize> = const { Cell::new(0) };
+        static DIRTY: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Looks at every block of the receive buffer's size as it is freed on a
+    /// thread that opted in, and counts the ones that still hold data.
+    struct Probe;
+
+    // SAFETY: every method forwards to the system allocator. `dealloc` only
+    // reads the live block it is about to free, and only on the opted-in thread.
+    unsafe impl GlobalAlloc for Probe {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if layout.size() == MAX_FRAME && WATCH.get() {
+                FREED.set(FREED.get() + 1);
+                // SAFETY: the block is live and `size` bytes long until freed.
+                let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                if block.iter().any(|byte| *byte != 0) {
+                    DIRTY.set(DIRTY.get() + 1);
+                }
+            }
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static PROBE: Probe = Probe;
+
+    fn ids() -> Credentials {
+        // SAFETY: these syscalls take no pointers.
+        unsafe {
+            Credentials {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        }
+    }
+
+    fn self_pidfd() -> OwnedFd {
+        // SAFETY: pidfd_open takes a PID and flags and returns a new FD.
+        new_fd(
+            unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as libc::pid_t, 0) }
+                as RawFd,
+        )
+        .unwrap()
+    }
+
+    /// A sender socket and a transport that accepts only `expected`.
+    fn pair(expected: Credentials) -> (OwnedFd, Transport) {
+        let mut pair = [-1; 2];
+        // SAFETY: the kernel writes two newly owned descriptors on success.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let [sender, receiver] = pair.map(|raw| new_fd(raw).unwrap());
+        for option in [libc::SO_PASSCRED, libc::SO_PASSPIDFD] {
+            let enabled: libc::c_int = 1;
+            // SAFETY: setsockopt reads the supplied integer.
+            let rc = unsafe {
+                libc::setsockopt(
+                    receiver.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    ptr::from_ref(&enabled).cast(),
+                    size_of::<libc::c_int>() as _,
+                )
+            };
+            assert_eq!(rc, 0);
+        }
+        let fd = self_pidfd();
+        let identity = pidfs(fd.as_fd()).unwrap();
+        (
+            sender,
+            Transport {
+                socket: receiver,
+                peer: Peer {
+                    fd,
+                    identity,
+                    expected,
+                },
+            },
+        )
+    }
+
+    fn send(sender: &OwnedFd, bytes: &[u8], rights: Option<RawFd>) {
+        let mut vector = libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut control = [0_usize; 4];
+        // SAFETY: the message points at readable data and a control buffer.
+        unsafe {
+            let mut message: libc::msghdr = zeroed();
+            message.msg_iov = &mut vector;
+            message.msg_iovlen = 1;
+            if let Some(raw) = rights {
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen = libc::CMSG_SPACE(size_of::<RawFd>() as _) as _;
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as _;
+                libc::CMSG_DATA(header).cast::<RawFd>().write_unaligned(raw);
+            }
+            let sent = libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_NOSIGNAL);
+            assert_eq!(sent, bytes.len() as isize, "{}", io::Error::last_os_error());
+        }
+    }
+
+    /// Runs `body` with the probe armed and returns (blocks freed, blocks
+    /// freed while still holding data).
+    fn watched(body: impl FnOnce()) -> (usize, usize) {
+        FREED.set(0);
+        DIRTY.set(0);
+        WATCH.set(true);
+        body();
+        WATCH.set(false);
+        (FREED.get(), DIRTY.get())
+    }
+
+    const SECRET: &[u8] = b"synthetic credential bytes that must not outlive the receive";
+
+    fn secret_frame(size: usize) -> Vec<u8> {
+        SECRET.iter().copied().cycle().take(size).collect()
+    }
+
+    #[test]
+    fn the_probe_sees_a_buffer_freed_with_data() {
+        let (freed, dirty) = watched(|| drop(vec![0xAA_u8; MAX_FRAME]));
+        assert_eq!((freed, dirty), (1, 1));
+    }
+
+    #[test]
+    fn receive_buffer_is_wiped_on_success() {
+        let (sender, transport) = pair(ids());
+        send(&sender, &secret_frame(300), None);
+        let (freed, dirty) = watched(|| {
+            let (bytes, _) = transport.receive(Instant::now() + PHASE_TIMEOUT).unwrap();
+            assert_eq!(&bytes[..SECRET.len()], SECRET);
+        });
+        assert_eq!((freed, dirty), (1, 0));
+    }
+
+    #[test]
+    fn receive_buffer_is_wiped_when_the_datagram_is_truncated() {
+        let (sender, transport) = pair(ids());
+        send(&sender, &secret_frame(MAX_FRAME + 1), None);
+        let (freed, dirty) = watched(|| {
+            let error = transport
+                .receive(Instant::now() + PHASE_TIMEOUT)
+                .unwrap_err();
+            assert!(error.to_string().contains("truncated"), "{error}");
+        });
+        assert_eq!((freed, dirty), (1, 0));
+    }
+
+    #[test]
+    fn receive_buffer_is_wiped_when_ancillary_data_is_refused() {
+        let (sender, transport) = pair(ids());
+        let extra = self_pidfd();
+        send(&sender, &secret_frame(300), Some(extra.as_raw_fd()));
+        let (freed, dirty) = watched(|| {
+            let error = transport
+                .receive(Instant::now() + PHASE_TIMEOUT)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("exactly one kernel credential"),
+                "{error}"
+            );
+        });
+        assert_eq!((freed, dirty), (1, 0));
+    }
+
+    #[test]
+    fn receive_buffer_is_wiped_when_the_sender_is_refused() {
+        let other = Credentials {
+            uid: ids().uid.wrapping_add(1),
+            gid: ids().gid,
+        };
+        let (sender, transport) = pair(other);
+        send(&sender, &secret_frame(300), None);
+        let (freed, dirty) = watched(|| {
+            let error = transport
+                .receive(Instant::now() + PHASE_TIMEOUT)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        });
+        assert_eq!((freed, dirty), (1, 0));
+    }
+
+    #[test]
+    fn receive_buffer_is_wiped_when_the_deadline_passes_after_reception() {
+        let (sender, transport) = pair(ids());
+        send(&sender, &secret_frame(300), None);
+        let (freed, dirty) = watched(|| {
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let error = transport
+                .receive_by(
+                    || {
+                        std::thread::sleep(Duration::from_millis(80));
+                        Ok(())
+                    },
+                    deadline,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        });
+        assert_eq!((freed, dirty), (1, 0));
+    }
+
+    #[test]
+    fn a_failed_wait_before_reception_frees_a_clean_buffer() {
+        let (_sender, transport) = pair(ids());
+        let (freed, dirty) = watched(|| {
+            let error = transport
+                .receive_when(|| Err(io::ErrorKind::BrokenPipe.into()))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        });
+        assert_eq!((freed, dirty), (1, 0));
     }
 }

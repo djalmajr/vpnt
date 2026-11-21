@@ -83,6 +83,25 @@ impl Config {
             networks,
         })
     }
+    /// The one rule for a literal IKE peer identity on Linux: a typed `fqdn:`,
+    /// `email:` or `ipv4:` value that VICI carries unchanged. Policy admission
+    /// and the instance's VICI adaptation must both use it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn literal_peer_identity(identity: &str) -> bool {
+        let Some((kind, text)) = identity.split_once(':') else {
+            return false;
+        };
+        identity.len() <= 253
+            && match kind {
+                "ipv4" => text
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok_and(|ip| endpoint(ip.into())),
+                "fqdn" | "email" => {
+                    text_identity_username(text) && text.bytes().all(|b| (0x20..0x7f).contains(&b))
+                }
+                _ => false,
+            }
+    }
     /// The Linux writer already owns the attempt and the reqid reservation.
     /// This config is usable only with the instance's private VICI adapter.
     #[cfg(target_os = "linux")]
@@ -95,18 +114,7 @@ impl Config {
         local_ts: Vec<String>,
         remote_ts: Vec<String>,
     ) -> Result<Self, Error> {
-        let (kind, text) = peer_identity.split_once(':').ok_or(Error::Invalid)?;
-        let literal = match kind {
-            "ipv4" => text
-                .parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| endpoint(ip.into())),
-            "fqdn" | "email" => {
-                text_identity_username(text) && text.bytes().all(|b| (0x20..0x7f).contains(&b))
-            }
-            _ => false,
-        };
-        if !literal
-            || peer_identity.len() > 253
+        if !Self::literal_peer_identity(peer_identity)
             || username.len() > 200
             || !text_identity_username(username)
         {
