@@ -258,21 +258,3 @@ fn ipsec_cancel_ignores_a_late_connected_generation_and_reconnects() {
     no_secret(&broker.snapshot());
     no_secret_on_disk(&peer);
 }
-
-#[cfg(target_os = "macos")]
-#[test]
-fn ovpn_connect_never_sends_a_privileged_request() {
-    let mut peer = Peer::new("ipsec");
-    let (secrets, calls) = IpsecSecrets::new("fictional-psk");
-    let mut broker = Broker::new(Some(peer.take()), secrets);
-    wait(&mut broker, |s| s.helper == "installed");
-    let connection = broker.connections.get_mut("ipsec").unwrap();
-    connection.view.profile.kind = VpnKind::Ovpn;
-    let before = connection.generation;
-    let snapshot = dispatch(&mut broker, Command::Connect { id: "ipsec".into() }).unwrap();
-    assert_eq!(state(&snapshot, "ipsec"), State::MissingProgram);
-    assert_eq!(broker.connections["ipsec"].generation, before);
-    assert_eq!(command_count(&peer, "connect"), 0);
-    assert!(calls.recorded().is_empty());
-    assert_not_connected(&snapshot, "ipsec");
-}

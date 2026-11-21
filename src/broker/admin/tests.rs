@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc::sync_channel,
     },
 };
 struct Secrets {
@@ -435,15 +436,8 @@ fn a_local_missing_program_warning_survives_an_unrelated_admin_snapshot() {
             .unwrap()
             .state
     };
-    assert_eq!(
-        state(
-            h.command(Command::Toggle {
-                id: ovpn.id.clone()
-            }),
-            &ovpn.id
-        ),
-        State::MissingProgram
-    );
+    refuse_ovpn_connect(&mut h.broker, &ovpn.id);
+    assert_eq!(state(h.broker.snapshot(), &ovpn.id), State::MissingProgram);
     // The local poll keeps the card off without reading credentials.
     assert_eq!(
         state(h.command(Command::GetSnapshot {}), &ovpn.id),
@@ -512,14 +506,7 @@ fn the_missing_program_warning_holds_only_for_a_same_generation_off_snapshot() {
         )
         .unwrap();
     let warn = |broker: &mut Broker<Secrets>| {
-        broker
-            .dispatch(
-                Command::Toggle {
-                    id: ovpn.id.clone(),
-                },
-                Instant::now() + Duration::from_secs(20),
-            )
-            .unwrap();
+        refuse_ovpn_connect(broker, &ovpn.id);
         assert_eq!(state_of(broker), State::MissingProgram);
     };
     // The merge runs through the cleanup verification seam: it is the existing
@@ -572,4 +559,37 @@ fn the_missing_program_warning_holds_only_for_a_same_generation_off_snapshot() {
     ssl.username = "fictional".into();
     merge(&mut broker, ssl, 1, State::Off).unwrap();
     assert_eq!(state_of(&mut broker), State::Off);
+}
+
+fn refuse_ovpn_connect(broker: &mut Broker<Secrets>, profile: &str) {
+    let (send, requests) = sync_channel(8);
+    let (replies, receive) = sync_channel(8);
+    // Use the channel peer for this Connect so the admin peer can still
+    // publish the unrelated catalog changes on its original transport.
+    let client = broker
+        .client
+        .replace(Client::fixture_channels(send, receive));
+    let before = broker.connections[profile].generation;
+    broker
+        .dispatch(
+            Command::Toggle { id: profile.into() },
+            Instant::now() + Duration::from_secs(20),
+        )
+        .unwrap();
+    let request = requests.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert!(matches!(
+        request.command,
+        protocol::Command::Connect { id, generation, .. }
+            if id == profile && generation == before + 1
+    ));
+    replies
+        .send(Message::Failed {
+            id: request.id,
+            error: ErrorCode::MissingProgram,
+        })
+        .unwrap();
+    broker.poll();
+    broker.client = client;
+    assert!(broker.connections[profile].pending.is_none());
+    assert_eq!(broker.connections[profile].generation, before);
 }

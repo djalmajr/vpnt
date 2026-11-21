@@ -172,8 +172,8 @@ impl Wire {
         self
     }
 
-    // The current macOS command path reports MissingProgram. Exercise the
-    // helper command and its local transition below that component guard.
+    // Arrange signer tests at the command transport boundary, including states
+    // that a normal Connect or Reconnect does not set immediately.
     fn submit_connect(&mut self, profile: &str, state: State) -> String {
         let generation = self.broker.connections[profile].generation + 1;
         let starting = if state == State::AwaitingApproval {
@@ -335,6 +335,177 @@ fn signature() -> serde_json::Value {
 
 fn error(name: &str) -> serde_json::Value {
     serde_json::json!({"error":name})
+}
+
+#[test]
+fn ovpn_component_missing_program_sets_the_card_state() {
+    let mut wire = Wire::new(None, None, None);
+    let before = wire.broker.connections["one"].generation;
+    wire.broker
+        .dispatch(
+            Command::Connect { id: "one".into() },
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
+    assert_eq!(wire.broker.connections["one"].view.state, State::Connecting);
+    let request = wire.request();
+    assert!(
+        matches!(request.command, protocol::Command::Connect { generation, .. } if generation == before + 1)
+    );
+    wire.send(Message::Failed {
+        id: request.id,
+        error: ErrorCode::MissingProgram,
+    });
+    assert!(wire.broker.connections["one"].pending.is_none());
+    assert_eq!(wire.broker.connections["one"].generation, before);
+    assert_eq!(
+        wire.broker.connections["one"].view.state,
+        State::MissingProgram
+    );
+}
+
+#[test]
+fn ovpn_reconnect_missing_program_sets_the_card_state() {
+    let mut wire = Wire::new(None, None, None);
+    let before = wire.accept("one", State::Connecting);
+    wire.change_state("one", before, State::Connected);
+    wire.broker
+        .dispatch(
+            Command::Reconnect { id: "one".into() },
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
+    assert_eq!(
+        wire.broker.connections["one"].view.state,
+        State::Reconnecting
+    );
+    let request = wire.request();
+    assert!(matches!(
+        request.command,
+        protocol::Command::Connect { id, generation, .. } if id == "one" && generation == before + 1
+    ));
+    wire.send(Message::Failed {
+        id: request.id,
+        error: ErrorCode::MissingProgram,
+    });
+    let restored = &wire.broker.connections["one"];
+    assert_eq!(restored.view.state, State::MissingProgram);
+    assert_eq!(restored.generation, before);
+}
+
+#[test]
+fn ssl_component_missing_program_restores_previous_state() {
+    let mut wire = Wire::new(None, None, None);
+    let before = wire.broker.connections["ssl"].generation;
+    wire.broker
+        .dispatch(
+            Command::Connect { id: "ssl".into() },
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
+    let request = wire.request();
+    assert!(matches!(
+        request.command,
+        protocol::Command::Connect { id, generation, .. } if id == "ssl" && generation == before + 1
+    ));
+    wire.send(Message::Failed {
+        id: request.id,
+        error: ErrorCode::MissingProgram,
+    });
+    let restored = &wire.broker.connections["ssl"];
+    assert_eq!(restored.view.state, State::Off);
+    assert_eq!(restored.generation, before);
+    assert!(restored.pending.is_none());
+}
+
+#[test]
+fn accepted_ovpn_connect_ignores_late_missing_program() {
+    let mut wire = Wire::new(None, None, None);
+    let request_id = wire.submit_connect("one", State::Connecting);
+    wire.send(Message::Accepted {
+        id: request_id.clone(),
+    });
+    let generation = wire.broker.connections["one"].generation;
+    assert!(
+        wire.broker.connections["one"]
+            .pending
+            .as_ref()
+            .unwrap()
+            .accepted
+    );
+
+    wire.send(Message::Failed {
+        id: request_id,
+        error: ErrorCode::MissingProgram,
+    });
+    assert_eq!(wire.broker.connections["one"].view.state, State::Connecting);
+    assert_eq!(wire.broker.connections["one"].generation, generation);
+}
+
+#[test]
+fn ovpn_disconnect_missing_program_restores_previous_state() {
+    let mut wire = Wire::new(None, None, None);
+    let before = wire.accept("one", State::Connecting);
+    wire.change_state("one", before, State::Connected);
+    wire.broker
+        .dispatch(
+            Command::Disconnect { id: "one".into() },
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
+    let request = wire.request();
+    assert!(matches!(
+        request.command,
+        protocol::Command::Disconnect { id, generation } if id == "one" && generation == before + 1
+    ));
+    wire.send(Message::Failed {
+        id: request.id,
+        error: ErrorCode::MissingProgram,
+    });
+    let restored = &wire.broker.connections["one"];
+    assert_eq!(restored.view.state, State::Connected);
+    assert_eq!(restored.generation, before);
+    assert!(restored.pending.is_none());
+}
+
+#[test]
+fn ovpn_connect_sends_empty_credentials_and_registers_the_signer() {
+    let mut wire = Wire::new(None, None, None);
+    let before = wire.broker.connections["one"].generation;
+    let loads = wire.broker.secrets.loads.clone();
+    wire.broker
+        .dispatch(
+            Command::Connect { id: "one".into() },
+            Instant::now() + BUDGET,
+        )
+        .unwrap();
+    assert_eq!(wire.broker.connections["one"].view.state, State::Connecting);
+    let request = wire.request();
+    let protocol::Command::Connect {
+        id,
+        generation,
+        credentials,
+        interval,
+    } = request.command
+    else {
+        panic!("expected a Connect request");
+    };
+    assert_eq!(id, "one");
+    assert_eq!(generation, before + 1);
+    assert_eq!(generation, wire.broker.connections["one"].generation);
+    assert!(credentials.password.expose().is_empty());
+    assert!(credentials.psk.expose().is_empty());
+    assert_eq!(interval, wire.broker.preferences.interval);
+    assert_eq!(loads.load(Ordering::Relaxed), 0);
+
+    wire.send(Message::Accepted { id: request.id });
+    wire.sign(1, "one", generation, certificate());
+    assert_eq!(
+        wire.reply(1, "one", generation),
+        serde_json::json!({"certificate":"MCo="})
+    );
+    wire.event(Event::Open("/fixture/one.dylib".into(), "01".into()));
+    wire.event(Event::Certificate);
 }
 
 #[test]
