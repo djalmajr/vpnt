@@ -5,7 +5,7 @@ use super::protocol::{
 };
 use crate::helper::local_socket::{Budget, connect_deadline, peer_uid};
 use std::{
-    fs,
+    fs, io,
     os::unix::{fs::MetadataExt, net::UnixStream},
     path::Path,
     time::Instant,
@@ -130,7 +130,18 @@ fn exchange(
     deadline: Instant,
 ) -> Result<Response, FrameError> {
     let mut io = timed(stream, deadline)?;
-    write_control(&mut io, &request)?;
+    if let Err(write_error) = write_control(&mut io, &request) {
+        // The server can queue a terminal rejection and close before seeing
+        // this request. Use the existing deadline and accept only that error.
+        if matches!(
+            write_error,
+            FrameError::Io(io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+        ) && let Ok(Response::Error { code }) = read_control(&mut io, decode_response)
+        {
+            return Err(code.into());
+        }
+        return Err(write_error);
+    }
     match read_control(&mut io, decode_response)? {
         Response::Error { code } => Err(code.into()),
         response => Ok(response),
@@ -314,6 +325,58 @@ mod tests {
             assert_eq!(client.stop(deadline()).unwrap(), State::Stopped);
             server.join().unwrap();
         });
+    }
+
+    #[test]
+    fn status_recovers_terminal_reply_after_server_closes() {
+        let fixture = SocketFixture::new();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let mut decoder = ServerDecoder::new(fixture.accept(deadline()));
+                decoder.hello(deadline()).unwrap();
+                decoder.prepare(deadline()).unwrap();
+                decoder.prepared(deadline()).unwrap();
+                decoder.credentials(deadline()).unwrap();
+                decoder
+                    .reject(ErrorCode::MissingProgram, deadline())
+                    .unwrap();
+            });
+            let mut client =
+                Client::connect_as(&fixture.path, deadline(), fixture.owner, fixture.peer).unwrap();
+            client.prepare(prepare(), deadline()).unwrap();
+            client
+                .send_credentials(Credentials::fortinet("fixture-only").unwrap(), deadline())
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                client.status(deadline()),
+                Err(FrameError::Protocol(ErrorCode::MissingProgram))
+            );
+        });
+    }
+
+    #[test]
+    fn failed_write_keeps_io_error_without_a_terminal_reply() {
+        for response in [
+            Some(Response::Status {
+                state: State::NetworkReady,
+            }),
+            None,
+        ] {
+            let (stream, mut server) = UnixStream::pair().unwrap();
+            if let Some(response) = response {
+                write_control(&mut server, &response).unwrap();
+            }
+            drop(server);
+            let mut client = Client {
+                stream: Some(stream),
+                phase: Phase::Active,
+            };
+            assert_eq!(
+                client.status(deadline()),
+                Err(FrameError::Io(io::ErrorKind::BrokenPipe))
+            );
+        }
     }
 
     #[test]

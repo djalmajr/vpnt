@@ -152,10 +152,17 @@ fn validate_addresses(addresses: &mut [Ipv4Addr], maximum: usize) -> io::Result<
     Ok(())
 }
 
-fn literal_ike_identity(identity: &str) -> bool {
+fn literal_ike_identity(identity: &str, transport_ipv4: &[Ipv4Addr]) -> bool {
     let Some((kind, text)) = identity.split_once(':') else {
         return false;
     };
+    if kind == "ipv4" {
+        return text.parse::<Ipv4Addr>().is_ok_and(|address| {
+            address.to_string() == text
+                && CidrV4::new(address, 32).is_ok()
+                && transport_ipv4.contains(&address)
+        });
+    }
     matches!(kind, "fqdn" | "email")
         && !text.is_empty()
         && !text.starts_with('#')
@@ -180,7 +187,7 @@ impl Entry {
             (Backend::Ipsec, None)
                 if self.dns_domains.is_empty()
                     && self.dns_servers.is_empty()
-                    && literal_ike_identity(&self.peer_identity) => {}
+                    && literal_ike_identity(&self.peer_identity, &self.transport_ipv4) => {}
             (Backend::Fortinet, Some(pin))
                 if self.peer_identity == self.hostname
                     && pin.len() == 64
@@ -476,6 +483,50 @@ mod tests {
             .unwrap()
             .replace("\"uid\":1000", "\"uid\":1000,\"uid\":1000");
         assert!(canonical_snapshot(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ipv4_ike_identity_must_be_canonical_unicast_and_in_the_grant_transport() {
+        let mut grant = ipsec();
+        grant["transport_ipv4"] = json!(["192.0.2.20", "192.0.2.10"]);
+        grant["peer_identity"] = json!("ipv4:192.0.2.10");
+        let bytes = snapshot(grant.clone()).expect("an IPv4 identity in the transport is allowed");
+        assert_eq!(
+            Policy::parse(&bytes, MAX_SNAPSHOT)
+                .unwrap()
+                .bytes()
+                .unwrap(),
+            bytes
+        );
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["entries"][0]["peer_identity"], "ipv4:192.0.2.10");
+        assert_eq!(
+            parsed["entries"][0]["transport_ipv4"],
+            json!(["192.0.2.10", "192.0.2.20"])
+        );
+        for rejected in [
+            "ipv4:192.0.2.11",
+            "ipv4:192.0.002.10",
+            "ipv4:0300.0.2.012",
+            "ipv4: 192.0.2.10",
+            "ipv4:192.0.2.10 ",
+            "ipv4:192.0.2.10\n",
+            "ipv4:192.0.2.10/32",
+            "ipv4:::ffff:192.0.2.10",
+            "ipv4:224.0.0.1",
+            "ipv4:0.0.0.0",
+            "ipv4:255.255.255.255",
+            "192.0.2.10",
+        ] {
+            grant["peer_identity"] = json!(rejected);
+            assert!(snapshot(grant.clone()).is_err(), "accepted {rejected:?}");
+        }
+        for accepted in ["fqdn:vpn.example", "email:fixture@example.test"] {
+            grant["peer_identity"] = json!(accepted);
+            let bytes = snapshot(grant.clone()).unwrap();
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["entries"][0]["peer_identity"], accepted);
+        }
     }
 
     #[test]
