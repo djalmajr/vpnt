@@ -6,7 +6,7 @@ use super::{
         UnitIdentity, Writer,
     },
     instance_protocol::{Order, Reply, Start, encode_credentials},
-    network::{Network, Receipt, parse_cidr, valid_generation},
+    network::{Network, Receipt, SetupCancellation, parse_cidr, valid_generation},
     policy::{Entry, MAX_IPSEC_ROUTES},
     protocol::{CidrV4, Credentials, ErrorCode, Prepare, State},
 };
@@ -27,10 +27,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -59,7 +56,7 @@ pub(super) trait Launch: Send + Sync {
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode>;
 }
 
@@ -190,22 +187,9 @@ struct IpsecStart {
     credentials: zeroize::Zeroizing<Vec<u8>>,
 }
 
-fn check_setup(cancel: &AtomicBool) -> io::Result<()> {
-    if cancel
-        .compare_exchange(false, false, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "client canceled setup",
-        ));
-    }
-    Ok(())
-}
-
 struct CapturePeer<'a, A> {
     attestor: &'a A,
-    cancel: &'a AtomicBool,
+    cancel: &'a SetupCancellation,
     peer: std::cell::RefCell<Option<OwnedFd>>,
 }
 
@@ -215,9 +199,9 @@ impl<A: UnitAttestor> UnitAttestor for CapturePeer<'_, A> {
     }
 
     fn attest_until(&self, fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<UnitIdentity> {
-        check_setup(self.cancel)?;
+        self.cancel.check()?;
         let identity = self.attestor.attest_until(fd, deadline)?;
-        check_setup(self.cancel)?;
+        self.cancel.check()?;
         self.peer.replace(Some(fd.try_clone_to_owned()?));
         Ok(identity)
     }
@@ -230,9 +214,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         setup: Option<IpsecStart>,
         authorization: Option<File>,
         channel: &mut Option<AuthenticatedChannel>,
-        cancel: &Arc<AtomicBool>,
+        cancel: &SetupCancellation,
     ) -> Result<OwnedFd, Failure> {
-        check_setup(cancel).map_err(|e| Failure::io("admission", &e))?;
+        cancel.check().map_err(|e| Failure::io("admission", &e))?;
         let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut {
                 Failure::new(ErrorCode::Busy, "network write lock is contended")
@@ -249,7 +233,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         {
             return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
         }
-        check_setup(cancel).map_err(|e| Failure::io("generation setup", &e))?;
+        cancel
+            .check()
+            .map_err(|e| Failure::io("generation setup", &e))?;
         let directory = self
             .create_directory(&attempt.generation)
             .map_err(|e| Failure::io("generation directory", &e))?;
@@ -265,7 +251,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     setup.order.remote_ts.clone(),
                 )
                 .map_err(|e| Failure::io("network admission", &e))?;
-            check_setup(cancel).map_err(|e| Failure::io("lease setup", &e))?;
+            cancel.check().map_err(|e| Failure::io("lease setup", &e))?;
             receipt
                 .save(&directory, &guard)
                 .map_err(|e| Failure::io("network receipt", &e))?;
@@ -300,16 +286,21 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         )
         .map_err(|e| Failure::io("handshake record basename", &e))?;
 
-        check_setup(cancel).map_err(|e| Failure::io("unit setup", &e))?;
-        attempt.started = true; // A failed call may still have queued the job.
-        run_systemctl(
-            &self.systemctl,
-            &["start", "--no-block", "--", &attempt.unit],
-            self.limits.start,
-        )
-        .map_err(|e| Failure::io("systemctl start", &e))?;
+        let start_deadline = Instant::now() + self.limits.start;
+        let child = cancel
+            .start(|| {
+                attempt.started = true; // A failed call may still have queued the job.
+                spawn_systemctl(
+                    &self.systemctl,
+                    &["start", "--no-block", "--", &attempt.unit],
+                )
+            })
+            .map_err(|e| Failure::io("systemctl start", &e))?;
+        wait_systemctl(child, start_deadline).map_err(|e| Failure::io("systemctl start", &e))?;
         drop(authorization);
-        check_setup(cancel).map_err(|e| Failure::io("handshake setup", &e))?;
+        cancel
+            .check()
+            .map_err(|e| Failure::io("handshake setup", &e))?;
         let attestor = CapturePeer {
             attestor: &self.attestor,
             cancel,
@@ -323,7 +314,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         if let Some(setup) = setup {
             self.establish(attempt, setup, authenticated, &directory, cancel)?;
         }
-        check_setup(cancel).map_err(|e| Failure::io("session publication", &e))?;
+        cancel
+            .check()
+            .map_err(|e| Failure::io("session publication", &e))?;
         let peer = attestor
             .peer
             .into_inner()
@@ -353,7 +346,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         mut setup: IpsecStart,
         channel: &mut AuthenticatedChannel,
         directory: &Path,
-        cancel: &Arc<AtomicBool>,
+        cancel: &SetupCancellation,
     ) -> Result<(), Failure> {
         let receipt = attempt
             .receipt
@@ -361,15 +354,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .expect("IPsec receipt precedes start");
         setup.order.if_id = receipt.if_id;
         setup.order.reqid = receipt.reqid;
-        check_setup(cancel).map_err(|e| Failure::io("instance setup", &e))?;
-        channel
-            .send(
-                &serde_json::to_vec(&Order::Start(setup.order))
-                    .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
-            )
+        let start = serde_json::to_vec(&Order::Start(setup.order))
+            .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?;
+        cancel
+            .start(|| channel.send(&start))
             .map_err(|e| Failure::io("instance Start", &e))?;
-        check_setup(cancel).map_err(|e| Failure::io("credential delivery", &e))?;
-        let sent = channel.send(&setup.credentials);
+        let sent = cancel.start(|| channel.send(&setup.credentials));
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
         attempt.credentials_sent = true;
@@ -398,9 +388,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         let guard = (self.lock)(Instant::now() + self.limits.lock)
             .map_err(|e| Failure::io("network write lock", &e))?;
         self.xfrm
-            .install_checked(&guard, directory, receipt, vip, &setup.approved, || {
-                check_setup(cancel)
-            })
+            .install_checked(&guard, directory, receipt, vip, &setup.approved, cancel)
             .map_err(|e| Failure::io("configure XFRM network", &e))
     }
 
@@ -559,7 +547,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         backend: Backend,
         setup: Option<IpsecStart>,
         authorization: Option<File>,
-        cancel: &Arc<AtomicBool>,
+        cancel: &SetupCancellation,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let generation = generation().map_err(|error| {
             eprintln!("vpnt-tunneld: could not draw a generation: {error}");
@@ -582,7 +570,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             })),
             Err(failure) => {
                 eprintln!("vpnt-tunneld: admission ended: {}", failure.cause);
-                if cancel.load(Ordering::Acquire) {
+                if cancel.is_cancelled() {
                     let mut session = Session {
                         launcher: self,
                         attempt,
@@ -605,14 +593,14 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
 
 fn wait_setup_reply(
     channel: &mut AuthenticatedChannel,
-    cancel: &Arc<AtomicBool>,
+    cancel: &SetupCancellation,
 ) -> io::Result<Reply> {
     let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
-    let budget = Budget::until(deadline, Some(Arc::clone(cancel)))?;
+    let budget = Budget::until(deadline, Some(cancel.flag()))?;
     loop {
         let wait = budget.poll_timeout()?;
         if channel.wait_control(Duration::from_millis(wait as u64))? {
-            check_setup(cancel)?;
+            cancel.check()?;
             return receive_reply(channel, deadline);
         }
     }
@@ -647,7 +635,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
-        cancel: &Arc<AtomicBool>,
+        cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let Prepare::Ipsec(request) = offer else {
             return self.launch_backend(offer.backend(), None, Some(authorization), cancel);
@@ -664,7 +652,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         if !(1..=MAX_IPSEC_ROUTES).contains(&remote_ts.len()) || grant.port != 500 {
             return Err(ErrorCode::PermissionDenied);
         }
-        check_setup(cancel).map_err(|_| ErrorCode::Backend)?;
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let remote_ipv4 = self
             .xfrm
             .resolve(&grant.hostname, &grant.transport_ipv4)
@@ -672,7 +660,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
                 eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
                 ErrorCode::Backend
             })?;
-        check_setup(cancel).map_err(|_| ErrorCode::Backend)?;
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let frame = encode_credentials(&credentials)?;
         drop(credentials);
         let setup = IpsecStart {
@@ -797,15 +785,21 @@ impl Drop for Reaper {
 /// Run the fixed systemctl with a clean environment and an absolute deadline.
 fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
-    let mut child = Reaper(
-        Command::new(path)
-            .args(args)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
+    wait_systemctl(spawn_systemctl(path, args)?, deadline)
+}
+
+fn spawn_systemctl(path: &Path, args: &[&str]) -> io::Result<Reaper> {
+    Command::new(path)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reaper)
+}
+
+fn wait_systemctl(mut child: Reaper, deadline: Instant) -> io::Result<()> {
     loop {
         if let Some(status) = child.0.try_wait()? {
             return if status.success() {
@@ -824,7 +818,7 @@ fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
-        self.launch_backend(backend, None, None, &Arc::default())
+        self.launch_backend(backend, None, None, &SetupCancellation::default())
     }
 
     fn for_test(
@@ -1947,7 +1941,7 @@ mod tests {
 
         struct ObservedLaunch<'a> {
             launcher: &'a dyn Launch,
-            cancel: mpsc::Sender<Arc<AtomicBool>>,
+            cancel: mpsc::Sender<Arc<SetupCancellation>>,
         }
 
         impl Launch for ObservedLaunch<'_> {
@@ -1957,7 +1951,7 @@ mod tests {
                 grant: &Entry,
                 credentials: Credentials,
                 authorization: File,
-                cancel: &Arc<AtomicBool>,
+                cancel: &Arc<SetupCancellation>,
             ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
                 self.cancel.send(Arc::clone(cancel)).unwrap();
                 self.launcher
@@ -1999,7 +1993,7 @@ mod tests {
                     client.write_all(b"{\"op\":\"stop\"}\n").unwrap();
                 }
                 let deadline = Instant::now() + Duration::from_secs(3);
-                while !cancel.load(Ordering::Acquire) {
+                while !cancel.is_cancelled() {
                     assert!(
                         Instant::now() < deadline,
                         "public cancel was not observed during the install preflight"
