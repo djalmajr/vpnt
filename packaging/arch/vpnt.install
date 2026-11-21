@@ -4,13 +4,18 @@ Add your user to the vpnt group, then sign out and sign in again:
   sudo usermod -aG vpnt "$USER"
 Enable and start the helper socket:
   sudo systemctl enable --now vpnt-helper.socket
+Enable and start the tunnel provider socket:
+  sudo systemctl enable --now vpnt-tunneld.socket
+Apply an exported profile policy by passing its JSON on standard input to:
+  sudo /usr/lib/vpnt/vpnt-tunneld policy apply
 MESSAGE
 }
 
 post_upgrade() {
-    systemctl try-restart vpnt-helper.service
+    systemctl try-restart vpnt-helper.service vpnt-tunneld.service
 }
 
 pre_remove() {
-    systemctl disable --now vpnt-helper.socket vpnt-helper.service || true
+    systemctl disable --now vpnt-helper.socket vpnt-helper.service \
+        vpnt-tunneld.socket vpnt-tunneld.service || true
 }
