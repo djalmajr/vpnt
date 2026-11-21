@@ -48,6 +48,14 @@ pub(crate) struct Observation {
     pub dns_domains: Vec<String>,
     pub dns_count: Option<(usize, usize)>,
     pub dns_invalid: bool,
+    /// Linux supervisor: the PPP interface name it configured for this attempt
+    /// (`--pppd-ifname`). `None` keeps the macOS rule (`ppp<digits>`).
+    pub expected_interface: Option<String>,
+    /// The expected name, once the client announced exactly it.
+    pub confirmed_interface: Option<String>,
+    /// The client announced another interface than the expected one. Everything
+    /// observed for the attempt, including later `vpnt:` lines, is untrusted.
+    pub interface_mismatch: bool,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +94,26 @@ impl Output {
                 false,
             );
         }
+    }
+    /// Linux: the interface name the supervisor configured, set before any pipe
+    /// is attached. The `Interface <name> is UP.` line is then accepted only for
+    /// exactly this name; any other name is a typed mismatch.
+    pub fn expect_interface(&mut self, name: &str) -> io::Result<()> {
+        if !(1..16).contains(&name.len())
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid expected interface name",
+            ));
+        }
+        self.observed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expected_interface = Some(name.to_owned());
+        Ok(())
     }
     /// Enable per-attempt diagnostic logging. Never fails: any failure leaves
     /// logging disabled and the connection proceeds without it.
@@ -132,7 +160,8 @@ impl Output {
         self.finish();
         if !self.finalized {
             self.finalized = true;
-            let candidate = self.snapshot().candidate.is_some();
+            let seen = self.snapshot();
+            let candidate = seen.candidate.is_some() || seen.confirmed_interface.is_some();
             if let Some(writer) = self.writer.take() {
                 if let Some(sender) = self.log.take() {
                     if sender.enabled.load(Ordering::Acquire) {
@@ -558,6 +587,19 @@ fn drain(
 }
 
 fn parse(line: &[u8], observed: &mut Observation) {
+    // The `vpnt:` lines carry no interface name: they describe the attempt whose
+    // interface the client announces. After an announcement of another one they
+    // no longer refer to the expected interface and are refused.
+    if observed.interface_mismatch {
+        if line.starts_with(b"INFO:   vpnt: split") {
+            observed.split_invalid = true;
+            return;
+        }
+        if line.starts_with(b"INFO:   vpnt: dns") {
+            observed.dns_invalid = true;
+            return;
+        }
+    }
     if let Some(value) = line.strip_prefix(b"INFO:   vpnt: dns-server ") {
         let server = std::str::from_utf8(value)
             .ok()
@@ -661,11 +703,20 @@ fn parse(line: &[u8], observed: &mut Observation) {
         observed.failure=Some(SslFailure::CredentialsRejected);
     } else if (line==b"ERROR:  connect: Connection timed out" || line==b"ERROR:  connect: Operation timed out") && observed.failure.is_none() {
         observed.failure=Some(SslFailure::GatewayTimeout);
-    } else if let Some(value)=line.strip_prefix(b"INFO:   Interface ").and_then(|value|value.strip_suffix(b" is UP."))
-        && let Ok(name)=std::str::from_utf8(value)
-        && let Some(name)=InterfaceName::parse(name)
-    {
-        observed.candidate=Some(name);
+    } else if let Some(value)=line.strip_prefix(b"INFO:   Interface ").and_then(|value|value.strip_suffix(b" is UP.")) {
+        if let Some(expected)=observed.expected_interface.clone() {
+            // Linux: the name is the one the supervisor configured, exactly.
+            if value==expected.as_bytes() && !observed.interface_mismatch {
+                observed.confirmed_interface=Some(expected);
+            } else {
+                observed.interface_mismatch=true;
+                observed.confirmed_interface=None;
+            }
+        } else if let Ok(name)=std::str::from_utf8(value)
+            && let Some(name)=InterfaceName::parse(name)
+        {
+            observed.candidate=Some(name);
+        }
     }
 }
 
@@ -989,6 +1040,121 @@ mod tests {
         parse(b"INFO:   Interface ppp12 is UP.", &mut observed);
         assert_eq!(observed.candidate.as_ref().unwrap().as_str(), "ppp12");
         assert!(!format!("{observed:?}").contains("fictional"));
+    }
+
+    fn expecting(name: &str) -> Observation {
+        Observation {
+            expected_interface: Some(name.into()),
+            ..Observation::default()
+        }
+    }
+
+    #[test]
+    fn the_configured_interface_name_is_accepted_only_exactly() {
+        let mut observed = expecting("vpntp1");
+        parse(b"INFO:   Interface vpntp1 is UP.", &mut observed);
+        assert_eq!(observed.confirmed_interface.as_deref(), Some("vpntp1"));
+        assert!(!observed.interface_mismatch);
+        assert!(observed.candidate.is_none(), "the macOS slot stays unused");
+
+        let hostile: [&[u8]; 12] = [
+            b"ppp0",
+            b"ppp1",
+            b"vpntp2",
+            b"vpntp10",
+            b"vpntp",
+            b"VPNTP1",
+            b"vpntp1 ",
+            b" vpntp1",
+            b"vpntp1;touch",
+            b"vpntp1\0",
+            b"vpntp\xc3\xa91",
+            b"",
+        ];
+        for name in hostile {
+            let mut observed = expecting("vpntp1");
+            let mut line = b"INFO:   Interface ".to_vec();
+            line.extend_from_slice(name);
+            line.extend_from_slice(b" is UP.");
+            parse(&line, &mut observed);
+            assert!(observed.interface_mismatch, "{name:?}");
+            assert!(observed.confirmed_interface.is_none(), "{name:?}");
+        }
+        // Not valid UTF-8 at all.
+        let mut observed = expecting("vpntp1");
+        parse(b"INFO:   Interface vpntp\xff is UP.", &mut observed);
+        assert!(observed.interface_mismatch);
+    }
+
+    #[test]
+    fn a_mismatch_is_final_and_poisons_the_vpnt_lines_that_follow() {
+        let mut observed = expecting("vpntp1");
+        parse(b"INFO:   Interface ppp0 is UP.", &mut observed);
+        // The right name afterwards does not clear it.
+        parse(b"INFO:   Interface vpntp1 is UP.", &mut observed);
+        assert!(observed.interface_mismatch);
+        assert!(observed.confirmed_interface.is_none());
+        parse(
+            b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0",
+            &mut observed,
+        );
+        parse(b"INFO:   vpnt: split-routes 1", &mut observed);
+        parse(b"INFO:   vpnt: dns-server 10.1.1.1", &mut observed);
+        parse(b"INFO:   vpnt: dns-domain corp.example.test", &mut observed);
+        parse(b"INFO:   vpnt: dns 1 1", &mut observed);
+        assert!(observed.split_invalid && observed.dns_invalid);
+        assert!(observed.split.is_empty() && observed.split_count.is_none());
+        assert!(observed.dns_servers.is_empty() && observed.dns_domains.is_empty());
+        assert!(observed.dns_count.is_none());
+        // Control: the same lines before any mismatch are accepted.
+        let mut fine = expecting("vpntp1");
+        parse(b"INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", &mut fine);
+        parse(b"INFO:   vpnt: dns-server 10.1.1.1", &mut fine);
+        assert!(!fine.split_invalid && !fine.dns_invalid);
+        assert_eq!(fine.split.len(), 1);
+        assert_eq!(fine.dns_servers.len(), 1);
+    }
+
+    #[test]
+    fn without_an_expected_name_the_macos_rule_is_unchanged() {
+        let mut observed = Observation::default();
+        parse(b"INFO:   Interface vpntp1 is UP.", &mut observed);
+        assert!(observed.candidate.is_none() && !observed.interface_mismatch);
+        parse(b"INFO:   Interface ppp0 is UP.", &mut observed);
+        assert_eq!(observed.candidate.as_ref().unwrap().as_str(), "ppp0");
+        assert!(observed.confirmed_interface.is_none());
+    }
+
+    #[test]
+    fn the_expected_name_is_validated_and_a_confirmed_one_counts_as_a_candidate_in_the_log() {
+        for bad in [
+            "",
+            "Vpntp1",
+            "vpn-p1",
+            "vpntp1\n",
+            "a_b",
+            "abcdefghijklmnop",
+        ] {
+            assert!(Output::default().expect_interface(bad).is_err(), "{bad:?}");
+        }
+        let mut output = Output::default();
+        output.expect_interface("vpntp1").unwrap();
+        let (reader, mut writer) = {
+            let mut fds = [0; 2];
+            // SAFETY: pipe fills two descriptors that are owned right below.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: both descriptors are fresh and owned here.
+            unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) }
+        };
+        output.attach(reader).unwrap();
+        writer
+            .write_all(b"INFO:   Interface vpntp1 is UP.\n")
+            .unwrap();
+        drop(writer);
+        output.finish();
+        let seen = output.snapshot();
+        assert_eq!(seen.confirmed_interface.as_deref(), Some("vpntp1"));
+        assert_eq!(seen.expected_interface.as_deref(), Some("vpntp1"));
     }
 
     #[test]
