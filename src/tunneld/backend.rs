@@ -42,6 +42,9 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const LOCK_DEADLINE: Duration = Duration::from_secs(4);
 const START_DEADLINE: Duration = Duration::from_secs(5);
 const STOP_DEADLINE: Duration = Duration::from_secs(30);
+const ESTABLISHED_TIMEOUT: Duration = Duration::from_secs(35);
+// Allow for the instance's bounded VICI cleanup and child termination.
+const STOPPED_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Admit a session and return its running handle.
 pub(super) trait Launch: Send + Sync {
@@ -58,6 +61,9 @@ pub(super) trait Launch: Send + Sync {
 pub(super) trait Running {
     fn state(&self) -> State;
     fn peer(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
+    fn channel_fd(&self) -> Option<BorrowedFd<'_>> {
         None
     }
     /// Stop and clean up. A `CleanupPending` result may be retried.
@@ -331,7 +337,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         let sent = channel.send(&setup.credentials);
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
-        let reply = receive_reply(channel).map_err(|e| Failure::io("instance setup reply", &e))?;
+        let reply = receive_reply(channel, Instant::now() + ESTABLISHED_TIMEOUT)
+            .map_err(|e| Failure::io("instance setup reply", &e))?;
         let vip = match reply {
             Reply::Established {
                 if_id,
@@ -444,7 +451,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             Some(mut channel) => {
                 let stopped = channel
                     .send(br#"{"op":"stop"}"#)
-                    .and_then(|()| receive_reply(&mut channel));
+                    .and_then(|()| receive_reply(&mut channel, Instant::now() + STOPPED_TIMEOUT));
                 if !matches!(stopped, Ok(Reply::Stopped {})) {
                     eprintln!("vpnt-tunneld: instance did not confirm Stop: {stopped:?}");
                 }
@@ -546,8 +553,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     }
 }
 
-fn receive_reply(channel: &mut AuthenticatedChannel) -> io::Result<Reply> {
-    let bytes = channel.receive()?;
+fn receive_reply(channel: &mut AuthenticatedChannel, deadline: Instant) -> io::Result<Reply> {
+    let bytes = channel.receive_until(deadline)?;
     if bytes.first() != Some(&b'{') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -623,6 +630,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
 
     fn peer(&self) -> Option<BorrowedFd<'_>> {
         self.peer.as_ref().map(AsFd::as_fd)
+    }
+
+    fn channel_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.channel
+            .as_ref()
+            .and_then(AuthenticatedChannel::poll_fd)
     }
 
     fn stop(&mut self) -> State {
@@ -1585,7 +1598,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["10.20.0.0/15", "172.16.0.0/12"]
             );
-            let mut frame = zeroize::Zeroizing::new(channel.receive().unwrap());
+            let mut frame = channel.receive().unwrap();
             let credentials =
                 crate::tunneld::instance_protocol::decode_credentials(&mut frame).unwrap();
             assert!(credentials.password.expose() == "fixture-password");
@@ -1595,17 +1608,32 @@ mod tests {
                 fs::write(root.join("received-start"), b"").unwrap();
                 wait_for_file(&root.join("allow-established"));
             }
-            channel
-                .send(
-                    &serde_json::to_vec(&Reply::Established {
-                        if_id: start.if_id,
-                        reqid: start.reqid,
-                        virtual_ipv4: Ipv4Addr::new(10, 99, 0, 2),
-                        remote_ts: vec![start.remote_ts[0]],
-                    })
-                    .unwrap(),
-                )
-                .unwrap();
+            let delay = fs::read_to_string(root.join("setup-delay"))
+                .ok()
+                .map(|text| text.parse::<u64>().unwrap());
+            if let Some(seconds) = delay {
+                thread::sleep(Duration::from_secs(seconds));
+            }
+            let established = channel.send(
+                &serde_json::to_vec(&Reply::Established {
+                    if_id: start.if_id,
+                    reqid: start.reqid,
+                    virtual_ipv4: Ipv4Addr::new(10, 99, 0, 2),
+                    remote_ts: vec![start.remote_ts[0]],
+                })
+                .unwrap(),
+            );
+            if root.join("expect-setup-timeout").is_file() && established.is_err() {
+                return;
+            }
+            established.unwrap();
+            if root.join("close-channel-after-setup").is_file() {
+                wait_for_file_until(&root.join("close-now"), Duration::from_secs(12));
+                drop(channel);
+                fs::write(root.join("channel-closed"), b"").unwrap();
+                wait_for_file_until(&root.join("exit-now"), Duration::from_secs(15));
+                return;
+            }
             if root.join("exit-after-setup").exists() {
                 while !root.join("exit-now").exists() {
                     assert!(
@@ -1625,7 +1653,11 @@ mod tests {
         }
 
         fn response(socket: &UnixStream) -> Response {
-            let mut socket = timed(socket, Instant::now() + Duration::from_secs(8)).unwrap();
+            response_with_timeout(socket, Duration::from_secs(8))
+        }
+
+        fn response_with_timeout(socket: &UnixStream, timeout: Duration) -> Response {
+            let mut socket = timed(socket, Instant::now() + timeout).unwrap();
             read_control(&mut socket, decode_response).unwrap()
         }
 
@@ -1670,7 +1702,11 @@ mod tests {
         }
 
         fn wait_for_file(path: &Path) {
-            let deadline = Instant::now() + Duration::from_secs(4);
+            wait_for_file_until(path, Duration::from_secs(4));
+        }
+
+        fn wait_for_file_until(path: &Path, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
             while !path.is_file() {
                 assert!(
                     Instant::now() < deadline,
@@ -1889,6 +1925,132 @@ printf '%s\n' "$*" >> '{log}'
             });
             assert!(process.0.wait().unwrap().success());
             assert!(harness.leases().is_empty());
+        }
+
+        fn exercise_setup_deadline(name: &str, seconds: u64, expect_timeout: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            fs::write(harness.root.join("setup-delay"), seconds.to_string()).unwrap();
+            if expect_timeout {
+                harness.flag("expect-setup-timeout", true);
+            }
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                let start = Instant::now();
+                client_credentials(&mut client);
+                client.write_all(br#"{"op":"status"}"#).unwrap();
+                client.write_all(b"\n").unwrap();
+                let reply = response_with_timeout(&client, Duration::from_secs(45));
+                if expect_timeout {
+                    assert!(
+                        matches!(
+                            reply,
+                            Response::Error {
+                                code: ErrorCode::Timeout
+                            }
+                        ),
+                        "{reply:?}"
+                    );
+                    assert!(
+                        start.elapsed() >= Duration::from_secs(35),
+                        "setup timed out at {:?}",
+                        start.elapsed()
+                    );
+                    assert!(harness.leases().is_empty(), "timeout retained lease");
+                    assert!(
+                        harness
+                            .log()
+                            .iter()
+                            .any(|entry| entry.starts_with("stop -- "))
+                    );
+                    assert!(!kernel.lock().unwrap().link);
+                } else {
+                    assert!(
+                        matches!(
+                            reply,
+                            Response::Status {
+                                state: State::NetworkReady
+                            }
+                        ),
+                        "{reply:?}"
+                    );
+                    assert!(start.elapsed() >= Duration::from_secs(seconds));
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                }
+                drop(client);
+                assert!(worker.join().is_ok());
+            });
+            assert!(process.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn ten_second_negotiation_reaches_network_ready() {
+            exercise_setup_deadline("ten_second_negotiation_reaches_network_ready", 10, false);
+        }
+
+        #[test]
+        fn negotiation_past_thirty_five_seconds_times_out_and_cleans() {
+            exercise_setup_deadline(
+                "negotiation_past_thirty_five_seconds_times_out_and_cleans",
+                38,
+                true,
+            );
+        }
+
+        #[test]
+        fn internal_channel_eof_cleans_while_client_and_supervisor_live() {
+            if !namespaced_in(
+                "internal_channel_eof_cleans_while_client_and_supervisor_live",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("close-channel-after-setup", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                harness.flag("close-now", true);
+                wait_for_file(&harness.root.join("channel-closed"));
+                let limit = Instant::now() + Duration::from_secs(5);
+                while !harness.leases().is_empty() {
+                    assert!(
+                        process.0.try_wait().unwrap().is_none(),
+                        "supervisor exited before EOF cleanup"
+                    );
+                    assert!(
+                        Instant::now() < limit,
+                        "internal EOF retained the lease with both peers alive"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(process.0.try_wait().unwrap().is_none());
+                assert!(!kernel.lock().unwrap().link);
+                command(&mut client, b"{\"op\":\"status\"}\n", State::Stopped);
+                harness.flag("exit-now", true);
+                drop(client);
+                assert!(worker.join().is_ok());
+            });
+            assert!(process.0.wait().unwrap().success());
         }
 
         #[test]

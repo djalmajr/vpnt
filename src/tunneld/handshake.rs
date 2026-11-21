@@ -871,7 +871,7 @@ impl<const N: usize> PartialEq<&[u8; N]> for Datagram {
 }
 
 /// An established channel keeps the connected socket and the peer's pidfd.
-/// The socket stays private so callers cannot bypass per-datagram checks.
+/// The receive methods perform per-datagram checks. Polling does not read data.
 pub struct AuthenticatedChannel {
     transport: Option<Transport>,
     invocation: String,
@@ -896,10 +896,23 @@ impl AuthenticatedChannel {
     /// The datagram may carry credentials: every buffer that held received
     /// bytes is wiped when it is released, on success and on every error.
     pub fn receive(&mut self) -> io::Result<Datagram> {
+        self.receive_until(Instant::now() + PHASE_TIMEOUT)
+    }
+
+    /// Like `receive`, with an absolute deadline for the application phase.
+    pub(super) fn receive_until(&mut self, deadline: Instant) -> io::Result<Datagram> {
         let transport = self.transport.take().ok_or(io::ErrorKind::NotConnected)?;
-        let (bytes, _) = transport.receive(Instant::now() + PHASE_TIMEOUT)?;
+        let (bytes, _) = transport.receive(deadline)?;
         self.transport = Some(transport);
         Ok(bytes)
+    }
+
+    /// Borrow the socket for readiness polling only. All reads must go
+    /// through the authenticated receive methods.
+    pub(super) fn poll_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.transport
+            .as_ref()
+            .map(|transport| transport.socket.as_fd())
     }
 
     /// Wait without an idle deadline for a datagram or for either process to

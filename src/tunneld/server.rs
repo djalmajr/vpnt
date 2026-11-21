@@ -232,8 +232,8 @@ fn dialogue(
     mut session: Box<dyn Running + '_>,
 ) -> Result<(), FrameError> {
     loop {
-        // Wait on the authenticated supervisor pidfd as well as client
-        // traffic. A silent client must not keep a dead instance's network.
+        // Watch the supervisor pidfd and internal hangup alongside the
+        // client. Internal data is read only by the authenticated backend.
         loop {
             let mut fds = [
                 libc::pollfd {
@@ -246,8 +246,15 @@ fn dialogue(
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: session
+                        .channel_fd()
+                        .map_or(-1, |channel| channel.as_raw_fd()),
+                    events: libc::POLLRDHUP,
+                    revents: 0,
+                },
             ];
-            // SAFETY: poll uses these two live descriptors and initializes revents.
+            // SAFETY: poll updates the initialized array of live or ignored descriptors.
             let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, SESSION_IDLE_MS) };
             if ready < 0 {
                 let error = io::Error::last_os_error();
@@ -259,7 +266,7 @@ fn dialogue(
             if ready == 0 {
                 return Err(io::Error::from(io::ErrorKind::TimedOut).into());
             }
-            if fds[1].revents != 0 {
+            if fds[1].revents != 0 || fds[2].revents != 0 {
                 session.stop();
             }
             if fds[0].revents != 0 {
