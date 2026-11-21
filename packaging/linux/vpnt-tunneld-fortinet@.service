@@ -1,0 +1,46 @@
+[Unit]
+Description=VPN Tray Fortinet tunnel instance %i
+Documentation=https://github.com/djalmajr/vpnt
+BindsTo=vpnt-tunneld.service
+After=vpnt-tunneld.service
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/vpnt/vpnt-tunneld instance fortinet %i
+Restart=no
+KillMode=control-group
+SendSIGKILL=yes
+
+PrivatePIDs=yes
+# Keep the backend's runtime state off the host and expose only its handshake.
+TemporaryFileSystem=/run
+BindReadOnlyPaths=/run/vpnt/tunneld/%i
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+BindPaths=/dev/ppp
+DeviceAllow=/dev/ppp rw
+ProtectSystem=strict
+ProtectHome=yes
+UMask=0077
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectProc=invisible
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
+# The writer must supply the approved egress exceptions before activation.
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self
+SystemCallArchitectures=native
+LimitCORE=0

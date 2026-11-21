@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize, de};
 pub use super::protocol::Backend;
 
 const VERSION: u32 = 1;
-const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME: usize = 4096;
 const SCM_PIDFD: libc::c_int = 4;
 const PID_FS_MAGIC: libc::c_long = 0x5049_4446;
@@ -484,11 +484,14 @@ pub struct UnitIdentity {
 
 /// Resolve the exact process through the trusted host manager.
 ///
-/// This call is synchronous. The handshake checks the phase deadline
-/// again after it returns. The I2b manager integration must pass the
-/// remaining phase budget to the real attestor to bound the request.
+/// The handshake passes its absolute phase deadline and rechecks it after
+/// attestation. External manager calls must finish within that budget.
 pub trait UnitAttestor {
     fn attest(&self, pidfd: BorrowedFd<'_>) -> io::Result<UnitIdentity>;
+
+    fn attest_until(&self, pidfd: BorrowedFd<'_>, _deadline: Instant) -> io::Result<UnitIdentity> {
+        self.attest(pidfd)
+    }
 }
 
 /// One-use listener with an already published generation record.
@@ -669,7 +672,7 @@ impl Writer {
 
         remaining(deadline)?;
         live(transport.peer.fd.as_fd())?;
-        let unit = attestor.attest(transport.peer.fd.as_fd())?;
+        let unit = attestor.attest_until(transport.peer.fd.as_fd(), deadline)?;
         remaining(deadline)?;
         live(transport.peer.fd.as_fd())?;
         if unit.name != attempt.unit_name()
