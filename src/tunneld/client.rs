@@ -154,6 +154,7 @@ mod tests {
     use crate::tunneld::protocol::{Command, Endpoint, FortinetRequest, ServerDecoder};
     use std::{
         io::{self, Read},
+        net::Shutdown,
         os::unix::{
             fs::{DirBuilderExt, PermissionsExt},
             net::UnixListener,
@@ -332,7 +333,8 @@ mod tests {
         let fixture = SocketFixture::new();
         std::thread::scope(|scope| {
             let server = scope.spawn(|| {
-                let mut decoder = ServerDecoder::new(fixture.accept(deadline()));
+                let stream = fixture.accept(deadline());
+                let mut decoder = ServerDecoder::new(stream.try_clone().unwrap());
                 decoder.hello(deadline()).unwrap();
                 decoder.prepare(deadline()).unwrap();
                 decoder.prepared(deadline()).unwrap();
@@ -340,6 +342,8 @@ mod tests {
                 decoder
                     .reject(ErrorCode::MissingProgram, deadline())
                     .unwrap();
+                // Force EPIPE even if another descriptor keeps the socket open.
+                stream.shutdown(Shutdown::Read).unwrap();
             });
             let mut client =
                 Client::connect_as(&fixture.path, deadline(), fixture.owner, fixture.peer).unwrap();
@@ -367,6 +371,7 @@ mod tests {
             if let Some(response) = response {
                 write_control(&mut server, &response).unwrap();
             }
+            server.shutdown(Shutdown::Read).unwrap();
             drop(server);
             let mut client = Client {
                 stream: Some(stream),
