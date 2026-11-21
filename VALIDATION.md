@@ -244,16 +244,16 @@ read -r pid && kill -USR1 "$pid"
      só no Wi-Fi (a interface cabeada foi desligada antes de conectar). O Wi-Fi
      ficou bloqueado com `rfkill` por cerca de 80 s. A tun e o PID do `openvpn`
      se mantiveram, e 15 s depois de liberar o Wi-Fi o túnel voltou, com
-     endereço novo, rotas, TCP 443 e HTTP pelo túnel, sem clique no app e sem
-     aprovação nova no celular.
+     endereço novo, rotas, TCP 443 e HTTP pelo túnel. O roteiro não registra se
+     houve aprovação no celular.
    - Suspender e retomar: **[PASS]** em 20/11, com uma suspensão curta
      (`s2idle`, cerca de 14 s entre `PM: suspend entry` e `PM: suspend exit` no
      kernel). O túnel voltou cerca de 10 s depois de acordar, com o mesmo
      `openvpn`. Uma suspensão longa, em que a sessão TLS expira e o token pede
      assinatura nova, ainda não foi exercitada.
-   - Em ambos, o diff de rede ficou vazio depois de desconectar, contra o
-     estado guardado com a máquina só no Wi-Fi, e de novo depois de religar a
-     interface cabeada, contra o estado inicial.
+   - Os dois cenários rodaram em sequência na mesma conexão. Depois deles, o
+     diff de rede ficou vazio após a desconexão, contra o estado só no Wi-Fi, e
+     após religar a interface cabeada, contra o estado inicial.
 7. Se o host tinha outro cliente OVPN do provedor, remova-o, com as units, a
    tun persistente e as regras de sudoers que ele instalou. Guarde de novo o
    estado de rede e reconecte pelo vpnt. Confira a rota e o TCP 443 até o host
