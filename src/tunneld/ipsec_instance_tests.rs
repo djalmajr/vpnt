@@ -1,6 +1,7 @@
 use super::*;
 use crate::test_support::write_script;
 use std::io::{Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,6 +68,10 @@ impl Fixture {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.join("instance"))
+            .unwrap();
         write_script(&root.join("charon"), FAKE);
         if ignore_term {
             fs::write(root.join("ignore-term"), []).unwrap();
@@ -77,6 +82,7 @@ impl Fixture {
             .args(["--exact", REEXEC, "--nocapture"])
             .env_clear()
             .env(FIXTURE, &root)
+            .env("RUNTIME_DIRECTORY", root.join("instance"))
             .stdin(Stdio::from(reader))
             .spawn()
             .unwrap();
@@ -121,7 +127,12 @@ impl Fixture {
         let mut answer = String::new();
         self.writer.read_to_string(&mut answer).unwrap();
         assert!(self.supervisor.wait().unwrap().success());
-        assert!(!self.root.join("instance").exists());
+        assert!(
+            fs::read_dir(self.root.join("instance"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
         if let Some(fd) = &self.backend_pidfd {
             assert!(poll_until(fd, Instant::now()).unwrap());
         }
@@ -155,7 +166,7 @@ fn supervisor_process() {
     // SAFETY: fcntl returned a new owned FD.
     let mut channel = UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
     let result = run_with(
-        || {
+        |_| {
             let mut byte = [0];
             channel.read_exact(&mut byte)?;
             match byte {
@@ -165,7 +176,7 @@ fn supervisor_process() {
             }
         },
         &Params {
-            directory: root.join("instance"),
+            directory: std::env::var_os("RUNTIME_DIRECTORY").unwrap().into(),
         },
         &root.join("charon"),
         unsafe { (libc::geteuid(), libc::getegid()) },
@@ -274,4 +285,111 @@ fn parent_death_kills_the_child() {
         .unwrap(),
         "child remained alive after supervisor death"
     );
+}
+
+#[test]
+#[ignore = "run under unshare -Ur to exercise the production root-only handshake"]
+fn authenticated_supervisor_survives_idle_and_observes_charon_exit() {
+    use crate::tunneld::handshake::{
+        self, Backend, CONTROL_SOCKET_NAME, PHASE_TIMEOUT, UnitAttestor, UnitIdentity, Writer,
+    };
+    use std::ffi::OsStr;
+
+    const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+    const INVOCATION: &str = "abcdef0123456789abcdef0123456789";
+
+    struct Workspace(PathBuf);
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    struct Attestor;
+
+    impl UnitAttestor for Attestor {
+        fn attest(&self, _: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
+            Ok(UnitIdentity {
+                name: format!("vpnt-tunneld-ipsec@{GENERATION}.service"),
+                invocation: INVOCATION.to_owned(),
+                main_pid: std::process::id() as libc::pid_t,
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("vpnt-i2c-auth-{}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let workspace = Workspace(root);
+    let root = &workspace.0;
+    let runtime = root.join("instance");
+    let artifacts = root.join("handshake");
+    for path in [&runtime, &artifacts] {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+    let program = root.join("charon");
+    write_script(&program, FAKE);
+    let writer = Writer::publish(
+        &artifacts,
+        OsStr::new(CONTROL_SOCKET_NAME),
+        GENERATION,
+        Backend::Ipsec,
+        0,
+    )
+    .unwrap();
+
+    std::thread::scope(|scope| {
+        let supervisor = scope.spawn(|| {
+            let channel = handshake::connect_instance(
+                &artifacts.join(CONTROL_SOCKET_NAME),
+                &artifacts.join(GENERATION),
+                GENERATION,
+                Backend::Ipsec,
+                INVOCATION,
+                0,
+            )
+            .unwrap();
+            run_authenticated(
+                channel,
+                &Params {
+                    directory: runtime.clone(),
+                },
+                &program,
+                (0, 0),
+            )
+        });
+        let mut client = writer.authenticate(&Attestor).unwrap();
+        client.send(br#""start""#).unwrap();
+        let deadline = Instant::now() + PHASE_TIMEOUT;
+        let ready = loop {
+            match fs::read(root.join("ready")) {
+                Ok(bytes) => break serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    assert!(
+                        !supervisor.is_finished(),
+                        "supervisor exited before readiness"
+                    );
+                    assert!(Instant::now() < deadline, "fake charon never became ready");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake charon readiness: {error}"),
+            }
+        };
+        let child = pidfd_open(ready["pid"].as_u64().unwrap() as u32).unwrap();
+        std::thread::sleep(PHASE_TIMEOUT + Duration::from_millis(250));
+        assert!(
+            !supervisor.is_finished(),
+            "supervisor exited during an idle authenticated session"
+        );
+        assert!(!poll_until(&child, Instant::now()).unwrap());
+        let exit = Instant::now();
+        pidfd_signal(&child, libc::SIGKILL).unwrap();
+        assert_eq!(
+            supervisor.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(exit.elapsed() < TERM_GRACE, "child exit was not prompt");
+        assert!(poll_until(&child, Instant::now()).unwrap());
+        assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+    });
 }

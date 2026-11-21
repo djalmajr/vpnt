@@ -2,8 +2,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,10 +14,12 @@ use serde::{Deserialize, Serialize};
 use super::handshake::AuthenticatedChannel;
 
 const CHARON: &str = "/usr/lib/strongswan/charon";
+const CONFIG_NAME: &str = "strongswan.conf";
+const VICI_SOCKET_NAME: &str = "vici.sock";
 const TERM_GRACE: Duration = Duration::from_secs(3);
 
-/// Local unit configuration. The directory must be unused and below the
-/// unit's trusted mounts. It must never be taken from a channel datagram.
+/// Local unit configuration. The directory comes from the service manager's
+/// RUNTIME_DIRECTORY and must be private and empty.
 pub struct Params {
     pub directory: PathBuf,
 }
@@ -39,7 +41,7 @@ pub enum Exit {
 /// Run in the instance's main thread after `handshake::connect_instance`.
 /// The unit must provide a private view of stock charon's compiled PIDDIR
 /// and contain descendants in its cgroup, including during supervisor loss.
-pub fn run(mut channel: AuthenticatedChannel, params: Params) -> io::Result<Exit> {
+pub fn run(channel: AuthenticatedChannel, params: Params) -> io::Result<Exit> {
     // SAFETY: these calls take no arguments or pointers.
     if unsafe { (libc::geteuid(), libc::getegid()) } != (0, 0) {
         return Err(io::Error::new(
@@ -51,11 +53,26 @@ pub fn run(mut channel: AuthenticatedChannel, params: Params) -> io::Result<Exit
     for parent in params.directory.ancestors().skip(1) {
         check_parent(parent, 0)?;
     }
+    run_authenticated(channel, &params, Path::new(CHARON), (0, 0))
+}
+
+fn run_authenticated(
+    mut channel: AuthenticatedChannel,
+    params: &Params,
+    program: &Path,
+    owner: (u32, u32),
+) -> io::Result<Exit> {
     run_with(
-        || decode_order(&channel.receive()?),
-        &params,
-        Path::new(CHARON),
-        (0, 0),
+        |child| {
+            let bytes = match child {
+                Some(pidfd) => channel.receive_while_running(pidfd)?,
+                None => channel.receive()?,
+            };
+            decode_order(&bytes)
+        },
+        params,
+        program,
+        owner,
     )
 }
 
@@ -64,7 +81,7 @@ fn decode_order(bytes: &[u8]) -> io::Result<Order> {
 }
 
 fn run_with(
-    mut receive: impl FnMut() -> io::Result<Order>,
+    mut receive: impl FnMut(Option<BorrowedFd<'_>>) -> io::Result<Order>,
     params: &Params,
     program: &Path,
     owner: (u32, u32),
@@ -72,7 +89,7 @@ fn run_with(
     // SAFETY: PR_SET_DUMPABLE takes an integer value. The handshake applies
     // the same protection before it opens the channel.
     checked(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) })?;
-    match receive() {
+    match receive(None) {
         Ok(Order::Start) => {}
         Ok(Order::Stop) => return Err(invalid("expected IPsec start")),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(Exit::Eof),
@@ -87,27 +104,42 @@ fn run_with(
             .ok_or_else(|| invalid("missing parent"))?,
         owner.0,
     )?;
-    fs::DirBuilder::new().mode(0o700).create(directory)?;
-    let result = run_in_directory(receive, directory, &socket, program, owner);
-    with_cleanup(result, fs::remove_dir_all(directory))
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir()
+        || (metadata.uid(), metadata.gid()) != owner
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "IPsec runtime directory must be private and owned by the supervisor",
+        ));
+    }
+    if fs::read_dir(directory)?.next().transpose()?.is_some() {
+        return Err(invalid("IPsec runtime directory must be empty"));
+    }
+
+    let result = run_in_directory(receive, directory, &socket, program);
+    let cleanup = with_cleanup(
+        remove_if_present(&directory.join(VICI_SOCKET_NAME)),
+        remove_if_present(&directory.join(CONFIG_NAME)),
+    );
+    with_cleanup(result, cleanup)
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 fn run_in_directory(
-    mut receive: impl FnMut() -> io::Result<Order>,
+    mut receive: impl FnMut(Option<BorrowedFd<'_>>) -> io::Result<Order>,
     directory: &Path,
     socket: &str,
     program: &Path,
-    owner: (u32, u32),
 ) -> io::Result<Exit> {
-    let metadata = fs::symlink_metadata(directory)?;
-    if (metadata.uid(), metadata.gid()) != owner {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unexpected IPsec instance directory owner",
-        ));
-    }
-    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-    let path = directory.join("strongswan.conf");
+    let path = directory.join(CONFIG_NAME);
     let mut config = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -151,7 +183,7 @@ fn run_in_directory(
         }
     };
 
-    let result = match receive() {
+    let result = match receive(Some(pidfd.as_fd())) {
         Ok(Order::Stop) => Ok(Exit::Stopped),
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
         Ok(Order::Start) => Err(invalid("IPsec instance already started")),
@@ -174,7 +206,7 @@ fn validate_path(directory: &Path) -> io::Result<String> {
                     .any(|ch| ch.is_control() || matches!(ch, '"' | '\\'))
         })
         .ok_or_else(|| invalid("unsafe IPsec instance directory"))?;
-    let socket = format!("{path}/vici.sock");
+    let socket = format!("{path}/{VICI_SOCKET_NAME}");
     let path_capacity = std::mem::size_of::<libc::sockaddr_un>()
         - std::mem::offset_of!(libc::sockaddr_un, sun_path);
     if socket.len() >= path_capacity {

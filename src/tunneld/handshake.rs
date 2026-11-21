@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize, de};
 
 pub use super::protocol::Backend;
 
+pub const GENERATION_ROOT: &str = "/run/vpnt/tunneld";
+pub const INSTANCE_HANDSHAKE_DIRECTORY: &str = "/run/vpnt-instance";
+pub const RECORD_NAME: &str = "record.json";
+pub const CONTROL_SOCKET_NAME: &str = "control.sock";
+
 const VERSION: u32 = 1;
 pub(super) const PHASE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FRAME: usize = 4096;

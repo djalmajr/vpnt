@@ -14,7 +14,9 @@ SendSIGKILL=yes
 PrivatePIDs=yes
 # Keep the backend's runtime state off the host and expose only its handshake.
 TemporaryFileSystem=/run
-BindReadOnlyPaths=/run/vpnt/tunneld/%i
+BindReadOnlyPaths=/run/vpnt/tunneld/%i:/run/vpnt-instance
+RuntimeDirectory=vpnt-instance-%i
+RuntimeDirectoryMode=0700
 PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
