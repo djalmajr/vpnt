@@ -7,27 +7,30 @@
 //! for it over a single-use descriptor 3 created after authentication.
 //!
 //! Lifecycle: the client leads its own process group, dies with the supervisor
-//! (`PR_SET_PDEATHSIG`), and is stopped with SIGTERM to the group, then SIGKILL
-//! after a grace period, and reaped exactly once. Descendants left in the group
+//! (`PR_SET_PDEATHSIG`), and is stopped with SIGTERM, then SIGKILL after a grace
+//! period, and reaped exactly once. The signals go to the group and to every
+//! other descendant, tracked by pidfd: the distribution's `pppd`, started by the
+//! client on a pty, runs in its own session and so leaves the group. Descendants
 //! are swept with SIGKILL before the leader is reaped, while the zombie leader
-//! still reserves the group id. A SIGKILL of the supervisor itself reaches only
-//! the client (the kernel offers no group-wide death signal); descendants that
-//! left it rely on the unit's `KillMode=control-group`.
+//! still reserves the group id. In a process dedicated to the client (`run`
+//! makes it a child subreaper), orphaned descendants are adopted, found from
+//! this process, stopped and reaped. A SIGKILL of the supervisor itself reaches
+//! only the client (the kernel offers no tree-wide death signal); descendants
+//! that left its group rely on the unit's `KillMode=control-group`.
 //!
-//! The PPP fence (`vpnt-pppd` and the supervised `pppd`) is not wired here: its
-//! macOS mechanism depends on Apple-only options and controller, see the slice
-//! report.
+//! There is no PPP fence on Linux: the client runs the distribution's `pppd`
+//! (`--with-pppd`) with its default argv, and the macOS `vpnt-pppd` wrapper is
+//! not used. The supervisor only fixes the interface name (`--pppd-ifname`).
 
 use std::{
-    ffi::OsString,
-    fs::File,
+    fs::{self, File},
     io,
     net::Ipv4Addr,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::process::{CommandExt, ExitStatusExt},
     },
-    path::PathBuf,
+    path::Path,
     process::{Command, ExitStatus},
     time::{Duration, Instant},
 };
@@ -50,6 +53,7 @@ const PASSWORD_LIMIT: usize = 256;
 const MAX_DATAGRAM: usize = 4096;
 const TICK: Duration = Duration::from_millis(50);
 const GROUP_GONE_WAIT: Duration = Duration::from_millis(500);
+const SWEEP_PASSES: usize = 8;
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
 /// The authenticated datagram channel to the writer, as the supervisor needs it.
@@ -147,16 +151,21 @@ pub struct Params {
     username: String,
     certificate_sha256: Option<[u8; 32]>,
     binding: Binding,
-    ca_file: Option<PathBuf>,
+    pppd_ifname: String,
 }
 
 impl Params {
+    /// Default name of the PPP interface for the attempt's ordinal.
+    pub fn default_pppd_ifname(ordinal: u32) -> String {
+        format!("vpntp{ordinal}")
+    }
+
     pub fn new(
         endpoint: Endpoint,
         username: String,
         certificate_sha256: Option<[u8; 32]>,
         binding: Binding,
-        ca_file: Option<PathBuf>,
+        pppd_ifname: String,
     ) -> io::Result<Self> {
         let interface = &binding.interface;
         if !(1..=64).contains(&username.len())
@@ -170,7 +179,10 @@ impl Params {
             || binding.gateway.is_unspecified()
             || binding.gateway.is_multicast()
             || binding.gateway == Ipv4Addr::BROADCAST
-            || ca_file.as_deref().is_some_and(|path| !path.is_absolute())
+            || !(1..libc::IFNAMSIZ).contains(&pppd_ifname.len())
+            || !pppd_ifname
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
         {
             return Err(invalid("invalid fortinet parameters"));
         }
@@ -179,14 +191,14 @@ impl Params {
             username,
             certificate_sha256,
             binding,
-            ca_file,
+            pppd_ifname,
         })
     }
 
     pub fn from_request(
         request: &FortinetRequest,
         binding: Binding,
-        ca_file: Option<PathBuf>,
+        pppd_ifname: String,
     ) -> io::Result<Self> {
         let endpoint = Endpoint::new(
             request.endpoint().host().to_owned(),
@@ -198,7 +210,7 @@ impl Params {
             request.username().to_owned(),
             Some(*request.certificate_sha256()),
             binding,
-            ca_file,
+            pppd_ifname,
         )
     }
 
@@ -255,6 +267,9 @@ struct Config<'a> {
     client: &'a str,
     pinentry: &'a str,
     limits: Limits,
+    /// This process exists for this one client: every child it ever has is
+    /// one of the client's orphaned descendants (see `harden`).
+    own_process: bool,
 }
 
 impl Config<'static> {
@@ -262,6 +277,7 @@ impl Config<'static> {
         client: OPENFORTIVPN,
         pinentry: PINENTRY,
         limits: Limits::PRODUCTION,
+        own_process: true,
     };
 }
 
@@ -273,15 +289,22 @@ pub fn run(
     params: Params,
     observer: &mut impl Observer,
 ) -> io::Result<Exit> {
-    protect()?;
+    harden()?;
     run_with(channel, params, observer, Config::PRODUCTION)
 }
 
-/// Other processes of the same UID must not read the supervisor's memory.
-fn protect() -> io::Result<()> {
+/// Other processes of the same UID must not read the supervisor's memory, and
+/// the supervisor adopts the client's orphaned descendants (the PPP daemon runs
+/// in its own session, so it leaves the client's group and, once the client is
+/// gone, would be left to init) so that it can find, stop and reap them.
+fn harden() -> io::Result<()> {
     // SAFETY: prctl takes integer arguments only.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0
+            || libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -301,7 +324,7 @@ fn run_with(
         Waited::Closed(error) => return Ok(never_started(Reason::ChannelClosed, Some(error))),
         Waited::Stop => return Ok(never_started(Reason::Stop, None)),
     };
-    let spawned = Client::spawn(command, password);
+    let spawned = Client::spawn(command, password, config.own_process);
     drop(null);
     let mut client = spawned?;
     for pipe in [client.take_stdout(), client.take_stderr()]
@@ -313,7 +336,7 @@ fn run_with(
 
     let mut sent = Observation::default();
     // A failure below drops `client`, which kills its group.
-    let end = supervise(channel, observer, &client, &mut sent)?;
+    let end = supervise(channel, observer, &mut client, &mut sent)?;
     let stopped = client.terminate(config.limits);
     observer.finish();
     let (reason, channel_error) = match end {
@@ -357,7 +380,7 @@ enum End {
 fn supervise(
     channel: &mut impl Channel,
     observer: &impl Observer,
-    client: &Client,
+    client: &mut Client,
     sent: &mut Observation,
 ) -> io::Result<End> {
     if let Err(error) = send(channel, &Event::Started) {
@@ -369,6 +392,7 @@ fn supervise(
             poll_entry(client.pidfd.as_raw_fd()),
         ];
         poll_fds(&mut fds, TICK)?;
+        client.track()?;
         if fds[1].revents != 0 {
             return Ok(End::Done(Reason::ClientExited, None));
         }
@@ -416,17 +440,12 @@ fn command(config: &Config<'_>, params: &Params, pin: &[u8; 32]) -> io::Result<(
             "--no-dns",
             "--pppd-no-peerdns",
             "--pppd-accept-remote=0",
-            "--persistent=0",
         ])
+        .arg(format!("--pppd-ifname={}", params.pppd_ifname))
+        .arg("--persistent=0")
         .arg(format!("--username={}", params.username))
-        .arg(format!("--pinentry={}", config.pinentry));
-    if let Some(ca_file) = &params.ca_file {
-        // Appended as bytes: a path is not necessarily UTF-8.
-        let mut argument = OsString::from("--ca-file=");
-        argument.push(ca_file);
-        command.arg(argument);
-    }
-    command
+        .arg(format!("--pinentry={}", config.pinentry))
+        // No --ca-file on Linux: the mandatory pin is the trust anchor.
         .arg(format!("--ifname={}", params.binding.interface))
         .arg(format!("--vpnt-ifindex={}", params.binding.index))
         .arg(format!("--vpnt-gateway-ip={}", params.binding.gateway))
@@ -644,12 +663,24 @@ fn changes(sent: &Observation, current: &Observation) -> Vec<Event> {
     events
 }
 
-/// The spawned client and the identity needed to stop its whole group.
+/// A descendant of the client, held by pidfd so a recycled pid is never signalled.
+struct Member {
+    pid: libc::pid_t,
+    pidfd: OwnedFd,
+}
+
+/// The spawned client and what it takes to stop everything it started: its
+/// process group, plus every other descendant (the PPP daemon leaves the group
+/// by starting its own session), tracked by pidfd while it is alive.
 struct Client {
     child: PinentryChild,
     pidfd: OwnedFd,
     group: libc::pid_t,
     reaped: bool,
+    /// Where the descendant search starts: this process when it is dedicated
+    /// to the client (orphans are reparented to it), else the client itself.
+    own_process: bool,
+    members: Vec<Member>,
 }
 
 struct Stopped {
@@ -659,23 +690,30 @@ struct Stopped {
 }
 
 impl Client {
-    fn spawn(command: Command, password: Secret) -> io::Result<Self> {
+    fn spawn(command: Command, password: Secret, own_process: bool) -> io::Result<Self> {
         let mut child = PinentryChild::spawn(command, password)?;
         let group = child.id() as libc::pid_t;
         // The child is not reaped until `poll`, so its pid is still ours.
-        match pidfd_open(group) {
-            Ok(pidfd) => Ok(Self {
-                child,
-                pidfd,
-                group,
-                reaped: false,
-            }),
+        let pidfd = match pidfd_open(group) {
+            Ok(pidfd) => pidfd,
             Err(error) => {
                 kill_group(group, libc::SIGKILL);
                 let _ = child.poll();
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        let mut client = Self {
+            child,
+            pidfd,
+            group,
+            reaped: false,
+            own_process,
+            members: Vec::new(),
+        };
+        // Fail closed where the kernel cannot list children: the client is
+        // dropped (group killed, leader reaped) and the error returned.
+        client.track()?;
+        Ok(client)
     }
 
     fn take_stdout(&mut self) -> Option<File> {
@@ -690,20 +728,60 @@ impl Client {
             .map(|pipe| File::from(OwnedFd::from(pipe)))
     }
 
-    /// The pidfd becomes readable when the client exits, before it is reaped.
-    fn wait_exit(&self, limit: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + limit;
-        loop {
-            let mut fds = [poll_entry(self.pidfd.as_raw_fd())];
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            poll_fds(&mut fds, remaining.min(TICK))?;
-            if fds[0].revents != 0 {
-                return Ok(true);
-            }
-            if remaining.is_zero() {
-                return Ok(false);
+    /// Add every live descendant not yet held. Returns how many were new.
+    fn track(&mut self) -> io::Result<usize> {
+        let root = if self.own_process {
+            std::process::id() as libc::pid_t
+        } else {
+            self.group
+        };
+        let mut pending = vec![root];
+        let mut added = 0;
+        while let Some(parent) = pending.pop() {
+            for pid in children_of(parent)? {
+                pending.push(pid);
+                if pid == self.group || self.members.iter().any(|member| member.pid == pid) {
+                    continue;
+                }
+                match pidfd_open(pid) {
+                    Ok(pidfd) => {
+                        self.members.push(Member { pid, pidfd });
+                        added += 1;
+                    }
+                    // Gone between the listing and the open.
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
+        Ok(added)
+    }
+
+    fn signal_members(&self, signal: libc::c_int) -> io::Result<()> {
+        for member in &self.members {
+            // SAFETY: the pidfd names the exact process; no pointers are used.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    member.pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0 as libc::c_uint,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The pidfd becomes readable when the client exits, before it is reaped.
+    fn wait_exit(&self, limit: Duration) -> io::Result<bool> {
+        wait_readable(&self.pidfd, limit)
     }
 
     /// Only while the leader is unreaped: its zombie keeps the group id ours.
@@ -719,16 +797,21 @@ impl Client {
         Ok(())
     }
 
-    /// SIGTERM to the group, SIGKILL after the grace, a final SIGKILL sweep of
-    /// whatever outlived the leader, then one reap and a check of the group.
+    /// SIGTERM to the group and to every tracked descendant, SIGKILL after the
+    /// grace, a sweep that repeats until no new descendant shows up, then one
+    /// reap of the leader and of the orphans this process adopted.
     fn terminate(&mut self, limits: Limits) -> io::Result<Stopped> {
         self.child.revoke_password();
         let mut escalated = false;
+        self.track()?;
         if !self.wait_exit(Duration::ZERO)? {
             self.signal_group(libc::SIGTERM)?;
+            self.signal_members(libc::SIGTERM)?;
             if !self.wait_exit(limits.grace)? {
                 escalated = true;
+                self.track()?;
                 self.signal_group(libc::SIGKILL)?;
+                self.signal_members(libc::SIGKILL)?;
                 if !self.wait_exit(limits.kill_wait)? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -737,7 +820,17 @@ impl Client {
                 }
             }
         }
-        self.signal_group(libc::SIGKILL)?;
+        // The leader is gone or a zombie: its group id is still ours, and its
+        // children now belong to this process (or to init). Sweep until quiet.
+        for _ in 0..SWEEP_PASSES {
+            self.signal_group(libc::SIGKILL)?;
+            let added = self.track()?;
+            self.signal_members(libc::SIGKILL)?;
+            if added == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let deadline = Instant::now() + limits.kill_wait;
         let status = loop {
             if let Some(status) = self.child.poll()? {
@@ -752,11 +845,41 @@ impl Client {
             std::thread::sleep(Duration::from_millis(5));
         };
         self.reaped = true;
+        let members_gone = self.reap_members(limits.kill_wait);
         Ok(Stopped {
             status,
             escalated,
-            descendants_gone: self.group_gone(),
+            descendants_gone: members_gone && self.group_gone() && self.no_orphans(),
         })
+    }
+
+    /// Every tracked descendant has exited; the ones this process adopted are
+    /// reaped (a pidfd of a process that is not our child gives ECHILD).
+    fn reap_members(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        self.members.iter().all(|member| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let exited = wait_readable(&member.pidfd, left).unwrap_or(false);
+            if exited {
+                // SAFETY: waitid takes a pidfd and a null-able info pointer.
+                unsafe {
+                    libc::waitid(
+                        libc::P_PIDFD,
+                        member.pidfd.as_raw_fd() as libc::id_t,
+                        std::ptr::null_mut(),
+                        libc::WEXITED | libc::WNOHANG,
+                    );
+                }
+            }
+            exited
+        })
+    }
+
+    /// In a dedicated process nothing may be left under it once the client and
+    /// its descendants are reaped.
+    fn no_orphans(&self) -> bool {
+        !self.own_process
+            || children_of(std::process::id() as libc::pid_t).is_ok_and(|left| left.is_empty())
     }
 
     fn group_gone(&self) -> bool {
@@ -782,8 +905,67 @@ impl Drop for Client {
             // Leader still unreaped: the group id is ours. Dropping the child
             // then kills and reaps the leader itself.
             kill_group(self.group, libc::SIGKILL);
+            let _ = self.signal_members(libc::SIGKILL);
         }
     }
+}
+
+/// Wait until the descriptor is readable (a pidfd: the process exited).
+fn wait_readable(fd: &OwnedFd, limit: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let mut fds = [poll_entry(fd.as_raw_fd())];
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        poll_fds(&mut fds, remaining.min(TICK))?;
+        if fds[0].revents != 0 {
+            return Ok(true);
+        }
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+    }
+}
+
+/// Direct children of every thread of `pid`, from `/proc/<pid>/task/*/children`.
+/// A vanished process or thread has none; a kernel without the file is an error.
+fn children_of(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let mut found = Vec::new();
+    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => return Err(error),
+    };
+    for task in tasks {
+        let path = match task {
+            Ok(task) => task.path().join("children"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                for word in text.split_ascii_whitespace() {
+                    found.push(word.parse().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "unreadable children list")
+                    })?);
+                }
+            }
+            // The thread ended meanwhile, or the kernel lacks CONFIG_PROC_CHILDREN.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    continue;
+                }
+                let own = std::process::id();
+                if !Path::new(&format!("/proc/self/task/{own}/children")).exists() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "kernel does not list children in /proc",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(found)
 }
 
 fn kill_group(group: libc::pid_t, signal: libc::c_int) {
@@ -799,6 +981,50 @@ fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
     }
     // SAFETY: the syscall returned a fresh descriptor that nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+impl Channel for super::handshake::AuthenticatedChannel {
+    fn fd(&self) -> io::Result<BorrowedFd<'_>> {
+        self.readable_fd()
+    }
+
+    fn receive(&mut self) -> io::Result<Vec<u8>> {
+        super::handshake::AuthenticatedChannel::receive(self)
+    }
+
+    fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        super::handshake::AuthenticatedChannel::send(self, bytes)
+    }
+}
+
+/// Production observer: the `ssl_output` parser shared with macOS.
+impl Observer for crate::connection::ssl_output::Output {
+    fn attach(&mut self, pipe: File) -> io::Result<()> {
+        crate::connection::ssl_output::Output::attach(self, pipe)
+    }
+
+    fn snapshot(&self) -> Observation {
+        use crate::connection::ssl::SslFailure;
+        let seen = crate::connection::ssl_output::Output::snapshot(self);
+        Observation {
+            candidate: seen.candidate.map(|name| name.as_str().to_owned()),
+            failure: seen.failure.map(|failure| match failure {
+                SslFailure::CredentialsRejected => Failure::CredentialsRejected,
+                SslFailure::GatewayTimeout => Failure::GatewayTimeout,
+            }),
+            split: seen.split,
+            split_count: seen.split_count,
+            split_invalid: seen.split_invalid,
+            dns_servers: seen.dns_servers,
+            dns_domains: seen.dns_domains,
+            dns_count: seen.dns_count,
+            dns_invalid: seen.dns_invalid,
+        }
+    }
+
+    fn finish(&mut self) {
+        crate::connection::ssl_output::Output::finish(self)
+    }
 }
 
 #[cfg(test)]

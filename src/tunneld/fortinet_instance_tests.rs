@@ -3,6 +3,7 @@
 //! directory, and the tests read it from outside.
 use super::*;
 use crate::test_support::write_script;
+use crate::tunneld::handshake::{AuthenticatedChannel, Backend, authenticated_pair_for_tests};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -11,7 +12,7 @@ use std::{
         fd::AsFd,
         unix::{fs::PermissionsExt, process::CommandExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process,
     sync::{
         Arc, Mutex,
@@ -21,9 +22,18 @@ use std::{
 };
 
 const PIN: [u8; 32] = [0xab; 32];
+const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+const INVOCATION: &str = "fedcba9876543210fedcba9876543210";
 const PASSWORD: &str = "pw-SENTINEL-4f9c";
 const HELPER_ENV: &str = "VPNT_FORTINET_INSTANCE_HELPER";
 const WAIT: Duration = Duration::from_secs(10);
+
+fn credential_frame(password: &str) -> Vec<u8> {
+    let mut frame = vec![MESSAGE_CREDENTIAL];
+    frame.extend_from_slice(&(password.len() as u16).to_be_bytes());
+    frame.extend_from_slice(password.as_bytes());
+    frame
+}
 
 struct Scratch(PathBuf);
 
@@ -156,10 +166,7 @@ impl Seq {
     }
 
     fn credential(&self, password: &str) {
-        let mut frame = vec![MESSAGE_CREDENTIAL];
-        frame.extend_from_slice(&(password.len() as u16).to_be_bytes());
-        frame.extend_from_slice(password.as_bytes());
-        self.put(&frame);
+        self.put(&credential_frame(password));
     }
 
     fn stop(&self) {
@@ -241,14 +248,22 @@ impl Observer for LineObserver {
         self.seen.lock().unwrap().clone()
     }
 
+    /// Bounded, like the real parser: a descendant that kept the pipe open must
+    /// not hold the supervisor (or hide that it was left alive).
     fn finish(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
         for reader in self.readers.drain(..) {
-            reader.join().unwrap();
+            while !reader.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if reader.is_finished() {
+                reader.join().unwrap();
+            }
         }
     }
 }
 
-fn params(pin: Option<[u8; 32]>, ca_file: Option<&str>) -> Params {
+fn params(pin: Option<[u8; 32]>) -> Params {
     Params::new(
         Endpoint::new("vpn.example.test".into(), 10443).unwrap(),
         "alice".into(),
@@ -258,7 +273,7 @@ fn params(pin: Option<[u8; 32]>, ca_file: Option<&str>) -> Params {
             index: 7,
             gateway: Ipv4Addr::new(192, 0, 2, 10),
         },
-        ca_file.map(PathBuf::from),
+        Params::default_pppd_ifname(1),
     )
     .unwrap()
 }
@@ -358,6 +373,7 @@ impl Instance {
                     client: client.to_str().unwrap(),
                     pinentry: pinentry.to_str().unwrap(),
                     limits: limits(grace),
+                    own_process: false,
                 },
             )
         });
@@ -391,20 +407,20 @@ fn pids(scratch: &Scratch) -> i64 {
     scratch.json("client")["pid"].as_i64().unwrap()
 }
 
-fn expected_argv(pinentry: &Path, ca_file: Option<&str>) -> Vec<String> {
+fn expected_argv(pinentry: &Path) -> Vec<String> {
     let mut argv: Vec<String> = [
         "--config=/dev/null",
         "--no-routes",
         "--no-dns",
         "--pppd-no-peerdns",
         "--pppd-accept-remote=0",
+        "--pppd-ifname=vpntp1",
         "--persistent=0",
         "--username=alice",
     ]
     .map(String::from)
     .into();
     argv.push(format!("--pinentry={}", pinentry.display()));
-    argv.extend(ca_file.map(|path| format!("--ca-file={path}")));
     argv.extend(
         [
             "--ifname=eth0",
@@ -420,35 +436,36 @@ fn expected_argv(pinentry: &Path, ca_file: Option<&str>) -> Vec<String> {
 }
 
 #[test]
-fn argv_is_exact_and_always_pins_the_certificate() {
-    for ca_file in [None, Some("/etc/vpnt/ca.pem")] {
-        let scratch = Scratch::new();
-        let instance = Instance::start(
-            &scratch,
-            "put('done', {})\nidle()\n",
-            params(Some(PIN), ca_file),
-            Duration::from_secs(2),
-        );
-        instance.writer.credential(PASSWORD);
-        let argv: Vec<String> =
-            serde_json::from_value(scratch.json("client")["argv"].clone()).unwrap();
-        assert_eq!(argv, expected_argv(&scratch.path("vpnt-pinentry"), ca_file));
-        let pins: Vec<_> = argv
-            .iter()
-            .filter(|arg| arg.starts_with("--trusted-cert="))
-            .collect();
-        let delimiter = argv.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(pins.len(), 1);
-        assert!(
-            argv.iter()
-                .position(|arg| arg.starts_with("--trusted-cert="))
-                .unwrap()
-                < delimiter
-        );
-        assert_eq!(argv.len(), delimiter + 2, "one operand after the delimiter");
-        instance.writer.stop();
-        assert_eq!(instance.join().unwrap().reason, Reason::Stop);
-    }
+fn argv_is_exact_pins_the_certificate_and_has_no_ca_file() {
+    let scratch = Scratch::new();
+    let instance = Instance::start(
+        &scratch,
+        "put('done', {})\nidle()\n",
+        params(Some(PIN)),
+        Duration::from_secs(2),
+    );
+    instance.writer.credential(PASSWORD);
+    let argv: Vec<String> = serde_json::from_value(scratch.json("client")["argv"].clone()).unwrap();
+    assert_eq!(argv, expected_argv(&scratch.path("vpnt-pinentry")));
+    let pins: Vec<_> = argv
+        .iter()
+        .filter(|arg| arg.starts_with("--trusted-cert="))
+        .collect();
+    let delimiter = argv.iter().position(|arg| arg == "--").unwrap();
+    assert_eq!(pins.len(), 1);
+    assert!(
+        argv.iter()
+            .position(|arg| arg.starts_with("--trusted-cert="))
+            .unwrap()
+            < delimiter
+    );
+    assert_eq!(argv.len(), delimiter + 2, "one operand after the delimiter");
+    assert!(
+        argv.iter().all(|arg| !arg.contains("ca-file")),
+        "the pin is the anchor on Linux"
+    );
+    instance.writer.stop();
+    assert_eq!(instance.join().unwrap().reason, Reason::Stop);
 }
 
 #[test]
@@ -457,7 +474,7 @@ fn password_reaches_the_pinentry_once_and_nothing_else() {
     let instance = Instance::start(
         &scratch,
         "pin('first')\npin('second')\nput('done', {})\nidle()\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(2),
     );
     instance.writer.credential(PASSWORD);
@@ -518,7 +535,7 @@ fn only_stdio_and_the_pinentry_descriptor_reach_the_client() {
     let instance = Instance::start(
         &scratch,
         "pin('only')\nput('done', {})\nidle()\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(2),
     );
     instance.writer.credential(PASSWORD);
@@ -570,12 +587,13 @@ fn a_missing_pin_is_refused_before_the_credential_is_read_or_anything_starts() {
         writer.stop();
         let error = run_with(
             &mut instance,
-            params(pin, None),
+            params(pin),
             &mut LineObserver::default(),
             Config {
                 client: client.to_str().unwrap(),
                 pinentry: pinentry.to_str().unwrap(),
                 limits: limits(Duration::from_secs(1)),
+                own_process: false,
             },
         )
         .unwrap_err();
@@ -592,7 +610,7 @@ fn a_missing_pin_is_refused_before_the_credential_is_read_or_anything_starts() {
     let instance = Instance::start(
         &scratch,
         "idle()\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(1),
     );
     instance.writer.credential(PASSWORD);
@@ -613,12 +631,7 @@ print("INFO:   token=RAWLINE-SECRET gateway said so", file=sys.stderr, flush=Tru
 put("done", {})
 idle()
 "#;
-    let instance = Instance::start(
-        &scratch,
-        body,
-        params(Some(PIN), None),
-        Duration::from_secs(2),
-    );
+    let instance = Instance::start(&scratch, body, params(Some(PIN)), Duration::from_secs(2));
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     instance.writer.stop();
@@ -656,12 +669,7 @@ fn channel_eof_stops_the_client_with_term_and_reaps_it_once() {
          signal.signal(signal.SIGTERM, term)\nput('done', {{}})\nidle()\n",
         scratch.0.display()
     );
-    let instance = Instance::start(
-        &scratch,
-        &body,
-        params(Some(PIN), None),
-        Duration::from_secs(2),
-    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(2));
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     let pid = pids(&scratch);
@@ -694,7 +702,7 @@ fn stop_command_sends_term_then_kill_to_everything_that_ignores_it() {
         grandchild = stubborn(&scratch)
     );
     let grace = Duration::from_millis(300);
-    let instance = Instance::start(&scratch, &body, params(Some(PIN), None), grace);
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), grace);
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     let grandchild = scratch.json("grandchild");
@@ -743,12 +751,7 @@ fn descendants_that_outlive_the_leader_are_swept_before_it_is_reaped() {
         dir = scratch.0.display(),
         grandchild = stubborn(&scratch)
     );
-    let instance = Instance::start(
-        &scratch,
-        &body,
-        params(Some(PIN), None),
-        Duration::from_secs(5),
-    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     let grandchild = scratch.json("grandchild")["pid"].as_i64().unwrap();
@@ -771,7 +774,7 @@ fn client_exit_is_reported_with_its_status() {
     let instance = Instance::start(
         &scratch,
         "put('done', {})\ntime.sleep(0.2)\nsys.exit(3)\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(1),
     );
     instance.writer.credential(PASSWORD);
@@ -792,7 +795,7 @@ fn a_repeated_credential_is_a_violation_that_stops_the_client() {
     let instance = Instance::start(
         &scratch,
         "put('done', {})\nidle()\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(2),
     );
     instance.writer.credential(PASSWORD);
@@ -810,7 +813,7 @@ fn an_unknown_message_is_a_violation_that_stops_the_client() {
     let instance = Instance::start(
         &scratch,
         "put('done', {})\nidle()\n",
-        params(Some(PIN), None),
+        params(Some(PIN)),
         Duration::from_secs(2),
     );
     instance.writer.credential(PASSWORD);
@@ -837,6 +840,7 @@ fn nothing_starts_without_a_credential() {
                 credential_wait: Duration::from_millis(150),
                 ..limits(Duration::from_secs(1))
             },
+            own_process: false,
         };
         match case {
             "stop" => writer.stop(),
@@ -845,7 +849,7 @@ fn nothing_starts_without_a_credential() {
         }
         let result = run_with(
             &mut instance,
-            params(Some(PIN), None),
+            params(Some(PIN)),
             &mut LineObserver::default(),
             config,
         );
@@ -891,33 +895,54 @@ fn helper_supervisor() {
     if mode == "dumpable" {
         // SAFETY: prctl query takes integers only.
         let before = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
-        let error = run(
-            &mut channel,
-            params(None, None),
-            &mut LineObserver::default(),
-        )
-        .unwrap_err();
+        let error = run(&mut channel, params(None), &mut LineObserver::default()).unwrap_err();
         // SAFETY: as above.
         let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+        let mut subreaper: libc::c_int = -1;
+        // SAFETY: the query writes one integer through the given pointer.
+        unsafe {
+            libc::prctl(
+                libc::PR_GET_CHILD_SUBREAPER,
+                &mut subreaper as *mut libc::c_int,
+            )
+        };
         fs::write(
             dir.join("dumpable"),
-            format!("{before} {after} {:?}", error.kind()),
+            format!("{before} {after} {:?} {subreaper}", error.kind()),
         )
         .unwrap();
         return;
     }
     let client = fields.next().unwrap();
     let pinentry = fields.next().unwrap();
-    let _ = run_with(
+    let own_process = mode == "reap";
+    if own_process {
+        harden().unwrap();
+    }
+    let result = run_with(
         &mut channel,
-        params(Some(PIN), None),
+        params(Some(PIN)),
         &mut LineObserver::default(),
         Config {
             client,
             pinentry,
             limits: limits(Duration::from_secs(2)),
+            own_process,
         },
     );
+    if own_process {
+        let orphan: Value = serde_json::from_slice(&fs::read(dir.join("pppd")).unwrap()).unwrap();
+        let pid = orphan["pid"].as_i64().unwrap();
+        let exit = result.unwrap();
+        let report = json!({
+            "reason": format!("{:?}", exit.reason),
+            "descendants_gone": exit.descendants_gone,
+            "escalated": exit.escalated,
+            "orphan_listed": fs::metadata(format!("/proc/{pid}")).is_ok(),
+            "children": children_of(process::id() as libc::pid_t).unwrap(),
+        });
+        fs::write(dir.join("reap"), report.to_string()).unwrap();
+    }
 }
 
 /// Starts the test binary as a separate process running `helper_supervisor`.
@@ -981,8 +1006,176 @@ fn run_makes_the_supervisor_non_dumpable_before_anything_else() {
     assert!(helper.wait().unwrap().success());
     assert_eq!(
         fs::read_to_string(scratch.path("dumpable")).unwrap(),
-        "1 0 InvalidInput"
+        "1 0 InvalidInput 1"
     );
+}
+
+/// Python for a stand-in of the PPP daemon: its own session, as `forkpty`
+/// gives the real one, so it is not in the client's process group.
+fn pppd_fixture(scratch: &Scratch, ignore_term: bool) -> String {
+    // One line of simple statements: it is embedded in a quoted `-c` argument.
+    format!(
+        "import json,os,signal,time; {ignore}\
+         json.dump({{\"pid\": os.getpid(), \"sid\": os.getsid(0), \"pgid\": os.getpgrp()}}, \
+         open(\"{dir}/pppd.tmp\", \"w\")); \
+         os.rename(\"{dir}/pppd.tmp\", \"{dir}/pppd\"); time.sleep(60)",
+        ignore = if ignore_term {
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        } else {
+            ""
+        },
+        dir = scratch.0.display()
+    )
+}
+
+/// Client body that starts the stand-in daemon in a new session and waits for it.
+fn with_pppd(scratch: &Scratch, ignore_term: bool, leader: &str) -> String {
+    format!(
+        "{leader}\
+         subprocess.Popen(['/usr/bin/python3', '-c', '{code}'], start_new_session=True)\n\
+         while not os.path.exists('{dir}/pppd'):\n    time.sleep(0.01)\n\
+         put('done', {{}})\nidle()\n",
+        code = pppd_fixture(scratch, ignore_term).replace('\'', ""),
+        dir = scratch.0.display()
+    )
+}
+
+fn pppd_pid(scratch: &Scratch) -> i64 {
+    scratch.json("pppd")["pid"].as_i64().unwrap()
+}
+
+#[test]
+fn a_pppd_in_its_own_session_is_stopped_with_the_client() {
+    let scratch = Scratch::new();
+    let body = with_pppd(&scratch, false, "");
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    let pppd = scratch.json("pppd");
+    let client = pids(&scratch);
+    assert_eq!(
+        pppd["sid"], pppd["pid"],
+        "control: it leads its own session"
+    );
+    assert_ne!(
+        pppd["pgid"].as_i64().unwrap(),
+        client,
+        "control: outside the client's group"
+    );
+    instance.writer.stop();
+    let exit = instance.join().unwrap();
+    assert_eq!(exit.reason, Reason::Stop);
+    assert!(!exit.escalated);
+    assert!(exit.descendants_gone);
+    assert!(gone(pppd_pid(&scratch)), "the pppd outlived the stop");
+    assert!(gone(client));
+}
+
+#[test]
+fn a_pppd_that_ignores_term_is_killed_after_the_grace() {
+    let scratch = Scratch::new();
+    let body = with_pppd(
+        &scratch,
+        true,
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n",
+    );
+    let instance = Instance::start(
+        &scratch,
+        &body,
+        params(Some(PIN)),
+        Duration::from_millis(300),
+    );
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    instance.writer.stop();
+    let exit = instance.join().unwrap();
+    assert!(exit.escalated);
+    assert_eq!(exit.status.unwrap().signal(), Some(libc::SIGKILL));
+    assert!(exit.descendants_gone);
+    assert!(gone(pppd_pid(&scratch)), "the pppd outlived the kill");
+}
+
+#[test]
+fn a_pppd_left_behind_by_a_client_that_leaves_on_term_is_still_stopped() {
+    let scratch = Scratch::new();
+    // The leader exits on TERM; the daemon, in another session, ignores it.
+    let body = with_pppd(
+        &scratch,
+        true,
+        "signal.signal(signal.SIGTERM, lambda *_: os._exit(0))\n",
+    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    let pppd = pppd_pid(&scratch);
+    assert!(
+        fs::metadata(format!("/proc/{pppd}")).is_ok(),
+        "control: alive"
+    );
+    instance.writer.stop();
+    let exit = instance.join().unwrap();
+    assert!(!exit.escalated, "the leader left within the grace");
+    assert!(exit.descendants_gone);
+    assert!(gone(pppd), "the pppd was left behind");
+}
+
+#[test]
+fn a_client_that_exits_by_itself_leaves_no_pppd() {
+    let scratch = Scratch::new();
+    let body = with_pppd(&scratch, true, "").replace(
+        "put('done', {})\nidle()\n",
+        "put('done', {})\ntime.sleep(0.3)\nsys.exit(3)\n",
+    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    instance.writer.credential(PASSWORD);
+    let exit = instance.join().unwrap();
+    assert_eq!(exit.reason, Reason::ClientExited);
+    assert_eq!(exit.status.unwrap().code(), Some(3));
+    assert!(exit.descendants_gone);
+    assert!(gone(pppd_pid(&scratch)), "the pppd outlived its client");
+}
+
+#[test]
+fn an_orphaned_pppd_is_adopted_stopped_and_reaped_by_a_dedicated_supervisor() {
+    let scratch = Scratch::new();
+    // Double fork: the daemon is orphaned at once, so it is never the client's
+    // child when the supervisor looks, only its (adopted) own.
+    let body = format!(
+        "if os.fork() == 0:\n\
+         \x20   if os.fork() == 0:\n\
+         \x20       os.setsid()\n\
+         \x20       signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+         \x20       json.dump({{'pid': os.getpid()}}, open('{dir}/pppd.tmp', 'w'))\n\
+         \x20       os.rename('{dir}/pppd.tmp', '{dir}/pppd')\n\
+         \x20       time.sleep(60)\n\
+         \x20   os._exit(0)\n\
+         while not os.path.exists('{dir}/pppd'):\n    time.sleep(0.01)\n\
+         time.sleep(0.2)\nput('done', {{}})\nidle()\n",
+        dir = scratch.0.display()
+    );
+    let (client, pinentry) = fixtures(&scratch, &body);
+    let (instance, writer) = Seq::pair();
+    let extra = format!("|{}|{}", client.display(), pinentry.display());
+    let mut helper = spawn_helper("reap", &scratch, &extra, &instance);
+    writer.credential(PASSWORD);
+    scratch.json("done");
+    let pppd = pppd_pid(&scratch);
+    assert!(
+        fs::metadata(format!("/proc/{pppd}")).is_ok(),
+        "control: alive"
+    );
+    writer.stop();
+    writer.events();
+    assert!(helper.wait().unwrap().success());
+    let report = scratch.json("reap");
+    assert_eq!(report["reason"], "Stop", "{report}");
+    assert_eq!(report["descendants_gone"], true, "{report}");
+    assert_eq!(
+        report["orphan_listed"], false,
+        "gone, not even a zombie: {report}"
+    );
+    assert_eq!(report["children"], json!([]), "{report}");
+    assert!(gone(pppd));
 }
 
 #[test]
@@ -1153,41 +1346,219 @@ fn parameters_refuse_hostile_values() {
     };
     let endpoint = || Endpoint::new("vpn.example.test".into(), 443).unwrap();
     let ok = Ipv4Addr::new(192, 0, 2, 1);
+    let ppp = || "vpntp1".to_owned();
     let hostile = [
-        ("", binding("eth0", 1, ok), None),
-        ("a\nb", binding("eth0", 1, ok), None),
-        (&*"u".repeat(65), binding("eth0", 1, ok), None),
-        ("alice", binding("", 1, ok), None),
-        ("alice", binding("eth0 --x", 1, ok), None),
-        ("alice", binding("a-very-long-name-x", 1, ok), None),
-        ("alice", binding("eth0", 0, ok), None),
-        ("alice", binding("eth0", 1, Ipv4Addr::UNSPECIFIED), None),
-        ("alice", binding("eth0", 1, Ipv4Addr::BROADCAST), None),
+        ("", binding("eth0", 1, ok), ppp()),
+        ("a\nb", binding("eth0", 1, ok), ppp()),
+        (&*"u".repeat(65), binding("eth0", 1, ok), ppp()),
+        ("alice", binding("", 1, ok), ppp()),
+        ("alice", binding("eth0 --x", 1, ok), ppp()),
+        ("alice", binding("a-very-long-name-x", 1, ok), ppp()),
+        ("alice", binding("eth0", 0, ok), ppp()),
+        ("alice", binding("eth0", 1, Ipv4Addr::UNSPECIFIED), ppp()),
+        ("alice", binding("eth0", 1, Ipv4Addr::BROADCAST), ppp()),
         (
             "alice",
             binding("eth0", 1, Ipv4Addr::new(224, 0, 0, 1)),
-            None,
+            ppp(),
         ),
-        ("alice", binding("eth0", 1, ok), Some("relative/ca.pem")),
+        ("alice", binding("eth0", 1, ok), String::new()),
+        ("alice", binding("eth0", 1, ok), "a".repeat(16)),
+        ("alice", binding("eth0", 1, ok), "Vpntp1".into()),
+        ("alice", binding("eth0", 1, ok), "vpn_p1".into()),
+        ("alice", binding("eth0", 1, ok), "vpn-p1".into()),
+        ("alice", binding("eth0", 1, ok), "vpn.p1".into()),
+        ("alice", binding("eth0", 1, ok), "vpn p1".into()),
+        ("alice", binding("eth0", 1, ok), "vpntp1\n".into()),
+        ("alice", binding("eth0", 1, ok), "vpntp\u{e9}".into()),
     ];
-    for (username, binding, ca_file) in hostile {
+    for (username, binding, interface) in hostile {
         let result = Params::new(
             endpoint(),
             username.into(),
             Some(PIN),
             binding.clone(),
-            ca_file.map(PathBuf::from),
+            interface.clone(),
         );
-        assert!(result.is_err(), "{username:?} {binding:?} {ca_file:?}");
+        assert!(result.is_err(), "{username:?} {binding:?} {interface:?}");
     }
-    assert!(
-        Params::new(
-            endpoint(),
-            "alice".into(),
-            Some(PIN),
-            binding("eth0", 1, ok),
-            None
+    // Controls: the longest accepted name, and the default for any ordinal.
+    for interface in [
+        "a".repeat(15),
+        "vpntp0".into(),
+        Params::default_pppd_ifname(4_000_000_000),
+    ] {
+        assert!(
+            Params::new(
+                endpoint(),
+                "alice".into(),
+                Some(PIN),
+                binding("eth0", 1, ok),
+                interface.clone()
+            )
+            .is_ok(),
+            "{interface}"
+        );
+    }
+}
+
+#[test]
+fn the_shared_parser_drives_the_same_typed_events() {
+    let scratch = Scratch::new();
+    let body = r#"
+print("INFO:   Interface ppp0 is UP.", flush=True)
+# One pipe for the counted lines: two pipes would race the count against the route.
+print("INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", flush=True)
+print("INFO:   vpnt: split-routes 1", flush=True)
+print("INFO:   vpnt: dns-server 10.1.1.1", flush=True)
+print("INFO:   vpnt: dns-server 0.0.0.0", flush=True)
+print("INFO:   vpnt: dns-domain corp.example.test", flush=True)
+print("INFO:   vpnt: dns 1 1", flush=True)
+print("ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc.", flush=True)
+print("INFO:   token=RAWLINE-SECRET gateway said so", file=sys.stderr, flush=True)
+put("done", {})
+idle()
+"#;
+    let (client, pinentry) = fixtures(&scratch, body);
+    let (instance, writer) = Seq::pair();
+    let thread = thread::spawn(move || {
+        let mut instance = instance;
+        run_with(
+            &mut instance,
+            params(Some(PIN)),
+            &mut crate::connection::ssl_output::Output::default(),
+            Config {
+                client: client.to_str().unwrap(),
+                pinentry: pinentry.to_str().unwrap(),
+                limits: limits(Duration::from_secs(2)),
+                own_process: false,
+            },
         )
-        .is_ok()
-    );
+    });
+    writer.credential(PASSWORD);
+    scratch.json("done");
+    writer.stop();
+    let events = writer.events();
+    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Stop);
+    let mut seen: Vec<String> = events.iter().map(Value::to_string).collect();
+    seen.sort();
+    let mut expected: Vec<String> = [
+        json!({"event": "started"}),
+        json!({"event": "interface", "name": "ppp0"}),
+        json!({"event": "failure", "kind": "credentials_rejected"}),
+        json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8}),
+        json!({"event": "split_routes", "count": 1}),
+        json!({"event": "dns_server", "address": "10.1.1.1"}),
+        json!({"event": "dns_domain", "name": "corp.example.test"}),
+        json!({"event": "dns_count", "servers": 1, "domains": 1}),
+        json!({"event": "dns_invalid"}),
+        json!({"event": "exited", "code": null, "signal": 15}),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+    let wire = serde_json::to_string(&events).unwrap();
+    for raw in ["RAWLINE", "token", "INFO:", "gateway said", "authenticate"] {
+        assert!(!wire.contains(raw), "{raw} came back");
+    }
+}
+
+fn real_pair(scratch: &Scratch) -> (AuthenticatedChannel, AuthenticatedChannel) {
+    authenticated_pair_for_tests(&scratch.0, GENERATION, Backend::Fortinet, INVOCATION).unwrap()
+}
+
+/// Events from the writer end of a real channel, up to `exited`.
+fn real_events(writer: &mut AuthenticatedChannel) -> Vec<Value> {
+    let mut events = Vec::new();
+    while let Ok(bytes) = writer.receive() {
+        let event: Value = serde_json::from_slice(&bytes).unwrap();
+        let done = event["event"] == "exited";
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+#[test]
+fn the_real_authenticated_channel_and_parser_drive_a_run() {
+    let scratch = Scratch::new();
+    let body = r#"
+print("INFO:   Interface ppp0 is UP.", flush=True)
+print("INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", file=sys.stderr, flush=True)
+print("INFO:   vpnt: dns-server 10.1.1.1", flush=True)
+pin('only')
+put("done", {})
+idle()
+"#;
+    let (client, pinentry) = fixtures(&scratch, body);
+    let (mut writer, instance) = real_pair(&scratch);
+    assert_eq!(instance.invocation(), INVOCATION);
+    let thread = thread::spawn(move || {
+        let mut instance = instance;
+        run_with(
+            &mut instance,
+            params(Some(PIN)),
+            &mut crate::connection::ssl_output::Output::default(),
+            Config {
+                client: client.to_str().unwrap(),
+                pinentry: pinentry.to_str().unwrap(),
+                limits: limits(Duration::from_secs(2)),
+                own_process: false,
+            },
+        )
+    });
+    writer.send(&credential_frame(PASSWORD)).unwrap();
+    scratch.json("done");
+    assert_eq!(scratch.json("pinentry.only")["password"], PASSWORD);
+    writer.send(&[MESSAGE_STOP]).unwrap();
+    let events = real_events(&mut writer);
+    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Stop);
+    let mut seen: Vec<String> = events.iter().map(Value::to_string).collect();
+    seen.sort();
+    let mut expected: Vec<String> = [
+        json!({"event": "started"}),
+        json!({"event": "interface", "name": "ppp0"}),
+        json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8}),
+        json!({"event": "dns_server", "address": "10.1.1.1"}),
+        json!({"event": "exited", "code": null, "signal": 15}),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn the_end_of_the_real_channel_stops_the_client() {
+    let scratch = Scratch::new();
+    let (client, pinentry) = fixtures(&scratch, "put('done', {})\nidle()\n");
+    let (mut writer, instance) = real_pair(&scratch);
+    let thread = thread::spawn(move || {
+        let mut instance = instance;
+        run_with(
+            &mut instance,
+            params(Some(PIN)),
+            &mut LineObserver::default(),
+            Config {
+                client: client.to_str().unwrap(),
+                pinentry: pinentry.to_str().unwrap(),
+                limits: limits(Duration::from_secs(2)),
+                own_process: false,
+            },
+        )
+    });
+    writer.send(&credential_frame(PASSWORD)).unwrap();
+    scratch.json("done");
+    let pid = pids(&scratch);
+    drop(writer);
+    let exit = thread.join().unwrap().unwrap();
+    assert_eq!(exit.reason, Reason::ChannelClosed);
+    assert!(exit.channel_error.is_some(), "the cause is kept");
+    assert!(exit.descendants_gone);
+    assert!(gone(pid));
 }

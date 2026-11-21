@@ -38,7 +38,7 @@ const CURRENT_NAME: &str = "openfortivpn.log";
 const PREVIOUS_NAME: &str = "openfortivpn.previous.log";
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct Observation {
+pub(crate) struct Observation {
     pub candidate: Option<InterfaceName>,
     pub failure: Option<SslFailure>,
     pub split: Vec<(Ipv4Addr, u8)>,
@@ -51,7 +51,7 @@ pub(super) struct Observation {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct Output {
+pub(crate) struct Output {
     observed: Arc<Mutex<Observation>>,
     canceled: Arc<AtomicBool>,
     done: Arc<AtomicUsize>,
