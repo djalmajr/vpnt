@@ -299,8 +299,14 @@ fn private_pid_namespace_observes_writer_pid_zero() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        eprintln!("skipped: unprivileged user and PID namespaces are unavailable here");
+    if !probe.as_ref().is_ok_and(|status| status.success()) {
+        // CI runs this case again after enabling the namespaces, with
+        // VPNT_REQUIRE_USERNS=1, where an unavailable namespace is a failure.
+        assert!(
+            std::env::var_os("VPNT_REQUIRE_USERNS").is_none(),
+            "unprivileged user and PID namespaces are required here: {probe:?}"
+        );
+        eprintln!("skipped: unprivileged user and PID namespaces are unavailable here: {probe:?}");
         return;
     }
     let fixture = Fixture::new();
