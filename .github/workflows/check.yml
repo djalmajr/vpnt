@@ -44,6 +44,10 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           VPNT_TEST_NETNS=1 cargo +1.99.0 test --locked --test netd_netns
+          # The handshake case with a private PID namespace skips while the
+          # namespaces are restricted; here it must run.
+          VPNT_REQUIRE_USERNS=1 cargo +1.99.0 test --locked --all-features --lib \
+            tunneld::handshake::tests::private_pid_namespace_observes_writer_pid_zero -- --exact
 
   macos:
     runs-on: macos-15

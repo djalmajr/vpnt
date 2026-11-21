@@ -1,6 +1,7 @@
 //! Linux tunneld protocol and authenticated runtime client.
 pub mod admin;
 pub mod client;
+pub mod handshake;
 pub mod policy;
 pub mod protocol;
 pub mod server;
