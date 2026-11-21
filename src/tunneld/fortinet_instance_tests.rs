@@ -214,12 +214,19 @@ impl Channel for Seq {
 struct LineObserver {
     seen: Arc<Mutex<Observation>>,
     readers: Vec<JoinHandle<()>>,
+    expected: Option<String>,
 }
 
 impl Observer for LineObserver {
+    fn expect_interface(&mut self, name: &str) -> io::Result<()> {
+        self.expected = Some(name.to_owned());
+        Ok(())
+    }
+
     fn attach(&mut self, pipe: File) -> io::Result<()> {
         use std::io::{BufRead, BufReader};
         let seen = Arc::clone(&self.seen);
+        let expected = self.expected.clone();
         self.readers.push(thread::spawn(move || {
             for line in BufReader::new(pipe).split(b'\n').map_while(Result::ok) {
                 let line = String::from_utf8_lossy(&line).into_owned();
@@ -228,7 +235,11 @@ impl Observer for LineObserver {
                     .strip_prefix("INFO:   Interface ")
                     .and_then(|rest| rest.strip_suffix(" is UP."))
                 {
-                    seen.candidate = Some(name.to_owned());
+                    if expected.as_deref().is_none_or(|expected| expected == name) {
+                        seen.candidate = Some(name.to_owned());
+                    } else {
+                        seen.interface_mismatch = true;
+                    }
                 } else if let Some(address) = line.strip_prefix("INFO:   vpnt: dns-server ") {
                     seen.dns_servers.push(address.parse().unwrap());
                 } else if let Some(name) = line.strip_prefix("INFO:   vpnt: dns-domain ") {
@@ -361,6 +372,16 @@ struct Instance {
 
 impl Instance {
     fn start(scratch: &Scratch, body: &str, params: Params, grace: Duration) -> Self {
+        Self::start_with(scratch, body, params, grace, LineObserver::default())
+    }
+
+    fn start_with(
+        scratch: &Scratch,
+        body: &str,
+        params: Params,
+        grace: Duration,
+        mut observer: impl Observer + Send + 'static,
+    ) -> Self {
         let (client, pinentry) = fixtures(scratch, body);
         let (instance, writer) = Seq::pair();
         let thread = thread::spawn(move || {
@@ -368,7 +389,7 @@ impl Instance {
             run_with(
                 &mut instance,
                 params,
-                &mut LineObserver::default(),
+                &mut observer,
                 Config {
                     client: client.to_str().unwrap(),
                     pinentry: pinentry.to_str().unwrap(),
@@ -623,7 +644,7 @@ fn a_missing_pin_is_refused_before_the_credential_is_read_or_anything_starts() {
 fn observations_become_typed_events_and_no_raw_line_returns() {
     let scratch = Scratch::new();
     let body = r#"
-print("INFO:   Interface ppp0 is UP.", flush=True)
+print("INFO:   Interface vpntp1 is UP.", flush=True)
 print("INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", file=sys.stderr, flush=True)
 print("INFO:   vpnt: dns-server 10.1.1.1", flush=True)
 print("INFO:   vpnt: dns-domain corp.example.test", flush=True)
@@ -642,7 +663,7 @@ idle()
     seen.sort();
     let mut expected: Vec<String> = [
         json!({"event": "started"}),
-        json!({"event": "interface", "name": "ppp0"}),
+        json!({"event": "interface", "name": "vpntp1"}),
         json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8}),
         json!({"event": "dns_server", "address": "10.1.1.1"}),
         json!({"event": "dns_domain", "name": "corp.example.test"}),
@@ -751,7 +772,8 @@ fn descendants_that_outlive_the_leader_are_swept_before_it_is_reaped() {
         dir = scratch.0.display(),
         grandchild = stubborn(&scratch)
     );
-    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    let grace = Duration::from_millis(400);
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), grace);
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     let grandchild = scratch.json("grandchild")["pid"].as_i64().unwrap();
@@ -759,10 +781,17 @@ fn descendants_that_outlive_the_leader_are_swept_before_it_is_reaped() {
         fs::metadata(format!("/proc/{grandchild}")).is_ok(),
         "control: alive"
     );
+    let started = Instant::now();
     instance.writer.stop();
     let exit = instance.join().unwrap();
     assert_eq!(exit.reason, Reason::Stop);
-    assert!(!exit.escalated, "the leader left on TERM, within the grace");
+    // The leader left on TERM, but its child ignored it: the grace belongs to
+    // the whole set, and the KILL that ended it is recorded.
+    assert!(exit.escalated, "a descendant needed SIGKILL");
+    assert!(
+        started.elapsed() >= grace,
+        "KILL came before the grace ended"
+    );
     assert_eq!(exit.status.unwrap().code(), Some(0));
     assert!(exit.descendants_gone);
     assert!(gone(grandchild), "the descendant outlived the leader");
@@ -1030,13 +1059,30 @@ fn pppd_fixture(scratch: &Scratch, ignore_term: bool) -> String {
 
 /// Client body that starts the stand-in daemon in a new session and waits for it.
 fn with_pppd(scratch: &Scratch, ignore_term: bool, leader: &str) -> String {
+    with_pppd_code(scratch, &pppd_fixture(scratch, ignore_term), leader)
+}
+
+fn with_pppd_code(scratch: &Scratch, code: &str, leader: &str) -> String {
     format!(
         "{leader}\
          subprocess.Popen(['/usr/bin/python3', '-c', '{code}'], start_new_session=True)\n\
          while not os.path.exists('{dir}/pppd'):\n    time.sleep(0.01)\n\
          put('done', {{}})\nidle()\n",
-        code = pppd_fixture(scratch, ignore_term).replace('\'', ""),
+        code = code.replace('\'', ""),
         dir = scratch.0.display()
+    )
+}
+
+/// A stand-in daemon that takes `delay` to finish handling TERM and then says so.
+fn slow_term_pppd(scratch: &Scratch, delay: &str) -> String {
+    pppd_fixture(scratch, false).replacen(
+        "import json,os,signal,time; ",
+        &format!(
+            "import json,os,signal,time; signal.signal(signal.SIGTERM, lambda *_: \
+             (time.sleep({delay}), open(\"{dir}/termdone\", \"w\").write(\"1\"), os._exit(0))); ",
+            dir = scratch.0.display()
+        ),
+        1,
     )
 }
 
@@ -1104,7 +1150,8 @@ fn a_pppd_left_behind_by_a_client_that_leaves_on_term_is_still_stopped() {
         true,
         "signal.signal(signal.SIGTERM, lambda *_: os._exit(0))\n",
     );
-    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    let grace = Duration::from_millis(400);
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), grace);
     instance.writer.credential(PASSWORD);
     scratch.json("done");
     let pppd = pppd_pid(&scratch);
@@ -1112,9 +1159,14 @@ fn a_pppd_left_behind_by_a_client_that_leaves_on_term_is_still_stopped() {
         fs::metadata(format!("/proc/{pppd}")).is_ok(),
         "control: alive"
     );
+    let started = Instant::now();
     instance.writer.stop();
     let exit = instance.join().unwrap();
-    assert!(!exit.escalated, "the leader left within the grace");
+    assert!(exit.escalated, "the daemon ignored TERM and needed SIGKILL");
+    assert!(
+        started.elapsed() >= grace,
+        "KILL came before the grace ended"
+    );
     assert!(exit.descendants_gone);
     assert!(gone(pppd), "the pppd was left behind");
 }
@@ -1261,10 +1313,11 @@ fn observations_turn_into_each_event_once() {
     let mut sent = Observation::default();
     let mut now = Observation::default();
     assert!(changes(&sent, &now).is_empty());
-    now.candidate = Some("ppp0".into());
+    now.candidate = Some("vpntp1".into());
     now.failure = Some(Failure::GatewayTimeout);
     now.split = vec![(Ipv4Addr::new(10, 0, 0, 0), 8)];
     now.split_count = Some(1);
+    now.interface_mismatch = true;
     now.split_invalid = true;
     now.dns_servers = vec![Ipv4Addr::new(10, 1, 1, 1)];
     now.dns_domains = vec!["corp.example.test".into()];
@@ -1275,7 +1328,7 @@ fn observations_turn_into_each_event_once() {
         first,
         vec![
             Event::Interface {
-                name: "ppp0".into()
+                name: "vpntp1".into()
             },
             Event::Failure {
                 kind: Failure::GatewayTimeout
@@ -1285,6 +1338,7 @@ fn observations_turn_into_each_event_once() {
                 prefix: 8
             },
             Event::SplitRoutes { count: 1 },
+            Event::InterfaceMismatch,
             Event::SplitInvalid,
             Event::DnsServer {
                 address: Ipv4Addr::new(10, 1, 1, 1)
@@ -1315,6 +1369,10 @@ fn observations_turn_into_each_event_once() {
 fn events_have_a_closed_wire_shape() {
     for (event, wire) in [
         (Event::Started, r#"{"event":"started"}"#),
+        (
+            Event::InterfaceMismatch,
+            r#"{"event":"interface_mismatch"}"#,
+        ),
         (
             Event::Failure {
                 kind: Failure::CredentialsRejected,
@@ -1406,7 +1464,7 @@ fn parameters_refuse_hostile_values() {
 fn the_shared_parser_drives_the_same_typed_events() {
     let scratch = Scratch::new();
     let body = r#"
-print("INFO:   Interface ppp0 is UP.", flush=True)
+print("INFO:   Interface vpntp1 is UP.", flush=True)
 # One pipe for the counted lines: two pipes would race the count against the route.
 print("INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", flush=True)
 print("INFO:   vpnt: split-routes 1", flush=True)
@@ -1444,7 +1502,7 @@ idle()
     seen.sort();
     let mut expected: Vec<String> = [
         json!({"event": "started"}),
-        json!({"event": "interface", "name": "ppp0"}),
+        json!({"event": "interface", "name": "vpntp1"}),
         json!({"event": "failure", "kind": "credentials_rejected"}),
         json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8}),
         json!({"event": "split_routes", "count": 1}),
@@ -1487,7 +1545,7 @@ fn real_events(writer: &mut AuthenticatedChannel) -> Vec<Value> {
 fn the_real_authenticated_channel_and_parser_drive_a_run() {
     let scratch = Scratch::new();
     let body = r#"
-print("INFO:   Interface ppp0 is UP.", flush=True)
+print("INFO:   Interface vpntp1 is UP.", flush=True)
 print("INFO:   vpnt: split-route 10.0.0.0/255.0.0.0", file=sys.stderr, flush=True)
 print("INFO:   vpnt: dns-server 10.1.1.1", flush=True)
 pin('only')
@@ -1521,7 +1579,7 @@ idle()
     seen.sort();
     let mut expected: Vec<String> = [
         json!({"event": "started"}),
-        json!({"event": "interface", "name": "ppp0"}),
+        json!({"event": "interface", "name": "vpntp1"}),
         json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8}),
         json!({"event": "dns_server", "address": "10.1.1.1"}),
         json!({"event": "exited", "code": null, "signal": 15}),
@@ -1561,4 +1619,249 @@ fn the_end_of_the_real_channel_stops_the_client() {
     assert!(exit.channel_error.is_some(), "the cause is kept");
     assert!(exit.descendants_gone);
     assert!(gone(pid));
+}
+
+#[test]
+fn a_descendant_gets_its_whole_grace_after_the_leader_left() {
+    let scratch = Scratch::new();
+    // The leader leaves on TERM at once; the daemon, in another session, needs
+    // 0.6 s to finish handling TERM, well inside the grace.
+    let body = with_pppd_code(
+        &scratch,
+        &slow_term_pppd(&scratch, "0.6"),
+        "signal.signal(signal.SIGTERM, lambda *_: os._exit(0))\n",
+    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    let pppd = pppd_pid(&scratch);
+    instance.writer.stop();
+    let exit = instance.join().unwrap();
+    assert!(
+        scratch.path("termdone").exists(),
+        "the daemon was killed before it finished handling TERM"
+    );
+    assert!(!exit.escalated, "no SIGKILL was needed");
+    assert!(exit.descendants_gone);
+    assert!(gone(pppd));
+}
+
+#[test]
+fn a_client_that_exited_by_itself_still_gives_its_pppd_the_grace() {
+    let scratch = Scratch::new();
+    let body = with_pppd_code(&scratch, &slow_term_pppd(&scratch, "0.6"), "").replace(
+        "put('done', {})\nidle()\n",
+        "put('done', {})\ntime.sleep(0.2)\nsys.exit(3)\n",
+    );
+    let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(5));
+    instance.writer.credential(PASSWORD);
+    let exit = instance.join().unwrap();
+    assert_eq!(exit.reason, Reason::ClientExited);
+    assert!(
+        scratch.path("termdone").exists(),
+        "the daemon was killed before it finished handling TERM"
+    );
+    assert!(!exit.escalated);
+    assert!(exit.descendants_gone);
+}
+
+/// Descriptors of a stand-in PPP daemon started the way the C client does it:
+/// `execv` after `forkpty`, so everything not close-on-exec is inherited.
+fn fake_pppd_fds(scratch: &Scratch, close_capability: bool) -> BTreeSet<String> {
+    let preamble = PREAMBLE.replace("@DIR@", scratch.0.to_str().unwrap());
+    write_script(
+        &scratch.path("fake-pppd"),
+        &format!("{preamble}\nput('pppd-fds', sorted(fds()))\n"),
+    );
+    // A descriptor the supervisor process holds, not close-on-exec: the
+    // supervisor must keep it from the client (and so from the daemon).
+    // SAFETY: duplicates stdin above 20, without close-on-exec.
+    let leaked = unsafe { libc::fcntl(0, libc::F_DUPFD, 20) };
+    assert!(leaked >= 20);
+    let body = format!(
+        "pin('only')\n{close}\
+         subprocess.Popen([D + '/fake-pppd'], close_fds=False).wait()\nput('done', {{}})\nidle()\n",
+        close = if close_capability {
+            "os.close(3)  # what the patched client does after the read\n"
+        } else {
+            ""
+        }
+    );
+    let instance = Instance::start(scratch, &body, params(Some(PIN)), Duration::from_secs(2));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    let fds: Vec<String> = serde_json::from_value(scratch.json("pppd-fds")).unwrap();
+    assert_eq!(scratch.json("pinentry.only")["password"], PASSWORD);
+    instance.writer.stop();
+    instance.join().unwrap();
+    // SAFETY: closes the duplicate made above, owned here.
+    unsafe { libc::close(leaked) };
+    fds.into_iter().collect()
+}
+
+#[test]
+fn the_pppd_inherits_only_stdio_once_the_client_closed_the_pinentry_descriptor() {
+    // The fixture client plays the patched client (it closes descriptor 3 after
+    // the pinentry read); the real client is proven by
+    // scripts/linux/check-openfortivpn-pinentry.sh. What this proves is that
+    // nothing else of the supervisor reaches the daemon.
+    let closed = fake_pppd_fds(&Scratch::new(), true);
+    assert_eq!(closed, ["0", "1", "2"].map(String::from).into());
+    // Control: a client that keeps 3 hands it to the daemon, and the probe sees it.
+    let kept = fake_pppd_fds(&Scratch::new(), false);
+    assert_eq!(kept, ["0", "1", "2", "3"].map(String::from).into());
+}
+
+#[test]
+fn a_listed_pid_that_is_not_the_leaders_child_is_never_held_or_signalled() {
+    struct Alien(process::Child);
+    impl Drop for Alien {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let alive = |pid: libc::pid_t| {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit(')').next().map(str::to_owned))
+            .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+    };
+    let scratch = Scratch::new();
+    let body = "child = subprocess.Popen(['/usr/bin/python3', '-c', 'import time; time.sleep(60)'])\n\
+                put('child', {'pid': child.pid})\nput('done', {})\nidle()\n";
+    let (client_path, pinentry) = fixtures(&scratch, body);
+    let config = Config {
+        client: client_path.to_str().unwrap(),
+        pinentry: pinentry.to_str().unwrap(),
+        limits: limits(Duration::from_secs(1)),
+        own_process: false,
+    };
+    let (spawn, null) = command(&config, &params(Some(PIN)), &PIN).unwrap();
+    let mut client = Client::spawn(spawn, Secret::from(PASSWORD), false).unwrap();
+    drop(null);
+    scratch.json("done");
+    let real = scratch.json("child")["pid"].as_i64().unwrap() as libc::pid_t;
+    // A process of the test, never a descendant of the client: what a pid
+    // recycled between the listing and the open looks like.
+    let alien = Alien(
+        process::Command::new("/usr/bin/python3")
+            .args(["-c", "import time; time.sleep(60)"])
+            .spawn()
+            .unwrap(),
+    );
+    let alien_pid = alien.0.id() as libc::pid_t;
+    let group = client.group;
+    // The stale listing names the alien as a child of the leader.
+    client
+        .track_in(|parent| {
+            let mut pids = children_of(parent)?;
+            if parent == group {
+                pids.push(alien_pid);
+            }
+            Ok(pids)
+        })
+        .unwrap();
+    let held: Vec<_> = client.members.iter().map(|member| member.pid).collect();
+    assert!(held.contains(&real), "control: the real child is held");
+    assert!(!held.contains(&alien_pid), "the alien was held: {held:?}");
+    client.signal_members(libc::SIGKILL, 0).unwrap();
+    assert!(
+        gone(i64::from(real)),
+        "control: the real child was signalled"
+    );
+    assert!(alive(alien_pid), "the alien was signalled");
+}
+
+fn real_parser_events(body: &str) -> Vec<Value> {
+    let scratch = Scratch::new();
+    let instance = Instance::start_with(
+        &scratch,
+        body,
+        params(Some(PIN)),
+        Duration::from_secs(2),
+        crate::connection::ssl_output::Output::default(),
+    );
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    instance.writer.stop();
+    let events = instance.writer.events();
+    instance.join().unwrap();
+    events
+}
+
+fn has(events: &[Value], wanted: Value) -> bool {
+    events.contains(&wanted)
+}
+
+#[test]
+fn the_real_parser_reports_the_interface_the_supervisor_configured() {
+    let events = real_parser_events(
+        "print('INFO:   Interface vpntp1 is UP.', flush=True)\n\
+         print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
+         put('done', {})\nidle()\n",
+    );
+    assert!(has(
+        &events,
+        json!({"event": "interface", "name": "vpntp1"})
+    ));
+    assert!(has(
+        &events,
+        json!({"event": "split_route", "network": "10.0.0.0", "prefix": 8})
+    ));
+    assert!(!has(&events, json!({"event": "interface_mismatch"})));
+}
+
+#[test]
+fn the_real_parser_types_any_other_interface_as_a_mismatch() {
+    for other in ["ppp0", "vpntp2", "vpntp10", "eth0"] {
+        let events = real_parser_events(&format!(
+            "print('INFO:   Interface {other} is UP.', flush=True)\n\
+             time.sleep(0.3)\n\
+             print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
+             print('INFO:   vpnt: dns-server 10.1.1.1', flush=True)\n\
+             put('done', {{}})\nidle()\n"
+        ));
+        assert!(
+            has(&events, json!({"event": "interface_mismatch"})),
+            "{other}: {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| event["event"] != "interface"),
+            "{other} was reported as the interface"
+        );
+        // The `vpnt:` lines after it do not refer to the expected interface.
+        assert!(has(&events, json!({"event": "split_invalid"})), "{other}");
+        assert!(has(&events, json!({"event": "dns_invalid"})), "{other}");
+        assert!(
+            events.iter().all(|event| event["event"] != "split_route"),
+            "{other}"
+        );
+    }
+}
+
+#[test]
+fn the_sweep_reports_a_kill_of_a_live_process_and_only_then() {
+    let scratch = Scratch::new();
+    let (client_path, pinentry) = fixtures(&scratch, "put('done', {})\nidle()\n");
+    let config = Config {
+        client: client_path.to_str().unwrap(),
+        pinentry: pinentry.to_str().unwrap(),
+        limits: limits(Duration::from_secs(1)),
+        own_process: false,
+    };
+    let (spawn, null) = command(&config, &params(Some(PIN)), &PIN).unwrap();
+    let mut client = Client::spawn(spawn, Secret::from(PASSWORD), false).unwrap();
+    drop(null);
+    scratch.json("done");
+    assert!(client.alive(), "control: the leader is running");
+    assert!(client.sweep().unwrap(), "a live leader was killed");
+    assert!(client.wait_exit(Duration::from_secs(5)).unwrap());
+    assert!(
+        !client.sweep().unwrap(),
+        "nothing was alive the second time"
+    );
+    // Reaped here, as `terminate` does after its sweep.
+    assert!(client.child.poll().unwrap().is_some());
+    client.reaped = true;
 }

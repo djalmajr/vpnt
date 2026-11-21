@@ -80,6 +80,8 @@ pub struct Observation {
     pub dns_domains: Vec<String>,
     pub dns_count: Option<(usize, usize)>,
     pub dns_invalid: bool,
+    /// The client announced another PPP interface than the one configured.
+    pub interface_mismatch: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -92,6 +94,10 @@ pub enum Failure {
 /// Parser of the client output. The production implementation is the
 /// `ssl_output` parser shared with macOS; raw lines never leave it.
 pub trait Observer {
+    /// The PPP interface name the supervisor configured (`--pppd-ifname`), given
+    /// before any pipe is attached: only that exact name may be reported, and any
+    /// other becomes `Observation::interface_mismatch`.
+    fn expect_interface(&mut self, name: &str) -> io::Result<()>;
     /// Drain this pipe on the observer's own thread.
     fn attach(&mut self, pipe: File) -> io::Result<()>;
     fn snapshot(&self) -> Observation;
@@ -118,6 +124,9 @@ pub enum Event {
         count: usize,
     },
     SplitInvalid,
+    /// The client announced a PPP interface other than the configured one: the
+    /// observations of this attempt are not to be trusted.
+    InterfaceMismatch,
     DnsServer {
         address: Ipv4Addr,
     },
@@ -318,6 +327,7 @@ fn run_with(
     // Refuse before reading the credential or starting anything.
     let pin = *params.pin()?;
     let (command, null) = command(&config, &params, &pin)?;
+    observer.expect_interface(&params.pppd_ifname)?;
 
     let password = match wait_credential(channel, config.limits.credential_wait)? {
         Waited::Credential(password) => password,
@@ -642,6 +652,9 @@ fn changes(sent: &Observation, current: &Observation) -> Vec<Event> {
     {
         events.push(Event::SplitRoutes { count });
     }
+    if current.interface_mismatch && !sent.interface_mismatch {
+        events.push(Event::InterfaceMismatch);
+    }
     if current.split_invalid && !sent.split_invalid {
         events.push(Event::SplitInvalid);
     }
@@ -730,6 +743,20 @@ impl Client {
 
     /// Add every live descendant not yet held. Returns how many were new.
     fn track(&mut self) -> io::Result<usize> {
+        self.track_in(children_of)
+    }
+
+    /// `list` gives the direct children of a pid. A listed pid is held only
+    /// after the process behind the opened pidfd is confirmed to be that
+    /// parent's child: the pid number comes from an earlier observation, and
+    /// between it and `pidfd_open` the process may have exited and the number
+    /// been given to an unrelated one. The pidfd names the exact process from
+    /// the open on, so reading its parent afterwards is not a second race: a
+    /// process that exits first leaves a pidfd that can no longer signal anyone.
+    fn track_in(
+        &mut self,
+        list: impl Fn(libc::pid_t) -> io::Result<Vec<libc::pid_t>>,
+    ) -> io::Result<usize> {
         let root = if self.own_process {
             std::process::id() as libc::pid_t
         } else {
@@ -738,13 +765,17 @@ impl Client {
         let mut pending = vec![root];
         let mut added = 0;
         while let Some(parent) = pending.pop() {
-            for pid in children_of(parent)? {
+            for pid in list(parent)? {
                 pending.push(pid);
                 if pid == self.group || self.members.iter().any(|member| member.pid == pid) {
                     continue;
                 }
                 match pidfd_open(pid) {
                     Ok(pidfd) => {
+                        if parent_of(pid)? != Some(parent) {
+                            // Not this parent's child any more: dropped, never signalled.
+                            continue;
+                        }
                         self.members.push(Member { pid, pidfd });
                         added += 1;
                     }
@@ -757,8 +788,9 @@ impl Client {
         Ok(added)
     }
 
-    fn signal_members(&self, signal: libc::c_int) -> io::Result<()> {
-        for member in &self.members {
+    /// Signal the tracked descendants from index `from` on.
+    fn signal_members(&self, signal: libc::c_int, from: usize) -> io::Result<()> {
+        for member in &self.members[from..] {
             // SAFETY: the pidfd names the exact process; no pointers are used.
             let result = unsafe {
                 libc::syscall(
@@ -784,6 +816,56 @@ impl Client {
         wait_readable(&self.pidfd, limit)
     }
 
+    /// The leader is gone or a zombie: its group id is still ours, and its
+    /// children now belong to this process (or to init). SIGKILL the group and
+    /// every descendant, repeating until no new one shows up. `true` when a
+    /// process that was still alive had to be killed here, without any grace.
+    fn sweep(&mut self) -> io::Result<bool> {
+        let mut killed = false;
+        for _ in 0..SWEEP_PASSES {
+            killed |= self.alive();
+            self.signal_group(libc::SIGKILL)?;
+            let added = self.track()?;
+            killed |= self.alive();
+            self.signal_members(libc::SIGKILL, 0)?;
+            if added == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(killed)
+    }
+
+    /// Wait until the leader and every descendant have exited, for at most
+    /// `limit`. Descendants that show up meanwhile get SIGTERM at once and are
+    /// waited for too. `false` when something is still alive at the limit.
+    fn wait_all_exit(&mut self, limit: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let known = self.members.len();
+            self.track()?;
+            self.signal_members(libc::SIGTERM, known)?;
+            if !self.alive() {
+                return Ok(true);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let mut fds: Vec<libc::pollfd> = std::iter::once(&self.pidfd)
+                .chain(self.members.iter().map(|member| &member.pidfd))
+                .filter(|fd| !exited(fd))
+                .map(|fd| poll_entry(fd.as_raw_fd()))
+                .collect();
+            poll_fds(&mut fds, remaining.min(TICK))?;
+        }
+    }
+
+    /// The leader or a tracked descendant has not exited yet.
+    fn alive(&self) -> bool {
+        !exited(&self.pidfd) || self.members.iter().any(|member| !exited(&member.pidfd))
+    }
+
     /// Only while the leader is unreaped: its zombie keeps the group id ours.
     fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
         assert!(!self.reaped, "signalling a reaped client's group");
@@ -797,40 +879,32 @@ impl Client {
         Ok(())
     }
 
-    /// SIGTERM to the group and to every tracked descendant, SIGKILL after the
-    /// grace, a sweep that repeats until no new descendant shows up, then one
-    /// reap of the leader and of the orphans this process adopted.
+    /// SIGTERM to the group and to every tracked descendant, then the whole set
+    /// (leader and descendants, also those that appear meanwhile) gets the full
+    /// grace, even when the leader exits first. SIGKILL only for what is still
+    /// alive after it, and any SIGKILL of a live process is an escalation. Then a
+    /// sweep that repeats until no new descendant shows up, one reap of the
+    /// leader and of the orphans this process adopted.
     fn terminate(&mut self, limits: Limits) -> io::Result<Stopped> {
         self.child.revoke_password();
         let mut escalated = false;
         self.track()?;
-        if !self.wait_exit(Duration::ZERO)? {
-            self.signal_group(libc::SIGTERM)?;
-            self.signal_members(libc::SIGTERM)?;
-            if !self.wait_exit(limits.grace)? {
-                escalated = true;
-                self.track()?;
-                self.signal_group(libc::SIGKILL)?;
-                self.signal_members(libc::SIGKILL)?;
-                if !self.wait_exit(limits.kill_wait)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "client exit unconfirmed",
-                    ));
-                }
-            }
-        }
-        // The leader is gone or a zombie: its group id is still ours, and its
-        // children now belong to this process (or to init). Sweep until quiet.
-        for _ in 0..SWEEP_PASSES {
+        // The group id is ours while the leader is unreaped, zombie or not.
+        self.signal_group(libc::SIGTERM)?;
+        self.signal_members(libc::SIGTERM, 0)?;
+        if !self.wait_all_exit(limits.grace)? {
+            escalated = true;
+            self.track()?;
             self.signal_group(libc::SIGKILL)?;
-            let added = self.track()?;
-            self.signal_members(libc::SIGKILL)?;
-            if added == 0 {
-                break;
+            self.signal_members(libc::SIGKILL, 0)?;
+            if !self.wait_exit(limits.kill_wait)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "client exit unconfirmed",
+                ));
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
+        escalated |= self.sweep()?;
         let deadline = Instant::now() + limits.kill_wait;
         let status = loop {
             if let Some(status) = self.child.poll()? {
@@ -905,9 +979,15 @@ impl Drop for Client {
             // Leader still unreaped: the group id is ours. Dropping the child
             // then kills and reaps the leader itself.
             kill_group(self.group, libc::SIGKILL);
-            let _ = self.signal_members(libc::SIGKILL);
+            let _ = self.signal_members(libc::SIGKILL, 0);
         }
     }
+}
+
+/// The pidfd is readable: the process exited (it may still be a zombie). A
+/// failed poll counts as alive, the conservative answer for an escalation.
+fn exited(fd: &OwnedFd) -> bool {
+    wait_readable(fd, Duration::ZERO).unwrap_or(false)
 }
 
 /// Wait until the descriptor is readable (a pidfd: the process exited).
@@ -968,6 +1048,27 @@ fn children_of(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
     Ok(found)
 }
 
+/// Parent of `pid` from `/proc/<pid>/stat`; `None` when the process is gone.
+fn parent_of(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // The process exited while it was read.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // `pid (comm) state ppid ...`, and comm may hold spaces and parentheses.
+    let rest = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unreadable stat"))?;
+    rest.split_ascii_whitespace()
+        .nth(1)
+        .and_then(|word| word.parse().ok())
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unreadable stat"))
+}
+
 fn kill_group(group: libc::pid_t, signal: libc::c_int) {
     // SAFETY: kill takes integers; callers hold an unreaped group leader.
     unsafe { libc::kill(-group, signal) };
@@ -999,6 +1100,10 @@ impl Channel for super::handshake::AuthenticatedChannel {
 
 /// Production observer: the `ssl_output` parser shared with macOS.
 impl Observer for crate::connection::ssl_output::Output {
+    fn expect_interface(&mut self, name: &str) -> io::Result<()> {
+        crate::connection::ssl_output::Output::expect_interface(self, name)
+    }
+
     fn attach(&mut self, pipe: File) -> io::Result<()> {
         crate::connection::ssl_output::Output::attach(self, pipe)
     }
@@ -1007,7 +1112,9 @@ impl Observer for crate::connection::ssl_output::Output {
         use crate::connection::ssl::SslFailure;
         let seen = crate::connection::ssl_output::Output::snapshot(self);
         Observation {
-            candidate: seen.candidate.map(|name| name.as_str().to_owned()),
+            // The parser was told the configured name: only it is ever confirmed.
+            candidate: seen.confirmed_interface,
+            interface_mismatch: seen.interface_mismatch,
             failure: seen.failure.map(|failure| match failure {
                 SslFailure::CredentialsRejected => Failure::CredentialsRejected,
                 SslFailure::GatewayTimeout => Failure::GatewayTimeout,
