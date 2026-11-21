@@ -2,8 +2,9 @@
 //! adapter that loads the SF Symbol it names.
 //!
 //! The symbols mirror the SwiftBar menu-bar mapping the owner already reads, so
-//! the tray keeps the same vocabulary: shield = IPsec, lock = SSL, stacked
-//! locks = both, open lock = nothing verified, warning triangle = attention.
+//! the tray keeps the same vocabulary: shield = IPsec, lock = SSL (Fortinet SSL
+//! and OpenVPN, both TLS tunnels), stacked locks = both, open lock = nothing
+//! verified, warning triangle = attention.
 //! Selection is pure and exhaustively tested; only [`Controller`] touches
 //! AppKit.
 
@@ -44,7 +45,7 @@ pub(crate) enum Icon {
     Open,
     /// IPsec connected.
     Ipsec,
-    /// SSL connected.
+    /// A TLS tunnel connected: Fortinet SSL or OpenVPN.
     Ssl,
     /// Both kinds connected.
     Both,
@@ -110,8 +111,8 @@ pub(crate) fn icon_for(snapshot: Option<&Snapshot>, error: bool) -> Icon {
             ConnectionState::Connected => {
                 kinds |= match view.profile.kind {
                     VpnKind::Ipsec => IPSEC,
-                    VpnKind::Ssl => SSL,
-                    VpnKind::Ovpn => return Icon::Warning,
+                    // OpenVPN is a TLS tunnel too, so it joins the lock family.
+                    VpnKind::Ssl | VpnKind::Ovpn => SSL,
                 };
             }
             // Work in progress proves no tunnel and is not a problem either: it
