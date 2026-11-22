@@ -259,6 +259,10 @@ pub enum Reason {
     Stop,
     /// The client ended by itself.
     ClientExited,
+    /// A fatal event was reported (`interface_mismatch` or a failure): the
+    /// client was stopped and the instance ends. The writer treats the
+    /// instance's exit as a stop and cleans up.
+    Fatal,
 }
 
 #[derive(Debug)]
@@ -548,6 +552,11 @@ fn supervise(
         }
         if let Err(error) = report(channel, observer, sent) {
             return Ok(End::Done(Reason::ChannelClosed, Some(error)));
+        }
+        // Reported first, then the instance ends: nothing observed after a
+        // wrong interface or a failure is worth keeping the client alive for.
+        if sent.interface_mismatch || sent.failure.is_some() {
+            return Ok(End::Done(Reason::Fatal, None));
         }
     }
 }

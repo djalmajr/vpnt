@@ -8,11 +8,12 @@ use super::{
         UnitIdentity, Writer,
     },
     instance_protocol::{Order, Reply, Start, encode_credentials},
-    network::{Network, Receipt, parse_cidr, valid_generation},
-    policy::Entry,
+    network::{Network, Receipt, SetupCancellation, parse_cidr, valid_generation},
+    policy::{Entry, MAX_IPSEC_ROUTES},
     protocol::{self, CidrV4, Credentials, ErrorCode, FortinetRequest, Prepare, State},
 };
 use crate::{
+    helper::local_socket::Budget,
     netd::{iproute::Backend as NetworkBackend, server::ovpn_present},
     netlease::{NetworkGuard, NetworkLock},
 };
@@ -28,6 +29,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -56,11 +58,12 @@ pub(super) trait Launch: Send + Sync {
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
+        cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode>;
 }
 
 /// One admitted session. Dropping it stops it.
-pub(super) trait Running {
+pub(super) trait Running: Send {
     fn state(&self) -> State;
     fn peer(&self) -> Option<BorrowedFd<'_>> {
         None
@@ -125,6 +128,10 @@ struct Attempt {
     registered: bool,
     directory: bool,
     started: bool,
+    /// A runtime `IPAddressAllow` was requested for the unit: a failed call
+    /// may still have written the drop-in, so teardown always reverts it.
+    allowed: bool,
+    credentials_sent: bool,
     receipt: Option<Receipt>,
     fortinet: Option<fortinet_network::Receipt>,
 }
@@ -143,6 +150,8 @@ impl Attempt {
             registered: false,
             directory: false,
             started: false,
+            allowed: false,
+            credentials_sent: false,
             receipt: None,
             fortinet: None,
         }
@@ -219,6 +228,7 @@ fn fatal_code(fatal: &fortinet_network::Fatal) -> ErrorCode {
 
 struct CapturePeer<'a, A> {
     attestor: &'a A,
+    cancel: &'a SetupCancellation,
     peer: std::cell::RefCell<Option<OwnedFd>>,
 }
 
@@ -228,7 +238,9 @@ impl<A: UnitAttestor> UnitAttestor for CapturePeer<'_, A> {
     }
 
     fn attest_until(&self, fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<UnitIdentity> {
+        self.cancel.check()?;
         let identity = self.attestor.attest_until(fd, deadline)?;
+        self.cancel.check()?;
         self.peer.replace(Some(fd.try_clone_to_owned()?));
         Ok(identity)
     }
@@ -242,7 +254,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         entry: Option<&Entry>,
         authorization: Option<File>,
         channel: &mut Option<AuthenticatedChannel>,
+        cancel: &SetupCancellation,
     ) -> Result<OwnedFd, Failure> {
+        cancel.check().map_err(|e| Failure::io("admission", &e))?;
         let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
             if error.kind() == io::ErrorKind::TimedOut {
                 Failure::new(ErrorCode::Busy, "network write lock is contended")
@@ -259,6 +273,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         {
             return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
         }
+        cancel
+            .check()
+            .map_err(|e| Failure::io("generation setup", &e))?;
         let directory = self
             .create_directory(&attempt.generation)
             .map_err(|e| Failure::io("generation directory", &e))?;
@@ -275,6 +292,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                         setup.order.remote_ts.clone(),
                     )
                     .map_err(|e| Failure::io("network admission", &e))?;
+                cancel.check().map_err(|e| Failure::io("lease setup", &e))?;
                 receipt
                     .save(&directory, &guard)
                     .map_err(|e| Failure::io("network receipt", &e))?;
@@ -289,6 +307,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     .fortinet
                     .plan(&guard, &attempt.generation, setup.remote, &setup.approved)
                     .map_err(|e| Failure::io("network admission", &e))?;
+                cancel.check().map_err(|e| Failure::io("lease setup", &e))?;
                 receipt
                     .save(&directory, &guard)
                     .map_err(|e| Failure::io("network receipt", &e))?;
@@ -324,16 +343,46 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         )
         .map_err(|e| Failure::io("handshake record basename", &e))?;
 
-        attempt.started = true; // A failed call may still have queued the job.
-        run_systemctl(
-            &self.systemctl,
-            &["start", "--no-block", "--", &attempt.unit],
-            self.limits.start,
-        )
-        .map_err(|e| Failure::io("systemctl start", &e))?;
+        // The units deny every address. Open only the frozen transport IPv4 of
+        // this generation (the one the Start order carries), at runtime, and
+        // before the unit exists as a process.
+        if let Some(transport) = match setup.as_ref() {
+            Some(Setup::Ipsec(setup)) => Some(setup.order.remote_ipv4),
+            Some(Setup::Fortinet(setup)) => Some(setup.remote),
+            None => None,
+        } {
+            let allow = format!("IPAddressAllow={transport}/32");
+            let allow_deadline = Instant::now() + self.limits.start;
+            let child = cancel
+                .start(|| {
+                    attempt.allowed = true; // A failed call may still have written the drop-in.
+                    spawn_systemctl(
+                        &self.systemctl,
+                        &["set-property", "--runtime", &attempt.unit, &allow],
+                    )
+                })
+                .map_err(|e| Failure::io("systemctl set-property", &e))?;
+            wait_systemctl(child, allow_deadline)
+                .map_err(|e| Failure::io("systemctl set-property", &e))?;
+        }
+        let start_deadline = Instant::now() + self.limits.start;
+        let child = cancel
+            .start(|| {
+                attempt.started = true; // A failed call may still have queued the job.
+                spawn_systemctl(
+                    &self.systemctl,
+                    &["start", "--no-block", "--", &attempt.unit],
+                )
+            })
+            .map_err(|e| Failure::io("systemctl start", &e))?;
+        wait_systemctl(child, start_deadline).map_err(|e| Failure::io("systemctl start", &e))?;
         drop(authorization);
+        cancel
+            .check()
+            .map_err(|e| Failure::io("handshake setup", &e))?;
         let attestor = CapturePeer {
             attestor: &self.attestor,
+            cancel,
             peer: Default::default(),
         };
         let authenticated = channel.insert(
@@ -343,14 +392,17 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         );
         match setup {
             Some(Setup::Ipsec(setup)) => {
-                self.establish(attempt, setup, authenticated, &directory)?;
+                self.establish(attempt, setup, authenticated, &directory, cancel)?;
             }
             Some(Setup::Fortinet(setup)) => {
                 let entry = entry.expect("a Fortinet setup comes with its policy entry");
-                self.establish_fortinet(attempt, setup, entry, authenticated, &directory)?;
+                self.establish_fortinet(attempt, setup, entry, authenticated, &directory, cancel)?;
             }
             None => {}
         }
+        cancel
+            .check()
+            .map_err(|e| Failure::io("session publication", &e))?;
         let peer = attestor
             .peer
             .into_inner()
@@ -380,6 +432,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         mut setup: IpsecStart,
         channel: &mut AuthenticatedChannel,
         directory: &Path,
+        cancel: &SetupCancellation,
     ) -> Result<(), Failure> {
         let receipt = attempt
             .receipt
@@ -387,16 +440,16 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .expect("IPsec receipt precedes start");
         setup.order.if_id = receipt.if_id;
         setup.order.reqid = receipt.reqid;
-        channel
-            .send(
-                &serde_json::to_vec(&Order::Start(setup.order))
-                    .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
-            )
+        let start = serde_json::to_vec(&Order::Start(setup.order))
+            .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?;
+        cancel
+            .start(|| channel.send(&start))
             .map_err(|e| Failure::io("instance Start", &e))?;
-        let sent = channel.send(&setup.credentials);
+        let sent = cancel.start(|| channel.send(&setup.credentials));
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
-        let reply = receive_reply(channel, Instant::now() + ESTABLISHED_TIMEOUT)
+        attempt.credentials_sent = true;
+        let reply = wait_setup_reply(channel, cancel)
             .map_err(|e| Failure::io("instance setup reply", &e))?;
         let vip = match reply {
             Reply::Established {
@@ -404,10 +457,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 reqid,
                 virtual_ipv4,
                 remote_ts,
-            } if if_id == receipt.if_id
-                && reqid == receipt.reqid
-                && receipt.permits_selectors(&remote_ts) =>
-            {
+            } if if_id == receipt.if_id && reqid == receipt.reqid => {
+                receipt
+                    .select_routes(remote_ts)
+                    .map_err(|e| Failure::io("negotiated routes", &e))?;
                 virtual_ipv4
             }
             Reply::Failed { code } => return Err(Failure::new(code, "instance failed setup")),
@@ -421,7 +474,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         let guard = (self.lock)(Instant::now() + self.limits.lock)
             .map_err(|e| Failure::io("network write lock", &e))?;
         self.xfrm
-            .install(&guard, directory, receipt, vip, &setup.approved)
+            .install_checked(&guard, directory, receipt, vip, &setup.approved, cancel)
             .map_err(|e| Failure::io("configure XFRM network", &e))
     }
 
@@ -434,6 +487,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         entry: &Entry,
         channel: &mut AuthenticatedChannel,
         directory: &Path,
+        cancel: &SetupCancellation,
     ) -> Result<(), Failure> {
         let receipt = attempt
             .fortinet
@@ -450,20 +504,21 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             gateway,
             ppp_ifname: receipt.ifname.clone(),
         };
-        channel
-            .send(
-                &serde_json::to_vec(&start)
-                    .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?,
-            )
+        let start = serde_json::to_vec(&start)
+            .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?;
+        // Each send begins under the cancellation lock, like the IPsec ones.
+        cancel
+            .start(|| channel.send(&start))
             .map_err(|e| Failure::io("instance Start", &e))?;
-        let sent = channel.send(&setup.credentials);
+        let sent = cancel.start(|| channel.send(&setup.credentials));
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
+        attempt.credentials_sent = true;
 
         let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
         let mut delivered = fortinet_network::Delivered::default();
         loop {
-            let event = receive_event(channel, deadline)
+            let event = wait_event(channel, cancel, deadline)
                 .map_err(|e| Failure::io("instance setup event", &e))?;
             delivered.absorb(event);
             if let Some(fatal) = delivered.fatal() {
@@ -482,7 +537,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .wait_control(Duration::ZERO)
             .map_err(|e| Failure::io("instance setup event", &e))?
         {
-            let event = receive_event(channel, deadline)
+            let event = wait_event(channel, cancel, deadline)
                 .map_err(|e| Failure::io("instance setup event", &e))?;
             delivered.absorb(event);
         }
@@ -492,6 +547,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 format_args!("instance reported {fatal:?}"),
             ));
         }
+        cancel
+            .check()
+            .map_err(|e| Failure::io("configure PPP network", &e))?;
         let guard = (self.lock)(Instant::now() + self.limits.lock)
             .map_err(|e| Failure::io("network write lock", &e))?;
         let scope = fortinet_network::Scope {
@@ -499,7 +557,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             grant: &setup.grant,
         };
         self.fortinet
-            .apply(&guard, directory, receipt, &delivered, &scope)
+            .apply(&guard, directory, receipt, &delivered, &scope, cancel)
             .map_err(|e| Failure::io("configure PPP network", &e))?;
         let report = receipt.report();
         // Counts only: nothing the gateway printed is logged.
@@ -549,9 +607,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     match fortinet_network::Receipt::load(&directory, &guard) {
                         Ok(mut receipt) => {
                             if !receipt.complete {
-                                let attempt =
+                                let mut attempt =
                                     Attempt::new(Backend::Fortinet, generation.to_owned());
+                                // The dead writer may have left the runtime drop-in.
+                                attempt.allowed = true;
                                 self.stop_unit(&attempt)?;
+                                self.revert_unit(&mut attempt)?;
                                 self.fortinet.clean(&guard, &directory, &receipt)?;
                                 receipt.complete = true;
                                 receipt.save(&directory, &guard)?;
@@ -566,8 +627,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 Err(e) => return Err(e),
             };
             if !receipt.complete {
-                let attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
+                let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
+                // The dead writer may have left the runtime drop-in.
+                attempt.allowed = true;
                 self.stop_unit(&attempt)?;
+                self.revert_unit(&mut attempt)?;
                 self.xfrm.clean(&guard, &directory, &receipt)?;
                 receipt.complete = true;
                 receipt.save(&directory, &guard)?;
@@ -583,6 +647,20 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             &["stop", "--", &attempt.unit],
             self.limits.stop,
         )
+    }
+
+    /// Remove the runtime drop-in that opened the transport address. Only after
+    /// the unit is stopped; a failure leaves `allowed` set so a retry repeats it.
+    fn revert_unit(&self, attempt: &mut Attempt) -> io::Result<()> {
+        if attempt.allowed {
+            run_systemctl(
+                &self.systemctl,
+                &["revert", "--", &attempt.unit],
+                self.limits.stop,
+            )?;
+            attempt.allowed = false;
+        }
+        Ok(())
     }
 
     fn teardown(&self, attempt: &mut Attempt, channel: Option<AuthenticatedChannel>) -> bool {
@@ -610,12 +688,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .runtime
             .join(INSTANCE_DIRECTORY)
             .join(&attempt.generation);
-        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
-        let stopped = match channel {
+        // The lease remains registered while the supervisor settles. Send
+        // Stop before waiting for the network writer lock.
+        let stopped = match channel.filter(|_| attempt.credentials_sent) {
             Some(mut channel) => {
-                let stopped = channel
-                    .send(br#"{"op":"stop"}"#)
-                    .and_then(|()| receive_reply(&mut channel, Instant::now() + STOPPED_TIMEOUT));
+                let stopped = stop_instance(&mut channel);
                 if !matches!(stopped, Ok(Reply::Stopped {})) {
                     eprintln!("vpnt-tunneld: instance did not confirm Stop: {stopped:?}");
                 }
@@ -623,6 +700,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             }
             None => false,
         };
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
         if attempt.started && !stopped {
             self.stop_unit(attempt)?;
             attempt.started = false;
@@ -641,7 +719,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             self.stop_unit(attempt)?;
             attempt.started = false;
         }
+        let reverted = self.revert_unit(attempt);
         clean?;
+        reverted?;
         let receipt = attempt
             .receipt
             .as_mut()
@@ -669,8 +749,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .runtime
             .join(INSTANCE_DIRECTORY)
             .join(&attempt.generation);
-        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
-        if let Some(mut channel) = channel {
+        // The lease remains registered while the instance settles. Send Stop
+        // before waiting for the network writer lock, and only when the
+        // credential was sent: before that the instance only waits for it.
+        if let Some(mut channel) = channel.filter(|_| attempt.credentials_sent) {
             let stopped = channel
                 .send(&[fortinet_instance::MESSAGE_STOP])
                 .and_then(|()| wait_exited(&mut channel, Instant::now() + STOPPED_TIMEOUT));
@@ -678,18 +760,30 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 eprintln!("vpnt-tunneld: instance did not confirm Stop: {error}");
             }
         }
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
         // The unit is stopped even when the instance confirmed: that is what
         // proves no client or pppd outlives the attempt.
         if attempt.started {
             self.stop_unit(attempt)?;
             attempt.started = false;
         }
+        let reverted = self.revert_unit(attempt);
+        let receipt = attempt
+            .fortinet
+            .as_mut()
+            .expect("Fortinet cleanup has a receipt");
+        let clean = if receipt.complete {
+            Ok(())
+        } else {
+            self.fortinet.clean(&guard, &directory, receipt)
+        };
+        clean?;
+        reverted?;
         let receipt = attempt
             .fortinet
             .as_mut()
             .expect("Fortinet cleanup has a receipt");
         if !receipt.complete {
-            self.fortinet.clean(&guard, &directory, receipt)?;
             receipt.complete = true;
             if let Err(error) = receipt.save(&directory, &guard) {
                 receipt.complete = false;
@@ -699,10 +793,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         guard.withdraw(&attempt.generation)
     }
 
-    fn teardown_before_ipsec(&self, attempt: &Attempt) -> io::Result<()> {
+    fn teardown_before_ipsec(&self, attempt: &mut Attempt) -> io::Result<()> {
         if attempt.started {
             self.stop_unit(attempt)?;
+            attempt.started = false;
         }
+        self.revert_unit(attempt)?;
         let removed = if attempt.directory {
             match fs::remove_dir_all(
                 self.runtime
@@ -728,6 +824,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         setup: Option<Setup>,
         entry: Option<&Entry>,
         authorization: Option<File>,
+        cancel: &SetupCancellation,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let generation = generation().map_err(|error| {
             eprintln!("vpnt-tunneld: could not draw a generation: {error}");
@@ -740,7 +837,14 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         } else {
             State::Starting
         };
-        match self.bring_up(&mut attempt, setup, entry, authorization, &mut channel) {
+        match self.bring_up(
+            &mut attempt,
+            setup,
+            entry,
+            authorization,
+            &mut channel,
+            cancel,
+        ) {
             Ok(peer) => Ok(Box::new(Session {
                 launcher: self,
                 attempt,
@@ -749,7 +853,18 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 state,
             })),
             Err(failure) => {
-                eprintln!("vpnt-tunneld: admission failed: {}", failure.cause);
+                eprintln!("vpnt-tunneld: admission ended: {}", failure.cause);
+                if cancel.is_cancelled() {
+                    let mut session = Session {
+                        launcher: self,
+                        attempt,
+                        channel,
+                        peer: None,
+                        state,
+                    };
+                    session.stop();
+                    return Ok(Box::new(session));
+                }
                 Err(if self.teardown(&mut attempt, channel) {
                     failure.code
                 } else {
@@ -781,6 +896,48 @@ fn wait_exited(channel: &mut AuthenticatedChannel, deadline: Instant) -> io::Res
     }
 }
 
+/// Wait for one event, polling so that a client cancellation is seen within a
+/// poll interval, as `wait_setup_reply` does for the IPsec reply.
+fn wait_event(
+    channel: &mut AuthenticatedChannel,
+    cancel: &SetupCancellation,
+    deadline: Instant,
+) -> io::Result<Event> {
+    let budget = Budget::until(deadline, Some(cancel.flag()))?;
+    loop {
+        let wait = budget.poll_timeout()?;
+        if channel.wait_control(Duration::from_millis(wait as u64))? {
+            cancel.check()?;
+            return receive_event(channel, deadline);
+        }
+    }
+}
+
+fn wait_setup_reply(
+    channel: &mut AuthenticatedChannel,
+    cancel: &SetupCancellation,
+) -> io::Result<Reply> {
+    let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
+    let budget = Budget::until(deadline, Some(cancel.flag()))?;
+    loop {
+        let wait = budget.poll_timeout()?;
+        if channel.wait_control(Duration::from_millis(wait as u64))? {
+            cancel.check()?;
+            return receive_reply(channel, deadline);
+        }
+    }
+}
+
+fn stop_instance(channel: &mut AuthenticatedChannel) -> io::Result<Reply> {
+    channel.send(br#"{"op":"stop"}"#)?;
+    let deadline = Instant::now() + STOPPED_TIMEOUT;
+    match receive_reply(channel, deadline)? {
+        // The supervisor can establish just as Stop overtakes it.
+        Reply::Established { .. } => receive_reply(channel, deadline),
+        reply => Ok(reply),
+    }
+}
+
 fn receive_reply(channel: &mut AuthenticatedChannel, deadline: Instant) -> io::Result<Reply> {
     let bytes = channel.receive_until(deadline)?;
     if bytes.first() != Some(&b'{') {
@@ -800,11 +957,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         grant: &Entry,
         credentials: Credentials,
         authorization: File,
+        cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let request = match offer {
             Prepare::Ipsec(request) => request,
             Prepare::Fortinet(request) => {
-                return self.launch_fortinet(request, grant, &credentials, authorization);
+                return self.launch_fortinet(request, grant, &credentials, authorization, cancel);
             }
         };
         let grant: IpsecGrant = serde_json::to_value(grant)
@@ -816,9 +974,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             .map(|r| parse_cidr(r))
             .collect::<io::Result<_>>()
             .map_err(|_| ErrorCode::PermissionDenied)?;
-        if !(1..=64).contains(&remote_ts.len()) || grant.port != 500 {
+        if !(1..=MAX_IPSEC_ROUTES).contains(&remote_ts.len()) || grant.port != 500 {
             return Err(ErrorCode::PermissionDenied);
         }
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let remote_ipv4 = self
             .xfrm
             .resolve(&grant.hostname, &grant.transport_ipv4)
@@ -826,6 +985,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
                 eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
                 ErrorCode::Backend
             })?;
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let frame = encode_credentials(&credentials)?;
         drop(credentials);
         let setup = IpsecStart {
@@ -847,6 +1007,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             Some(Setup::Ipsec(setup)),
             None,
             Some(authorization),
+            cancel,
         )
     }
 }
@@ -858,6 +1019,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         grant: &Entry,
         credentials: &Credentials,
         authorization: File,
+        cancel: &SetupCancellation,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         if credentials.backend() != protocol::Backend::Fortinet {
             return Err(ErrorCode::BadRequest);
@@ -866,6 +1028,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             fortinet_network::Grant::from_entry(grant).map_err(|_| ErrorCode::Backend)?;
         // The pin and the endpoint come from the policy entry, which the offer
         // matched exactly; the offer supplies only the username.
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let remote = self
             .xfrm
             .resolve(&projection.hostname, &projection.transport_ipv4)
@@ -873,6 +1036,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 eprintln!("vpnt-tunneld: policy transport selection failed: {error}");
                 ErrorCode::Backend
             })?;
+        cancel.check().map_err(|_| ErrorCode::Backend)?;
         let credentials = fortinet_instance::credential_frame(credentials.password())
             .map_err(|_| ErrorCode::BadRequest)?;
         let setup = FortinetStart {
@@ -890,6 +1054,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             Some(Setup::Fortinet(setup)),
             Some(grant),
             Some(authorization),
+            cancel,
         )
     }
 }
@@ -998,15 +1163,21 @@ impl Drop for Reaper {
 /// Run the fixed systemctl with a clean environment and an absolute deadline.
 fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
-    let mut child = Reaper(
-        Command::new(path)
-            .args(args)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?,
-    );
+    wait_systemctl(spawn_systemctl(path, args)?, deadline)
+}
+
+fn spawn_systemctl(path: &Path, args: &[&str]) -> io::Result<Reaper> {
+    Command::new(path)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Reaper)
+}
+
+fn wait_systemctl(mut child: Reaper, deadline: Instant) -> io::Result<()> {
     loop {
         if let Some(status) = child.0.try_wait()? {
             return if status.success() {
@@ -1025,7 +1196,7 @@ fn run_systemctl(path: &Path, args: &[&str], timeout: Duration) -> io::Result<()
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
-        self.launch_backend(backend, None, None, None)
+        self.launch_backend(backend, None, None, None, &SetupCancellation::default())
     }
 
     fn with_fortinet(mut self, network: FortinetNetwork, xfrm: Network) -> Self {
@@ -1213,6 +1384,8 @@ mod tests {
                 "#!/bin/sh\necho \"$*\" >> '{log}'\n\
                  [ \"$1\" = start ] && [ -e '{root}/fail-start' ] && exit 1\n\
                  [ \"$1\" = stop ] && [ -e '{root}/fail-stop' ] && exit 1\n\
+                 [ \"$1\" = set-property ] && [ -e '{root}/fail-set-property' ] && exit 1\n\
+                 [ \"$1\" = revert ] && [ -e '{root}/fail-revert' ] && exit 1\n\
                  exit 0\n",
                 log = log.display(),
                 root = root.display(),
@@ -1902,6 +2075,15 @@ mod tests {
                 launcher: &'a Launcher<FakeNetwork, FakeAttestor>,
                 entry: &Entry,
             ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+                self.launch_with(launcher, entry, &Arc::default())
+            }
+
+            fn launch_with<'a>(
+                &self,
+                launcher: &'a Launcher<FakeNetwork, FakeAttestor>,
+                entry: &Entry,
+                cancel: &Arc<SetupCancellation>,
+            ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
                 let offer = Prepare::Fortinet(
                     FortinetRequest::new(
                         Endpoint::new("vpn.example".into(), 443).unwrap(),
@@ -1916,6 +2098,7 @@ mod tests {
                     entry,
                     Credentials::fortinet(PASSWORD).unwrap(),
                     File::open("/dev/null").unwrap(),
+                    cancel,
                 )
             }
 
@@ -1945,6 +2128,22 @@ mod tests {
                 self.harness.stop.store(true, Ordering::SeqCst);
                 drop(self.instance.lock().unwrap().take().map(JoinHandle::join));
             }
+        }
+
+        /// Everything that stopped the unit also reverted its runtime drop-in
+        /// right after, and nothing came after that.
+        fn assert_reverted_after_stop(rig: &Rig, unit: &str) {
+            let log = rig.harness.log();
+            let stop = log
+                .iter()
+                .position(|l| *l == format!("stop -- {unit}"))
+                .unwrap();
+            let revert = log
+                .iter()
+                .position(|l| *l == format!("revert -- {unit}"))
+                .unwrap();
+            assert!(stop < revert, "{log:?}");
+            assert_eq!(log.last(), Some(&format!("revert -- {unit}")), "{log:?}");
         }
 
         fn policy(dns_servers: &[&str]) -> Entry {
@@ -2009,15 +2208,22 @@ mod tests {
             assert_eq!(receipt["refused_dns"], 1);
             assert_eq!(receipt["confirmed"], true);
             assert_eq!(rig.harness.leases(), [generation.as_str()]);
-            assert_eq!(rig.harness.log(), [format!("start --no-block -- {unit}")]);
+            // The frozen transport address, and only it, is opened before the start.
+            let allow = format!("set-property --runtime {unit} IPAddressAllow=192.0.2.20/32");
+            assert_eq!(
+                rig.harness.log(),
+                [allow.clone(), format!("start --no-block -- {unit}")]
+            );
 
             assert_eq!(running.stop(), State::Stopped);
             assert_eq!(rig.seen.lock().unwrap().stop_frames, 1);
             assert_eq!(
                 rig.harness.log(),
                 [
+                    allow,
                     format!("start --no-block -- {unit}"),
-                    format!("stop -- {unit}")
+                    format!("stop -- {unit}"),
+                    format!("revert -- {unit}")
                 ]
             );
             assert!(rig.routes().is_empty() && rig.dns().is_empty());
@@ -2026,7 +2232,7 @@ mod tests {
             // A repeated stop does not repeat any mutation.
             let ops = rig.kernel.lock().unwrap().ops.len();
             assert_eq!(running.stop(), State::Stopped);
-            assert_eq!(rig.harness.log().len(), 2);
+            assert_eq!(rig.harness.log().len(), 4);
             assert_eq!(rig.kernel.lock().unwrap().ops.len(), ops);
         }
 
@@ -2072,6 +2278,7 @@ mod tests {
             assert!(rig.routes().is_empty() && rig.dns().is_empty());
             let unit = started_unit(&rig.harness.log).unwrap();
             assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert_reverted_after_stop(&rig, &unit);
             assert!(rig.harness.leases().is_empty());
             assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
         }
@@ -2099,6 +2306,7 @@ mod tests {
                 assert!(rig.routes().is_empty());
                 let unit = started_unit(&rig.harness.log).unwrap();
                 assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+                assert_reverted_after_stop(&rig, &unit);
             }
         }
 
@@ -2127,6 +2335,7 @@ mod tests {
             assert!(rig.routes().is_empty() && rig.dns().is_empty());
             let unit = started_unit(&rig.harness.log).unwrap();
             assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert_reverted_after_stop(&rig, &unit);
             assert!(rig.harness.leases().is_empty());
             assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
         }
@@ -2149,6 +2358,9 @@ mod tests {
             assert_eq!(running.stop(), State::CleanupPending);
             assert_eq!(rig.harness.leases(), [generation.as_str()]);
             assert_eq!(rig.receipt(&generation)["complete"], false);
+            // The network cleanup failed, but the unit was stopped and its
+            // drop-in reverted all the same.
+            assert_reverted_after_stop(&rig, &unit);
             rig.kernel.lock().unwrap().refuse_delete = false;
             assert_eq!(running.stop(), State::Stopped);
             assert!(rig.routes().is_empty() && rig.dns().is_empty());
@@ -2201,6 +2413,112 @@ mod tests {
         }
 
         #[test]
+        fn a_failed_property_call_aborts_without_start_and_reverts() {
+            if !namespaced_in(
+                "a_failed_property_call_aborts_without_start_and_reverts",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.harness.flag("fail-set-property", true);
+            let launcher = rig.launcher(false);
+            assert_eq!(
+                rig.launch(&launcher, &policy(&[])).err(),
+                Some(ErrorCode::Backend)
+            );
+            let log = rig.harness.log();
+            let unit = log[0].rsplit(' ').nth(1).unwrap().to_owned();
+            assert_eq!(
+                log,
+                [
+                    format!("set-property --runtime {unit} IPAddressAllow=192.0.2.20/32"),
+                    format!("revert -- {unit}")
+                ],
+                "no start, and the possibly written drop-in is reverted"
+            );
+            assert!(rig.harness.leases().is_empty());
+            assert!(rig.seen.lock().unwrap().start.is_none(), "no instance ran");
+            // Nothing was written to the network: only the planning reads ran.
+            assert!(
+                rig.kernel
+                    .lock()
+                    .unwrap()
+                    .ops
+                    .iter()
+                    .all(|op| !op.contains(" add ") && !op.contains(RESOLVECTL_PREFIX))
+            );
+            assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
+        }
+
+        const RESOLVECTL_PREFIX: &str = "resolvectl";
+
+        #[test]
+        fn a_failed_revert_is_cleanup_pending_and_a_retry_converges() {
+            if !namespaced_in(
+                "a_failed_revert_is_cleanup_pending_and_a_retry_converges",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            rig.instance(Script::Ready(standard_events()));
+            let launcher = rig.launcher(false);
+            let mut running = rig.launch(&launcher, &policy(&[])).unwrap();
+            let unit = started_unit(&rig.harness.log).unwrap();
+            let generation = generation_of(&unit);
+            rig.harness.flag("fail-revert", true);
+            assert_eq!(running.stop(), State::CleanupPending);
+            // The lease stays: the drop-in that opened the address may remain.
+            assert_eq!(rig.harness.leases(), [generation.as_str()]);
+            assert_eq!(rig.receipt(&generation)["complete"], false);
+            rig.harness.flag("fail-revert", false);
+            assert_eq!(running.stop(), State::Stopped);
+            let log = rig.harness.log();
+            let count = |line: String| log.iter().filter(|l| **l == line).count();
+            assert_eq!(count(format!("stop -- {unit}")), 1, "{log:?}");
+            assert_eq!(count(format!("revert -- {unit}")), 2, "{log:?}");
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation)["complete"], true);
+        }
+
+        #[test]
+        fn a_cancelled_attempt_is_stopped_and_its_drop_in_reverted() {
+            if !namespaced_in(
+                "a_cancelled_attempt_is_stopped_and_its_drop_in_reverted",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            // The instance takes the order and the password and then reports
+            // nothing: the attempt waits for the link until the client cancels.
+            let rig = Rig::new();
+            rig.instance(Script::Report(vec![Event::Started]));
+            let launcher = rig.launcher(false);
+            let cancel = Arc::new(SetupCancellation::default());
+            thread::scope(|scope| {
+                let attempt = scope.spawn(|| rig.launch_with(&launcher, &policy(&[]), &cancel));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while rig.seen.lock().unwrap().password.is_none() {
+                    assert!(Instant::now() < deadline, "the password never arrived");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+                let mut session = attempt
+                    .join()
+                    .unwrap()
+                    .expect("a cancelled setup is stopped");
+                assert_eq!(session.state(), State::Stopped);
+                assert_eq!(session.stop(), State::Stopped);
+            });
+            let unit = started_unit(&rig.harness.log).unwrap();
+            assert_reverted_after_stop(&rig, &unit);
+            assert!(rig.routes().is_empty() && rig.dns().is_empty());
+            assert!(rig.harness.leases().is_empty());
+            assert_eq!(rig.receipt(&generation_of(&unit))["complete"], true);
+        }
+
+        #[test]
         fn recovery_cleans_a_fortinet_generation_left_by_a_dead_writer() {
             if !namespaced_in(
                 "recovery_cleans_a_fortinet_generation_left_by_a_dead_writer",
@@ -2219,6 +2537,7 @@ mod tests {
             std::mem::forget(running);
             launcher.recover().unwrap();
             assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
+            assert_reverted_after_stop(&rig, &unit);
             assert!(rig.routes().is_empty() && rig.dns().is_empty());
             assert!(rig.harness.leases().is_empty());
             assert_eq!(rig.receipt(&generation)["complete"], true);
@@ -2241,7 +2560,7 @@ mod tests {
         use std::{
             io::Write,
             os::unix::net::UnixStream,
-            sync::{Arc, Mutex},
+            sync::{Mutex, mpsc},
         };
 
         const CHILD: &str = "VPNT_XFRM_FIXTURE_CHILD";
@@ -2257,6 +2576,7 @@ mod tests {
             ignore_delete: bool,
             refuse_delete: bool,
             leftover_policy: bool,
+            before_install: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         }
 
         fn fake_network(runtime: PathBuf, kernel: Arc<Mutex<Kernel>>) -> Network {
@@ -2286,6 +2606,12 @@ mod tests {
                     {"dev":"eth-fixture","prefsrc":"192.0.2.2","gateway":"192.0.2.1"}
                 ]),
                 ["-j", "-d", "link", "show"] => {
+                    // Plan and install each read egress and then inventory.
+                    let link_reads = k.ops.iter().filter(|op| op.as_str() == "-j -d link show").count();
+                    if link_reads == 4 && let Some((entered, resume)) = k.before_install.take() {
+                        entered.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(4)).unwrap();
+                    }
                     let mut links = vec![serde_json::json!({"ifname":"eth-fixture","ifindex":2,"flags":["UP"]})];
                     if k.link {
                         links.push(serde_json::json!({
@@ -2319,7 +2645,10 @@ mod tests {
                     let intent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(intent["creating"], true);
                     assert_eq!(intent["vip"], "10.99.0.2");
-                    assert_eq!(intent["routes"].as_array().unwrap().len(), 2);
+                    if runtime.join("../negotiated-route").is_file() {
+                        let routes: Vec<CidrV4> = serde_json::from_value(intent["routes"].clone()).unwrap();
+                        assert_eq!(routes, [parse_cidr("10.20.0.0/16").unwrap()]);
+                    }
                     k.link = true;
                     return Ok(vec![]);
                 }
@@ -2328,7 +2657,7 @@ mod tests {
                 ["link", "set", "dev", "vpnti1", "up"] => { k.up = true; return Ok(vec![]); }
                 ["-4", "addr", "add", "10.99.0.2/32", "dev", "vpnti1", "noprefixroute"] => { k.address = true; return Ok(vec![]); }
                 ["-4", "route", "add", dst, "dev", "vpnti1", "table", "main", "proto", "boot", "scope", "link"] => {
-                    assert!(["10.20.0.0/15", "172.16.0.0/12"].contains(dst), "unapproved network command: {args:?}");
+                    assert!(["10.20.0.0/15", "10.20.0.0/16", "172.16.0.0/12"].contains(dst), "unapproved network command: {args:?}");
                     k.routes.push((*dst).into());
                         return Ok(vec![]);
                 }
@@ -2407,6 +2736,19 @@ mod tests {
                 fs::write(root.join("received-start"), b"").unwrap();
                 wait_for_file(&root.join("allow-established"));
             }
+            if root.join("cancel-negotiation").is_file() {
+                fs::write(root.join("negotiation-started"), b"").unwrap();
+                let bytes = channel
+                    .receive_until(Instant::now() + Duration::from_secs(3))
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<Order>(&bytes).unwrap(),
+                    Order::Stop {}
+                ));
+                fs::write(root.join("instance-stopped"), b"").unwrap();
+                channel.send(br#"{"op":"stopped"}"#).unwrap();
+                return;
+            }
             let delay = fs::read_to_string(root.join("setup-delay"))
                 .ok()
                 .map(|text| text.parse::<u64>().unwrap());
@@ -2418,7 +2760,14 @@ mod tests {
                     if_id: start.if_id,
                     reqid: start.reqid,
                     virtual_ipv4: Ipv4Addr::new(10, 99, 0, 2),
-                    remote_ts: vec![start.remote_ts[0]],
+                    remote_ts: vec![
+                        parse_cidr(if root.join("outside-selector").is_file() {
+                            "10.22.0.0/16"
+                        } else {
+                            "10.20.0.0/16"
+                        })
+                        .unwrap(),
+                    ],
                 })
                 .unwrap(),
             );
@@ -2522,6 +2871,7 @@ mod tests {
             let harness = Harness::new();
             let policy = PolicyFixture::new();
             policy.install();
+            harness.flag("negotiated-route", true);
             if exit {
                 fs::write(harness.root.join("exit-after-setup"), b"").unwrap();
             }
@@ -2537,7 +2887,7 @@ mod tests {
                 command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
                 {
                     let k = kernel.lock().unwrap();
-                    assert_eq!(k.routes, ["10.20.0.0/15", "172.16.0.0/12"]);
+                    assert_eq!(k.routes, ["10.20.0.0/16"]);
                     assert!(k.link && k.up && k.address);
                 }
                 if exit && unproven {
@@ -2576,6 +2926,15 @@ mod tests {
                     kernel.lock().unwrap().refuse_delete = true;
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
                     assert_eq!(harness.leases().len(), 1);
+                    // The network cleanup failed, but the unit was stopped and its
+                    // drop-in reverted all the same, in that order.
+                    let log = harness.log();
+                    let stop = log.iter().position(|l| l.starts_with("stop -- ")).unwrap();
+                    let revert = log
+                        .iter()
+                        .position(|l| l.starts_with("revert -- "))
+                        .unwrap();
+                    assert!(stop < revert, "{log:?}");
                     {
                         let mut k = kernel.lock().unwrap();
                         k.refuse_delete = false;
@@ -2603,6 +2962,261 @@ mod tests {
             let k = kernel.lock().unwrap();
             assert!(!k.link && !k.address && k.routes.is_empty());
             assert!(harness.leases().is_empty());
+            assert_systemctl_order(&harness);
+        }
+
+        /// The transport address is opened once, before the start, and the
+        /// runtime drop-in is reverted last, after the unit was stopped.
+        fn assert_systemctl_order(harness: &Harness) {
+            let log = harness.log();
+            let unit = started_unit(&harness.log).unwrap();
+            let position = |line: String| {
+                log.iter()
+                    .position(|entry| *entry == line)
+                    .unwrap_or_else(|| panic!("{line} is not in {log:?}"))
+            };
+            let allow = position(format!(
+                "set-property --runtime {unit} IPAddressAllow=192.0.2.20/32"
+            ));
+            let start = position(format!("start --no-block -- {unit}"));
+            let stop = position(format!("stop -- {unit}"));
+            let revert = position(format!("revert -- {unit}"));
+            assert!(allow < start && start < stop && stop < revert, "{log:?}");
+            assert_eq!(
+                log.iter()
+                    .filter(|entry| entry.starts_with("set-property "))
+                    .count(),
+                1
+            );
+            assert_eq!(log.last(), Some(&format!("revert -- {unit}")), "{log:?}");
+        }
+
+        #[test]
+        fn an_ipsec_property_failure_aborts_before_start_and_reverts() {
+            let name = "an_ipsec_property_failure_aborts_before_start_and_reverts";
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            harness.flag("fail-set-property", true);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let remote = Ipv4Addr::new(192, 0, 2, 20);
+            let setup = IpsecStart {
+                order: Start {
+                    remote_ipv4: remote,
+                    port: 500,
+                    peer_identity: "fqdn:vpn.example".into(),
+                    username: "fixture".into(),
+                    if_id: 0,
+                    reqid: 0,
+                    local_ts: vec!["dynamic".into()],
+                    remote_ts: vec![parse_cidr("10.20.0.0/15").unwrap()],
+                },
+                approved: vec![remote],
+                credentials: zeroize::Zeroizing::new(Vec::new()),
+            };
+            let result = launcher.launch_backend(
+                Backend::Ipsec,
+                Some(Setup::Ipsec(setup)),
+                None,
+                None,
+                &SetupCancellation::default(),
+            );
+            assert_eq!(result.err(), Some(ErrorCode::Backend));
+            let log = harness.log();
+            let unit = log[0].rsplit(' ').nth(1).unwrap().to_owned();
+            assert_eq!(
+                log,
+                [
+                    format!("set-property --runtime {unit} IPAddressAllow=192.0.2.20/32"),
+                    format!("revert -- {unit}")
+                ],
+                "no start, and the possibly written drop-in is reverted"
+            );
+            assert!(harness.leases().is_empty());
+            assert!(!kernel.lock().unwrap().link);
+        }
+
+        fn exercise_cancel_negotiation(name: &str, eof: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("cancel-negotiation", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                wait_for_file(&harness.root.join("negotiation-started"));
+                if !eof {
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                }
+                drop(client);
+                worker.join().unwrap().ok();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
+        }
+
+        struct ObservedLaunch<'a> {
+            launcher: &'a dyn Launch,
+            cancel: mpsc::Sender<Arc<SetupCancellation>>,
+        }
+
+        impl Launch for ObservedLaunch<'_> {
+            fn launch<'a>(
+                &'a self,
+                offer: &Prepare,
+                grant: &Entry,
+                credentials: Credentials,
+                authorization: File,
+                cancel: &Arc<SetupCancellation>,
+            ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+                self.cancel.send(Arc::clone(cancel)).unwrap();
+                self.launcher
+                    .launch(offer, grant, credentials, authorization, cancel)
+            }
+        }
+
+        fn exercise_cancel_before_install(name: &str, eof: bool) {
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut process = supervisor(&harness);
+            let (entered, at_install) = mpsc::channel();
+            let (resume, release) = mpsc::channel();
+            let kernel = Arc::new(Mutex::new(Kernel {
+                before_install: Some((entered, release)),
+                ..Kernel::default()
+            }));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (observer, token) = mpsc::channel();
+            let launch = ObservedLaunch {
+                launcher: &launcher,
+                cancel: observer,
+            };
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launch));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                let cancel = token.recv_timeout(Duration::from_secs(3)).unwrap();
+                at_install.recv_timeout(Duration::from_secs(3)).unwrap();
+                if eof {
+                    client.shutdown(std::net::Shutdown::Both).unwrap();
+                } else {
+                    client.write_all(b"{\"op\":\"stop\"}\n").unwrap();
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !cancel.is_cancelled() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "public cancel was not observed during the install preflight"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                resume.send(()).unwrap();
+                if !eof {
+                    assert!(matches!(
+                        response(&client),
+                        Response::Status {
+                            state: State::Stopped
+                        }
+                    ));
+                }
+                drop(client);
+                worker.join().unwrap().ok();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
+        }
+
+        #[test]
+        fn public_stop_after_established_prevents_network_install() {
+            exercise_cancel_before_install(
+                "public_stop_after_established_prevents_network_install",
+                false,
+            );
+        }
+
+        #[test]
+        fn public_eof_after_established_prevents_network_install() {
+            exercise_cancel_before_install(
+                "public_eof_after_established_prevents_network_install",
+                true,
+            );
+        }
+
+        fn assert_no_install(kernel: &Kernel) {
+            assert!(!kernel.link && !kernel.address && kernel.routes.is_empty());
+            assert!(
+                !kernel
+                    .ops
+                    .iter()
+                    .any(|operation| operation.starts_with("link add ")),
+                "{:?}",
+                kernel.ops
+            );
+        }
+
+        #[test]
+        fn public_stop_cancels_negotiation() {
+            exercise_cancel_negotiation("public_stop_cancels_negotiation", false);
+        }
+
+        #[test]
+        fn public_eof_cancels_negotiation() {
+            exercise_cancel_negotiation("public_eof_cancels_negotiation", true);
+        }
+
+        #[test]
+        fn negotiated_selector_outside_policy_is_rejected_and_cleaned() {
+            let name = "negotiated_selector_outside_policy_is_rejected_and_cleaned";
+            if !namespaced_in(name, "tests::xfrm_tests") {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("outside-selector", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                assert!(matches!(
+                    response(&client),
+                    Response::Error {
+                        code: ErrorCode::Backend
+                    }
+                ));
+                worker.join().unwrap().unwrap();
+            });
+            assert!(process.0.wait().unwrap().success());
+            assert!(harness.root.join("instance-stopped").is_file());
+            assert!(harness.leases().is_empty());
+            assert_no_install(&kernel.lock().unwrap());
         }
 
         #[test]
@@ -2627,6 +3241,40 @@ mod tests {
                 true,
                 true,
             );
+        }
+
+        #[test]
+        fn oversized_ipsec_grant_on_disk_is_refused_before_backend_setup() {
+            use crate::tunneld::{admin::IPSEC_SNAPSHOT, policy::canonical_snapshot};
+
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut snapshot: serde_json::Value = serde_json::from_slice(IPSEC_SNAPSHOT).unwrap();
+            let mut routes: Vec<_> = (0..64).map(|i| format!("10.25.0.{i}/32")).collect();
+            routes.push("10.20.0.0/15".into());
+            snapshot["entries"][0]["route_cidrs"] = serde_json::json!(routes);
+            let bytes = canonical_snapshot(snapshot.to_string().as_bytes()).unwrap();
+            fs::write(policy.path(), &bytes).unwrap();
+
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm =
+                Network::fake(|_, args| panic!("oversized grant reached backend setup: {args:?}"));
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                assert!(matches!(
+                    response(&client),
+                    Response::Error {
+                        code: ErrorCode::PermissionDenied
+                    }
+                ));
+                worker.join().unwrap().unwrap();
+            });
+            harness.assert_no_effect(&[]);
+            assert_eq!(fs::read(policy.path()).unwrap(), bytes);
         }
 
         #[test]
@@ -2695,9 +3343,11 @@ printf '%s\n' "$*" >> '{log}'
                 client_credentials(&mut client);
                 wait_for_file(&harness.root.join("start-entered"));
                 assert_eq!(harness.leases().len(), 1);
+                // Only the property call preceded the start the manager has not accepted.
+                let log = harness.log();
                 assert!(
-                    harness.log().is_empty(),
-                    "the fake manager has not accepted the request"
+                    log.len() == 1 && log[0].starts_with("set-property --runtime "),
+                    "the fake manager has not accepted the request: {log:?}"
                 );
 
                 let contender = File::open(policy.lock_path()).unwrap();
@@ -2893,12 +3543,17 @@ printf '%s\n' "$*" >> '{log}'
             launcher.recover().unwrap();
             assert!(harness.leases().is_empty());
             assert!(!kernel.lock().unwrap().link);
+            // The dead writer may have left the runtime drop-in: recovery reverts it
+            // after the stop.
             assert_eq!(
                 harness.log(),
-                [format!("stop -- vpnt-tunneld-ipsec@{generation}.service")]
+                [
+                    format!("stop -- vpnt-tunneld-ipsec@{generation}.service"),
+                    format!("revert -- vpnt-tunneld-ipsec@{generation}.service")
+                ]
             );
             launcher.recover().unwrap();
-            assert_eq!(harness.log().len(), 1);
+            assert_eq!(harness.log().len(), 2);
         }
     }
 }

@@ -10,6 +10,10 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -81,12 +85,17 @@ pub(super) fn valid_generation(name: &str) -> bool {
 }
 
 impl Receipt {
-    pub(super) fn permits_selectors(&self, selectors: &[CidrV4]) -> bool {
-        !selectors.is_empty()
-            && selectors.iter().enumerate().all(|(index, selected)| {
+    pub(super) fn select_routes(&mut self, selectors: Vec<CidrV4>) -> io::Result<()> {
+        if selectors.is_empty()
+            || !selectors.iter().enumerate().all(|(index, selected)| {
                 !selectors[..index].contains(selected)
                     && self.routes.iter().any(|r| contains(r, selected))
             })
+        {
+            return Err(invalid("negotiated selectors do not match the policy"));
+        }
+        self.routes = selectors;
+        Ok(())
     }
 
     fn name(&self) -> String {
@@ -153,7 +162,46 @@ impl Receipt {
     }
 }
 
-type Run = dyn Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync;
+/// Order cancellation with the start of admission effects. Polling can
+/// observe the flag without waiting for the current effect to start.
+#[derive(Default)]
+pub(super) struct SetupCancellation {
+    cancelled: Arc<AtomicBool>,
+    effects: Mutex<()>,
+}
+
+impl SetupCancellation {
+    pub(super) fn cancel(&self) {
+        let _effects = self.effects.lock().expect("setup effects");
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(super) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    pub(super) fn check(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "client canceled setup",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn start<T>(&self, start: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let _effects = self.effects.lock().expect("setup effects");
+        self.check()?;
+        start()
+    }
+}
+
+type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>) -> io::Result<Vec<u8>> + Send + Sync;
 
 pub(super) struct Network(Box<Run>);
 
@@ -282,11 +330,18 @@ impl Network {
     pub(super) fn fake(
         run: impl Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(run))
+        Self(Box::new(move |program, args, cancel| match cancel {
+            Some(cancel) => cancel.start(|| run(program, args)),
+            None => run(program, args),
+        }))
     }
 
     fn ip(&self, args: &[&str]) -> io::Result<Vec<u8>> {
-        (self.0)("/usr/bin/ip", args)
+        self.run_ip(args, None)
+    }
+
+    fn run_ip(&self, args: &[&str], cancel: Option<&SetupCancellation>) -> io::Result<Vec<u8>> {
+        (self.0)("/usr/bin/ip", args, cancel)
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> io::Result<T> {
@@ -322,6 +377,7 @@ impl Network {
                 "2",
                 "1",
             ],
+            None,
         )?)?;
         if reply
             .data
@@ -504,6 +560,7 @@ impl Network {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn install(
         &self,
         guard: &NetworkGuard,
@@ -512,6 +569,26 @@ impl Network {
         vip: Ipv4Addr,
         approved: &[Ipv4Addr],
     ) -> io::Result<()> {
+        self.install_checked(
+            guard,
+            directory,
+            receipt,
+            vip,
+            approved,
+            &SetupCancellation::default(),
+        )
+    }
+
+    pub(super) fn install_checked(
+        &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        receipt: &mut Receipt,
+        vip: Ipv4Addr,
+        approved: &[Ipv4Addr],
+        cancel: &SetupCancellation,
+    ) -> io::Result<()> {
+        cancel.check()?;
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
         CidrV4::new(vip, 32).map_err(|_| invalid("invalid virtual IPv4"))?;
@@ -528,46 +605,57 @@ impl Network {
         // each address or route write. Unattempted keys cannot be removed.
         receipt.creating = true;
         receipt.save(directory, guard)?;
-        self.ip(&[
-            "link",
-            "add",
-            "name",
-            &name,
-            "type",
-            "xfrm",
-            "dev",
-            &receipt.egress.dev,
-            "if_id",
-            &receipt.if_id.to_string(),
-        ])?;
-        let link = self
-            .link(receipt)?
-            .ok_or_else(|| invalid("XFRM link missing after add"))?;
-        if link.ifalias.is_some() {
-            return Err(invalid("new XFRM link unexpectedly marked"));
-        }
-        self.ip(&["link", "set", "dev", &name, "alias", &receipt.marker()])?;
-        receipt.ifindex = Some(link.ifindex);
+        // Keep add and ownership marking in the same cancellation scope.
+        // Cleanup can only delete a marked link, and ip link add does not
+        // install the alias on a newly created XFRM link.
+        receipt.ifindex = Some(cancel.start(|| {
+            self.ip(&[
+                "link",
+                "add",
+                "name",
+                &name,
+                "type",
+                "xfrm",
+                "dev",
+                &receipt.egress.dev,
+                "if_id",
+                &receipt.if_id.to_string(),
+            ])?;
+            let link = self
+                .link(receipt)?
+                .ok_or_else(|| invalid("XFRM link missing after add"))?;
+            if link.ifalias.is_some() {
+                return Err(invalid("new XFRM link unexpectedly marked"));
+            }
+            self.ip(&["link", "set", "dev", &name, "alias", &receipt.marker()])?;
+            Ok(link.ifindex)
+        })?);
         self.owned_link(receipt)?
             .ok_or_else(|| invalid("XFRM link missing after marking"))?;
         receipt.save(directory, guard)?;
-        self.ip(&["link", "set", "dev", &name, "addrgenmode", "none"])?;
+        self.run_ip(
+            &["link", "set", "dev", &name, "addrgenmode", "none"],
+            Some(cancel),
+        )?;
         receipt.address_intended = true;
         receipt.save(directory, guard)?;
-        self.ip(&[
-            "-4",
-            "addr",
-            "add",
-            &format!("{vip}/32"),
-            "dev",
-            &name,
-            "noprefixroute",
-        ])?;
-        self.ip(&["link", "set", "dev", &name, "up"])?;
+        self.run_ip(
+            &[
+                "-4",
+                "addr",
+                "add",
+                &format!("{vip}/32"),
+                "dev",
+                &name,
+                "noprefixroute",
+            ],
+            Some(cancel),
+        )?;
+        self.run_ip(&["link", "set", "dev", &name, "up"], Some(cancel))?;
         for (index, route) in receipt.routes.iter().enumerate() {
             receipt.routes_intended = index + 1;
             receipt.save(directory, guard)?;
-            self.route_change("add", route, &name)?;
+            self.route_change("add", route, &name, Some(cancel))?;
         }
         let current = self
             .owned_link(receipt)?
@@ -579,6 +667,7 @@ impl Network {
         {
             return Err(invalid("network configuration confirmation failed"));
         }
+        cancel.check()?;
         receipt.confirmed = true;
         receipt.save(directory, guard)
     }
@@ -617,21 +706,30 @@ impl Network {
         Ok(link)
     }
 
-    fn route_change(&self, op: &str, route: &CidrV4, name: &str) -> io::Result<()> {
-        self.ip(&[
-            "-4",
-            "route",
-            op,
-            &cidr_text(route),
-            "dev",
-            name,
-            "table",
-            "main",
-            "proto",
-            PROTOCOL,
-            "scope",
-            "link",
-        ])?;
+    fn route_change(
+        &self,
+        op: &str,
+        route: &CidrV4,
+        name: &str,
+        cancel: Option<&SetupCancellation>,
+    ) -> io::Result<()> {
+        self.run_ip(
+            &[
+                "-4",
+                "route",
+                op,
+                &cidr_text(route),
+                "dev",
+                name,
+                "table",
+                "main",
+                "proto",
+                PROTOCOL,
+                "scope",
+                "link",
+            ],
+            cancel,
+        )?;
         Ok(())
     }
 
@@ -719,7 +817,7 @@ impl Network {
                 let routes = self.applied_routes(receipt)?;
                 let has_address = self.address_present(receipt, &link)?;
                 for route in receipt.routes.iter().rev().filter(|r| routes.contains(r)) {
-                    self.route_change("del", route, &link.ifname)?;
+                    self.route_change("del", route, &link.ifname, None)?;
                 }
                 if has_address {
                     let vip = receipt
@@ -785,16 +883,24 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-fn run_command(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+fn run_command(
+    program: &str,
+    args: &[&str],
+    cancel: Option<&SetupCancellation>,
+) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(4);
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = match cancel {
+        Some(cancel) => cancel.start(|| command.spawn()),
+        None => command.spawn(),
+    }?;
     let result = (|| {
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
@@ -834,4 +940,63 @@ fn run_command(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
         let _ = child.wait();
     }
     result
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::{TryLockError, mpsc};
+
+    #[test]
+    fn cancel_orders_with_the_start_of_network_effects() {
+        let cancel = SetupCancellation::default();
+        let (entered, executing) = mpsc::channel();
+        let (resume, release) = mpsc::channel();
+        let release = Mutex::new(release);
+        let network = Network::fake(move |_, args| {
+            assert_eq!(args, ["first"]);
+            entered.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(Vec::new())
+        });
+
+        thread::scope(|scope| {
+            let effect = scope.spawn(|| network.run_ip(&["first"], Some(&cancel)));
+            executing.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            // This competing thread probes the gate while the executor is
+            // still paused, then attempts to record cancellation.
+            let (probe, contended) = mpsc::sync_channel(0);
+            let gate = &cancel;
+            let cancelling = scope.spawn(move || {
+                probe
+                    .send(matches!(
+                        gate.effects.try_lock(),
+                        Err(TryLockError::WouldBlock)
+                    ))
+                    .unwrap();
+                gate.cancel();
+            });
+            let gate_held_at_start = contended.recv().unwrap();
+            resume.send(()).unwrap();
+            effect.join().unwrap().unwrap();
+            cancelling.join().unwrap();
+
+            assert!(
+                gate_held_at_start,
+                "effect began outside the cancellation gate"
+            );
+            assert_eq!(
+                network
+                    .run_ip(&["second"], Some(&cancel))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::ConnectionAborted
+            );
+        });
+    }
 }

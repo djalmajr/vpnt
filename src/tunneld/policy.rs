@@ -6,6 +6,7 @@ use std::{fmt, io, net::Ipv4Addr, str::FromStr};
 
 pub(super) const MAX_SNAPSHOT: usize = 16 * 1024;
 pub(super) const MAX_POLICY: usize = 1024 * 1024;
+pub(super) const MAX_IPSEC_ROUTES: usize = 64;
 const MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -351,6 +352,14 @@ impl Policy {
             ));
         }
         Ok(policy.entries.pop().expect("one snapshot entry").0)
+    }
+
+    pub(super) fn apply_snapshot(bytes: &[u8]) -> io::Result<Entry> {
+        let entry = Self::snapshot(bytes)?;
+        if entry.backend == Backend::Ipsec && entry.route_cidrs.len() > MAX_IPSEC_ROUTES {
+            return Err(invalid("IPsec policy supports at most 64 route CIDRs"));
+        }
+        Ok(entry)
     }
 
     pub(super) fn from_disk(bytes: &[u8]) -> io::Result<Self> {

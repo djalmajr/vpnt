@@ -1493,9 +1493,10 @@ idle()
     });
     writer.credential(PASSWORD);
     scratch.json("done");
-    writer.stop();
+    // The rejected-password line is a fatal event: the supervisor ends the run
+    // by itself, so no Stop is sent (one would race the fatal exit).
     let events = writer.events();
-    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Stop);
+    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Fatal);
     let mut seen: Vec<String> = events.iter().map(Value::to_string).collect();
     seen.sort();
     let mut expected: Vec<String> = [
@@ -1771,7 +1772,9 @@ fn a_listed_pid_that_is_not_the_leaders_child_is_never_held_or_signalled() {
     assert!(alive(alien_pid), "the alien was signalled");
 }
 
-fn real_parser_events(body: &str) -> Vec<Value> {
+/// Events of a run with the real parser. `ends_alone`: the supervisor is
+/// expected to end the run by itself (a fatal event), so no Stop is sent.
+fn real_parser_events(body: &str, ends_alone: bool) -> (Vec<Value>, Exit) {
     let scratch = Scratch::new();
     let instance = Instance::start_with(
         &scratch,
@@ -1782,10 +1785,12 @@ fn real_parser_events(body: &str) -> Vec<Value> {
     );
     instance.writer.credential(PASSWORD);
     scratch.json("done");
-    instance.writer.stop();
+    if !ends_alone {
+        instance.writer.stop();
+    }
     let events = instance.writer.events();
-    instance.join().unwrap();
-    events
+    let exit = instance.join().unwrap();
+    (events, exit)
 }
 
 fn has(events: &[Value], wanted: Value) -> bool {
@@ -1794,11 +1799,13 @@ fn has(events: &[Value], wanted: Value) -> bool {
 
 #[test]
 fn the_real_parser_reports_the_interface_the_supervisor_configured() {
-    let events = real_parser_events(
+    let (events, exit) = real_parser_events(
         "print('INFO:   Interface vpntp1 is UP.', flush=True)\n\
          print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
          put('done', {})\nidle()\n",
+        false,
     );
+    assert_eq!(exit.reason, Reason::Stop, "a good interface is not fatal");
     assert!(has(
         &events,
         json!({"event": "interface", "name": "vpntp1"})
@@ -1813,13 +1820,18 @@ fn the_real_parser_reports_the_interface_the_supervisor_configured() {
 #[test]
 fn the_real_parser_types_any_other_interface_as_a_mismatch() {
     for other in ["ppp0", "vpntp2", "vpntp10", "eth0"] {
-        let events = real_parser_events(&format!(
-            "print('INFO:   Interface {other} is UP.', flush=True)\n\
-             time.sleep(0.3)\n\
-             print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
-             print('INFO:   vpnt: dns-server 10.1.1.1', flush=True)\n\
-             put('done', {{}})\nidle()\n"
-        ));
+        let (events, exit) = real_parser_events(
+            &format!(
+                "print('INFO:   Interface {other} is UP.', flush=True)\n\
+                 print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
+                 print('INFO:   vpnt: dns-server 10.1.1.1', flush=True)\n\
+                 put('done', {{}})\nidle()\n"
+            ),
+            true,
+        );
+        // The mismatch ends the instance by itself: the client was stopped.
+        assert_eq!(exit.reason, Reason::Fatal, "{other}");
+        assert!(exit.status.is_some(), "{other}: the client was reaped");
         assert!(
             has(&events, json!({"event": "interface_mismatch"})),
             "{other}: {events:?}"
@@ -2105,4 +2117,49 @@ fn events_round_trip_and_unknown_ones_are_refused() {
     ] {
         assert!(serde_json::from_str::<Event>(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn a_fatal_event_makes_the_supervisor_stop_the_client_and_exit_by_itself() {
+    // The writer sends nothing: the instance ends on its own, after reporting.
+    let cases: [(&str, &str, &str); 2] = [
+        (
+            "interface_mismatch",
+            "print('INFO:   Interface ppp0 is UP.', flush=True)\n",
+            "interface_mismatch",
+        ),
+        (
+            "credentials_rejected",
+            "print('ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc.', flush=True)\n",
+            "failure",
+        ),
+    ];
+    for (label, line, event) in cases {
+        let scratch = Scratch::new();
+        let body = format!("{line}put('done', {{}})\nidle()\n");
+        let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(2));
+        instance.writer.credential(PASSWORD);
+        scratch.json("done");
+        let pid = pids(&scratch);
+        let events = instance.writer.events();
+        let exit = instance.join().unwrap();
+        assert_eq!(exit.reason, Reason::Fatal, "{label}");
+        assert!(
+            events.iter().any(|e| e["event"] == event),
+            "{label}: {events:?}"
+        );
+        assert_eq!(events.last().unwrap()["event"], "exited", "{label}");
+        assert!(exit.descendants_gone, "{label}");
+        assert!(gone(pid), "{label}: the client outlived the fatal event");
+    }
+    // Control: observations that are not fatal keep the run going until Stop.
+    let scratch = Scratch::new();
+    let body = "print('INFO:   Interface vpntp1 is UP.', flush=True)\nput('done', {})\nidle()\n";
+    let instance = Instance::start(&scratch, body, params(Some(PIN)), Duration::from_secs(2));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    thread::sleep(Duration::from_millis(300));
+    assert!(!instance.thread.is_finished(), "a good run ended by itself");
+    instance.writer.stop();
+    assert_eq!(instance.join().unwrap().reason, Reason::Stop);
 }

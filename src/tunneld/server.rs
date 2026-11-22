@@ -1,11 +1,12 @@
 //! Linux socket activation, bounded admission, and the v1 dialogue.
 use super::admin::PolicyStore;
 use super::backend::{Launch, Launcher, Running};
+use super::network::SetupCancellation;
 #[cfg(test)]
 use super::protocol::Prepare;
 use super::protocol::{
-    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, decode_request, read_control,
-    timed, write_control,
+    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, State, decode_request,
+    read_control, timed, write_control,
 };
 use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
@@ -216,11 +217,146 @@ fn serve(
     let Ok(Some(authorization)) = current else {
         return decoder.reject(ErrorCode::PermissionDenied, credential_deadline);
     };
-    let session = match launcher.launch(&offer, grant, credentials, authorization) {
+    let (completion, done) = UnixStream::pair()?;
+    let cancel = Arc::new(SetupCancellation::default());
+    let (commands, result) = thread::scope(|scope| -> Result<_, FrameError> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            let _signal_on_drop = done;
+            launcher.launch(&offer, grant, credentials, authorization, &cancel)
+        })?;
+        let commands = watch_setup(&stream, &completion, &mut decoder);
+        if !matches!(commands, Ok((_, false))) {
+            cancel.cancel();
+        }
+        let result = worker
+            .join()
+            .map_err(|_| io::Error::other("setup worker panicked"))?;
+        Ok((commands?, result))
+    })?;
+    let (statuses, stop) = commands;
+    let mut session = match result {
         Ok(session) => session,
+        Err(code) if stop => {
+            let state = if code == ErrorCode::CleanupPending {
+                State::CleanupPending
+            } else {
+                State::Stopped
+            };
+            return reply_setup_statuses(&mut decoder, statuses + 1, state);
+        }
         Err(code) => return decoder.reject(code, Instant::now() + FRAME_TIMEOUT),
     };
+    if stop && matches!(session.state(), State::Starting | State::NetworkReady) {
+        session.stop();
+    }
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    for _ in 0..statuses + usize::from(stop) {
+        let (_, ended) = poll_session(None, &*session, 0)?;
+        if ended {
+            session.stop();
+        }
+        decoder.reply_status(session.state(), deadline)?;
+    }
     dialogue(&stream, decoder, session)
+}
+
+// Preserve the first Status as a report of the launch result. Keep reading
+// while it is pending so a queued Stop or a disconnect can overtake setup.
+fn watch_setup(
+    client: &UnixStream,
+    completion: &UnixStream,
+    decoder: &mut ServerDecoder,
+) -> Result<(usize, bool), FrameError> {
+    let mut statuses = 0;
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: client.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLRDHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: completion.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll updates the initialized array of live descriptors.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+            continue;
+        }
+        if fds[0].revents != 0 {
+            match decoder.command(Instant::now() + FRAME_TIMEOUT)? {
+                Command::Status => statuses += 1,
+                Command::Stop => return Ok((statuses, true)),
+            }
+            // A half-close can follow the last queued Status. Read EOF
+            // before releasing the setup worker's result to the client.
+            if fds[0].revents & libc::POLLRDHUP != 0 {
+                continue;
+            }
+        }
+        if fds[1].revents != 0 {
+            return Ok((statuses, false));
+        }
+    }
+}
+
+fn reply_setup_statuses(
+    decoder: &mut ServerDecoder,
+    count: usize,
+    state: State,
+) -> Result<(), FrameError> {
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    for _ in 0..count {
+        decoder.reply_status(state, deadline)?;
+    }
+    Ok(())
+}
+
+// Internal data is read only by the authenticated backend. The same
+// liveness signals take precedence over queued and live client commands.
+fn poll_session(
+    client: Option<&UnixStream>,
+    session: &dyn Running,
+    timeout: libc::c_int,
+) -> io::Result<(bool, bool)> {
+    let mut fds = [
+        libc::pollfd {
+            fd: client.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: session.peer().map_or(-1, |peer| peer.as_raw_fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: session
+                .channel_fd()
+                .map_or(-1, |channel| channel.as_raw_fd()),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: poll updates the initialized array of live or ignored descriptors.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } >= 0 {
+            return Ok((
+                fds[0].revents != 0,
+                fds[1].revents != 0 || fds[2].revents != 0,
+            ));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Answer the client's commands for one admitted session. A stop, a closed
@@ -232,46 +368,15 @@ fn dialogue(
     mut session: Box<dyn Running + '_>,
 ) -> Result<(), FrameError> {
     loop {
-        // Watch the supervisor pidfd and internal hangup alongside the
-        // client. Internal data is read only by the authenticated backend.
-        loop {
-            let mut fds = [
-                libc::pollfd {
-                    fd: stream.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: session.peer().map_or(-1, |peer| peer.as_raw_fd()),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: session
-                        .channel_fd()
-                        .map_or(-1, |channel| channel.as_raw_fd()),
-                    events: libc::POLLRDHUP,
-                    revents: 0,
-                },
-            ];
-            // SAFETY: poll updates the initialized array of live or ignored descriptors.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, SESSION_IDLE_MS) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error.into());
+        let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS)?;
+        if ended {
+            session.stop();
+        }
+        if !client_ready {
+            if ended {
+                continue;
             }
-            if ready == 0 {
-                return Err(io::Error::from(io::ErrorKind::TimedOut).into());
-            }
-            if fds[1].revents != 0 || fds[2].revents != 0 {
-                session.stop();
-            }
-            if fds[0].revents != 0 {
-                break;
-            }
+            return Err(io::Error::from(io::ErrorKind::TimedOut).into());
         }
         let state = match decoder.command(Instant::now() + FRAME_TIMEOUT) {
             Ok(Command::Status) => session.state(),
@@ -420,6 +525,7 @@ mod policy_dialogue_tests {
             _: &super::super::policy::Entry,
             _: super::super::protocol::Credentials,
             _: File,
+            _: &Arc<SetupCancellation>,
         ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
             Err(ErrorCode::Backend)
         }
@@ -621,12 +727,14 @@ mod policy_dialogue_tests {
         counters: Counters,
         refuse: Option<ErrorCode>,
         stop_result: State,
+        ended: Option<(UnixStream, bool)>,
     }
 
     struct FakeSession {
         counters: Counters,
         state: State,
         stop_result: State,
+        ended: Option<(UnixStream, bool)>,
     }
 
     impl Launch for Fake {
@@ -636,6 +744,7 @@ mod policy_dialogue_tests {
             _: &super::super::policy::Entry,
             _: super::super::protocol::Credentials,
             _: File,
+            _: &Arc<SetupCancellation>,
         ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
             let backend = offer.backend();
             self.counters.launches.fetch_add(1, Ordering::SeqCst);
@@ -644,8 +753,16 @@ mod policy_dialogue_tests {
                 Some(code) => Err(code),
                 None => Ok(Box::new(FakeSession {
                     counters: self.counters.clone(),
-                    state: State::Starting,
+                    state: if self.ended.is_some() {
+                        State::NetworkReady
+                    } else {
+                        State::Starting
+                    },
                     stop_result: self.stop_result,
+                    ended: self
+                        .ended
+                        .as_ref()
+                        .map(|(fd, peer)| (fd.try_clone().unwrap(), *peer)),
                 })),
             }
         }
@@ -655,7 +772,22 @@ mod policy_dialogue_tests {
         fn state(&self) -> State {
             self.state
         }
+        fn peer(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+            use std::os::fd::AsFd;
+            self.ended
+                .as_ref()
+                .filter(|(_, peer)| *peer)
+                .map(|(fd, _)| fd.as_fd())
+        }
+        fn channel_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+            use std::os::fd::AsFd;
+            self.ended
+                .as_ref()
+                .filter(|(_, peer)| !*peer)
+                .map(|(fd, _)| fd.as_fd())
+        }
         fn stop(&mut self) -> State {
+            self.ended.take();
             self.counters.stops.fetch_add(1, Ordering::SeqCst);
             self.state = self.stop_result;
             self.state
@@ -670,6 +802,14 @@ mod policy_dialogue_tests {
 
     /// Run the dialogue through the credentials and return the open client.
     fn admitted_client(policy: &PolicyFixture, fake: Fake) -> (UnixStream, thread::JoinHandle<()>) {
+        admitted_client_with_queued_status(policy, fake, false)
+    }
+
+    fn admitted_client_with_queued_status(
+        policy: &PolicyFixture,
+        fake: Fake,
+        queue_status: bool,
+    ) -> (UnixStream, thread::JoinHandle<()>) {
         let server = Arc::new(Server::with_launcher(policy.store.clone(), Box::new(fake)));
         let (mut client, stream) = UnixStream::pair().unwrap();
         let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
@@ -679,10 +819,15 @@ mod policy_dialogue_tests {
         assert!(matches!(tests_receive(&client), Response::Version { .. }));
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
         assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        let mut credentials = Vec::new();
         Credentials::ipsec("fixture-password", "fixture-psk")
             .unwrap()
-            .write(&mut client)
+            .write(&mut credentials)
             .unwrap();
+        if queue_status {
+            credentials.extend_from_slice(b"{\"op\":\"status\"}\n");
+        }
+        client.write_all(&credentials).unwrap();
         (client, worker)
     }
 
@@ -705,8 +850,35 @@ mod policy_dialogue_tests {
             counters: counters.clone(),
             refuse,
             stop_result,
+            ended: None,
         };
         (fake, counters)
+    }
+
+    #[test]
+    fn queued_status_checks_peer_and_channel_before_publication() {
+        let fixture = installed();
+        for (peer, stop_result) in [(true, State::Stopped), (false, State::CleanupPending)] {
+            let (mut fake, counters) = fake(None, stop_result);
+            let (fd, other) = UnixStream::pair().unwrap();
+            let _live_peer = if peer {
+                (&other).write_all(b"ready").unwrap();
+                Some(other)
+            } else {
+                drop(other);
+                None
+            };
+            fake.ended = Some((fd, peer));
+            let (client, worker) = admitted_client_with_queued_status(&fixture, fake, true);
+            let response = tests_receive(&client);
+            drop(client);
+            worker.join().unwrap();
+            assert!(
+                matches!(response, Response::Status { state } if state == stop_result),
+                "peer={peer}: unexpected queued status {response:?}"
+            );
+            assert_eq!(counters.stops.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]

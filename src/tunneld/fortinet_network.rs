@@ -11,7 +11,7 @@
 //! flushes addresses, so it cannot configure a PPP link and is not reused as is.
 use super::{
     fortinet_instance::{Event, Failure},
-    network::{cidr_text, valid_generation},
+    network::{SetupCancellation, cidr_text, valid_generation},
     policy::Entry,
     protocol::CidrV4,
 };
@@ -301,7 +301,9 @@ pub(super) struct Scope<'a> {
     pub grant: &'a Grant,
 }
 
-type Run = dyn Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync;
+/// Every privileged effect carries the setup's cancellation, so that it
+/// begins under the same lock as the cancellation mark.
+type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>) -> io::Result<Vec<u8>> + Send + Sync;
 
 pub(super) struct FortinetNetwork(Box<Run>);
 
@@ -378,19 +380,22 @@ impl FortinetNetwork {
     pub(super) fn fake(
         run: impl Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(run))
+        Self(Box::new(move |program, args, cancel| match cancel {
+            Some(cancel) => cancel.start(|| run(program, args)),
+            None => run(program, args),
+        }))
     }
 
     fn ip(&self, args: &[&str]) -> io::Result<Vec<u8>> {
-        (self.0)(IP, args)
+        (self.0)(IP, args, None)
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> io::Result<T> {
         decode(&self.ip(args)?)
     }
 
-    fn resolvectl(&self, args: &[&str]) -> io::Result<Vec<u8>> {
-        (self.0)(RESOLVECTL, args)
+    fn resolvectl(&self, args: &[&str], cancel: Option<&SetupCancellation>) -> io::Result<Vec<u8>> {
+        (self.0)(RESOLVECTL, args, cancel)
     }
 
     fn links(&self) -> io::Result<Vec<Link>> {
@@ -503,21 +508,31 @@ impl FortinetNetwork {
         }
     }
 
-    fn route_change(&self, op: &str, route: &CidrV4, name: &str) -> io::Result<()> {
-        self.ip(&[
-            "-4",
-            "route",
-            op,
-            &cidr_text(route),
-            "dev",
-            name,
-            "table",
-            "main",
-            "proto",
-            PROTOCOL,
-            "scope",
-            "link",
-        ])?;
+    fn route_change(
+        &self,
+        op: &str,
+        route: &CidrV4,
+        name: &str,
+        cancel: Option<&SetupCancellation>,
+    ) -> io::Result<()> {
+        (self.0)(
+            IP,
+            &[
+                "-4",
+                "route",
+                op,
+                &cidr_text(route),
+                "dev",
+                name,
+                "table",
+                "main",
+                "proto",
+                PROTOCOL,
+                "scope",
+                "link",
+            ],
+            cancel,
+        )?;
         Ok(())
     }
 
@@ -573,11 +588,11 @@ impl FortinetNetwork {
                 .flat_map(|(_, rest)| rest.split_ascii_whitespace().map(str::to_owned))
                 .collect())
         }
-        let servers = words(&self.resolvectl(&["dns", name])?)?
+        let servers = words(&self.resolvectl(&["dns", name], None)?)?
             .iter()
             .map(|word| word.parse().map_err(|_| invalid("unreadable DNS server")))
             .collect::<io::Result<Vec<Ipv4Addr>>>()?;
-        let domains = words(&self.resolvectl(&["domain", name])?)?
+        let domains = words(&self.resolvectl(&["domain", name], None)?)?
             .into_iter()
             .map(|word| word.strip_prefix('~').map_or(word.clone(), str::to_owned))
             .collect();
@@ -593,7 +608,9 @@ impl FortinetNetwork {
         receipt: &mut Receipt,
         delivered: &Delivered,
         scope: &Scope<'_>,
+        cancel: &SetupCancellation,
     ) -> io::Result<()> {
+        cancel.check()?;
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
         if delivered.fatal().is_some() || !delivered.ready() {
@@ -684,21 +701,21 @@ impl FortinetNetwork {
         for (index, route) in accepted.iter().enumerate() {
             receipt.routes_intended = index + 1;
             receipt.save(directory, guard)?;
-            self.route_change("add", route, &link.ifname)?;
+            self.route_change("add", route, &link.ifname, Some(cancel))?;
         }
         if let Some(dns) = &dns {
             receipt.dns_intended = true;
             receipt.save(directory, guard)?;
-            self.resolvectl(&["revert", &link.ifname])?;
+            self.resolvectl(&["revert", &link.ifname], Some(cancel))?;
             let mut args = vec!["dns", link.ifname.as_str()];
             let servers: Vec<String> = dns.servers.iter().map(ToString::to_string).collect();
             args.extend(servers.iter().map(String::as_str));
-            self.resolvectl(&args)?;
+            self.resolvectl(&args, Some(cancel))?;
             let mut args = vec!["domain", link.ifname.as_str()];
             let domains: Vec<String> = dns.domains.iter().map(|d| format!("~{d}")).collect();
             args.extend(domains.iter().map(String::as_str));
-            self.resolvectl(&args)?;
-            self.resolvectl(&["default-route", &link.ifname, "false"])?;
+            self.resolvectl(&args, Some(cancel))?;
+            self.resolvectl(&["default-route", &link.ifname, "false"], Some(cancel))?;
         }
 
         let current = self
@@ -742,10 +759,10 @@ impl FortinetNetwork {
                 .rev()
                 .filter(|route| present.contains(route))
             {
-                self.route_change("del", route, &link.ifname)?;
+                self.route_change("del", route, &link.ifname, None)?;
             }
             if receipt.dns_intended {
-                self.resolvectl(&["revert", &link.ifname])?;
+                self.resolvectl(&["revert", &link.ifname], None)?;
             }
         }
         // Prove it: nothing of ours is left under the recorded identity.
@@ -781,16 +798,25 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// Fixed program, clean environment, absolute deadline, bounded output.
-fn run_command(program: &str, args: &[&str]) -> io::Result<Vec<u8>> {
+fn run_command(
+    program: &str,
+    args: &[&str],
+    cancel: Option<&SetupCancellation>,
+) -> io::Result<Vec<u8>> {
     let deadline = Instant::now() + COMMAND_DEADLINE;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // The effect begins under the cancellation lock: once cancelled, nothing starts.
+    let mut child = match cancel {
+        Some(cancel) => cancel.start(|| command.spawn()),
+        None => command.spawn(),
+    }?;
     let result = (|| {
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
@@ -1187,6 +1213,7 @@ mod tests {
                 entry,
                 grant: &grant,
             },
+            &SetupCancellation::default(),
         )
     }
 
