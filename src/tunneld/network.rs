@@ -294,7 +294,7 @@ pub(super) fn cidr_text(cidr: &CidrV4) -> String {
     format!("{}/{}", cidr.network(), cidr.prefix())
 }
 
-fn prefix(text: &str) -> io::Result<(u32, u8)> {
+pub(super) fn prefix(text: &str) -> io::Result<(u32, u8)> {
     let (address, length) = text.split_once('/').unwrap_or((text, "32"));
     let addr = address
         .parse::<Ipv4Addr>()
@@ -312,17 +312,29 @@ pub(super) fn parse_cidr(text: &str) -> io::Result<CidrV4> {
     CidrV4::new(base.into(), length).map_err(|_| invalid("invalid policy route"))
 }
 
-fn overlaps(a: (u32, u8), b: (u32, u8)) -> bool {
+pub(super) fn overlaps(a: (u32, u8), b: (u32, u8)) -> bool {
     let shift = 32 - a.1.min(b.1);
     shift == 32 || (a.0 >> shift) == (b.0 >> shift)
 }
 
-fn route_key(route: &CidrV4) -> (u32, u8) {
+pub(super) fn route_key(route: &CidrV4) -> (u32, u8) {
     (route.network().into(), route.prefix())
 }
 
 fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
+}
+
+pub(super) fn check_standard_ipv4_rules(rules: &[serde_json::Value]) -> io::Result<()> {
+    let standard = serde_json::json!([
+        {"priority":0,"src":"all","table":"local"},
+        {"priority":32766,"src":"all","table":"main"},
+        {"priority":32767,"src":"all","table":"default"}
+    ]);
+    if rules != standard.as_array().expect("rules array").as_slice() {
+        return Err(invalid("nonstandard IPv4 policy rules"));
+    }
+    Ok(())
 }
 
 impl Network {
@@ -470,14 +482,7 @@ impl Network {
         egress: &Egress,
     ) -> io::Result<()> {
         let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        let standard = serde_json::json!([
-            {"priority":0,"src":"all","table":"local"},
-            {"priority":32766,"src":"all","table":"main"},
-            {"priority":32767,"src":"all","table":"default"}
-        ]);
-        if rules != standard.as_array().expect("rules array").as_slice() {
-            return Err(invalid("nonstandard IPv4 policy rules"));
-        }
+        check_standard_ipv4_rules(&rules)?;
         let protected = approved
             .iter()
             .copied()
