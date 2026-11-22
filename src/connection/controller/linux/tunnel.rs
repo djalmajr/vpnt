@@ -33,6 +33,7 @@ use std::{
 
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const CLEANUP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROBE_DESTINATIONS: usize = 64;
 
 type Probe = fn(&Profile, &ProbeBinding, &AtomicBool, Instant, ProbeSlot) -> Result<bool, Failure>;
@@ -41,6 +42,7 @@ enum Session {
     Inactive,
     Active(Client),
     Observing,
+    CleanupUnconfirmed,
 }
 
 pub(super) struct TunnelAttempt {
@@ -53,6 +55,7 @@ pub(super) struct TunnelAttempt {
     connect_deadline: Instant,
     next_status: Instant,
     generation: Option<Generation>,
+    cleanup_until: Option<Instant>,
     probe_binding: Option<ProbeBinding>,
 }
 
@@ -78,6 +81,7 @@ impl TunnelAttempt {
             connect_deadline: now,
             next_status: now,
             generation: None,
+            cleanup_until: None,
             probe_binding: None,
         }
     }
@@ -125,6 +129,7 @@ impl TunnelAttempt {
     fn cleaned(&mut self) {
         self.session = Session::Inactive;
         self.generation = None;
+        self.cleanup_until = None;
         self.probe_binding = None;
     }
 }
@@ -301,18 +306,48 @@ impl Attempt for TunnelAttempt {
         self.probe_busy
     }
 
+    fn phase(&self) -> Option<ConnectionState> {
+        matches!(self.session, Session::CleanupUnconfirmed)
+            .then_some(ConnectionState::CleanupUnconfirmed)
+    }
+
     fn cleanup(&mut self) -> bool {
         self.probe_binding = None;
         let session = std::mem::replace(&mut self.session, Session::Observing);
-        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        let now = Instant::now();
+        let until = *self
+            .cleanup_until
+            .get_or_insert(now + CLEANUP_CONFIRMATION_TIMEOUT);
+        let deadline = (now + CONTROL_TIMEOUT).min(until);
         let stopped = match session {
             Session::Inactive => true,
+            Session::CleanupUnconfirmed => {
+                self.session = Session::CleanupUnconfirmed;
+                false
+            }
             Session::Active(mut client) => matches!(client.stop(deadline), Ok(State::Stopped)),
-            Session::Observing => self.generation.as_ref().is_some_and(|generation| {
-                Client::connect_v2(&self.socket_path, deadline)
-                    .and_then(|client| client.cleanup_status(generation, deadline))
-                    .is_ok_and(|state| state == CleanupState::Stopped)
-            }),
+            Session::Observing if now >= until => {
+                self.session = Session::CleanupUnconfirmed;
+                false
+            }
+            Session::Observing => {
+                let result = self
+                    .generation
+                    .as_ref()
+                    .ok_or(FrameError::Protocol(WireError::BadRequest))
+                    .and_then(|generation| {
+                        Client::connect_v2(&self.socket_path, deadline)
+                            .and_then(|client| client.cleanup_status(generation, deadline))
+                    });
+                match result {
+                    Ok(CleanupState::Stopped) => true,
+                    Ok(CleanupState::Unknown) => {
+                        self.session = Session::CleanupUnconfirmed;
+                        false
+                    }
+                    Ok(CleanupState::Pending) | Err(_) => false,
+                }
+            }
         };
         if stopped {
             self.cleaned();

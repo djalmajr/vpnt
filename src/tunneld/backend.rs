@@ -633,14 +633,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     pub(super) fn recover_with(&self, cleanup: Option<&Store>) -> io::Result<()> {
         let guard = (self.lock)(Instant::now() + self.limits.lock)?;
         let parent = self.runtime.join(INSTANCE_DIRECTORY);
-        match require_private(&parent) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Self::recover_without_leases(cleanup, &guard);
-            }
-            Err(e) => return Err(e),
-        }
-        for entry in fs::read_dir(&parent)? {
+        let entries = match require_private(&parent) {
+            Ok(()) => Some(fs::read_dir(parent)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        for entry in entries.into_iter().flatten() {
             let entry = entry?;
             let filename = entry.file_name();
             let Some(generation) = filename.to_str().filter(|name| valid_generation(name)) else {
@@ -648,57 +646,47 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             };
             let directory = entry.path();
             require_private(&directory)?;
-            let mut receipt = match Receipt::load(&directory, &guard) {
-                Ok(receipt) => receipt,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    match fortinet_network::Receipt::load(&directory, &guard) {
-                        Ok(mut receipt) => {
-                            if !receipt.complete {
-                                let mut attempt =
-                                    Attempt::new(Backend::Fortinet, generation.to_owned());
-                                // The dead writer may have left the runtime drop-in.
-                                attempt.allowed = true;
-                                self.stop_unit(&attempt)?;
-                                self.revert_unit(&mut attempt)?;
-                                self.fortinet.clean(&guard, &directory, &receipt)?;
-                                receipt.complete = true;
-                                receipt.save(&directory, &guard)?;
-                            }
-                            guard.withdraw(generation)?;
-                            if let Some(cleanup) = cleanup {
-                                cleanup.recovered(generation)?;
-                            }
-                            continue;
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                        Err(e) => return Err(e),
+            let ipsec = absent_receipt(Receipt::load(&directory, &guard))?;
+            let fortinet = absent_receipt(fortinet_network::Receipt::load(&directory, &guard))?;
+            match (ipsec, fortinet) {
+                (Some(mut receipt), None) => {
+                    if !receipt.complete {
+                        let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
+                        // The dead writer may have left the runtime drop-in.
+                        attempt.allowed = true;
+                        self.stop_unit(&attempt)?;
+                        self.revert_unit(&mut attempt)?;
+                        self.xfrm.clean(&guard, &directory, &receipt)?;
+                        receipt.complete = true;
+                        receipt.save(&directory, &guard)?;
                     }
                 }
-                Err(e) => return Err(e),
-            };
-            if !receipt.complete {
-                let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
-                // The dead writer may have left the runtime drop-in.
-                attempt.allowed = true;
-                self.stop_unit(&attempt)?;
-                self.revert_unit(&mut attempt)?;
-                self.xfrm.clean(&guard, &directory, &receipt)?;
-                receipt.complete = true;
-                receipt.save(&directory, &guard)?;
+                (None, Some(mut receipt)) => {
+                    if !receipt.complete {
+                        let mut attempt = Attempt::new(Backend::Fortinet, generation.to_owned());
+                        attempt.allowed = true;
+                        self.stop_unit(&attempt)?;
+                        self.revert_unit(&mut attempt)?;
+                        self.fortinet.clean(&guard, &directory, &receipt)?;
+                        receipt.complete = true;
+                        receipt.save(&directory, &guard)?;
+                    }
+                }
+                (None, None) => continue,
+                (Some(_), Some(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ambiguous network recovery receipt",
+                    ));
+                }
             }
             guard.withdraw(generation)?;
             if let Some(cleanup) = cleanup {
                 cleanup.recovered(generation)?;
             }
         }
-        Self::recover_without_leases(cleanup, &guard)
-    }
-
-    fn recover_without_leases(cleanup: Option<&Store>, guard: &NetworkGuard) -> io::Result<()> {
-        if let Some(cleanup) = cleanup
-            && !guard.tunnels_present()?
-        {
-            cleanup.recovered_without_leases()?;
+        if let Some(cleanup) = cleanup {
+            cleanup.finish_recovery()?;
         }
         Ok(())
     }
@@ -947,6 +935,14 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 })
             }
         }
+    }
+}
+
+fn absent_receipt<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3349,6 +3345,54 @@ mod tests {
             let kernel = kernel.lock().unwrap();
             assert!(kernel.routes.is_empty() && !kernel.link && !kernel.address);
             assert!(process.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn recovery_only_confirms_an_empty_preparation_not_an_orphaned_pending() {
+            use crate::tunneld::protocol::CleanupState;
+            let harness = Harness::new();
+            let launcher = harness.launcher(false);
+            let store = Store::open(&harness.runtime).unwrap();
+            let fresh = store.reserve(1000).unwrap();
+            let mut started = store.reserve(1000).unwrap();
+            started.arm().unwrap();
+            let started_id = started.generation().clone();
+            drop(started);
+            assert!(launcher.recover_with(Some(&store)).is_err());
+            assert_eq!(
+                store.status(1000, fresh.generation()),
+                CleanupState::Stopped
+            );
+            assert_eq!(store.status(1000, &started_id), CleanupState::Pending);
+            assert!(harness.log().is_empty());
+            assert!(harness.leases().is_empty());
+        }
+
+        #[test]
+        fn malformed_network_receipts_never_confirm_their_generations() {
+            use crate::tunneld::protocol::CleanupState;
+            for receipt_name in [
+                super::super::super::network::RECEIPT,
+                fortinet_network::RECEIPT,
+            ] {
+                let harness = Harness::new();
+                let launcher = harness.launcher(false);
+                let store = Store::open(&harness.runtime).unwrap();
+                let mut record = store.reserve(1000).unwrap();
+                record.arm().unwrap();
+                let generation = record.generation().as_str();
+                let directory = launcher.create_directory(generation).unwrap();
+                let path = directory.join(receipt_name);
+                fs::write(&path, b"{").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(launcher.recover_with(Some(&store)).is_err());
+                assert_eq!(
+                    store.status(1000, record.generation()),
+                    CleanupState::Pending
+                );
+                assert!(harness.log().is_empty());
+                assert!(harness.leases().is_empty());
+            }
         }
 
         #[test]

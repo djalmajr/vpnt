@@ -899,3 +899,154 @@ fn cancellation_during_tcp_discards_success_without_status_refresh() {
         server.join().unwrap();
     });
 }
+
+#[test]
+fn unknown_cleanup_proof_enters_an_explicit_fence_without_polling_again() {
+    if !wire_fixture("unknown_cleanup_proof_enters_an_explicit_fence_without_polling_again") {
+        return;
+    }
+    let fixture = SocketFixture::new("expired-proof");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Stop, State::Stopping);
+            drop(decoder);
+            query(&fixture, CleanupState::Unknown);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
+        attempt
+            .start(&AtomicBool::new(false), wire_deadline())
+            .unwrap();
+        assert!(!attempt.cleanup());
+        assert!(!attempt.cleanup());
+        assert_eq!(attempt.phase(), Some(ConnectionState::CleanupUnconfirmed));
+        assert!(!attempt.cleanup());
+        server.join().unwrap();
+        assert_eq!(
+            fixture.listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    });
+}
+
+#[test]
+fn expired_observation_budget_keeps_unavailable_cleanup_fenced() {
+    if !wire_fixture("expired_observation_budget_keeps_unavailable_cleanup_fenced") {
+        return;
+    }
+    let fixture = SocketFixture::new("unavailable-proof");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Stop, State::Stopping);
+            drop(decoder);
+            drop(fixture.accept()); // the independent query gets a transport failure
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
+        attempt
+            .start(&AtomicBool::new(false), wire_deadline())
+            .unwrap();
+        assert!(!attempt.cleanup());
+        assert!(!attempt.cleanup());
+        assert_eq!(attempt.phase(), None);
+        attempt.cleanup_until = Some(Instant::now());
+        assert!(!attempt.cleanup());
+        assert_eq!(attempt.phase(), Some(ConnectionState::CleanupUnconfirmed));
+        server.join().unwrap();
+        assert_eq!(
+            fixture.listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    });
+}
+
+#[test]
+fn unconfirmed_cleanup_reports_a_typed_error_while_the_worker_holds_admission() {
+    if !wire_fixture("unconfirmed_cleanup_reports_a_typed_error_while_the_worker_holds_admission") {
+        return;
+    }
+    // Permit only fixture shutdown to join a production controller whose
+    // real attempt intentionally keeps the admission fence.
+    struct Exitable(TunnelAttempt);
+    impl Attempt for Exitable {
+        fn start(&mut self, canceled: &AtomicBool, deadline: Instant) -> Result<(), Failure> {
+            self.0.start(canceled, deadline)
+        }
+        fn ready(&mut self) -> Result<bool, Failure> {
+            self.0.ready()
+        }
+        fn healthy(&mut self) -> Result<(), Failure> {
+            self.0.healthy()
+        }
+        fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
+            self.0.probe(canceled, timeout)
+        }
+        fn phase(&self) -> Option<ConnectionState> {
+            self.0.phase()
+        }
+        fn cleanup(&mut self) -> bool {
+            self.0.cleanup()
+        }
+        fn abandon(
+            &mut self,
+            _: crate::helper::runtime::cleanup::Reason,
+        ) -> Result<(), super::super::super::AbandonError> {
+            Ok(())
+        }
+    }
+
+    struct ExitOnDrop(Arc<worker::ExitRequested>);
+    impl Drop for ExitOnDrop {
+        fn drop(&mut self) {
+            self.0.request();
+        }
+    }
+
+    let fixture = SocketFixture::new("typed-proof");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
+            decoder.reject(WireError::Backend, wire_deadline()).unwrap();
+            query(&fixture, CleanupState::Unknown);
+        });
+        let exit = Arc::new(worker::ExitRequested::new(Duration::ZERO));
+        let _exit = ExitOnDrop(exit.clone());
+        let progress = Arc::new(Mutex::new(None));
+        let signals = worker::Signals {
+            canceled: Arc::new(AtomicBool::new(false)),
+            probe: Arc::new(AtomicBool::new(false)),
+            state: progress.clone(),
+            exit: exit.clone(),
+        };
+        let attempt = Exitable(fixture.attempt(VpnKind::Ssl, no_probe));
+        let timing = Timing::default();
+        let worker = scope
+            .spawn(move || worker::run(attempt, signals, timing, ProbeClock::new(timing.interval)));
+        let deadline = wire_deadline();
+        let notice = loop {
+            if let Some(notice) = *progress.lock().unwrap()
+                && notice.state == ConnectionState::CleanupUnconfirmed
+            {
+                break notice;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not publish the cleanup failure"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(!notice.cleaning);
+        assert_eq!(
+            notice.failure,
+            Some(crate::helper::protocol::FailureNote {
+                code: ErrorCode::BackendFailure,
+                step: Step::Tunnel,
+            })
+        );
+        assert!(!worker.is_finished());
+        server.join().unwrap();
+        exit.request();
+        worker.join().unwrap();
+    });
+}

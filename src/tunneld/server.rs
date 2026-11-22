@@ -34,6 +34,8 @@ const SESSION_IDLE_MS: libc::c_int = 24 * 60 * 60 * 1000;
 const MAX_PER_UID: usize = 2;
 const MAX_CONNECTIONS: usize = 8;
 const LISTEN_FD: RawFd = 3;
+const RECONCILE_MIN: Duration = Duration::from_secs(1);
+const RECONCILE_MAX: Duration = Duration::from_secs(8);
 
 struct Server {
     connections: Mutex<Connections>,
@@ -95,14 +97,15 @@ impl Server {
             .name("vpnt-tunneld-recovery".into())
             .spawn(move || {
                 let (launcher, cleanup, recovered) = worker;
-                let ready = retry_cleanup(|| match launcher.recover_with(Some(&cleanup)) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        eprintln!("vpnt-tunneld: startup recovery is unproven: {error}");
-                        false
-                    }
-                });
-                recovered.store(ready, Ordering::Release);
+                reconcile(
+                    &recovered,
+                    || launcher.recover_with(Some(&cleanup)),
+                    || cleanup.republish(),
+                    |delay| {
+                        thread::sleep(delay);
+                        true
+                    },
+                );
             })?;
         Ok(Self {
             connections: Mutex::default(),
@@ -175,6 +178,47 @@ impl Server {
             Err(error) => {
                 eprintln!("vpnt-tunneld: could not start connection worker: {error}");
                 None
+            }
+        }
+    }
+}
+
+/// A single worker owns startup recovery. After admission opens it only
+/// retries publication of already-proved results, never live network teardown.
+fn reconcile(
+    recovered: &AtomicBool,
+    mut recover: impl FnMut() -> io::Result<()>,
+    mut publish: impl FnMut() -> io::Result<()>,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    let mut delay = RECONCILE_MIN;
+    let mut reporting_failure = false;
+    loop {
+        let ready = recovered.load(Ordering::Acquire);
+        let result = if ready { publish() } else { recover() };
+        match result {
+            Ok(()) => {
+                recovered.store(true, Ordering::Release);
+                reporting_failure = false;
+                delay = RECONCILE_MIN;
+                if !wait(delay) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !reporting_failure {
+                    let stage = if ready {
+                        "cleanup publication"
+                    } else {
+                        "startup recovery"
+                    };
+                    eprintln!("vpnt-tunneld: {stage} will be retried: {error}");
+                    reporting_failure = true;
+                }
+                if !wait(delay) {
+                    return;
+                }
+                delay = delay.saturating_mul(2).min(RECONCILE_MAX);
             }
         }
     }
@@ -505,13 +549,9 @@ fn dialogue(
 }
 
 fn record_stopped(record: &Reservation<'_>) {
-    retry_cleanup(|| match record.stopped() {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("vpnt-tunneld: could not record completed cleanup: {error}");
-            false
-        }
-    });
+    if let Err(error) = record.stopped() {
+        eprintln!("vpnt-tunneld: could not publish completed cleanup: {error}");
+    }
 }
 
 fn finish_v2(mut session: Box<dyn Running + '_>, record: &Reservation<'_>) {
@@ -768,6 +808,105 @@ mod policy_dialogue_tests {
             super::super::protocol::decode_response,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn background_recovery_keeps_status_available_and_retries_until_proved() {
+        let policy = PolicyFixture::new();
+        policy.install();
+        let mut server = Server::with_launcher(policy.store.clone(), Box::new(Unavailable));
+        server.recovered.store(false, Ordering::Release);
+        let store = Arc::new(Store::open(policy.path().parent().unwrap()).unwrap());
+        let reservation = store.reserve(1000).unwrap();
+        let id = reservation.generation().clone();
+        drop(reservation);
+        server.cleanup = Some(store);
+        let server = Arc::new(server);
+        let (observed, next) = std::sync::mpsc::channel();
+        let (resume, continued) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let recovered = &server.recovered;
+            let scheduler = scope.spawn(move || {
+                let mut attempts = 0;
+                reconcile(
+                    recovered,
+                    || {
+                        attempts += 1;
+                        if attempts <= 5 {
+                            Err(io::ErrorKind::WouldBlock.into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || Ok(()),
+                    |delay| {
+                        observed.send(delay).unwrap();
+                        continued
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap_or(false)
+                    },
+                );
+                attempts
+            });
+            let open = |version| {
+                let (mut client, stream) = UnixStream::pair().unwrap();
+                let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
+                writeln!(client, r#"{{"op":"hello","version":{version}}}"#).unwrap();
+                assert!(
+                    matches!(tests_receive(&client), Response::Version { version: received } if received == version)
+                );
+                (client, worker)
+            };
+            let offer = br#"{"op":"prepare_ipsec","endpoint":{"host":"vpn.example","port":500},"username":"fixture","networks":[{"network":"10.20.0.0","prefix":16}]}"#;
+            for seconds in [1, 2, 4, 8, 8] {
+                assert_eq!(
+                    next.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Duration::from_secs(seconds)
+                );
+                let (mut client, worker) = open(2);
+                write_control(
+                    &mut client,
+                    &Request::CleanupStatus {
+                        generation: id.clone(),
+                    },
+                )
+                .unwrap();
+                assert!(matches!(
+                    tests_receive(&client),
+                    Response::CleanupStatus {
+                        state: CleanupState::Stopped
+                    }
+                ));
+                worker.join().unwrap();
+
+                let (mut client, worker) = open(1);
+                client.write_all(offer).unwrap();
+                client.write_all(b"\n").unwrap();
+                assert!(matches!(
+                    tests_receive(&client),
+                    Response::Error {
+                        code: ErrorCode::Busy
+                    }
+                ));
+                worker.join().unwrap();
+                resume.send(true).unwrap();
+            }
+            assert_eq!(
+                next.recv_timeout(Duration::from_secs(5)).unwrap(),
+                RECONCILE_MIN
+            );
+            let (mut client, worker) = open(1);
+            client.write_all(offer).unwrap();
+            client.write_all(b"\n").unwrap();
+            assert!(matches!(
+                tests_receive(&client),
+                Response::Prepared { generation: None }
+            ));
+            drop(client);
+            worker.join().unwrap();
+            resume.send(false).unwrap();
+            assert_eq!(scheduler.join().unwrap(), 6);
+        });
     }
 
     #[test]
