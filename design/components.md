@@ -155,8 +155,9 @@ o idioma já validado do host. Sem novos tokens nem alteração visual da UI.
 ### Ícone da barra de menus
 
 Usar SF Symbols nativos como imagens de template, acompanhando a aparência da
-barra: `lock.shield.fill` para IPsec conectado, `lock.fill` para SSL conectado,
-`lock.square.stack.fill` para ambos e `lock.open` quando nenhum está conectado.
+barra: `lock.shield.fill` para IPsec conectado, `lock.fill` para um túnel TLS
+conectado (Fortinet SSL ou OpenVPN), `lock.square.stack.fill` para IPsec junto
+com um túnel TLS e `lock.open` quando nenhum está conectado.
 `exclamationmark.triangle.fill` indica erro, túnel sem resposta ou componente
 não verificado. Por correção do Djalma em 2026-11-14, estados em andamento
 (conectando, verificando, reconectando, desconectando) não são alerta: leem como

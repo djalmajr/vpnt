@@ -128,6 +128,25 @@ fn several_profiles_of_one_kind_keep_that_kind_symbol() {
 }
 
 #[test]
+fn a_connected_openvpn_is_a_verified_tls_tunnel() {
+    use ConnectionState::{Connected, Off};
+    let alone = ready(vec![view("ovpn", VpnKind::Ovpn, Connected)]);
+    assert_eq!(icon_for(Some(&alone), false), Icon::Ssl);
+    let with_ssl = ready(vec![
+        view("ovpn", VpnKind::Ovpn, Connected),
+        view("ssl", VpnKind::Ssl, Connected),
+    ]);
+    assert_eq!(icon_for(Some(&with_ssl), false), Icon::Ssl);
+    let with_ipsec = ready(vec![
+        view("ovpn", VpnKind::Ovpn, Connected),
+        view("ipsec", VpnKind::Ipsec, Connected),
+    ]);
+    assert_eq!(icon_for(Some(&with_ipsec), false), Icon::Both);
+    let off = ready(vec![view("ovpn", VpnKind::Ovpn, Off)]);
+    assert_eq!(icon_for(Some(&off), false), Icon::Open);
+}
+
+#[test]
 fn all_profiles_off_is_the_open_lock() {
     let snapshot = ready(vec![
         view("a", IPSEC, ConnectionState::Off),
