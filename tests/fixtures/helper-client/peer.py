@@ -8,9 +8,10 @@ mode, marker = sys.argv[1:]
 f = s.makefile("rb",buffering=0)
 def send(value):
     s.sendall(json.dumps(value).encode() + b"\n")
-def changed(id, generation, state):
+def changed(id, generation, state, failures=None):
     previous=states.get(id,{})
-    failures=min(previous.get("failures",0)+1,3) if state=="unresponsive" and previous.get("generation")==generation else (1 if state=="unresponsive" else 0)
+    if failures is None:
+        failures=min(previous.get("failures",0)+1,3) if state=="unresponsive" and previous.get("generation")==generation else (1 if state=="unresponsive" else 0)
     if generation>=states.get(id,dict(generation=0))["generation"]:
         states[id]=dict(id=id,generation=generation,state=state,failures=failures)
         with open(marker+".states","w") as out:json.dump(states,out)
@@ -19,6 +20,9 @@ profiles=[dict(id=id,name=id,kind="ssl",gateway="vpn.example.test",username="fic
 if mode in ["ipsec","ipsec-denied"]:
     profiles.append(dict(id="ipsec",name="ipsec",kind="ipsec",gateway="vpn.example.test",username="fictional",networks=["10.20.0.0/24"],port=500,certificate="",probeHost="10.20.0.15",probePort=8443,probeMethod="tcp"))
 states={p["id"]:dict(id=p["id"],generation=0,state="off",failures=0) for p in profiles}
+# Only the explicit `notice` mode announces the first failed probe as
+# Connected/0; every legacy mode keeps its original wire sequence.
+notice_counts={}
 waiting=[]
 s.settimeout(10)
 # Barrier for tests that must arm the broker's startup deadline only after
@@ -95,7 +99,21 @@ while True:
         send(dict(type="accepted",id=request["id"]))
     elif command["type"]=="probe":
         send(dict(type="accepted",id=request["id"]))
-        changed(command["id"],command["generation"],"connected" if os.path.exists(marker+".probe_ok") else "unresponsive")
+        if mode=="notice":
+            if os.path.exists(marker+".probe_ok"):
+                notice_counts[command["id"]]=0
+                changed(command["id"],command["generation"],"connected",0)
+            else:
+                notice_counts[command["id"]]=min(notice_counts.get(command["id"],0)+1,3)
+                count=notice_counts[command["id"]]
+                # The worker counts this sample internally but the wire still
+                # carries Connected/0 until the second failed probe.
+                if count==1:
+                    changed(command["id"],command["generation"],"connected",0)
+                else:
+                    changed(command["id"],command["generation"],"unresponsive",count)
+        else:
+            changed(command["id"],command["generation"],"connected" if os.path.exists(marker+".probe_ok") else "unresponsive")
     else:
         raise AssertionError("unexpected fixture command")
 open(marker+".retiring","w").close()

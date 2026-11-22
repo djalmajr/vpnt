@@ -767,7 +767,10 @@ fn soft_restart_suppresses_failed_probes_until_connected_again() {
     worker.phase(Phase::Connected);
     worker.expect(ConnectionState::Connected, 0);
     assert_eq!(worker.probes.load(Ordering::Relaxed), 2);
-    for failures in 1..=3 {
+    let _ = worker.status.lock().unwrap().take();
+    worker.probe();
+    worker.expect(ConnectionState::Connected, 0);
+    for failures in 2..=3 {
         worker.probe();
         worker.expect(ConnectionState::Unresponsive, failures);
     }
@@ -808,10 +811,11 @@ fn soft_restart_discards_a_failed_probe_already_in_flight() {
 #[test]
 fn completed_restarts_discard_an_in_flight_probe_and_reset_the_failure_streak() {
     let worker = RecoveryWorker::start();
-    for failures in 1..=2 {
-        worker.probe();
-        worker.expect(ConnectionState::Unresponsive, failures);
-    }
+    let _ = worker.status.lock().unwrap().take();
+    worker.probe();
+    worker.expect(ConnectionState::Connected, 0);
+    worker.probe();
+    worker.expect(ConnectionState::Unresponsive, 2);
 
     let (armed, ready) = mpsc::channel();
     let (entered, blocked) = mpsc::channel();
@@ -876,14 +880,18 @@ fn completed_restarts_discard_an_in_flight_probe_and_reset_the_failure_streak() 
 #[test]
 fn probe_deferral_keeps_manual_request_and_failure_streak() {
     let worker = RecoveryWorker::start();
+    let _ = worker.status.lock().unwrap().take();
     worker.probe();
-    worker.expect(ConnectionState::Unresponsive, 1);
+    worker.expect(ConnectionState::Connected, 0);
 
     let (entered, release) = worker.arm_busy_probe();
     worker.probe();
     entered.recv_timeout(SYNC_GUARD).unwrap();
     let before = worker.status.lock().unwrap().take();
-    assert_eq!(before.unwrap().failures, 1);
+    assert_eq!(
+        (before.unwrap().state, before.unwrap().failures),
+        (ConnectionState::Connected, 0)
+    );
     worker
         .events
         .send(RecoveryEvent::SetProbeBusy(false))
@@ -907,8 +915,10 @@ fn probe_deferral_counts_a_failure_after_one_cadence() {
     // The status slot keeps only the latest value. A 250 ms cadence between
     // failure samples gives the reader more time before a later sample
     // overwrites the first failure; a count per poll is already caught above.
+    let _ = worker.status.lock().unwrap().take();
     worker.interval.set(Duration::from_millis(250));
-    worker.expect(ConnectionState::Unresponsive, 1);
+    worker.expect(ConnectionState::Connected, 0);
+    worker.expect(ConnectionState::Unresponsive, 2);
 }
 
 #[test]
@@ -1691,10 +1701,11 @@ fn complete_restart_between_probes_resets_failure_streak() {
     // A periodic health check drains Reconnecting and Connected together while
     // no probe is running. The next probe starts a new streak.
     let worker = RecoveryWorker::start();
-    for failures in 1..=2 {
-        worker.probe();
-        worker.expect(ConnectionState::Unresponsive, failures);
-    }
+    let _ = worker.status.lock().unwrap().take();
+    worker.probe();
+    worker.expect(ConnectionState::Connected, 0);
+    worker.probe();
+    worker.expect(ConnectionState::Unresponsive, 2);
     let (armed, ready) = mpsc::channel();
     let (entered, blocked) = mpsc::channel();
     let (release, gate) = mpsc::channel();

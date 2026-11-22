@@ -553,6 +553,7 @@ struct Control {
     hold_probe: bool,
     probed: bool,
     probes: usize,
+    restart_epoch: u64,
     invalidate_after_probe: bool,
     invalid: bool,
     cleanup_allowed: bool,
@@ -761,6 +762,9 @@ impl Attempt for FixtureAttempt {
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+    fn restart_epoch(&self) -> u64 {
+        self.kernel.lock().unwrap().attempts[&self.key()].restart_epoch
     }
     fn cleanup(&mut self) -> bool {
         assert!(self.canceled.load(Ordering::Acquire));
@@ -1087,16 +1091,80 @@ fn controller_connects_only_after_leases_and_probe_then_detects_and_recovers_no_
         c.ready = true;
         c.hold_probe = true;
     });
-    h.wait(|h| h.state("one", 1, ConnectionState::Verifying));
-    assert!(!h.state("one", 1, ConnectionState::Connected));
-    h.control("one", 1, |c| c.hold_probe = false);
-    h.wait(|h| h.state("one", 1, ConnectionState::Unresponsive));
-    h.control("one", 1, |c| c.responsive = true);
-    h.command(Command::Probe {
-        id: "one".into(),
-        generation: 1,
+    h.wait(|h| {
+        h.state("one", 1, ConnectionState::Verifying)
+            || h.state("one", 1, ConnectionState::Connected)
     });
-    h.wait(|h| h.state("one", 1, ConnectionState::Connected));
+    assert!(
+        !h.state("one", 1, ConnectionState::Connected),
+        "Connected published before any probe completed"
+    );
+    let expect_probe = |h: &mut Harness, start: usize, expected, label: &str| {
+        let progress = |h: &Harness| {
+            h.seen[start..].iter().find_map(|m| match m {
+                Message::Changed {
+                    profile_id,
+                    generation: 1,
+                    state: state @ (ConnectionState::Connected | ConnectionState::Unresponsive),
+                    failures,
+                    ..
+                } if profile_id == "one" => Some((*state, *failures)),
+                _ => None,
+            })
+        };
+        h.wait(|h| progress(h).is_some());
+        assert_eq!(progress(h), Some(expected), "{label} Changed");
+        let snapshot = h.snapshot_states();
+        let status = snapshot.iter().find(|s| s.id == "one").unwrap();
+        assert_eq!(status.generation, 1, "{label} Snapshot generation");
+        assert_eq!(
+            (status.state, status.failures),
+            expected,
+            "{label} Snapshot"
+        );
+    };
+    use ConnectionState::{Connected, Unresponsive};
+    let start = h.seen.len();
+    h.control("one", 1, |c| c.hold_probe = false);
+    expect_probe(&mut h, start, (Unresponsive, 1), "initial failed probe");
+    for (responsive, expected, label) in [
+        (true, (Connected, 0), "initial positive proof"),
+        (false, (Connected, 0), "first health failure"),
+        (false, (Unresponsive, 2), "second health failure"),
+        (false, (Unresponsive, 3), "third health failure"),
+        (true, (Connected, 0), "recovery"),
+    ] {
+        h.control("one", 1, |c| {
+            c.responsive = responsive;
+            c.hold_probe = true;
+        });
+        let echo_start = h.seen.len();
+        let request = h.command(Command::Probe {
+            id: "one".into(),
+            generation: 1,
+        });
+        // Probe acknowledges and echoes the current slot before the worker
+        // publishes the sample. Keep the sample blocked until the echo arrives.
+        h.wait(|h| {
+            let mut replies = h.seen[echo_start..].iter();
+            replies.any(|m| matches!(m, Message::Accepted { id } if id == &request))
+                && replies.any(|m| matches!(m, Message::Changed { profile_id, generation: 1, .. } if profile_id == "one"))
+        });
+        let start = h.seen.len();
+        h.control("one", 1, |c| c.hold_probe = false);
+        expect_probe(&mut h, start, expected, label);
+    }
+    let start = h.seen.len();
+    h.control("one", 1, |c| {
+        c.responsive = false;
+        c.restart_epoch += 1;
+    });
+    expect_probe(
+        &mut h,
+        start,
+        (Unresponsive, 1),
+        "first failure after restart",
+    );
     h.command(Command::Disconnect {
         id: "one".into(),
         generation: 2,
