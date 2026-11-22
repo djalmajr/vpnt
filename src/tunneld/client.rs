@@ -1,7 +1,8 @@
 //! Authenticated synchronous client for a single tunneld generation.
 use super::protocol::{
-    Backend, Credentials, ErrorCode, FrameError, Prepare, Request, Response, State, VERSION,
-    decode_response, read_control, timed, write_control,
+    Backend, CLEANUP_VERSION, CleanupState, Credentials, ErrorCode, FrameError, Generation,
+    Prepare, Request, Response, State, VERSION, decode_response, read_control, timed,
+    write_control,
 };
 use crate::helper::local_socket::{Budget, connect_deadline, peer_uid};
 use std::{
@@ -21,18 +22,34 @@ enum Phase {
 pub struct Client {
     stream: Option<UnixStream>,
     phase: Phase,
+    version: u32,
 }
 impl Client {
     pub fn connect(path: &Path, deadline: Instant) -> Result<Self, FrameError> {
-        Self::connect_as(path, deadline, 0, 0)
+        Self::connect_version(path, deadline, 0, 0, VERSION)
     }
 
-    // UID overrides are only reachable by this module and its test fixtures.
+    pub fn connect_v2(path: &Path, deadline: Instant) -> Result<Self, FrameError> {
+        Self::connect_version(path, deadline, 0, 0, CLEANUP_VERSION)
+    }
+
+    #[cfg(test)]
     fn connect_as(
         path: &Path,
         deadline: Instant,
         owner_uid: u32,
         peer: u32,
+    ) -> Result<Self, FrameError> {
+        Self::connect_version(path, deadline, owner_uid, peer, VERSION)
+    }
+
+    // UID overrides are only reachable by this module and its test fixtures.
+    fn connect_version(
+        path: &Path,
+        deadline: Instant,
+        owner_uid: u32,
+        peer: u32,
+        version: u32,
     ) -> Result<Self, FrameError> {
         let budget = Budget::until(deadline, None)?;
         let parent = path.parent().ok_or(ErrorCode::PermissionDenied)?;
@@ -47,26 +64,55 @@ impl Client {
         if before != after || peer_uid(&stream)? != peer {
             return Err(ErrorCode::PermissionDenied.into());
         }
-        match exchange(&stream, Request::Hello { version: VERSION }, deadline)? {
-            Response::Version { version: VERSION } => Ok(Self {
+        match exchange(&stream, Request::Hello { version }, deadline)? {
+            Response::Version {
+                version: negotiated,
+            } if negotiated == version => Ok(Self {
                 stream: Some(stream),
                 phase: Phase::Prepare,
+                version,
             }),
             Response::Version { .. } => Err(ErrorCode::UnsupportedVersion.into()),
             _ => Err(ErrorCode::BadRequest.into()),
         }
     }
 
-    pub fn prepare(&mut self, request: Prepare, deadline: Instant) -> Result<(), FrameError> {
+    pub fn prepare(
+        &mut self,
+        request: Prepare,
+        deadline: Instant,
+    ) -> Result<Option<Generation>, FrameError> {
         let backend = request.backend();
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(
             Phase::Prepare,
             Phase::Credentials(backend),
             |stream| match exchange(stream, request.into(), deadline)? {
-                Response::Prepared {} => Ok(()),
+                Response::Prepared { generation } if generation.is_some() == v2 => Ok(generation),
                 _ => Err(ErrorCode::BadRequest.into()),
             },
         )
+    }
+
+    pub fn cleanup_status(
+        self,
+        generation: &Generation,
+        deadline: Instant,
+    ) -> Result<CleanupState, FrameError> {
+        if self.phase != Phase::Prepare || self.version != CLEANUP_VERSION {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let stream = self.stream.ok_or(ErrorCode::BadRequest)?;
+        match exchange(
+            &stream,
+            Request::CleanupStatus {
+                generation: generation.clone(),
+            },
+            deadline,
+        )? {
+            Response::CleanupStatus { state } => Ok(state),
+            _ => Err(ErrorCode::BadRequest.into()),
+        }
     }
 
     /// Takes ownership so the write buffers are cleared on success or failure.
@@ -376,6 +422,7 @@ mod tests {
             let mut client = Client {
                 stream: Some(stream),
                 phase: Phase::Active,
+                version: VERSION,
             };
             assert_eq!(
                 client.status(deadline()),

@@ -159,7 +159,7 @@ fn json_frames_are_closed_and_bounded() {
         Ok(Request::Hello { version: VERSION })
     ));
     assert_eq!(
-        decode_request(b"{\"op\":\"hello\",\"version\":2}\n").unwrap_err(),
+        decode_request(b"{\"op\":\"hello\",\"version\":3}\n").unwrap_err(),
         ErrorCode::UnsupportedVersion
     );
     for line in [
@@ -510,4 +510,33 @@ fn accepts_credential_limits_and_reports_partial_write() {
         assert!(Credentials::ipsec("p", value).is_err());
         assert!(Credentials::fortinet(value).is_err());
     }
+}
+
+#[test]
+fn version_two_hello_and_cleanup_status_are_strict() {
+    assert!(decode_request(b"{\"op\":\"hello\",\"version\":2}\n").is_ok());
+    assert!(
+        decode_request(
+            b"{\"op\":\"cleanup_status\",\"generation\":\"0123456789abcdef0123456789abcdef\"}\n"
+        )
+        .is_ok()
+    );
+    for invalid in ["../generation", "0123456789ABCDEF0123456789ABCDEF", "", "0"] {
+        let request = format!("{{\"op\":\"cleanup_status\",\"generation\":\"{invalid}\"}}\n");
+        assert_eq!(
+            decode_request(request.as_bytes()).unwrap_err(),
+            ErrorCode::BadRequest
+        );
+    }
+    for malformed in [
+        b"{\"op\":\"cleanup_status\",\"generation\":[]}\n".as_slice(),
+        b"{\"op\":\"cleanup_status\"}\n",
+        b"{\"op\":\"cleanup_status\",\"generation\":\"0123456789abcdef0123456789abcdef\",\"path\":\"/run\"}\n",
+    ] {
+        assert_eq!(decode_request(malformed).unwrap_err(), ErrorCode::BadRequest);
+    }
+    let mut prepared = Vec::new();
+    write_control(&mut prepared, &Response::Prepared { generation: None }).unwrap();
+    assert_eq!(prepared, b"{\"op\":\"prepared\"}\n");
+    assert!(decode_response(b"{\"op\":\"prepared\",\"generation\":null}\n").is_err());
 }

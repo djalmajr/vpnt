@@ -10,8 +10,8 @@ use crate::{
         SOCKET_PATH,
         client::Client,
         protocol::{
-            CidrV4, Credentials as WireCredentials, Endpoint, ErrorCode as WireError,
-            FortinetRequest, FrameError, IpsecRequest, Prepare, State,
+            CidrV4, CleanupState, Credentials as WireCredentials, Endpoint, ErrorCode as WireError,
+            FortinetRequest, FrameError, Generation, IpsecRequest, Prepare, State,
         },
     },
 };
@@ -37,8 +37,7 @@ type Probe = fn(&Profile, &AtomicBool, Duration, ProbeSlot) -> Result<bool, Fail
 enum Session {
     Inactive,
     Active(Client),
-    Stopping(Client),
-    Unconfirmed,
+    Observing,
 }
 
 pub(super) struct TunnelAttempt {
@@ -50,7 +49,7 @@ pub(super) struct TunnelAttempt {
     session: Session,
     connect_deadline: Instant,
     next_status: Instant,
-    admission_pending: bool,
+    generation: Option<Generation>,
 }
 
 impl TunnelAttempt {
@@ -74,7 +73,7 @@ impl TunnelAttempt {
             session: Session::Inactive,
             connect_deadline: now,
             next_status: now,
-            admission_pending: true,
+            generation: None,
         }
     }
 
@@ -86,41 +85,23 @@ impl TunnelAttempt {
         match client.status(deadline) {
             Ok(state) => {
                 match state {
-                    State::Starting | State::NetworkReady => self.admission_pending = false,
-                    State::Stopped => self.session = Session::Inactive,
-                    State::Stopping | State::CleanupPending => {
-                        self.admission_pending = false;
-                        let Session::Active(client) =
-                            std::mem::replace(&mut self.session, Session::Unconfirmed)
-                        else {
-                            unreachable!("status requires an active session");
-                        };
-                        self.session = Session::Stopping(client);
-                    }
-                    State::Prepared => {}
+                    State::Stopped => self.cleaned(),
+                    State::Stopping | State::CleanupPending => self.session = Session::Observing,
+                    _ => {}
                 }
                 Ok(state)
             }
             Err(error) => {
-                self.session = if confirms_absence(error, self.admission_pending) {
-                    Session::Inactive
-                } else {
-                    Session::Unconfirmed
-                };
+                self.session = Session::Observing;
                 Err(wire_failure(error, step))
             }
         }
     }
-}
 
-fn confirms_absence(error: FrameError, admission_pending: bool) -> bool {
-    // These protocol refusals can reject admission. After observed activation
-    // or a stop in progress, only Stopped confirms that the generation is gone.
-    admission_pending
-        && matches!(
-            error,
-            FrameError::Protocol(WireError::MissingProgram | WireError::PermissionDenied)
-        )
+    fn cleaned(&mut self) {
+        self.session = Session::Inactive;
+        self.generation = None;
+    }
 }
 
 fn profile_failure() -> Failure {
@@ -217,15 +198,15 @@ impl Attempt for TunnelAttempt {
             step: Step::Profile,
         })?;
         drop(credentials);
-        let mut client = Client::connect(&self.socket_path, expires)
+        let mut client = Client::connect_v2(&self.socket_path, expires)
             .map_err(|error| wire_failure(error, Step::Runtime))?;
-        client
+        self.generation = client
             .prepare(offer, expires)
             .map_err(|error| wire_failure(error, Step::Tunnel))?;
+        self.session = Session::Observing;
         if canceled.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.session = Session::Unconfirmed;
         client
             .send_credentials(wire_credentials, expires)
             .map_err(|error| wire_failure(error, Step::Tunnel))?;
@@ -272,35 +253,21 @@ impl Attempt for TunnelAttempt {
     }
 
     fn cleanup(&mut self) -> bool {
-        let session = std::mem::replace(&mut self.session, Session::Unconfirmed);
+        let session = std::mem::replace(&mut self.session, Session::Observing);
         let deadline = Instant::now() + CONTROL_TIMEOUT;
-        let (client, result) = match session {
-            Session::Inactive => {
-                self.session = Session::Inactive;
-                return true;
-            }
-            Session::Unconfirmed => return false,
-            Session::Active(mut client) => {
-                let result = client.stop(deadline);
-                (client, result)
-            }
-            Session::Stopping(mut client) => {
-                let result = client.status(deadline);
-                (client, result)
-            }
+        let stopped = match session {
+            Session::Inactive => true,
+            Session::Active(mut client) => matches!(client.stop(deadline), Ok(State::Stopped)),
+            Session::Observing => self.generation.as_ref().is_some_and(|generation| {
+                Client::connect_v2(&self.socket_path, deadline)
+                    .and_then(|client| client.cleanup_status(generation, deadline))
+                    .is_ok_and(|state| state == CleanupState::Stopped)
+            }),
         };
-        match result {
-            Ok(State::Stopped) => self.session = Session::Inactive,
-            Ok(_) => {
-                self.admission_pending = false;
-                self.session = Session::Stopping(client);
-            }
-            Err(error) if confirms_absence(error, self.admission_pending) => {
-                self.session = Session::Inactive;
-            }
-            Err(_) => {}
+        if stopped {
+            self.cleaned();
         }
-        matches!(self.session, Session::Inactive)
+        stopped
     }
 }
 

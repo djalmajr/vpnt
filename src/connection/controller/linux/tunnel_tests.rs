@@ -69,7 +69,7 @@ fn fortinet_without_pin_fails_before_socket_connect() {
 
 use crate::{
     connection::controller::{ProbeClock, Timing, worker},
-    tunneld::protocol::{Command, ServerDecoder, VERSION},
+    tunneld::protocol::{CLEANUP_VERSION, Command, InitialRequest, ServerDecoder},
 };
 use std::{
     fs,
@@ -253,11 +253,35 @@ fn admitted(fixture: &SocketFixture, kind: VpnKind) -> ServerDecoder {
         }
         _ => panic!("tunneld received the wrong backend"),
     }
-    decoder.prepared(wire_deadline()).unwrap();
+    decoder
+        .acknowledge(Some(fixture_generation()), wire_deadline())
+        .unwrap();
     let secret = decoder.credentials(wire_deadline()).unwrap();
     assert!(secret.password() == TEST_PASSWORD);
     assert!(secret.psk() == (kind == VpnKind::Ipsec).then_some(TEST_PSK));
     decoder
+}
+
+fn fixture_generation() -> Generation {
+    Generation::parse("0123456789abcdef0123456789abcdef".into()).unwrap()
+}
+
+fn query_decoder(fixture: &SocketFixture) -> ServerDecoder {
+    let mut decoder = ServerDecoder::new(fixture.accept());
+    decoder.hello(wire_deadline()).unwrap();
+    let InitialRequest::CleanupStatus(generation) =
+        decoder.initial_request(wire_deadline()).unwrap()
+    else {
+        panic!("expected cleanup query");
+    };
+    assert_eq!(generation, fixture_generation());
+    decoder
+}
+
+fn query(fixture: &SocketFixture, state: CleanupState) {
+    query_decoder(fixture)
+        .reply_cleanup(state, wire_deadline())
+        .unwrap();
 }
 
 fn reply(decoder: &mut ServerDecoder, command: Command, state: State) {
@@ -382,8 +406,9 @@ fn stop_waits_for_confirmed_cleanup() {
             let mut decoder = admitted(&fixture, VpnKind::Ssl);
             reply(&mut decoder, Command::Status, State::NetworkReady);
             reply(&mut decoder, Command::Stop, State::CleanupPending);
-            reply(&mut decoder, Command::Status, State::Stopping);
-            reply(&mut decoder, Command::Status, State::Stopped);
+            drop(decoder);
+            query(&fixture, CleanupState::Pending);
+            query(&fixture, CleanupState::Stopped);
         });
         let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
         attempt
@@ -452,7 +477,9 @@ fn daemon_refusals_keep_their_typed_failure() {
                         .unwrap();
                     assert!(matches!(
                         crate::tunneld::protocol::decode_request(request.as_bytes()),
-                        Ok(crate::tunneld::protocol::Request::Hello { version: VERSION })
+                        Ok(crate::tunneld::protocol::Request::Hello {
+                            version: CLEANUP_VERSION
+                        })
                     ));
                     serde_json::to_writer(
                         &mut stream,
@@ -471,6 +498,7 @@ fn daemon_refusals_keep_their_typed_failure() {
                     let mut decoder = admitted(&fixture, VpnKind::Ssl);
                     assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
                     decoder.reject(code, wire_deadline()).unwrap();
+                    query(&fixture, CleanupState::Stopped);
                 }
             });
             let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
@@ -482,10 +510,7 @@ fn daemon_refusals_keep_their_typed_failure() {
                 (failure.state, failure.error, failure.step),
                 (state, error, step)
             );
-            assert_eq!(
-                attempt.cleanup(),
-                !matches!(code, WireError::Timeout | WireError::Backend)
-            );
+            assert!(attempt.cleanup());
             server.join().unwrap();
         });
     }
@@ -558,10 +583,11 @@ fn terminal_refusal_after_cleanup_pending_does_not_confirm_stop() {
         let server = scope.spawn(|| {
             let mut decoder = admitted(&fixture, VpnKind::Ssl);
             reply(&mut decoder, Command::Stop, State::CleanupPending);
-            assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
-            decoder
+            drop(decoder);
+            query_decoder(&fixture)
                 .reject(WireError::PermissionDenied, wire_deadline())
                 .unwrap();
+            query(&fixture, CleanupState::Unknown);
         });
         let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
         attempt
@@ -575,4 +601,80 @@ fn terminal_refusal_after_cleanup_pending_does_not_confirm_stop() {
         assert!(!attempt.cleanup());
         server.join().unwrap();
     });
+}
+
+#[test]
+fn old_daemon_rejects_before_preparation_or_credentials() {
+    if !wire_fixture("old_daemon_rejects_before_preparation_or_credentials") {
+        return;
+    }
+    let fixture = SocketFixture::new("old");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            use std::io::{BufRead, BufReader, Read};
+            let mut socket = BufReader::new(fixture.accept());
+            socket
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut hello = String::new();
+            socket.read_line(&mut hello).unwrap();
+            assert_eq!(hello, "{\"op\":\"hello\",\"version\":2}\n");
+            socket
+                .get_mut()
+                .write_all(b"{\"op\":\"error\",\"code\":\"unsupported_version\"}\n")
+                .unwrap();
+            assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
+        assert!(
+            attempt
+                .start(&AtomicBool::new(false), wire_deadline())
+                .is_err()
+        );
+        assert!(attempt.cleanup());
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn lost_control_replies_leave_generation_available_for_fresh_queries() {
+    if !wire_fixture("lost_control_replies_leave_generation_available_for_fresh_queries") {
+        return;
+    }
+    for stopping in [true, false] {
+        let fixture = SocketFixture::new(if stopping { "lost-stop" } else { "lost-status" });
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let mut decoder = admitted(&fixture, VpnKind::Ssl);
+                let command = if stopping {
+                    Command::Stop
+                } else {
+                    Command::Status
+                };
+                assert_eq!(decoder.command(wire_deadline()).unwrap(), command);
+                thread::sleep(if stopping {
+                    CONTROL_TIMEOUT + Duration::from_millis(150)
+                } else {
+                    Duration::from_millis(500)
+                });
+                drop(decoder);
+                query(&fixture, CleanupState::Pending);
+                query(&fixture, CleanupState::Stopped);
+            });
+            let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
+            attempt
+                .start(&AtomicBool::new(false), wire_deadline())
+                .unwrap();
+            if stopping {
+                assert!(!attempt.cleanup());
+            } else {
+                attempt.connect_deadline = Instant::now() + Duration::from_millis(150);
+                assert!(attempt.ready().is_err());
+            }
+            assert!(!attempt.cleanup());
+            assert!(attempt.cleanup());
+            server.join().unwrap();
+        });
+    }
 }

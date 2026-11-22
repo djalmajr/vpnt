@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod attest;
 mod backend;
+mod cleanup;
 pub mod client;
 pub mod fortinet_instance;
 mod fortinet_network;

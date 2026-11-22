@@ -1,12 +1,13 @@
-//! Linux socket activation, bounded admission, and the v1 dialogue.
+//! Linux socket activation, bounded admission, and versioned dialogues.
 use super::admin::PolicyStore;
-use super::backend::{Launch, Launcher, Running};
+use super::backend::{Launch, Launcher, RUNTIME_DIRECTORY, Running, retry_cleanup};
+use super::cleanup::{Reservation, Store};
 use super::network::SetupCancellation;
 #[cfg(test)]
 use super::protocol::Prepare;
 use super::protocol::{
-    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, State, decode_request,
-    read_control, timed, write_control,
+    CLEANUP_VERSION, CleanupState, Command, ErrorCode, FrameError, InitialRequest, Request,
+    Response, ServerDecoder, State, decode_request, read_control, timed, write_control,
 };
 use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
@@ -14,11 +15,16 @@ use std::{
     ffi::OsString,
     fs::File,
     io,
+    net::Shutdown,
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
-    sync::{Arc, Mutex},
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,7 +38,9 @@ const LISTEN_FD: RawFd = 3;
 struct Server {
     connections: Mutex<Connections>,
     policy: PolicyStore,
-    launcher: Box<dyn Launch>,
+    launcher: Arc<dyn Launch>,
+    cleanup: Option<Arc<Store>>,
+    recovered: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -79,16 +87,40 @@ impl Default for Server {
 
 impl Server {
     fn new(policy: PolicyStore) -> io::Result<Self> {
-        let launcher = Launcher::system(IpRoute::system());
-        launcher.recover()?;
-        Ok(Self::with_launcher(policy, Box::new(launcher)))
+        let launcher = Arc::new(Launcher::system(IpRoute::system()));
+        let cleanup = Arc::new(Store::open(Path::new(RUNTIME_DIRECTORY))?);
+        let recovered = Arc::new(AtomicBool::new(false));
+        let worker = (launcher.clone(), cleanup.clone(), recovered.clone());
+        thread::Builder::new()
+            .name("vpnt-tunneld-recovery".into())
+            .spawn(move || {
+                let (launcher, cleanup, recovered) = worker;
+                let ready = retry_cleanup(|| match launcher.recover_with(Some(&cleanup)) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("vpnt-tunneld: startup recovery is unproven: {error}");
+                        false
+                    }
+                });
+                recovered.store(ready, Ordering::Release);
+            })?;
+        Ok(Self {
+            connections: Mutex::default(),
+            policy,
+            launcher,
+            cleanup: Some(cleanup),
+            recovered,
+        })
     }
 
+    #[cfg(test)]
     fn with_launcher(policy: PolicyStore, launcher: Box<dyn Launch>) -> Self {
         Self {
             connections: Mutex::default(),
             policy,
-            launcher,
+            launcher: Arc::from(launcher),
+            cleanup: None,
+            recovered: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -133,6 +165,8 @@ impl Server {
                 &slot.admission,
                 &slot.server.policy,
                 &*slot.server.launcher,
+                slot.server.cleanup.as_deref(),
+                &slot.server.recovered,
                 accepted,
             );
             drop(slot);
@@ -151,6 +185,8 @@ fn serve(
     admission: &Admission,
     policy: &PolicyStore,
     launcher: &dyn Launch,
+    cleanup: Option<&Store>,
+    recovered: &AtomicBool,
     accepted: Instant,
 ) -> Result<(), FrameError> {
     let hello_deadline = accepted + FRAME_TIMEOUT;
@@ -178,13 +214,23 @@ fn serve(
     }
 
     let prepare_deadline = Instant::now() + FRAME_TIMEOUT;
-    let offer = match decoder.prepare(prepare_deadline) {
-        Ok(offer) => offer,
+    let v2 = decoder.version() == CLEANUP_VERSION;
+    let offer = match decoder.initial_request(prepare_deadline) {
+        Ok(InitialRequest::Prepare(offer)) => offer,
+        Ok(InitialRequest::CleanupStatus(generation)) => {
+            let status = cleanup.map_or(CleanupState::Unknown, |store| {
+                store.status(uid, &generation)
+            });
+            return decoder.reply_cleanup(status, prepare_deadline);
+        }
         Err(FrameError::Protocol(_)) => {
             return reply_error(&stream, ErrorCode::BadRequest, prepare_deadline);
         }
         Err(error) => return Err(error),
     };
+    if !recovered.load(Ordering::Acquire) {
+        return decoder.reject(ErrorCode::Busy, prepare_deadline);
+    }
     let read_policy = || {
         let directory = policy.open()?;
         let _lock = directory.lock_shared()?;
@@ -199,7 +245,22 @@ fn serve(
     }) else {
         return decoder.reject(ErrorCode::PermissionDenied, prepare_deadline);
     };
-    decoder.prepared(prepare_deadline)?;
+    let mut reservation = if v2 {
+        match cleanup.map(|store| store.reserve(uid)) {
+            Some(Ok(reservation)) => Some(reservation),
+            Some(Err(error)) => {
+                eprintln!("vpnt-tunneld: could not reserve cleanup receipt: {error}");
+                return decoder.reject(ErrorCode::Busy, prepare_deadline);
+            }
+            None => return decoder.reject(ErrorCode::Backend, prepare_deadline),
+        }
+    } else {
+        None
+    };
+    let generation = reservation
+        .as_ref()
+        .map(|record| record.generation().clone());
+    decoder.acknowledge(generation.clone(), prepare_deadline)?;
 
     let credential_deadline = Instant::now() + FRAME_TIMEOUT;
     let credentials = decoder.credentials(credential_deadline)?;
@@ -220,20 +281,58 @@ fn serve(
     let (completion, done) = UnixStream::pair()?;
     let cancel = Arc::new(SetupCancellation::default());
     let (commands, result) = thread::scope(|scope| -> Result<_, FrameError> {
+        let launch_cancel = &cancel;
         let worker = thread::Builder::new().spawn_scoped(scope, || {
             let _signal_on_drop = done;
-            launcher.launch(&offer, grant, credentials, authorization, &cancel)
+            if let Some(record) = reservation.as_mut() {
+                if let Err(error) = record.arm() {
+                    eprintln!("vpnt-tunneld: could not arm cleanup receipt: {error}");
+                    return Err(ErrorCode::Backend);
+                }
+                launcher.launch_v2(
+                    &offer,
+                    grant,
+                    credentials,
+                    authorization,
+                    launch_cancel,
+                    record.generation(),
+                )
+            } else {
+                launcher.launch(&offer, grant, credentials, authorization, launch_cancel)
+            }
         })?;
-        let commands = watch_setup(&stream, &completion, &mut decoder);
+        let commands = watch_setup(&stream, &completion, &mut decoder, &cancel, v2);
         if !matches!(commands, Ok((_, false))) {
             cancel.cancel();
         }
         let result = worker
             .join()
             .map_err(|_| io::Error::other("setup worker panicked"))?;
-        Ok((commands?, result))
+        Ok((commands, result))
     })?;
-    let (statuses, stop) = commands;
+    if let Some(record) = reservation {
+        return match result {
+            Ok(session) if matches!(commands, Ok((_, false))) => {
+                dialogue_v2(&stream, decoder, session, &record)
+            }
+            Ok(session) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                finish_v2(session, &record);
+                commands.map(|_| ())
+            }
+            Err(code) => {
+                if code != ErrorCode::CleanupPending {
+                    record_stopped(&record);
+                }
+                if matches!(commands, Ok((_, false))) {
+                    decoder.reject(code, Instant::now() + FRAME_TIMEOUT)
+                } else {
+                    commands.map(|_| ())
+                }
+            }
+        };
+    }
+    let (statuses, stop) = commands?;
     let mut session = match result {
         Ok(session) => session,
         Err(code) if stop => {
@@ -270,6 +369,8 @@ fn watch_setup(
     client: &UnixStream,
     completion: &UnixStream,
     decoder: &mut ServerDecoder,
+    cancel: &SetupCancellation,
+    v2: bool,
 ) -> Result<(usize, bool), FrameError> {
     let mut statuses = 0;
     loop {
@@ -295,8 +396,20 @@ fn watch_setup(
         }
         if fds[0].revents != 0 {
             match decoder.command(Instant::now() + FRAME_TIMEOUT)? {
+                Command::Status if v2 => {
+                    decoder.reply_status(State::Starting, Instant::now() + FRAME_TIMEOUT)?;
+                }
                 Command::Status => statuses += 1,
-                Command::Stop => return Ok((statuses, true)),
+                Command::Stop => {
+                    if v2 {
+                        cancel.cancel();
+                        let result =
+                            decoder.reply_status(State::Stopping, Instant::now() + FRAME_TIMEOUT);
+                        let _ = client.shutdown(Shutdown::Both);
+                        result?;
+                    }
+                    return Ok((statuses, true));
+                }
             }
             // A half-close can follow the last queued Status. Read EOF
             // before releasing the setup worker's result to the client.
@@ -391,6 +504,46 @@ fn dialogue(
     }
 }
 
+fn record_stopped(record: &Reservation<'_>) {
+    retry_cleanup(|| match record.stopped() {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("vpnt-tunneld: could not record completed cleanup: {error}");
+            false
+        }
+    });
+}
+
+fn finish_v2(mut session: Box<dyn Running + '_>, record: &Reservation<'_>) {
+    if retry_cleanup(|| session.stop() == State::Stopped) {
+        record_stopped(record);
+    }
+}
+
+fn dialogue_v2(
+    stream: &UnixStream,
+    mut decoder: ServerDecoder,
+    session: Box<dyn Running + '_>,
+    record: &Reservation<'_>,
+) -> Result<(), FrameError> {
+    let result = (|| {
+        loop {
+            let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS)?;
+            if ended || !client_ready {
+                return Ok(());
+            }
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            match decoder.command(deadline)? {
+                Command::Status => decoder.reply_status(session.state(), deadline)?,
+                Command::Stop => return decoder.reply_status(State::Stopping, deadline),
+            }
+        }
+    })();
+    let _ = stream.shutdown(Shutdown::Both);
+    finish_v2(session, record);
+    result
+}
+
 #[cfg(test)]
 pub(super) fn serve_fixture(
     stream: UnixStream,
@@ -402,6 +555,27 @@ pub(super) fn serve_fixture(
         &Admission::Session(1000),
         policy,
         launcher,
+        None,
+        &AtomicBool::new(true),
+        Instant::now(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn serve_cleanup_fixture(
+    stream: UnixStream,
+    uid: u32,
+    policy: &PolicyStore,
+    launcher: &dyn Launch,
+    cleanup: &Store,
+) -> Result<(), FrameError> {
+    serve(
+        stream,
+        &Admission::Session(uid),
+        policy,
+        launcher,
+        Some(cleanup),
+        &AtomicBool::new(true),
         Instant::now(),
     )
 }
@@ -553,7 +727,7 @@ mod policy_dialogue_tests {
         assert!(matches!(tests_receive(&client), Response::Version { .. }));
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":{port}}},"username":"fixture","networks":[{{"network":"{network}","prefix":16}}]}}"#).unwrap();
         let mut response = tests_receive(&client);
-        if matches!(response, Response::Prepared {}) {
+        if matches!(response, Response::Prepared { generation: None }) {
             after_prepared();
             Credentials::ipsec("fixture-password", "fixture-psk")
                 .unwrap()
@@ -826,7 +1000,10 @@ mod policy_dialogue_tests {
             .unwrap();
         assert!(matches!(tests_receive(&client), Response::Version { .. }));
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
-        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        assert!(matches!(
+            tests_receive(&client),
+            Response::Prepared { generation: None }
+        ));
         let mut credentials = Vec::new();
         Credentials::ipsec("fixture-password", "fixture-psk")
             .unwrap()
@@ -1043,7 +1220,10 @@ mod policy_dialogue_tests {
             .unwrap();
         tests_receive(&client);
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
-        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        assert!(matches!(
+            tests_receive(&client),
+            Response::Prepared { generation: None }
+        ));
         fixture.revoke();
         let directory = fixture.store.open().unwrap();
         drop(acquire_eventually(|| directory.lock_shared()).unwrap());

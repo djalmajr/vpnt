@@ -1,4 +1,4 @@
-//! Version-one control and credential frames for a single tunnel generation.
+//! Versioned control and credential frames for a single tunnel generation.
 use crate::helper::local_socket::{Budget, TimedStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -11,6 +11,7 @@ use std::{
 use zeroize::Zeroizing;
 
 pub const VERSION: u32 = 1;
+pub const CLEANUP_VERSION: u32 = 2;
 /// Maximum encoded control frame size, including LF.
 pub const MAX_LINE: usize = 16 * 1024;
 
@@ -118,6 +119,51 @@ macro_rules! named_object {
     };
 }
 
+/// Server-assigned generation, also safe as a single private path component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Generation(String);
+
+impl Generation {
+    pub(crate) fn parse(text: String) -> Option<Self> {
+        (text.len() == 32
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(Self(text))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Generation {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(decoder)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid generation"))
+    }
+}
+
+fn present_generation<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Generation>, D::Error> {
+    Generation::deserialize(decoder).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupState {
+    Pending,
+    Stopped,
+    Unknown,
+}
+
+pub(crate) enum InitialRequest {
+    Prepare(Prepare),
+    CleanupStatus(Generation),
+}
+
 named_object! {
     #[derive(Debug, Serialize)]
     #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -128,6 +174,7 @@ named_object! {
         PrepareFortinet(FortinetRequest),
         Status {},
         Stop {},
+        CleanupStatus { generation: Generation },
     }
 }
 
@@ -137,7 +184,11 @@ named_object! {
     serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)
     pub enum Response {
         Version { version: u32 },
-        Prepared {},
+        Prepared {
+            #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_generation")]
+            generation: Option<Generation>,
+        },
+        CleanupStatus { state: CleanupState },
         Status { state: State },
         Error { code: ErrorCode },
     }
@@ -410,7 +461,9 @@ mod pin {
 
 pub fn decode_request(line: &[u8]) -> Result<Request, ErrorCode> {
     match decode(line)? {
-        Request::Hello { version } if version != VERSION => Err(ErrorCode::UnsupportedVersion),
+        Request::Hello { version } if !matches!(version, VERSION | CLEANUP_VERSION) => {
+            Err(ErrorCode::UnsupportedVersion)
+        }
         request => Ok(request),
     }
 }
@@ -654,6 +707,7 @@ enum Phase {
     Prepare,
     Admission(Backend),
     Credentials(Backend),
+    CleanupStatus,
     Active,
 }
 
@@ -663,12 +717,14 @@ enum Phase {
 pub struct ServerDecoder {
     stream: Option<UnixStream>,
     phase: Phase,
+    version: u32,
 }
 impl ServerDecoder {
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream: Some(stream),
             phase: Phase::Hello,
+            version: VERSION,
         }
     }
 
@@ -689,11 +745,11 @@ impl ServerDecoder {
     }
 
     pub fn hello(&mut self, deadline: Instant) -> Result<(), FrameError> {
-        self.in_phase(Phase::Hello, deadline, |_, io| {
+        let version = self.in_phase(Phase::Hello, deadline, |_, io| {
             match read_control(io, decode_request) {
-                Ok(Request::Hello { .. }) => {
-                    write_control(io, &Response::Version { version: VERSION })?;
-                    Ok(((), Phase::Prepare))
+                Ok(Request::Hello { version }) => {
+                    write_control(io, &Response::Version { version })?;
+                    Ok((version, Phase::Prepare))
                 }
                 Err(FrameError::Protocol(ErrorCode::UnsupportedVersion)) => {
                     write_control(
@@ -707,22 +763,73 @@ impl ServerDecoder {
                 Ok(_) => Err(ErrorCode::BadRequest.into()),
                 Err(error) => Err(error),
             }
-        })
+        })?;
+        self.version = version;
+        Ok(())
     }
 
-    pub fn prepare(&mut self, deadline: Instant) -> Result<Prepare, FrameError> {
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub(crate) fn initial_request(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<InitialRequest, FrameError> {
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(Phase::Prepare, deadline, |_, io| {
             let prepare = match read_control(io, decode_request)? {
                 Request::PrepareIpsec(request) => Prepare::Ipsec(request),
                 Request::PrepareFortinet(request) => Prepare::Fortinet(request),
+                Request::CleanupStatus { generation } if v2 => {
+                    return Ok((
+                        InitialRequest::CleanupStatus(generation),
+                        Phase::CleanupStatus,
+                    ));
+                }
                 _ => return Err(ErrorCode::BadRequest.into()),
             };
             let backend = prepare.backend();
-            Ok((prepare, Phase::Admission(backend)))
+            Ok((InitialRequest::Prepare(prepare), Phase::Admission(backend)))
         })
     }
 
+    pub(crate) fn reply_cleanup(
+        &mut self,
+        state: CleanupState,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        self.in_phase(Phase::CleanupStatus, deadline, |_, io| {
+            write_control(io, &Response::CleanupStatus { state })?;
+            Ok(((), Phase::CleanupStatus))
+        })
+    }
+
+    #[cfg(test)]
+    pub fn prepare(&mut self, deadline: Instant) -> Result<Prepare, FrameError> {
+        match self.initial_request(deadline)? {
+            InitialRequest::Prepare(offer) => Ok(offer),
+            InitialRequest::CleanupStatus(_) => {
+                self.stream.take();
+                Err(ErrorCode::BadRequest.into())
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn prepared(&mut self, deadline: Instant) -> Result<(), FrameError> {
+        self.acknowledge(None, deadline)
+    }
+
+    pub(crate) fn acknowledge(
+        &mut self,
+        generation: Option<Generation>,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        if generation.is_some() != (self.version == CLEANUP_VERSION) {
+            self.stream.take();
+            return Err(ErrorCode::BadRequest.into());
+        }
         let Phase::Admission(backend) = self.phase else {
             self.stream.take();
             return Err(ErrorCode::BadRequest.into());
@@ -733,7 +840,7 @@ impl ServerDecoder {
             if has_queued_byte(stream, deadline)? {
                 return Err(ErrorCode::BadRequest.into());
             }
-            write_control(io, &Response::Prepared {})?;
+            write_control(io, &Response::Prepared { generation })?;
             Ok(((), Phase::Credentials(backend)))
         })
     }

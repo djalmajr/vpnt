@@ -1,6 +1,7 @@
 //! Admission, authenticated instance control, and lease recovery.
 use super::{
     attest::SystemdAttestor,
+    cleanup::Store,
     fortinet_instance::{self, Event},
     fortinet_network::{self, FortinetNetwork},
     handshake::{
@@ -10,7 +11,7 @@ use super::{
     instance_protocol::{Order, Reply, Start, encode_credentials},
     network::{Network, Receipt, SetupCancellation, parse_cidr, valid_generation},
     policy::{Entry, MAX_IPSEC_ROUTES},
-    protocol::{self, CidrV4, Credentials, ErrorCode, FortinetRequest, Prepare, State},
+    protocol::{self, CidrV4, Credentials, ErrorCode, FortinetRequest, Generation, Prepare, State},
 };
 use crate::{
     helper::local_socket::Budget,
@@ -60,6 +61,19 @@ pub(super) trait Launch: Send + Sync {
         authorization: File,
         cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode>;
+
+    fn launch_v2<'a>(
+        &'a self,
+        offer: &Prepare,
+        grant: &Entry,
+        credentials: Credentials,
+        authorization: File,
+        cancel: &Arc<SetupCancellation>,
+        generation: &Generation,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        let _ = (offer, grant, credentials, authorization, cancel, generation);
+        Err(ErrorCode::Backend)
+    }
 }
 
 /// One admitted session. Dropping it stops it.
@@ -73,6 +87,19 @@ pub(super) trait Running: Send {
     }
     /// Stop and clean up. A `CleanupPending` result may be retried.
     fn stop(&mut self) -> State;
+}
+
+pub(super) fn retry_cleanup(mut attempt: impl FnMut() -> bool) -> bool {
+    const ATTEMPTS: usize = 3;
+    for count in 0..ATTEMPTS {
+        if count != 0 {
+            thread::sleep(Duration::from_millis(100));
+        }
+        if attempt() {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -585,12 +612,19 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         Ok(directory)
     }
 
+    #[cfg(test)]
     pub(super) fn recover(&self) -> io::Result<()> {
+        self.recover_with(None)
+    }
+
+    pub(super) fn recover_with(&self, cleanup: Option<&Store>) -> io::Result<()> {
         let guard = (self.lock)(Instant::now() + self.limits.lock)?;
         let parent = self.runtime.join(INSTANCE_DIRECTORY);
         match require_private(&parent) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Self::recover_without_leases(cleanup, &guard);
+            }
             Err(e) => return Err(e),
         }
         for entry in fs::read_dir(&parent)? {
@@ -618,6 +652,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                                 receipt.save(&directory, &guard)?;
                             }
                             guard.withdraw(generation)?;
+                            if let Some(cleanup) = cleanup {
+                                cleanup.recovered(generation)?;
+                            }
                             continue;
                         }
                         Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -637,6 +674,18 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 receipt.save(&directory, &guard)?;
             }
             guard.withdraw(generation)?;
+            if let Some(cleanup) = cleanup {
+                cleanup.recovered(generation)?;
+            }
+        }
+        Self::recover_without_leases(cleanup, &guard)
+    }
+
+    fn recover_without_leases(cleanup: Option<&Store>, guard: &NetworkGuard) -> io::Result<()> {
+        if let Some(cleanup) = cleanup
+            && !guard.tunnels_present()?
+        {
+            cleanup.recovered_without_leases()?;
         }
         Ok(())
     }
@@ -825,11 +874,16 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         entry: Option<&Entry>,
         authorization: Option<File>,
         cancel: &SetupCancellation,
+        reserved: Option<&Generation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
-        let generation = generation().map_err(|error| {
-            eprintln!("vpnt-tunneld: could not draw a generation: {error}");
-            ErrorCode::Backend
-        })?;
+        let generation = match reserved {
+            Some(id) => id.as_str().to_owned(),
+            None => generation().map_err(|error| {
+                eprintln!("vpnt-tunneld: could not draw a generation: {error}");
+                ErrorCode::Backend
+            })?,
+        };
+        let managed_cleanup = reserved.is_some();
         let mut attempt = Attempt::new(backend, generation);
         let mut channel = None;
         let state = if setup.is_some() {
@@ -851,6 +905,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 channel,
                 peer: Some(peer),
                 state,
+                managed_cleanup,
             })),
             Err(failure) => {
                 eprintln!("vpnt-tunneld: admission ended: {}", failure.cause);
@@ -861,11 +916,19 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                         channel,
                         peer: None,
                         state,
+                        managed_cleanup,
                     };
-                    session.stop();
+                    if !managed_cleanup {
+                        session.stop();
+                    }
                     return Ok(Box::new(session));
                 }
-                Err(if self.teardown(&mut attempt, channel) {
+                let stopped = if managed_cleanup {
+                    retry_cleanup(|| self.teardown(&mut attempt, channel.take()))
+                } else {
+                    self.teardown(&mut attempt, channel)
+                };
+                Err(if stopped {
                     failure.code
                 } else {
                     ErrorCode::CleanupPending
@@ -959,10 +1022,50 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         authorization: File,
         cancel: &Arc<SetupCancellation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        self.launch_for(offer, grant, credentials, authorization, cancel, None)
+    }
+
+    fn launch_v2<'a>(
+        &'a self,
+        offer: &Prepare,
+        grant: &Entry,
+        credentials: Credentials,
+        authorization: File,
+        cancel: &Arc<SetupCancellation>,
+        generation: &Generation,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+        self.launch_for(
+            offer,
+            grant,
+            credentials,
+            authorization,
+            cancel,
+            Some(generation),
+        )
+    }
+}
+
+impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
+    fn launch_for<'a>(
+        &'a self,
+        offer: &Prepare,
+        grant: &Entry,
+        credentials: Credentials,
+        authorization: File,
+        cancel: &SetupCancellation,
+        generation: Option<&Generation>,
+    ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let request = match offer {
             Prepare::Ipsec(request) => request,
             Prepare::Fortinet(request) => {
-                return self.launch_fortinet(request, grant, &credentials, authorization, cancel);
+                return self.launch_fortinet(
+                    request,
+                    grant,
+                    &credentials,
+                    authorization,
+                    cancel,
+                    generation,
+                );
             }
         };
         let grant: IpsecGrant = serde_json::to_value(grant)
@@ -1008,11 +1111,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             None,
             Some(authorization),
             cancel,
+            generation,
         )
     }
-}
 
-impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch_fortinet<'a>(
         &'a self,
         request: &FortinetRequest,
@@ -1020,6 +1122,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         credentials: &Credentials,
         authorization: File,
         cancel: &SetupCancellation,
+        generation: Option<&Generation>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         if credentials.backend() != protocol::Backend::Fortinet {
             return Err(ErrorCode::BadRequest);
@@ -1055,6 +1158,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             Some(grant),
             Some(authorization),
             cancel,
+            generation,
         )
     }
 }
@@ -1065,6 +1169,7 @@ struct Session<'a, N: NetworkBackend, A: UnitAttestor + Send + Sync> {
     channel: Option<AuthenticatedChannel>,
     peer: Option<OwnedFd>,
     state: State,
+    managed_cleanup: bool,
 }
 
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N, A> {
@@ -1102,7 +1207,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
 
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Drop for Session<'_, N, A> {
     fn drop(&mut self) {
-        Running::stop(self);
+        if !self.managed_cleanup || self.state != State::CleanupPending {
+            Running::stop(self);
+        }
     }
 }
 
@@ -1121,7 +1228,7 @@ fn require_private(path: &Path) -> io::Result<()> {
 }
 
 /// 32 lowercase hex characters from the kernel, new for every session.
-fn generation() -> io::Result<String> {
+pub(super) fn generation() -> io::Result<String> {
     use std::fmt::Write as _;
 
     let mut bytes = [0_u8; 16];
@@ -1196,7 +1303,14 @@ fn wait_systemctl(mut child: Reaper, deadline: Instant) -> io::Result<()> {
 #[cfg(test)]
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn launch(&self, backend: Backend) -> Result<Box<dyn Running + '_>, ErrorCode> {
-        self.launch_backend(backend, None, None, None, &SetupCancellation::default())
+        self.launch_backend(
+            backend,
+            None,
+            None,
+            None,
+            &SetupCancellation::default(),
+            None,
+        )
     }
 
     fn with_fortinet(mut self, network: FortinetNetwork, xfrm: Network) -> Self {
@@ -1385,6 +1499,12 @@ mod tests {
                  [ \"$1\" = start ] && [ -e '{root}/fail-start' ] && exit 1\n\
                  [ \"$1\" = stop ] && [ -e '{root}/fail-stop' ] && exit 1\n\
                  [ \"$1\" = set-property ] && [ -e '{root}/fail-set-property' ] && exit 1\n\
+                 if [ \"$1\" = revert ] && [ -e '{root}/slow-revert-once' ]; then
+                     : > '{root}/revert-entered'
+                     /usr/bin/sleep 1.4
+                     /usr/bin/rm -- '{root}/slow-revert-once'
+                     exit 1
+                 fi
                  [ \"$1\" = revert ] && [ -e '{root}/fail-revert' ] && exit 1\n\
                  exit 0\n",
                 log = log.display(),
@@ -2151,6 +2271,88 @@ mod tests {
         }
 
         #[test]
+        fn v2_fortinet_uses_the_prepared_generation_through_cleanup() {
+            use crate::tunneld::{
+                admin::PolicyFixture, client::Client, policy::canonical_snapshot,
+                protocol::CleanupState, server::serve_cleanup_fixture,
+            };
+            use std::os::unix::net::UnixListener;
+            if !namespaced_in(
+                "v2_fortinet_uses_the_prepared_generation_through_cleanup",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            let rig = Rig::new();
+            let launcher = rig.launcher(false);
+            let policy_file = PolicyFixture::new();
+            policy_file.install();
+            let snapshot = serde_json::json!({"version": 1, "entries": [policy(&[])]});
+            fs::write(
+                policy_file.path(),
+                canonical_snapshot(snapshot.to_string().as_bytes()).unwrap(),
+            )
+            .unwrap();
+            rig.instance(Script::Ready(standard_events()));
+            let cleanup = Store::open(&rig.harness.runtime).unwrap();
+            let path = rig.harness.root.join("client.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    let (stream, _) = listener.accept().unwrap();
+                    serve_cleanup_fixture(stream, 1000, &policy_file.store, &launcher, &cleanup)
+                });
+                let deadline = || Instant::now() + Duration::from_secs(1);
+                let mut client = Client::connect_v2(&path, deadline()).unwrap();
+                let offer = Prepare::Fortinet(
+                    FortinetRequest::new(
+                        Endpoint::new("vpn.example".into(), 443).unwrap(),
+                        "alice".into(),
+                        PIN,
+                    )
+                    .unwrap(),
+                );
+                let id = client.prepare(offer, deadline()).unwrap().unwrap();
+                assert!(rig.harness.log().is_empty());
+                client
+                    .send_credentials(Credentials::fortinet(PASSWORD).unwrap(), deadline())
+                    .unwrap();
+                let ready_by = Instant::now() + Duration::from_secs(8);
+                loop {
+                    match client.status(deadline()).unwrap() {
+                        State::NetworkReady => break,
+                        State::Starting if Instant::now() < ready_by => {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        state => panic!("unexpected v2 status: {state:?}"),
+                    }
+                }
+                assert_eq!(rig.routes(), ["10.20.0.0/16"]);
+                assert_eq!(rig.dns(), ["10.20.1.53"]);
+                let unit = started_unit(&rig.harness.log).unwrap();
+                assert_eq!(generation_of(&unit), id.as_str());
+                assert_eq!(client.stop(deadline()).unwrap(), State::Stopping);
+                worker.join().unwrap().unwrap();
+                let observer = scope.spawn(|| {
+                    let (stream, _) = listener.accept().unwrap();
+                    serve_cleanup_fixture(stream, 1000, &policy_file.store, &launcher, &cleanup)
+                });
+                let observer_client = Client::connect_v2(&path, deadline()).unwrap();
+                assert_eq!(
+                    observer_client.cleanup_status(&id, deadline()).unwrap(),
+                    CleanupState::Stopped
+                );
+                observer.join().unwrap().unwrap();
+                assert!(
+                    rig.routes().is_empty()
+                        && rig.dns().is_empty()
+                        && rig.harness.leases().is_empty()
+                );
+                assert_reverted_after_stop(&rig, &unit);
+            });
+        }
+
+        #[test]
         fn a_fortinet_attempt_reaches_network_ready_with_the_accepted_network_and_stops_clean() {
             if !namespaced_in(
                 "a_fortinet_attempt_reaches_network_ready_with_the_accepted_network_and_stops_clean",
@@ -2869,7 +3071,313 @@ mod tests {
                 .unwrap();
             assert!(matches!(response(client), Response::Version { .. }));
             client.write_all(b"{\"op\":\"prepare_ipsec\",\"endpoint\":{\"host\":\"vpn.example\",\"port\":500},\"username\":\"fixture\",\"networks\":[{\"network\":\"10.20.1.0\",\"prefix\":24}]}\n").unwrap();
-            assert!(matches!(response(client), Response::Prepared {}));
+            assert!(matches!(
+                response(client),
+                Response::Prepared { generation: None }
+            ));
+        }
+
+        fn v2_prepare(client: &mut UnixStream) -> Generation {
+            v2_hello(client);
+            client.write_all(b"{\"op\":\"prepare_ipsec\",\"endpoint\":{\"host\":\"vpn.example\",\"port\":500},\"username\":\"fixture\",\"networks\":[{\"network\":\"10.20.1.0\",\"prefix\":24}]}\n").unwrap();
+            match response(client) {
+                Response::Prepared {
+                    generation: Some(generation),
+                } => generation,
+                reply => panic!("expected v2 preparation, got {reply:?}"),
+            }
+        }
+
+        fn v2_hello(client: &mut UnixStream) {
+            client
+                .write_all(b"{\"op\":\"hello\",\"version\":2}\n")
+                .unwrap();
+            assert!(matches!(response(client), Response::Version { version: 2 }));
+        }
+
+        fn v2_query(
+            uid: u32,
+            policy: &PolicyFixture,
+            launcher: &dyn Launch,
+            cleanup: &Store,
+            generation: &Generation,
+        ) -> protocol::CleanupState {
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    super::super::super::server::serve_cleanup_fixture(
+                        stream,
+                        uid,
+                        &policy.store,
+                        launcher,
+                        cleanup,
+                    )
+                });
+                v2_hello(&mut client);
+                protocol::write_control(
+                    &mut client,
+                    &protocol::Request::CleanupStatus {
+                        generation: generation.clone(),
+                    },
+                )
+                .unwrap();
+                let Response::CleanupStatus { state } =
+                    response_with_timeout(&client, Duration::from_secs(1))
+                else {
+                    panic!("expected cleanup receipt status");
+                };
+                worker.join().unwrap().unwrap();
+                state
+            })
+        }
+
+        fn v2_ready(client: &mut UnixStream) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                client.write_all(b"{\"op\":\"status\"}\n").unwrap();
+                match response_with_timeout(client, Duration::from_secs(1)) {
+                    Response::Status {
+                        state: State::NetworkReady,
+                    } => return,
+                    Response::Status {
+                        state: State::Starting,
+                    } if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    reply => panic!("unexpected v2 status: {reply:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn v2_stop_and_eof_converge_after_slow_transient_revert() {
+            use crate::tunneld::{
+                client::Client, protocol::CleanupState, server::serve_cleanup_fixture,
+            };
+            use std::os::unix::net::UnixListener;
+            if !namespaced_in(
+                "v2_stop_and_eof_converge_after_slow_transient_revert",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            for explicit in [true, false] {
+                let harness = Harness::new();
+                let policy = PolicyFixture::new();
+                policy.install();
+                harness.flag("negotiated-route", true);
+                harness.flag("slow-revert-once", true);
+                let mut process = supervisor(&harness);
+                let kernel = Arc::new(Mutex::new(Kernel::default()));
+                let mut launcher = harness.launcher(false);
+                launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+                let cleanup = Store::open(&harness.runtime).unwrap();
+                let path = harness.root.join("client.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+                thread::scope(|scope| {
+                    let worker = scope.spawn(|| {
+                        let (stream, _) = listener.accept().unwrap();
+                        serve_cleanup_fixture(stream, 1000, &policy.store, &launcher, &cleanup)
+                    });
+                    let deadline = || Instant::now() + Duration::from_secs(1);
+                    let mut client = Client::connect_v2(&path, deadline()).unwrap();
+                    let offer = Prepare::Ipsec(
+                        protocol::IpsecRequest::new(
+                            protocol::Endpoint::new("vpn.example".into(), 500).unwrap(),
+                            "fixture".into(),
+                            vec![parse_cidr("10.20.1.0/24").unwrap()],
+                        )
+                        .unwrap(),
+                    );
+                    let id = client.prepare(offer, deadline()).unwrap().unwrap();
+                    assert!(harness.log().is_empty() && harness.leases().is_empty());
+                    client
+                        .send_credentials(
+                            Credentials::ipsec("fixture-password", "fixture-psk").unwrap(),
+                            deadline(),
+                        )
+                        .unwrap();
+                    let ready_by = Instant::now() + Duration::from_secs(8);
+                    loop {
+                        match client.status(deadline()).unwrap() {
+                            State::NetworkReady => break,
+                            State::Starting if Instant::now() < ready_by => {
+                                thread::sleep(Duration::from_millis(10))
+                            }
+                            state => panic!("unexpected v2 status: {state:?}"),
+                        }
+                    }
+                    assert_eq!(
+                        generation_of(&started_unit(&harness.log).unwrap()),
+                        id.as_str()
+                    );
+                    assert_eq!(kernel.lock().unwrap().routes, ["10.20.0.0/16"]);
+                    if explicit {
+                        assert_eq!(client.stop(deadline()).unwrap(), State::Stopping);
+                    }
+                    drop(client);
+                    wait_for_file(&harness.root.join("revert-entered"));
+                    assert_eq!(harness.leases(), [id.as_str()]);
+                    assert_eq!(
+                        v2_query(1000, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Pending
+                    );
+                    assert_eq!(
+                        v2_query(1001, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Unknown
+                    );
+                    let result = worker.join().unwrap();
+                    if explicit {
+                        result.unwrap();
+                    }
+                    assert_eq!(
+                        v2_query(1000, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Stopped
+                    );
+                    assert!(harness.leases().is_empty());
+                    assert_eq!(
+                        harness
+                            .log()
+                            .iter()
+                            .filter(|line| line.starts_with("revert --"))
+                            .count(),
+                        2
+                    );
+                    let kernel = kernel.lock().unwrap();
+                    assert!(kernel.routes.is_empty() && !kernel.link && !kernel.address);
+                });
+                assert!(process.0.wait().unwrap().success());
+            }
+        }
+
+        #[test]
+        fn v2_persistent_cleanup_stays_pending_until_recovery_proves_removal() {
+            use crate::tunneld::{protocol::CleanupState, server::serve_cleanup_fixture};
+            if !namespaced_in(
+                "v2_persistent_cleanup_stays_pending_until_recovery_proves_removal",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("negotiated-route", true);
+            harness.flag("fail-revert", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let cleanup = Store::open(&harness.runtime).unwrap();
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            let generation = thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    serve_cleanup_fixture(stream, 1000, &policy.store, &launcher, &cleanup)
+                });
+                let id = v2_prepare(&mut client);
+                client_credentials(&mut client);
+                v2_ready(&mut client);
+                command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopping);
+                drop(client);
+                worker.join().unwrap().unwrap();
+                id
+            });
+            assert_eq!(harness.leases(), [generation.as_str()]);
+            assert_eq!(
+                harness
+                    .log()
+                    .iter()
+                    .filter(|line| line.starts_with("revert --"))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                v2_query(1000, &policy, &launcher, &cleanup, &generation),
+                CleanupState::Pending
+            );
+            drop(cleanup);
+            harness.flag("fail-revert", false);
+            let reopened = Store::open(&harness.runtime).unwrap();
+            launcher.recover_with(Some(&reopened)).unwrap();
+            assert!(harness.leases().is_empty());
+            assert_eq!(
+                v2_query(1000, &policy, &launcher, &reopened, &generation),
+                CleanupState::Stopped
+            );
+            let kernel = kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty() && !kernel.link && !kernel.address);
+            assert!(process.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn v2_precredential_eof_and_failed_property_rollback_produce_read_only_proof() {
+            use crate::tunneld::{protocol::CleanupState, server::serve_cleanup_fixture};
+            if !namespaced_in(
+                "v2_precredential_eof_and_failed_property_rollback_produce_read_only_proof",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(
+                harness.runtime.clone(),
+                Arc::new(Mutex::new(Kernel::default())),
+            );
+            let cleanup = Store::open(&harness.runtime).unwrap();
+            for send in [false, true] {
+                if send {
+                    harness.flag("fail-set-property", true);
+                }
+                let (mut client, stream) = UnixStream::pair().unwrap();
+                thread::scope(|scope| {
+                    let worker = scope.spawn(|| {
+                        serve_cleanup_fixture(stream, 1000, &policy.store, &launcher, &cleanup)
+                    });
+                    let id = v2_prepare(&mut client);
+                    assert_eq!(
+                        v2_query(1000, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Pending
+                    );
+                    assert_eq!(
+                        v2_query(1001, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Unknown
+                    );
+                    if send {
+                        client_credentials(&mut client);
+                        assert!(matches!(
+                            response(&client),
+                            Response::Error {
+                                code: ErrorCode::Backend
+                            }
+                        ));
+                    }
+                    drop(client);
+                    let result = worker.join().unwrap();
+                    if send {
+                        result.unwrap();
+                    }
+                    let log = harness.log();
+                    assert_eq!(
+                        v2_query(1000, &policy, &launcher, &cleanup, &id),
+                        CleanupState::Stopped
+                    );
+                    assert_eq!(harness.log(), log, "query has no backend effects");
+                    assert!(harness.leases().is_empty());
+                    if send {
+                        assert_eq!(log.len(), 2);
+                        assert!(log[0].starts_with("set-property --runtime "));
+                        assert_eq!(
+                            log[1],
+                            format!("revert -- vpnt-tunneld-ipsec@{}.service", id.as_str())
+                        );
+                    } else {
+                        assert!(log.is_empty());
+                    }
+                });
+            }
         }
 
         fn client_credentials(client: &mut UnixStream) {
@@ -3077,6 +3585,7 @@ mod tests {
                 None,
                 None,
                 &SetupCancellation::default(),
+                None,
             );
             assert_eq!(result.err(), Some(ErrorCode::Backend));
             let log = harness.log();
@@ -3445,15 +3954,59 @@ printf '%s\n' "$*" >> '{log}'
             let kernel = Arc::new(Mutex::new(Kernel::default()));
             let mut launcher = harness.launcher(false);
             launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            let cleanup = Store::open(&harness.runtime).unwrap();
             let (mut client, stream) = UnixStream::pair().unwrap();
             thread::scope(|scope| {
-                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
-                client_prepare(&mut client);
+                let worker = scope.spawn(|| {
+                    if expect_timeout {
+                        super::super::super::server::serve_cleanup_fixture(
+                            stream,
+                            1000,
+                            &policy.store,
+                            &launcher,
+                            &cleanup,
+                        )
+                    } else {
+                        serve_fixture(stream, &policy.store, &launcher)
+                    }
+                });
+                let generation = if expect_timeout {
+                    Some(v2_prepare(&mut client))
+                } else {
+                    client_prepare(&mut client);
+                    None
+                };
                 let start = Instant::now();
                 client_credentials(&mut client);
-                client.write_all(br#"{"op":"status"}"#).unwrap();
-                client.write_all(b"\n").unwrap();
-                let reply = response_with_timeout(&client, Duration::from_secs(45));
+                let deadline = start + Duration::from_secs(45);
+                let reply = loop {
+                    client
+                        .write_all(b"{\"op\":\"status\"}\n")
+                        .or_else(|error| {
+                            // The server may have already sent the typed rejection.
+                            if expect_timeout && error.kind() == io::ErrorKind::BrokenPipe {
+                                Ok(())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .unwrap();
+                    let reply =
+                        read_control(&mut timed(&client, deadline).unwrap(), decode_response)
+                            .unwrap();
+                    if expect_timeout
+                        && matches!(
+                            reply,
+                            Response::Status {
+                                state: State::Starting
+                            }
+                        )
+                    {
+                        thread::sleep(Duration::from_millis(100));
+                    } else {
+                        break reply;
+                    }
+                };
                 if expect_timeout {
                     assert!(
                         matches!(
@@ -3477,6 +4030,16 @@ printf '%s\n' "$*" >> '{log}'
                             .any(|entry| entry.starts_with("stop -- "))
                     );
                     assert!(!kernel.lock().unwrap().link);
+                    assert_eq!(
+                        v2_query(
+                            1000,
+                            &policy,
+                            &launcher,
+                            &cleanup,
+                            generation.as_ref().unwrap()
+                        ),
+                        protocol::CleanupState::Stopped
+                    );
                 } else {
                     assert!(
                         matches!(
