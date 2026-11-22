@@ -275,7 +275,8 @@ HTTPS retornou 302. Depois da desconexão, as fotos completas da rede ficaram
 idênticas byte a byte e nenhuma interface de túnel restou. O roteiro saiu com
 código 0. Uma execução anterior registrou mudanças na rede de contêineres. A
 rechecagem usou uma nova foto inicial com o mesmo pacote instalado e manteve
-a comparação integral.
+a comparação integral. O #42 entrou na `main` pelo merge
+`7f381fa7c2ca3a6f5dc4c9cd4c34c425d355fb87`, com CI verde no head validado.
 
 IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
 seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
@@ -432,6 +433,18 @@ Appliance, quase todo na negociação LCP/IPCP do `pppd`.
   terceiros e tráfego já marcado por firewall do host não são observados
   durante a sessão (VPT-44).
 - Follow-ups no Cinzel: VPT-34 a VPT-44.
+
+### Units Linux do IPsec e Fortinet
+
+**[PASS, verificação nativa isolada, 21/11/2026]** O
+`systemd-analyze verify --instance=0123456789abcdef0123456789abcdef` passou
+nos dois templates do #53 em `fb6a66cc5003858f33c9ecb993c3f06c72f33191`.
+O namespace isolado montou o binário extraído do pacote de ensaio no caminho
+absoluto de `ExecStart`. Os sete checks do CI passaram nesse head, integrado à
+`main` pelo merge `13afdb4f6392013858eea57e2335f9c7ca5528b7`.
+
+A ativação das instâncias, o filtro de rede e a prova de limpeza com os dois
+gateways ficam para a validação real do pacote integrado.
 
 ## Checkpoint atual — 14/11/2026
 
