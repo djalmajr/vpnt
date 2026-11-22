@@ -1,5 +1,5 @@
 //! Journaled Linux XFRM effects serialized by the shared network writer lock.
-use super::protocol::CidrV4;
+use super::protocol::{CidrV4, Generation, ProbeBinding};
 use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -709,6 +709,34 @@ impl Network {
             return Err(invalid("XFRM link ownership cannot be proven"));
         }
         Ok(link)
+    }
+
+    /// A fresh identity observation for the already confirmed receipt.
+    pub(super) fn probe_binding(
+        &self,
+        _guard: &NetworkGuard,
+        receipt: &Receipt,
+    ) -> io::Result<ProbeBinding> {
+        if !receipt.confirmed || receipt.complete || receipt.routes_intended != receipt.routes.len()
+        {
+            return Err(invalid("XFRM probe scope is unconfirmed"));
+        }
+        let link = self
+            .owned_link(receipt)?
+            .filter(|link| {
+                receipt.ifindex == Some(link.ifindex) && link.flags.iter().any(|flag| flag == "UP")
+            })
+            .ok_or_else(|| invalid("XFRM probe link is unproven"))?;
+        if !self.address_present(receipt, &link)? {
+            return Err(invalid("XFRM probe address is unproven"));
+        }
+        let generation = Generation::parse(receipt.generation.clone())
+            .ok_or_else(|| invalid("invalid probe generation"))?;
+        let local = receipt
+            .vip
+            .ok_or_else(|| invalid("missing probe address"))?;
+        ProbeBinding::new(generation, link.ifindex, local, receipt.routes.clone())
+            .ok_or_else(|| invalid("invalid XFRM probe scope"))
     }
 
     fn route_change(

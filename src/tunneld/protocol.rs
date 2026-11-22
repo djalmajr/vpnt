@@ -5,6 +5,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     net::Ipv4Addr,
+    num::NonZeroU32,
     os::{fd::AsRawFd, unix::net::UnixStream},
     time::Instant,
 };
@@ -189,8 +190,101 @@ named_object! {
             generation: Option<Generation>,
         },
         CleanupStatus { state: CleanupState },
+        NetworkReady { binding: ProbeBinding },
         Status { state: State },
         Error { code: ErrorCode },
+    }
+}
+
+// Both the negotiated IPsec selectors and the Fortinet split-route feed
+// already have a 64-route ceiling.
+const MAX_PROBE_ROUTES: usize = 64;
+
+named_object! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    serde(deny_unknown_fields)
+    pub struct ProbeBinding {
+        generation: Generation,
+        ifindex: NonZeroU32,
+        #[serde(deserialize_with = "deserialize_probe_local")]
+        local: Ipv4Addr,
+        #[serde(deserialize_with = "deserialize_probe_routes")]
+        routes: Vec<CidrV4>,
+    }
+}
+
+impl ProbeBinding {
+    pub(crate) fn new(
+        generation: Generation,
+        ifindex: u32,
+        local: Ipv4Addr,
+        routes: Vec<CidrV4>,
+    ) -> Option<Self> {
+        if !valid_probe_local(local) || !valid_probe_routes(&routes) {
+            return None;
+        }
+        Some(Self {
+            generation,
+            ifindex: NonZeroU32::new(ifindex)?,
+            local,
+            routes,
+        })
+    }
+
+    pub(crate) fn generation(&self) -> &Generation {
+        &self.generation
+    }
+
+    pub(crate) fn ifindex(&self) -> NonZeroU32 {
+        self.ifindex
+    }
+
+    pub(crate) fn allows(&self, destination: Ipv4Addr) -> bool {
+        destination != self.local
+            && CidrV4::new(destination, 32).is_ok()
+            && self.routes.iter().any(|route| {
+                overlaps(
+                    destination.into(),
+                    32,
+                    route.network().into(),
+                    route.prefix(),
+                )
+            })
+    }
+}
+
+fn valid_probe_local(local: Ipv4Addr) -> bool {
+    !local.is_unspecified()
+        && !local.is_loopback()
+        && !local.is_multicast()
+        && !local.is_broadcast()
+}
+
+fn valid_probe_routes(routes: &[CidrV4]) -> bool {
+    routes.len() <= MAX_PROBE_ROUTES
+        && routes
+            .iter()
+            .enumerate()
+            .all(|(index, route)| !routes[..index].contains(route))
+}
+
+fn deserialize_probe_local<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Ipv4Addr, D::Error> {
+    let local = Ipv4Addr::deserialize(decoder)?;
+    valid_probe_local(local)
+        .then_some(local)
+        .ok_or_else(|| serde::de::Error::custom("invalid probe local address"))
+}
+
+fn deserialize_probe_routes<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<CidrV4>, D::Error> {
+    let routes = Vec::deserialize(decoder)?;
+    if valid_probe_routes(&routes) {
+        Ok(routes)
+    } else {
+        Err(serde::de::Error::custom("invalid probe routes"))
     }
 }
 
@@ -864,6 +958,21 @@ impl ServerDecoder {
                 _ => return Err(ErrorCode::BadRequest.into()),
             };
             Ok((command, Phase::Active))
+        })
+    }
+
+    pub(crate) fn reply_ready(
+        &mut self,
+        binding: ProbeBinding,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        if self.version != CLEANUP_VERSION {
+            self.stream.take();
+            return Err(ErrorCode::BadRequest.into());
+        }
+        self.in_phase(Phase::Active, deadline, |_, io| {
+            write_control(io, &Response::NetworkReady { binding })?;
+            Ok(((), Phase::Active))
         })
     }
 

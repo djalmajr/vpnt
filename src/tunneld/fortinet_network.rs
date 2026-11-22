@@ -16,7 +16,7 @@ use super::{
         valid_generation,
     },
     policy::Entry,
-    protocol::CidrV4,
+    protocol::{CidrV4, Generation, ProbeBinding},
 };
 use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -91,6 +91,8 @@ pub(super) struct Receipt {
     refused_routes: usize,
     refused_dns: usize,
     confirmed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    probe_marked: bool,
     pub(super) complete: bool,
 }
 
@@ -121,6 +123,7 @@ impl Receipt {
             || !valid_ifname(&self.ifname)
             || self.routes_intended > self.routes.len()
             || (self.routes_intended > 0 || self.dns_intended) && self.ifindex.is_none()
+            || self.probe_marked && (!self.confirmed || self.ifindex.is_none())
             || self.netns != namespace.id
             || self.boot != namespace.boot
         {
@@ -172,6 +175,10 @@ impl Receipt {
     /// The egress the client must bind to: policy-resolved gateway, planned link.
     pub(super) fn binding(&self) -> (&str, u32, Ipv4Addr) {
         (&self.egress.dev, self.egress.ifindex, self.remote)
+    }
+
+    fn marker(&self) -> String {
+        format!("vpnt:{}", self.generation)
     }
 
     fn protected_transport(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
@@ -334,6 +341,7 @@ struct Link {
     ifindex: u32,
     #[serde(default)]
     link_type: Option<String>,
+    ifalias: Option<String>,
     flags: Vec<String>,
 }
 
@@ -535,6 +543,7 @@ impl FortinetNetwork {
             refused_routes: 0,
             refused_dns: 0,
             confirmed: false,
+            probe_marked: false,
             complete: false,
         };
         // Prove the technical peer is clear before pppd can assign it.
@@ -863,6 +872,87 @@ impl FortinetNetwork {
         receipt.save(directory, guard)
     }
 
+    fn probe_link(&self, receipt: &Receipt) -> io::Result<Link> {
+        if !receipt.confirmed || receipt.complete || receipt.routes_intended != receipt.routes.len()
+        {
+            return Err(invalid("PPP probe scope is unconfirmed"));
+        }
+        let link = self
+            .link(receipt)?
+            .filter(|link| {
+                receipt.ifindex == Some(link.ifindex)
+                    && link.link_type.as_deref() == Some("ppp")
+                    && link.flags.iter().any(|flag| flag == "UP")
+            })
+            .ok_or_else(|| invalid("PPP probe link is unproven"))?;
+        if Some(self.address(&link)?) != receipt.local {
+            return Err(invalid("PPP probe address is unproven"));
+        }
+        Ok(link)
+    }
+
+    pub(super) fn mark_probe_link(
+        &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        receipt: &mut Receipt,
+        cancel: &SetupCancellation,
+    ) -> io::Result<()> {
+        let link = self.probe_link(receipt)?;
+        if link.ifalias.is_some() {
+            return Err(invalid("PPP probe link is already marked"));
+        }
+        receipt.probe_marked = true;
+        receipt.save(directory, guard)?;
+        (self.0)(
+            IP,
+            &[
+                "link",
+                "set",
+                "dev",
+                &link.ifname,
+                "alias",
+                &receipt.marker(),
+            ],
+            Some(cancel),
+        )?;
+        self.probe_binding(guard, receipt).map(|_| ())
+    }
+
+    pub(super) fn probe_binding(
+        &self,
+        _guard: &NetworkGuard,
+        receipt: &Receipt,
+    ) -> io::Result<ProbeBinding> {
+        let link = self.probe_link(receipt)?;
+        if !receipt.probe_marked || link.ifalias.as_deref() != Some(&receipt.marker()) {
+            return Err(invalid("PPP probe ownership is unproven"));
+        }
+        let generation = Generation::parse(receipt.generation.clone())
+            .ok_or_else(|| invalid("invalid probe generation"))?;
+        let local = receipt
+            .local
+            .ok_or_else(|| invalid("missing probe address"))?;
+        ProbeBinding::new(generation, link.ifindex, local, receipt.routes.clone())
+            .ok_or_else(|| invalid("invalid PPP probe scope"))
+    }
+
+    fn cleanup_link(&self, receipt: &Receipt, ifindex: u32) -> io::Result<Option<Link>> {
+        let marker = receipt.marker();
+        let mut owned = None;
+        for link in self.links()? {
+            let recorded = link.ifname == receipt.ifname && link.ifindex == ifindex;
+            let marked = link.ifalias.as_deref() == Some(marker.as_str());
+            if receipt.probe_marked && recorded != marked {
+                return Err(invalid("PPP cleanup ownership is unproven"));
+            }
+            if recorded && owned.replace(link).is_some() {
+                return Err(invalid("PPP cleanup link identity is ambiguous"));
+            }
+        }
+        Ok(owned)
+    }
+
     /// Remove what the receipt says was attempted, then prove it is gone. A
     /// link that disappeared took its routes and DNS with it; a link that now
     /// answers to the name with another identity is not touched.
@@ -876,8 +966,7 @@ impl FortinetNetwork {
         let Some(ifindex) = receipt.ifindex else {
             return Ok(());
         };
-        let ours = |link: &Link| link.ifname == receipt.ifname && link.ifindex == ifindex;
-        if let Some(link) = self.links()?.into_iter().find(ours) {
+        if let Some(link) = self.cleanup_link(receipt, ifindex)? {
             let present = Self::applied(receipt, &self.routes()?)?;
             for route in receipt.routes[..receipt.routes_intended]
                 .iter()
@@ -891,7 +980,7 @@ impl FortinetNetwork {
             }
         }
         // Prove it: nothing of ours is left under the recorded identity.
-        if let Some(link) = self.links()?.into_iter().find(ours) {
+        if let Some(link) = self.cleanup_link(receipt, ifindex)? {
             if !Self::applied(receipt, &self.routes()?)?.routes.is_empty() {
                 return Err(invalid("a route remains on the PPP link"));
             }
@@ -997,6 +1086,7 @@ pub(super) mod fixture {
         pub up: bool,
         pub link_type: &'static str,
         pub ifindex: u32,
+        pub ifalias: Option<String>,
         pub peer: Option<&'static str>,
         pub peer_route: Option<&'static str>,
         pub routes: Vec<String>,
@@ -1026,6 +1116,7 @@ pub(super) mod fixture {
                 up: true,
                 link_type: "ppp",
                 ifindex: 9,
+                ifalias: None,
                 peer: Some(PEER),
                 peer_route: Some(PEER),
                 routes: Vec::new(),
@@ -1130,11 +1221,15 @@ pub(super) mod fixture {
                     })];
                     if k.ppp {
                         links.push(json!({
-                            "ifname": NAME, "ifindex": k.ifindex, "link_type": k.link_type,
+                            "ifname": NAME, "ifindex": k.ifindex, "link_type": k.link_type, "ifalias": k.ifalias,
                             "flags": if k.up { vec!["POINTOPOINT", "UP"] } else { vec!["POINTOPOINT"] }
                         }));
                     }
                     say(json!(links))
+                }
+                ["link", "set", "dev", NAME, "alias", alias] if k.ppp => {
+                    k.ifalias = Some((*alias).into());
+                    Ok(vec![])
                 }
                 ["-j", "-4", "addr", "show", "dev", NAME] => say(json!([{
                     "ifindex": k.ifindex,
@@ -1883,6 +1978,50 @@ mod tests {
         apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
         assert_eq!(fixture.kernel.lock().unwrap().routes.len(), 2);
         (fixture, receipt)
+    }
+
+    #[test]
+    fn a_recycled_ppp_link_with_the_same_name_and_index_cannot_prove_the_probe() {
+        let (fixture, mut receipt) = applied_fixture();
+        let guard = fixture.guard();
+        fixture
+            .network
+            .mark_probe_link(
+                &guard,
+                &fixture.directory,
+                &mut receipt,
+                &SetupCancellation::default(),
+            )
+            .unwrap();
+        let saved = Receipt::load(&fixture.directory, &guard).unwrap();
+        let binding = fixture.network.probe_binding(&guard, &saved).unwrap();
+        assert_eq!(binding.ifindex().get(), 9);
+        assert_eq!(binding.generation().as_str(), GENERATION);
+        assert!(binding.allows("10.20.0.5".parse().unwrap()));
+        assert!(!binding.allows("10.22.0.5".parse().unwrap()));
+        fixture.kernel.lock().unwrap().ifalias = None;
+        assert!(fixture.network.probe_binding(&guard, &saved).is_err());
+        let writes = fixture.writes();
+        assert!(
+            fixture
+                .network
+                .clean(&guard, &fixture.directory, &saved)
+                .is_err()
+        );
+        assert_eq!(fixture.writes(), writes);
+        assert_eq!(fixture.kernel.lock().unwrap().routes.len(), 2);
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.ifindex += 1;
+            kernel.ifalias = Some(saved.marker());
+        }
+        assert!(
+            fixture
+                .network
+                .clean(&guard, &fixture.directory, &saved)
+                .is_err()
+        );
+        assert_eq!(fixture.writes(), writes);
     }
 
     #[test]

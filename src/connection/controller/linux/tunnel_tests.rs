@@ -55,7 +55,7 @@ fn fortinet_without_pin_fails_before_socket_connect() {
             psk: Secret::from(""),
         },
         PathBuf::from("/nonexistent-fixture/socket"),
-        |_, _, _, _| panic!("probe ran"),
+        |_, _, _, _, _| panic!("probe ran"),
     );
     let err = attempt
         .start(
@@ -227,7 +227,13 @@ fn wire_fixture(name: &str) -> bool {
     false
 }
 
-fn no_probe(_: &Profile, _: &AtomicBool, _: Duration, _: ProbeSlot) -> Result<bool, Failure> {
+fn no_probe(
+    _: &Profile,
+    _: &ProbeBinding,
+    _: &AtomicBool,
+    _: Instant,
+    _: ProbeSlot,
+) -> Result<bool, Failure> {
     panic!("probe ran before readiness");
 }
 
@@ -284,16 +290,37 @@ fn query(fixture: &SocketFixture, state: CleanupState) {
         .unwrap();
 }
 
+fn fixture_binding(generation: Generation, ifindex: u32) -> ProbeBinding {
+    ProbeBinding::new(
+        generation,
+        ifindex,
+        "10.99.0.2".parse().unwrap(),
+        vec![CidrV4::new("10.20.0.0".parse().unwrap(), 24).unwrap()],
+    )
+    .unwrap()
+}
+
+fn reply_state(decoder: &mut ServerDecoder, state: State) {
+    if state == State::NetworkReady {
+        decoder
+            .reply_ready(fixture_binding(fixture_generation(), 7), wire_deadline())
+            .unwrap();
+    } else {
+        decoder.reply_status(state, wire_deadline()).unwrap();
+    }
+}
+
 fn reply(decoder: &mut ServerDecoder, command: Command, state: State) {
     assert_eq!(decoder.command(wire_deadline()).unwrap(), command);
-    decoder.reply_status(state, wire_deadline()).unwrap();
+    reply_state(decoder, state);
 }
 
 fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
     fn success(
         profile: &Profile,
+        _: &ProbeBinding,
         _: &AtomicBool,
-        _: Duration,
+        _: Instant,
         _: ProbeSlot,
     ) -> Result<bool, Failure> {
         assert_eq!(profile.probe_host, "10.20.0.15");
@@ -305,7 +332,7 @@ fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
         if responsive {
             success
         } else {
-            |_, _, _, _| Ok(false)
+            |_, _, _, _, _| Ok(false)
         },
     );
     thread::scope(|scope| {
@@ -315,9 +342,7 @@ fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
             let started = Instant::now();
             assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
             assert!(started.elapsed() >= Duration::from_millis(450));
-            decoder
-                .reply_status(State::NetworkReady, wire_deadline())
-                .unwrap();
+            reply_state(&mut decoder, State::NetworkReady);
             loop {
                 if decoder.command(wire_deadline()).unwrap() == Command::Stop {
                     decoder
@@ -325,9 +350,7 @@ fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
                         .unwrap();
                     break;
                 }
-                decoder
-                    .reply_status(State::NetworkReady, wire_deadline())
-                    .unwrap();
+                reply_state(&mut decoder, State::NetworkReady);
             }
         });
         let canceled = Arc::new(AtomicBool::new(false));
@@ -677,4 +700,202 @@ fn lost_control_replies_leave_generation_available_for_fresh_queries() {
             server.join().unwrap();
         });
     }
+}
+
+#[test]
+fn probe_filters_ipv6_own_address_link_local_and_unaccepted_routes() {
+    let binding = ProbeBinding::new(
+        fixture_generation(),
+        7,
+        "10.20.0.2".parse().unwrap(),
+        vec![CidrV4::new("10.20.0.0".parse().unwrap(), 24).unwrap()],
+    )
+    .unwrap();
+    let accepted = "10.20.0.15:8443".parse().unwrap();
+    assert_eq!(
+        allowed_probe_address(&binding, accepted),
+        Some("10.20.0.15:8443".parse().unwrap())
+    );
+    for rejected in [
+        "10.20.1.15:8443",
+        "10.20.0.2:8443",
+        "169.254.2.1:8443",
+        "127.0.0.1:8443",
+        "[::ffff:10.20.0.15]:8443",
+        "[2001:db8::1]:8443",
+    ] {
+        assert!(allowed_probe_address(&binding, rejected.parse().unwrap()).is_none());
+    }
+}
+
+#[test]
+fn native_loopback_probe_socket_binds_and_bind_failure_has_no_fallback() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+        panic!("expected IPv4 listener");
+    };
+    // SAFETY: this is a static, NUL-terminated interface name.
+    let index = NonZeroU32::new(unsafe { libc::if_nametoindex(c"lo".as_ptr()) }).unwrap();
+    let cap = || Instant::now() + Duration::from_secs(1);
+
+    let invalid = NonZeroU32::new(u32::MAX).unwrap();
+    assert!(connect_bound(invalid, address, cap()).is_err());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+
+    let socket = connect_bound(index, address, cap()).unwrap();
+    assert_eq!(socket.device_index_v4().unwrap(), Some(index));
+    let (peer, _) = listener.accept().unwrap();
+    drop((peer, socket));
+    assert_eq!(
+        connect_bound(index, address, Instant::now())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+fn simulated_tcp_success(
+    _: &Profile,
+    binding: &ProbeBinding,
+    _: &AtomicBool,
+    _: Instant,
+    _: ProbeSlot,
+) -> Result<bool, Failure> {
+    assert_eq!(binding.ifindex().get(), 7);
+    Ok(true)
+}
+
+#[test]
+fn initial_and_recovery_probes_recheck_before_accepting_tcp_success() {
+    if !wire_fixture("initial_and_recovery_probes_recheck_before_accepting_tcp_success") {
+        return;
+    }
+    let fixture = SocketFixture::new("recheck");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            reply(&mut decoder, Command::Stop, State::Stopped);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, simulated_tcp_success);
+        let canceled = AtomicBool::new(false);
+        attempt.start(&canceled, wire_deadline()).unwrap();
+        assert!(attempt.ready().unwrap());
+        for _ in 0..2 {
+            assert!(attempt.probe(&canceled, Duration::from_secs(1)).unwrap());
+        }
+        assert!(attempt.cleanup());
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn changed_generation_link_pending_or_lost_channel_invalidates_probe() {
+    if !wire_fixture("changed_generation_link_pending_or_lost_channel_invalidates_probe") {
+        return;
+    }
+    for scenario in ["generation", "link", "pending", "eof"] {
+        let fixture = SocketFixture::new(scenario);
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let mut decoder = admitted(&fixture, VpnKind::Ssl);
+                reply(&mut decoder, Command::Status, State::NetworkReady);
+                assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
+                match scenario {
+                    "generation" => {
+                        let other =
+                            Generation::parse("fedcba9876543210fedcba9876543210".into()).unwrap();
+                        decoder
+                            .reply_ready(fixture_binding(other, 7), wire_deadline())
+                            .unwrap();
+                    }
+                    "link" => decoder
+                        .reply_ready(fixture_binding(fixture_generation(), 8), wire_deadline())
+                        .unwrap(),
+                    "pending" => decoder
+                        .reply_status(State::CleanupPending, wire_deadline())
+                        .unwrap(),
+                    "eof" => {}
+                    _ => unreachable!(),
+                }
+                drop(decoder);
+                query(&fixture, CleanupState::Stopped);
+            });
+            let mut attempt = fixture.attempt(VpnKind::Ssl, simulated_tcp_success);
+            let canceled = AtomicBool::new(false);
+            attempt.start(&canceled, wire_deadline()).unwrap();
+            assert!(attempt.ready().unwrap());
+            assert!(
+                attempt.probe(&canceled, Duration::from_secs(1)).is_err(),
+                "{scenario}"
+            );
+            assert!(attempt.cleanup(), "{scenario}");
+            server.join().unwrap();
+        });
+    }
+}
+
+#[test]
+fn successful_tcp_does_not_extend_the_probe_budget_for_status() {
+    if !wire_fixture("successful_tcp_does_not_extend_the_probe_budget_for_status") {
+        return;
+    }
+    let fixture = SocketFixture::new("refresh-budget");
+    thread::scope(|scope| {
+        let (release, wait) = mpsc::channel();
+        let fixture = &fixture;
+        let peer = scope.spawn(move || {
+            let mut decoder = admitted(fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
+            wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, simulated_tcp_success);
+        let canceled = AtomicBool::new(false);
+        attempt.start(&canceled, wire_deadline()).unwrap();
+        assert!(attempt.ready().unwrap());
+        let started = Instant::now();
+        let result = attempt.probe(&canceled, Duration::from_millis(120));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        assert!(result.is_err());
+        assert!(elapsed >= Duration::from_millis(100));
+        assert!(elapsed < Duration::from_millis(750), "{elapsed:?}");
+        peer.join().unwrap();
+    });
+}
+
+#[test]
+fn cancellation_during_tcp_discards_success_without_status_refresh() {
+    if !wire_fixture("cancellation_during_tcp_discards_success_without_status_refresh") {
+        return;
+    }
+    let fixture = SocketFixture::new("cancel-probe");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            reply(&mut decoder, Command::Stop, State::Stopped);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, |_, _, cancel, _, _| {
+            cancel.store(true, Ordering::Release);
+            Ok(true)
+        });
+        let canceled = AtomicBool::new(false);
+        attempt.start(&canceled, wire_deadline()).unwrap();
+        assert!(attempt.ready().unwrap());
+        assert!(!attempt.probe(&canceled, Duration::from_secs(1)).unwrap());
+        assert!(attempt.cleanup());
+        server.join().unwrap();
+    });
 }

@@ -11,7 +11,10 @@ use super::{
     instance_protocol::{Order, Reply, Start, encode_credentials},
     network::{Network, Receipt, SetupCancellation, parse_cidr, valid_generation},
     policy::{Entry, MAX_IPSEC_ROUTES},
-    protocol::{self, CidrV4, Credentials, ErrorCode, FortinetRequest, Generation, Prepare, State},
+    protocol::{
+        self, CidrV4, Credentials, ErrorCode, FortinetRequest, Generation, Prepare, ProbeBinding,
+        State,
+    },
 };
 use crate::{
     helper::local_socket::Budget,
@@ -79,6 +82,9 @@ pub(super) trait Launch: Send + Sync {
 /// One admitted session. Dropping it stops it.
 pub(super) trait Running: Send {
     fn state(&self) -> State;
+    fn probe_binding(&self) -> io::Result<ProbeBinding> {
+        Err(io::Error::other("unconfirmed probe binding"))
+    }
     fn peer(&self) -> Option<BorrowedFd<'_>> {
         None
     }
@@ -159,6 +165,7 @@ struct Attempt {
     /// may still have written the drop-in, so teardown always reverts it.
     allowed: bool,
     credentials_sent: bool,
+    managed_cleanup: bool,
     receipt: Option<Receipt>,
     fortinet: Option<fortinet_network::Receipt>,
 }
@@ -179,6 +186,7 @@ impl Attempt {
             started: false,
             allowed: false,
             credentials_sent: false,
+            managed_cleanup: false,
             receipt: None,
             fortinet: None,
         }
@@ -586,6 +594,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         self.fortinet
             .apply(&guard, directory, receipt, &delivered, &scope, cancel)
             .map_err(|e| Failure::io("configure PPP network", &e))?;
+        if attempt.managed_cleanup {
+            self.fortinet
+                .mark_probe_link(&guard, directory, receipt, cancel)
+                .map_err(|e| Failure::io("mark PPP probe link", &e))?;
+        }
         let report = receipt.report();
         // Counts only: nothing the gateway printed is logged.
         eprintln!(
@@ -885,6 +898,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         };
         let managed_cleanup = reserved.is_some();
         let mut attempt = Attempt::new(backend, generation);
+        attempt.managed_cleanup = managed_cleanup;
         let mut channel = None;
         let state = if setup.is_some() {
             State::NetworkReady
@@ -905,7 +919,6 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 channel,
                 peer: Some(peer),
                 state,
-                managed_cleanup,
             })),
             Err(failure) => {
                 eprintln!("vpnt-tunneld: admission ended: {}", failure.cause);
@@ -916,7 +929,6 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                         channel,
                         peer: None,
                         state,
-                        managed_cleanup,
                     };
                     if !managed_cleanup {
                         session.stop();
@@ -1169,12 +1181,31 @@ struct Session<'a, N: NetworkBackend, A: UnitAttestor + Send + Sync> {
     channel: Option<AuthenticatedChannel>,
     peer: Option<OwnedFd>,
     state: State,
-    managed_cleanup: bool,
 }
 
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N, A> {
     fn state(&self) -> State {
         self.state
+    }
+
+    fn probe_binding(&self) -> io::Result<ProbeBinding> {
+        if self.state != State::NetworkReady {
+            return Err(io::Error::other("network is not ready for probing"));
+        }
+        let guard = (self.launcher.lock)(Instant::now() + self.launcher.limits.lock)?;
+        match (
+            self.attempt.backend,
+            &self.attempt.receipt,
+            &self.attempt.fortinet,
+        ) {
+            (Backend::Ipsec, Some(receipt), None) => {
+                self.launcher.xfrm.probe_binding(&guard, receipt)
+            }
+            (Backend::Fortinet, None, Some(receipt)) => {
+                self.launcher.fortinet.probe_binding(&guard, receipt)
+            }
+            _ => Err(io::Error::other("probe receipt is unproven")),
+        }
     }
 
     fn peer(&self) -> Option<BorrowedFd<'_>> {
@@ -1207,7 +1238,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
 
 impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Drop for Session<'_, N, A> {
     fn drop(&mut self) {
-        if !self.managed_cleanup || self.state != State::CleanupPending {
+        if !self.attempt.managed_cleanup || self.state != State::CleanupPending {
             Running::stop(self);
         }
     }
@@ -2176,6 +2207,7 @@ mod tests {
                                 // resolver forget what hung on it.
                                 let mut k = kernel.lock().unwrap();
                                 k.ppp = false;
+                                k.ifalias = None;
                                 k.routes.clear();
                                 k.dns.clear();
                                 k.domains.clear();
@@ -2319,9 +2351,15 @@ mod tests {
                     .unwrap();
                 let ready_by = Instant::now() + Duration::from_secs(8);
                 loop {
-                    match client.status(deadline()).unwrap() {
-                        State::NetworkReady => break,
-                        State::Starting if Instant::now() < ready_by => {
+                    match client.status_with_binding(deadline()).unwrap() {
+                        (State::NetworkReady, Some(binding)) => {
+                            assert_eq!(binding.generation(), &id);
+                            assert_eq!(binding.ifindex().get(), 9);
+                            assert!(binding.allows("10.20.0.5".parse().unwrap()));
+                            assert!(!binding.allows("172.16.0.5".parse().unwrap()));
+                            break;
+                        }
+                        (State::Starting, None) if Instant::now() < ready_by => {
                             thread::sleep(Duration::from_millis(10))
                         }
                         state => panic!("unexpected v2 status: {state:?}"),
@@ -3136,9 +3174,7 @@ mod tests {
             loop {
                 client.write_all(b"{\"op\":\"status\"}\n").unwrap();
                 match response_with_timeout(client, Duration::from_secs(1)) {
-                    Response::Status {
-                        state: State::NetworkReady,
-                    } => return,
+                    Response::NetworkReady { .. } => return,
                     Response::Status {
                         state: State::Starting,
                     } if Instant::now() < deadline => {
@@ -3199,9 +3235,15 @@ mod tests {
                         .unwrap();
                     let ready_by = Instant::now() + Duration::from_secs(8);
                     loop {
-                        match client.status(deadline()).unwrap() {
-                            State::NetworkReady => break,
-                            State::Starting if Instant::now() < ready_by => {
+                        match client.status_with_binding(deadline()).unwrap() {
+                            (State::NetworkReady, Some(binding)) => {
+                                assert_eq!(binding.generation(), &id);
+                                assert_eq!(binding.ifindex().get(), 7);
+                                assert!(binding.allows("10.20.0.5".parse().unwrap()));
+                                assert!(!binding.allows("10.21.0.5".parse().unwrap()));
+                                break;
+                            }
+                            (State::Starting, None) if Instant::now() < ready_by => {
                                 thread::sleep(Duration::from_millis(10))
                             }
                             state => panic!("unexpected v2 status: {state:?}"),

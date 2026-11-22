@@ -11,14 +11,16 @@ use crate::{
         client::Client,
         protocol::{
             CidrV4, CleanupState, Credentials as WireCredentials, Endpoint, ErrorCode as WireError,
-            FortinetRequest, FrameError, Generation, IpsecRequest, Prepare, State,
+            FortinetRequest, FrameError, Generation, IpsecRequest, Prepare, ProbeBinding, State,
         },
     },
 };
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::BTreeSet,
     io,
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, SocketAddrV4, ToSocketAddrs},
+    num::NonZeroU32,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -31,8 +33,9 @@ use std::{
 
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_PROBE_DESTINATIONS: usize = 64;
 
-type Probe = fn(&Profile, &AtomicBool, Duration, ProbeSlot) -> Result<bool, Failure>;
+type Probe = fn(&Profile, &ProbeBinding, &AtomicBool, Instant, ProbeSlot) -> Result<bool, Failure>;
 
 enum Session {
     Inactive,
@@ -50,6 +53,7 @@ pub(super) struct TunnelAttempt {
     connect_deadline: Instant,
     next_status: Instant,
     generation: Option<Generation>,
+    probe_binding: Option<ProbeBinding>,
 }
 
 impl TunnelAttempt {
@@ -74,6 +78,7 @@ impl TunnelAttempt {
             connect_deadline: now,
             next_status: now,
             generation: None,
+            probe_binding: None,
         }
     }
 
@@ -82,25 +87,45 @@ impl TunnelAttempt {
             return Err(Failure::at(step));
         };
         self.next_status = Instant::now() + STATUS_INTERVAL;
-        match client.status(deadline) {
-            Ok(state) => {
+        match client.status_with_binding(deadline) {
+            Ok((State::NetworkReady, Some(binding)))
+                if Some(binding.generation()) == self.generation.as_ref()
+                    && self
+                        .probe_binding
+                        .as_ref()
+                        .is_none_or(|previous| previous == &binding) =>
+            {
+                self.probe_binding = Some(binding);
+                Ok(State::NetworkReady)
+            }
+            Ok((State::NetworkReady, _)) => {
+                self.observe_cleanup();
+                Err(Failure::at(step))
+            }
+            Ok((state, _)) => {
                 match state {
                     State::Stopped => self.cleaned(),
-                    State::Stopping | State::CleanupPending => self.session = Session::Observing,
-                    _ => {}
+                    State::Stopping | State::CleanupPending => self.observe_cleanup(),
+                    _ => self.probe_binding = None,
                 }
                 Ok(state)
             }
             Err(error) => {
-                self.session = Session::Observing;
+                self.observe_cleanup();
                 Err(wire_failure(error, step))
             }
         }
     }
 
+    fn observe_cleanup(&mut self) {
+        self.session = Session::Observing;
+        self.probe_binding = None;
+    }
+
     fn cleaned(&mut self) {
         self.session = Session::Inactive;
         self.generation = None;
+        self.probe_binding = None;
     }
 }
 
@@ -240,12 +265,36 @@ impl Attempt for TunnelAttempt {
     }
 
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
+        let deadline = Instant::now() + timeout;
+        if timeout.is_zero() || canceled.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         self.probe_busy = true;
         let Some(slot) = ProbeSlot::acquire(&self.profile.id) else {
             return Ok(false);
         };
         self.probe_busy = false;
-        (self.probe)(&self.profile, canceled, timeout, slot)
+        let binding = self
+            .probe_binding
+            .as_ref()
+            .ok_or_else(|| Failure::at(Step::Verify))?
+            .clone();
+        if !(self.probe)(&self.profile, &binding, canceled, deadline, slot)?
+            || canceled.load(Ordering::Acquire)
+            || Instant::now() >= deadline
+        {
+            return Ok(false);
+        }
+
+        // Force an authenticated refresh even inside the periodic status interval.
+        // Resolution, TCP and the refresh share the caller's absolute budget.
+        let refresh_by = deadline.min(Instant::now() + CONTROL_TIMEOUT);
+        if self.status(refresh_by, Step::Verify)? != State::NetworkReady
+            || self.probe_binding.as_ref() != Some(&binding)
+        {
+            return Err(Failure::at(Step::Verify));
+        }
+        Ok(!canceled.load(Ordering::Acquire) && Instant::now() < deadline)
     }
 
     fn probe_busy(&self) -> bool {
@@ -253,6 +302,7 @@ impl Attempt for TunnelAttempt {
     }
 
     fn cleanup(&mut self) -> bool {
+        self.probe_binding = None;
         let session = std::mem::replace(&mut self.session, Session::Observing);
         let deadline = Instant::now() + CONTROL_TIMEOUT;
         let stopped = match session {
@@ -293,16 +343,39 @@ impl Drop for ProbeSlot {
     }
 }
 
+fn allowed_probe_address(binding: &ProbeBinding, address: SocketAddr) -> Option<SocketAddrV4> {
+    match address {
+        SocketAddr::V4(address) if binding.allows(*address.ip()) => Some(address),
+        _ => None,
+    }
+}
+
+fn connect_bound(
+    ifindex: NonZeroU32,
+    address: SocketAddrV4,
+    deadline: Instant,
+) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind_device_by_index_v4(Some(ifindex))?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    socket.connect_timeout(&SocketAddr::V4(address).into(), remaining)?;
+    Ok(socket)
+}
+
 fn probe_tcp(
     profile: &Profile,
+    binding: &ProbeBinding,
     canceled: &AtomicBool,
-    timeout: Duration,
+    deadline: Instant,
     slot: ProbeSlot,
 ) -> Result<bool, Failure> {
-    if timeout.is_zero() || canceled.load(Ordering::Acquire) {
+    if Instant::now() >= deadline || canceled.load(Ordering::Acquire) {
         return Ok(false);
     }
-    let deadline = Instant::now() + timeout;
+    let binding = binding.clone();
     let (host, port) = (profile.probe_host.clone(), profile.probe_port);
     let (send, receive) = mpsc::sync_channel(1);
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -313,12 +386,13 @@ fn probe_tcp(
             let _slot = slot;
             let reachable = (host.as_str(), port)
                 .to_socket_addrs()
-                .is_ok_and(|mut addresses| {
-                    addresses.any(|address| {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        !remaining.is_zero()
+                .is_ok_and(|addresses| {
+                    addresses.take(MAX_PROBE_DESTINATIONS).any(|address| {
+                        Instant::now() < deadline
                             && !job_interrupted.load(Ordering::Acquire)
-                            && TcpStream::connect_timeout(&address, remaining).is_ok()
+                            && allowed_probe_address(&binding, address).is_some_and(|address| {
+                                connect_bound(binding.ifindex(), address, deadline).is_ok()
+                            })
                     })
                 });
             let _ = send.send(reachable);

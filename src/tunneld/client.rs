@@ -1,7 +1,7 @@
 //! Authenticated synchronous client for a single tunneld generation.
 use super::protocol::{
     Backend, CLEANUP_VERSION, CleanupState, Credentials, ErrorCode, FrameError, Generation,
-    Prepare, Request, Response, State, VERSION, decode_response, read_control, timed,
+    Prepare, ProbeBinding, Request, Response, State, VERSION, decode_response, read_control, timed,
     write_control,
 };
 use crate::helper::local_socket::{Budget, connect_deadline, peer_uid};
@@ -129,17 +129,36 @@ impl Client {
     }
 
     pub fn status(&mut self, deadline: Instant) -> Result<State, FrameError> {
+        self.status_with_binding(deadline).map(|(state, _)| state)
+    }
+
+    pub(crate) fn status_with_binding(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(State, Option<ProbeBinding>), FrameError> {
         self.status_command(Request::Status {}, deadline)
     }
 
     pub fn stop(&mut self, deadline: Instant) -> Result<State, FrameError> {
         self.status_command(Request::Stop {}, deadline)
+            .map(|(state, _)| state)
     }
 
-    fn status_command(&mut self, request: Request, deadline: Instant) -> Result<State, FrameError> {
+    fn status_command(
+        &mut self,
+        request: Request,
+        deadline: Instant,
+    ) -> Result<(State, Option<ProbeBinding>), FrameError> {
+        let v2 = self.version == CLEANUP_VERSION;
+        let status = matches!(request, Request::Status {});
         self.in_phase(Phase::Active, Phase::Active, |stream| {
             match exchange(stream, request, deadline)? {
-                Response::Status { state } => Ok(state),
+                Response::Status { state } if !v2 || state != State::NetworkReady => {
+                    Ok((state, None))
+                }
+                Response::NetworkReady { binding } if v2 && status => {
+                    Ok((State::NetworkReady, Some(binding)))
+                }
                 _ => Err(ErrorCode::BadRequest.into()),
             }
         })

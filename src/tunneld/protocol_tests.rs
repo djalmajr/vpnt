@@ -540,3 +540,53 @@ fn version_two_hello_and_cleanup_status_are_strict() {
     assert_eq!(prepared, b"{\"op\":\"prepared\"}\n");
     assert!(decode_response(b"{\"op\":\"prepared\",\"generation\":null}\n").is_err());
 }
+
+#[test]
+fn v2_ready_binding_has_a_generation_nonzero_index_and_bounded_ipv4_scope() {
+    let frame = |ifindex, local: &str, routes: serde_json::Value| {
+        let value = serde_json::json!({
+            "op": "network_ready",
+            "binding": {
+                "generation": "0123456789abcdef0123456789abcdef",
+                "ifindex": ifindex,
+                "local": local,
+                "routes": routes,
+            }
+        });
+        format!("{value}\n")
+    };
+    let scope = serde_json::json!([{"network": "10.20.0.0", "prefix": 16}]);
+    let routes = |count| {
+        serde_json::Value::Array(
+            (0..count)
+                .map(|i| serde_json::json!({"network": format!("10.20.0.{i}"), "prefix": 32}))
+                .collect(),
+        )
+    };
+    let largest = frame(7, "10.99.0.2", routes(64));
+    assert!(largest.len() <= MAX_LINE);
+    assert!(decode_response(largest.as_bytes()).is_ok());
+    let mut legacy = Vec::new();
+    write_control(
+        &mut legacy,
+        &Response::Status {
+            state: State::NetworkReady,
+        },
+    )
+    .unwrap();
+    assert_eq!(legacy, b"{\"op\":\"status\",\"state\":\"network_ready\"}\n");
+    assert!(decode_response(frame(7, "10.99.0.2", scope.clone()).as_bytes()).is_ok());
+    for invalid in [
+        frame(0, "10.99.0.2", scope.clone()),
+        frame(7, "::1", scope.clone()),
+        frame(7, "0.0.0.0", scope.clone()),
+        frame(
+            7,
+            "10.99.0.2",
+            serde_json::json!([{"network":"169.254.2.1", "prefix":32}]),
+        ),
+        frame(7, "10.99.0.2", routes(65)),
+    ] {
+        assert!(decode_response(invalid.as_bytes()).is_err());
+    }
+}

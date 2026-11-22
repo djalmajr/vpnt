@@ -534,6 +534,19 @@ fn dialogue_v2(
             }
             let deadline = Instant::now() + FRAME_TIMEOUT;
             match decoder.command(deadline)? {
+                Command::Status if session.state() == State::NetworkReady => {
+                    let binding = match session.probe_binding() {
+                        Ok(binding) if binding.generation() == record.generation() => binding,
+                        _ => {
+                            let _ = decoder.reject(ErrorCode::Backend, deadline);
+                            return Ok(());
+                        }
+                    };
+                    if poll_session(None, &*session, 0)?.1 {
+                        return decoder.reply_status(State::Stopping, deadline);
+                    }
+                    decoder.reply_ready(binding, deadline)?;
+                }
                 Command::Status => decoder.reply_status(session.state(), deadline)?,
                 Command::Stop => return decoder.reply_status(State::Stopping, deadline),
             }
