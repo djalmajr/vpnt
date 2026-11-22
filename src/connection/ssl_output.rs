@@ -98,6 +98,7 @@ impl Output {
     /// Linux: the interface name the supervisor configured, set before any pipe
     /// is attached. The `Interface <name> is UP.` line is then accepted only for
     /// exactly this name; any other name is a typed mismatch.
+    #[cfg(any(target_os = "linux", test))]
     pub fn expect_interface(&mut self, name: &str) -> io::Result<()> {
         if !(1..16).contains(&name.len())
             || !name
