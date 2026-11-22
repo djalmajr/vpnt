@@ -1,2 +1,3 @@
 # Unified diffs retain leading context spaces before upstream tabs and blanks.
 /scripts/macos/patches/*.patch -whitespace
+/packaging/linux/patches/*.patch -whitespace
