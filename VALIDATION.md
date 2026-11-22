@@ -262,6 +262,21 @@ read -r pid && kill -USR1 "$pid"
    até o host interno funcionaram, e o `SIGKILL` no app deixou o diff vazio
    contra o estado guardado depois da remoção.
 
+### Regressão OVPN com a exclusão de rede do #42
+
+**[PASS, VPN real, 21/11/2026]** Pacote Arch `0.1.0-1` construído do merge
+local `00a7f32dce306128c9cfed3a9992e8509dfeb6e9`, que inclui o head
+`aa3eb2465ce15794144e21d4e4856276de365fe4` do #42. O app, o helper e a unit
+instalados eram idênticos aos arquivos do pacote.
+
+O operador conectou o perfil OVPN já importado pelo ícone e aprovou pelo
+celular. A rota e a sonda TCP passaram pela interface do túnel, e a sonda
+HTTPS retornou 302. Depois da desconexão, as fotos completas da rede ficaram
+idênticas byte a byte e nenhuma interface de túnel restou. O roteiro saiu com
+código 0. Uma execução anterior registrou mudanças na rede de contêineres. A
+rechecagem usou uma nova foto inicial com o mesmo pacote instalado e manteve
+a comparação integral.
+
 IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
 seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
 
