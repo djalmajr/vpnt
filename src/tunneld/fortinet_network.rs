@@ -40,6 +40,9 @@ const IP: &str = "/usr/bin/ip";
 const RESOLVECTL: &str = "/usr/bin/resolvectl";
 const MAX_ORDINAL: u32 = 99;
 const MAX_OUTPUT: usize = 1024 * 1024;
+// Fixed by the packaged openfortivpn argv to pppd, without ipcp-accept-remote.
+const PPP_PEER: Ipv4Addr = Ipv4Addr::new(169, 254, 2, 1);
+const PPP_PEER_PREFIX: (u32, u8) = (PPP_PEER.to_bits(), 32);
 // Same protocol and scope as the routes netd adds.
 const PROTOCOL: &str = "boot";
 const COMMAND_DEADLINE: Duration = Duration::from_secs(4);
@@ -169,6 +172,14 @@ impl Receipt {
     /// The egress the client must bind to: policy-resolved gateway, planned link.
     pub(super) fn binding(&self) -> (&str, u32, Ipv4Addr) {
         (&self.egress.dev, self.egress.ifindex, self.remote)
+    }
+
+    fn protected_transport(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
+        self.approved
+            .iter()
+            .copied()
+            .chain([self.egress.prefsrc, self.remote])
+            .chain(self.egress.gateway)
     }
 
     pub(super) fn report(&self) -> Report {
@@ -388,16 +399,23 @@ impl Route {
         {
             return false;
         }
-        let host = Some(Ipv4Addr::from(dst.0));
-        (host == receipt.peer
-            && self.main_table()
-            && self.kind.as_deref() == Some("unicast")
-            && self.scope.as_deref() == Some("link"))
-            || (host == receipt.local
-                && self.table.as_deref() == Some("local")
-                && self.kind.as_deref() == Some("local")
-                && self.scope.as_deref() == Some("host"))
+        if dst == PPP_PEER_PREFIX {
+            return receipt.peer == Some(PPP_PEER)
+                && self.table.as_deref() == Some("main")
+                && self.kind.as_deref() == Some("unicast")
+                && self.scope.as_deref() == Some("link");
+        }
+        Some(Ipv4Addr::from(dst.0)) == receipt.local
+            && self.table.as_deref() == Some("local")
+            && self.kind.as_deref() == Some("local")
+            && self.scope.as_deref() == Some("host")
     }
+}
+
+#[derive(Default)]
+struct Applied {
+    routes: Vec<CidrV4>,
+    technical_peer: bool,
 }
 
 #[derive(Deserialize)]
@@ -499,7 +517,7 @@ impl FortinetNetwork {
         let ordinal = (1..=MAX_ORDINAL)
             .find(|n| !links.iter().any(|link| link.ifname == format!("vpntp{n}")))
             .ok_or_else(|| invalid("no PPP interface name is available"))?;
-        Ok(Receipt {
+        let receipt = Receipt {
             generation: generation.into(),
             boot: namespace.boot,
             netns: namespace.id,
@@ -518,7 +536,13 @@ impl FortinetNetwork {
             refused_dns: 0,
             confirmed: false,
             complete: false,
-        })
+        };
+        // Prove the technical peer is clear before pppd can assign it.
+        if receipt.protected_transport().any(|ip| ip == PPP_PEER) {
+            return Err(invalid("PPP peer conflicts with protected transport"));
+        }
+        self.fib_clear(&receipt)?;
+        Ok(receipt)
     }
 
     /// The link of this attempt as it stands now. A link that answers to the
@@ -536,7 +560,7 @@ impl FortinetNetwork {
         Ok(found)
     }
 
-    fn address(&self, link: &Link) -> io::Result<(Ipv4Addr, Option<Ipv4Addr>)> {
+    fn address(&self, link: &Link) -> io::Result<Ipv4Addr> {
         let result: Vec<AddressList> =
             self.json(&["-j", "-4", "addr", "show", "dev", &link.ifname])?;
         let [row] = result.as_slice() else {
@@ -549,11 +573,13 @@ impl FortinetNetwork {
             [addr]
                 if addr.family == "inet"
                     && addr.prefixlen == 32
+                    && addr.address == Some(PPP_PEER)
+                    && addr.local != PPP_PEER
                     && !addr.local.is_unspecified()
                     && !addr.local.is_loopback()
                     && !addr.local.is_multicast() =>
             {
-                Ok((addr.local, addr.address))
+                Ok(addr.local)
             }
             _ => Err(invalid("unexpected addresses on the PPP link")),
         }
@@ -593,20 +619,23 @@ impl FortinetNetwork {
 
     /// Prove each route on the identified PPP link against the saved intent.
     /// Kernel address entries are identified independently of the policy CIDRs.
-    fn applied(receipt: &Receipt, routes: &[Route]) -> io::Result<Vec<CidrV4>> {
-        let mut applied = Vec::new();
+    fn applied(receipt: &Receipt, routes: &[Route]) -> io::Result<Applied> {
+        let mut applied = Applied::default();
         for existing in routes
             .iter()
             .filter(|r| r.dev.as_deref() == Some(&receipt.ifname))
         {
             let dst = prefix(&existing.dst)?;
             if existing.is_ppp_kernel_route(receipt, dst) {
+                if dst == PPP_PEER_PREFIX && std::mem::replace(&mut applied.technical_peer, true) {
+                    return Err(invalid("ambiguous PPP peer route"));
+                }
                 continue;
             }
             let route = receipt.routes[..receipt.routes_intended]
                 .iter()
                 .find(|r| route_key(r) == dst)
-                .filter(|r| !applied.contains(*r))
+                .filter(|r| !applied.routes.contains(*r))
                 .filter(|_| {
                     existing.main_table()
                         && existing.kind.as_deref() == Some("unicast")
@@ -616,7 +645,7 @@ impl FortinetNetwork {
                         && existing.prefsrc.is_none()
                 })
                 .ok_or_else(|| invalid("unexpected IPv4 route on the PPP link"))?;
-            applied.push(*route);
+            applied.routes.push(*route);
         }
         Ok(applied)
     }
@@ -625,9 +654,13 @@ impl FortinetNetwork {
         let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
         check_standard_ipv4_rules(&rules)?;
         let routes = self.routes()?;
-        // Admission has no intended routes. Confirmation must find every
-        // intended route in this same snapshot before excluding the PPP rows.
-        if Self::applied(receipt, &routes)?.len() != receipt.routes_intended {
+        // Planning has no PPP link. Once identified, the technical peer
+        // and all intended routes must be present in this same snapshot.
+        let applied = Self::applied(receipt, &routes)?;
+        if receipt.ifindex.is_some() && !applied.technical_peer {
+            return Err(invalid("missing PPP peer route"));
+        }
+        if applied.routes.len() != receipt.routes_intended {
             return Err(invalid("network configuration confirmation failed"));
         }
         let mut has_default = false;
@@ -643,7 +676,9 @@ impl FortinetNetwork {
                     .gateway
                     .into_iter()
                     .chain(existing.prefsrc)
-                    .any(|ip| receipt.routes.iter().any(|route| contains(route, ip)))
+                    .any(|ip| {
+                        ip == PPP_PEER || receipt.routes.iter().any(|route| contains(route, ip))
+                    })
                 {
                     return Err(invalid("VPN scope conflicts with protected transport"));
                 }
@@ -653,6 +688,9 @@ impl FortinetNetwork {
             let dst = prefix(&existing.dst)?;
             if dst.1 == 0 || dst.0.trailing_zeros() < u32::from(32 - dst.1) {
                 return Err(invalid("invalid FIB destination"));
+            }
+            if overlaps(PPP_PEER_PREFIX, dst) {
+                return Err(invalid("PPP peer conflicts with an existing route"));
             }
             if receipt
                 .routes
@@ -721,10 +759,10 @@ impl FortinetNetwork {
                     && link.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("PPP link is not up or is not a PPP link"))?;
-        let (local, peer) = self.address(&link)?;
+        let local = self.address(&link)?;
         receipt.ifindex = Some(link.ifindex);
         receipt.local = Some(local);
-        receipt.peer = peer;
+        receipt.peer = Some(PPP_PEER);
 
         // Routes: only what policy accepts; the rest is refused and counted.
         let mut accepted: Vec<CidrV4> = Vec::new();
@@ -739,14 +777,8 @@ impl FortinetNetwork {
                 _ => refused += 1,
             }
         }
-        let protected = receipt
-            .approved
-            .iter()
-            .copied()
-            .chain([receipt.egress.prefsrc, receipt.remote])
-            .chain(receipt.egress.gateway);
-        if protected
-            .into_iter()
+        if receipt
+            .protected_transport()
             .any(|ip| accepted.iter().any(|route| contains(route, ip)))
         {
             return Err(invalid("VPN scope conflicts with protected transport"));
@@ -815,9 +847,7 @@ impl FortinetNetwork {
                     && current.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("PPP link changed during configuration"))?;
-        if self.address(&current)? != (local, peer)
-            || self.egress(receipt.remote)? != receipt.egress
-        {
+        if self.address(&current)? != local || self.egress(receipt.remote)? != receipt.egress {
             return Err(invalid("network configuration confirmation failed"));
         }
         if let Some(dns) = &dns
@@ -849,7 +879,7 @@ impl FortinetNetwork {
             for route in receipt.routes[..receipt.routes_intended]
                 .iter()
                 .rev()
-                .filter(|route| present.contains(route))
+                .filter(|route| present.routes.contains(route))
             {
                 self.route_change("del", route, &link.ifname, None)?;
             }
@@ -859,7 +889,7 @@ impl FortinetNetwork {
         }
         // Prove it: nothing of ours is left under the recorded identity.
         if let Some(link) = self.links()?.into_iter().find(ours) {
-            if !Self::applied(receipt, &self.routes()?)?.is_empty() {
+            if !Self::applied(receipt, &self.routes()?)?.routes.is_empty() {
                 return Err(invalid("a route remains on the PPP link"));
             }
             if receipt.dns_intended {
@@ -964,6 +994,8 @@ pub(super) mod fixture {
         pub up: bool,
         pub link_type: &'static str,
         pub ifindex: u32,
+        pub peer: Option<&'static str>,
+        pub peer_route: Option<&'static str>,
         pub routes: Vec<String>,
         pub foreign: Vec<serde_json::Value>,
         pub default_override: Option<Vec<serde_json::Value>>,
@@ -991,6 +1023,8 @@ pub(super) mod fixture {
                 up: true,
                 link_type: "ppp",
                 ifindex: 9,
+                peer: Some(PEER),
+                peer_route: Some(PEER),
                 routes: Vec::new(),
                 foreign: Vec::new(),
                 default_override: None,
@@ -1016,7 +1050,7 @@ pub(super) mod fixture {
     }
 
     pub(in crate::tunneld) const LOCAL: &str = "10.99.0.2";
-    pub(in crate::tunneld) const PEER: &str = "10.99.0.1";
+    pub(in crate::tunneld) const PEER: &str = "169.254.2.1";
     pub(in crate::tunneld) const NAME: &str = "vpntp1";
 
     /// A kernel whose every command is checked against the writer lock when a
@@ -1101,7 +1135,7 @@ pub(super) mod fixture {
                 }
                 ["-j", "-4", "addr", "show", "dev", NAME] => say(json!([{
                     "ifindex": k.ifindex,
-                    "addr_info": [{"family": "inet", "local": LOCAL, "address": PEER, "prefixlen": 32}]
+                    "addr_info": [{"family": "inet", "local": LOCAL, "address": k.peer, "prefixlen": 32}]
                 }])),
                 ["-4", "-j", "rule", "show"] => say(json!(k.rules)),
                 ["-4", "-j", "-d", "route", "show", "table", "all"] => {
@@ -1114,16 +1148,16 @@ pub(super) mod fixture {
                     });
                     routes.extend(k.foreign.iter().cloned());
                     if k.ppp {
-                        routes.extend([
-                            json!({
-                                "dst": PEER, "dev": NAME, "type": "unicast", "table": "main",
+                        if let Some(peer_route) = k.peer_route {
+                            routes.push(json!({
+                                "dst": peer_route, "dev": NAME, "type": "unicast", "table": "main",
                                 "protocol": "kernel", "scope": "link", "prefsrc": LOCAL, "flags": []
-                            }),
-                            json!({
-                                "dst": LOCAL, "dev": NAME, "type": "local", "table": "local",
-                                "protocol": "kernel", "scope": "host", "prefsrc": LOCAL, "flags": []
-                            }),
-                        ]);
+                            }));
+                        }
+                        routes.push(json!({
+                            "dst": LOCAL, "dev": NAME, "type": "local", "table": "local",
+                            "protocol": "kernel", "scope": "host", "prefsrc": LOCAL, "flags": []
+                        }));
                         routes.extend(k.routes.iter().map(|dst| {
                             json!({
                                 "dst": dst, "dev": NAME, "type": "unicast", "table": "main",
@@ -1347,6 +1381,53 @@ mod tests {
     }
 
     #[test]
+    fn planning_refuses_preexisting_routes_covering_the_technical_peer() {
+        for (dst, table) in [
+            (PEER, "local"),
+            ("169.254.0.0/16", "main"),
+            ("169.254.2.1/32", "100"),
+        ] {
+            let fixture = Fixture::new();
+            let competing = external_route(dst, table);
+            fixture
+                .kernel
+                .lock()
+                .unwrap()
+                .foreign
+                .push(competing.clone());
+            let result = fixture
+                .network
+                .plan(&fixture.guard(), GENERATION, REMOTE, &[REMOTE]);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            assert!(!fixture.directory.join(RECEIPT).exists());
+            assert!(fixture.writes().is_empty());
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(!kernel.ppp);
+            assert_eq!(kernel.foreign, [competing]);
+        }
+    }
+
+    #[test]
+    fn apply_requires_the_fixed_peer_address_and_its_kernel_route() {
+        for (peer, route) in [
+            (Some("10.99.0.1"), Some("10.99.0.1")),
+            (None, None),
+            (Some(PEER), None),
+            (Some(PEER), Some("169.254.2.0/31")),
+        ] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                kernel.ppp = true;
+                kernel.peer = peer;
+                kernel.peer_route = route;
+            }
+            assert_rejected_before_writes(&fixture, &mut receipt);
+        }
+    }
+
+    #[test]
     fn routes_inside_the_ceiling_are_applied_and_the_rest_refused_and_counted() {
         let fixture = Fixture::new();
         let mut receipt = fixture.plan();
@@ -1361,6 +1442,8 @@ mod tests {
                 ("10.20.0.0", 16),
                 // Wider than the ceiling.
                 ("10.0.0.0", 8),
+                // The technical peer is never a policy route.
+                (PEER, 32),
             ],
             &[],
         );
@@ -1370,7 +1453,7 @@ mod tests {
             receipt.report(),
             Report {
                 accepted_routes: 1,
-                refused_routes: 3,
+                refused_routes: 4,
                 dns_servers: 0,
                 refused_dns: 0
             }
@@ -1380,6 +1463,7 @@ mod tests {
         let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
         assert_eq!((saved.routes_intended, saved.confirmed), (1, true));
         assert_eq!(saved.ifindex, Some(9));
+        assert_eq!(saved.peer, Some(PEER.parse().unwrap()));
     }
 
     #[test]
@@ -1421,7 +1505,7 @@ mod tests {
         let entry = entry(&["10.20.0.0/15"], &[], &["corp.example"]);
         // 8.8.8.8 is outside the ceiling; 10.21.0.53 is inside the ceiling but
         // outside the only route the gateway delivered.
-        let delivered = ready(&[("10.20.0.0", 16)], &["8.8.8.8", "10.21.0.53"]);
+        let delivered = ready(&[("10.20.0.0", 16)], &["8.8.8.8", "10.21.0.53", PEER]);
         apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
         assert!(
             !fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL)),
@@ -1429,7 +1513,7 @@ mod tests {
             fixture.ops()
         );
         assert_eq!(receipt.report().dns_servers, 0);
-        assert_eq!(receipt.report().refused_dns, 2);
+        assert_eq!(receipt.report().refused_dns, 3);
     }
 
     #[test]
@@ -1654,6 +1738,7 @@ mod tests {
         let route = external_route("10.20.1.0/24", "main");
         for (foreign_on_add, rule, foreign_after_dns) in [
             (Some(route.clone()), None, None),
+            (Some(external_route(PEER, "local")), None, None),
             (None, Some(custom_rule()), None),
             (None, None, Some(route)),
         ] {
