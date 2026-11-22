@@ -813,7 +813,10 @@ impl FortinetNetwork {
             receipt.refused_dns = denied.len();
             allowed.into_iter().copied().collect()
         };
-        let dns = (!servers.is_empty() && !domains.is_empty()).then_some(Dns { servers, domains });
+        if !domains.is_empty() && servers.is_empty() {
+            return Err(invalid("no reachable DNS server for policy domains"));
+        }
+        let dns = (!domains.is_empty()).then_some(Dns { servers, domains });
         receipt.dns = dns.clone();
         receipt.save(directory, guard)?;
 
@@ -1472,13 +1475,13 @@ mod tests {
         let mut receipt = fixture.plan();
         up(&fixture);
         let entry = entry(&["10.20.0.0/15"], &[], &["corp.example"]);
-        let delivered = ready(&[("10.20.0.0", 16)], &["10.20.1.53"]);
+        let delivered = ready(&[("10.20.0.0", 16)], &["10.20.1.53", "10.21.0.53"]);
         apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
         let k = fixture.kernel.lock().unwrap();
         assert_eq!(k.dns, ["10.20.1.53"]);
         assert_eq!(k.domains, ["~corp.example"]);
         assert_eq!(receipt.report().dns_servers, 1);
-        assert_eq!(receipt.report().refused_dns, 0);
+        assert_eq!(receipt.report().refused_dns, 1);
         // The same per-link sequence netd uses: revert, dns, domain, default-route.
         drop(k);
         let writes = fixture.writes();
@@ -1498,22 +1501,22 @@ mod tests {
     }
 
     #[test]
-    fn a_gateway_dns_outside_the_accepted_routes_is_refused() {
-        let fixture = Fixture::new();
-        let mut receipt = fixture.plan();
-        up(&fixture);
+    fn policy_domains_require_a_valid_reachable_gateway_offer_when_dns_is_not_fixed() {
         let entry = entry(&["10.20.0.0/15"], &[], &["corp.example"]);
-        // 8.8.8.8 is outside the ceiling; 10.21.0.53 is inside the ceiling but
-        // outside the only route the gateway delivered.
-        let delivered = ready(&[("10.20.0.0", 16)], &["8.8.8.8", "10.21.0.53", PEER]);
-        apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
-        assert!(
-            !fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL)),
-            "no DNS write: {:?}",
-            fixture.ops()
-        );
-        assert_eq!(receipt.report().dns_servers, 0);
-        assert_eq!(receipt.report().refused_dns, 3);
+        for (servers, invalid) in [
+            (&[][..], false),
+            (&["198.51.100.53", "10.21.0.53", PEER][..], false),
+            (&["10.20.1.53"][..], true),
+        ] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let mut delivered = ready(&[("10.20.0.0", 16)], servers);
+            if invalid {
+                delivered.absorb(Event::DnsInvalid);
+            }
+            assert_missing_policy_dns(&fixture, &mut receipt, &delivered, &entry);
+        }
     }
 
     #[test]
@@ -1554,18 +1557,7 @@ mod tests {
         up(&fixture);
         let entry = entry(&["10.20.0.0/15"], &["10.21.0.53"], &["corp.example"]);
         let delivered = ready(&[("10.20.0.0", 16)], &["10.20.1.53"]);
-        apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
-        let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
-        assert!(saved.confirmed);
-        assert!(!saved.dns_intended);
-        assert_eq!(saved.report().refused_dns, 1);
-        assert!(fixture.kernel.lock().unwrap().dns.is_empty());
-        assert!(
-            fixture
-                .writes()
-                .iter()
-                .all(|op| !op.starts_with(RESOLVECTL))
-        );
+        assert_missing_policy_dns(&fixture, &mut receipt, &delivered, &entry);
     }
 
     #[test]
@@ -1578,12 +1570,7 @@ mod tests {
             let fixed_servers = if fixed { &servers[..] } else { &[] };
             let entry = entry(&["10.99.0.0/24"], fixed_servers, &["corp.example"]);
             let delivered = ready(&[("10.99.0.0", 24)], &servers);
-            apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
-            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
-            assert!(saved.confirmed);
-            assert!(!saved.dns_intended);
-            assert_eq!(saved.report().refused_dns, 1);
-            assert!(fixture.kernel.lock().unwrap().dns.is_empty());
+            assert_missing_policy_dns(&fixture, &mut receipt, &delivered, &entry);
         }
     }
 
@@ -1598,6 +1585,12 @@ mod tests {
         let delivered = ready(&[("10.20.0.0", 16)], &[]);
         apply(&fixture, &mut receipt, &delivered, &entry).unwrap();
         assert!(!fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL)));
+        let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+        assert_eq!(
+            (saved.routes_intended, saved.dns_intended, saved.confirmed),
+            (1, false, true)
+        );
+        assert_eq!(fixture.kernel.lock().unwrap().routes, ["10.20.0.0/16"]);
     }
 
     #[test]
@@ -1626,6 +1619,33 @@ mod tests {
         let delivered = ready(&[("10.20.0.0", 16)], &["10.20.1.53"]);
         let result = apply(fixture, receipt, &delivered, &entry);
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_no_network_effects(fixture);
+    }
+
+    fn assert_missing_policy_dns(
+        fixture: &Fixture,
+        receipt: &mut Receipt,
+        delivered: &Delivered,
+        entry: &Entry,
+    ) {
+        let error = apply(fixture, receipt, delivered, entry).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "no reachable DNS server for policy domains"
+        );
+        assert_eq!(
+            (
+                receipt.routes_intended,
+                receipt.dns_intended,
+                receipt.confirmed
+            ),
+            (0, false, false)
+        );
+        assert_no_network_effects(fixture);
+    }
+
+    fn assert_no_network_effects(fixture: &Fixture) {
         let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
         assert_eq!(
             (saved.routes_intended, saved.dns_intended, saved.confirmed),
@@ -1636,6 +1656,8 @@ mod tests {
             .clean(&fixture.guard(), &fixture.directory, &saved)
             .unwrap();
         assert!(fixture.writes().is_empty());
+        let kernel = fixture.kernel.lock().unwrap();
+        assert!(kernel.routes.is_empty() && kernel.dns.is_empty() && kernel.domains.is_empty());
     }
 
     #[test]

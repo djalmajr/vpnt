@@ -2258,6 +2258,60 @@ mod tests {
         }
 
         #[test]
+        fn fortinet_without_reachable_policy_dns_never_reaches_network_ready() {
+            if !namespaced_in(
+                "fortinet_without_reachable_policy_dns_never_reaches_network_ready",
+                "tests::fortinet_tests",
+            ) {
+                return;
+            }
+            for fixed in [false, true] {
+                let rig = Rig::new();
+                let mut events = standard_events();
+                let servers: &[&str] = if fixed {
+                    // Offers from the standard fixture include a reachable server.
+                    &["10.21.0.53"]
+                } else {
+                    events.retain(|event| {
+                        !matches!(event, Event::DnsServer { .. } | Event::DnsCount { .. })
+                    });
+                    events.push(Event::DnsCount {
+                        servers: 0,
+                        domains: 0,
+                    });
+                    &[]
+                };
+                rig.instance(Script::Ready(events));
+                let launcher = rig.launcher(false);
+                assert_eq!(
+                    rig.launch(&launcher, &policy(servers)).err(),
+                    Some(ErrorCode::Backend)
+                );
+
+                let unit = started_unit(&rig.harness.log).unwrap();
+                let saved = rig.receipt(&generation_of(&unit));
+                assert_eq!(saved["routes_intended"], 0);
+                assert_eq!(saved["dns_intended"], false);
+                assert_eq!(saved["confirmed"], false);
+                assert_eq!(saved["complete"], true);
+                assert_reverted_after_stop(&rig, &unit);
+                assert!(rig.harness.leases().is_empty());
+                let kernel = rig.kernel.lock().unwrap();
+                assert_eq!(kernel.adds, 0);
+                assert!(!kernel.ppp);
+                assert!(
+                    kernel.routes.is_empty() && kernel.dns.is_empty() && kernel.domains.is_empty()
+                );
+                assert!(
+                    !kernel
+                        .ops
+                        .iter()
+                        .any(|op| op.starts_with("/usr/bin/resolvectl "))
+                );
+            }
+        }
+
+        #[test]
         fn an_interface_mismatch_is_fatal_and_leaves_nothing_behind() {
             if !namespaced_in(
                 "an_interface_mismatch_is_fatal_and_leaves_nothing_behind",
