@@ -75,8 +75,8 @@ fn linux_controller_child() {
         profiles: Arc::new(Profiles::for_current_user().unwrap()),
     };
     assert!(factory.supports(VpnKind::Ovpn));
-    assert!(!factory.supports(VpnKind::Ssl));
-    assert!(!factory.supports(VpnKind::Ipsec));
+    assert!(factory.supports(VpnKind::Ssl));
+    assert!(factory.supports(VpnKind::Ipsec));
     let config = store.ovpn_dir().unwrap().join("third.ovpn");
     fs::write(&config, b"fixture").unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
@@ -138,40 +138,40 @@ fn linux_controller_child() {
         }
         other => panic!("unexpected snapshot response: {other:?}"),
     }
-    requests
-        .send(Request {
-            id: "connect".into(),
-            command: RequestCommand::Connect {
-                id: "first".into(),
-                generation: 1,
-                interval: ProbeInterval::TEN,
-                credentials: Credentials {
-                    password: Secret::from("fixture"),
-                    psk: Secret::from(""),
+    // Both backends reach the worker. The fixtures have no SSL pin or
+    // IPsec routes, so validation fails before using any real daemon socket.
+    for (request_id, profile_id, psk) in [
+        ("connect-ssl", "first", ""),
+        ("connect-ipsec", "second", "fixture"),
+    ] {
+        requests
+            .send(Request {
+                id: request_id.into(),
+                command: RequestCommand::Connect {
+                    id: profile_id.into(),
+                    generation: 1,
+                    interval: ProbeInterval::TEN,
+                    credentials: Credentials {
+                        password: Secret::from("fixture"),
+                        psk: Secret::from(psk),
+                    },
                 },
-            },
-        })
-        .unwrap();
-    assert!(
-        matches!(messages.recv_timeout(Duration::from_secs(3)).unwrap(), Message::Failed { id, error: ErrorCode::MissingProgram } if id == "connect")
-    );
-    requests
-        .send(Request {
-            id: "connect-ipsec".into(),
-            command: RequestCommand::Connect {
-                id: "second".into(),
-                generation: 1,
-                interval: ProbeInterval::TEN,
-                credentials: Credentials {
-                    password: Secret::from("fixture"),
-                    psk: Secret::from("fixture"),
-                },
-            },
-        })
-        .unwrap();
-    assert!(
-        matches!(messages.recv_timeout(Duration::from_secs(3)).unwrap(), Message::Failed { id, error: ErrorCode::MissingProgram } if id == "connect-ipsec")
-    );
+            })
+            .unwrap();
+        assert!(matches!(
+            messages.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Message::Accepted { id } if id == request_id
+        ));
+        loop {
+            if let Message::Failed { id, error } =
+                messages.recv_timeout(Duration::from_secs(3)).unwrap()
+            {
+                assert_eq!(id, request_id);
+                assert_eq!(error, ErrorCode::UntrustedConfiguration);
+                break;
+            }
+        }
+    }
     requests
         .send(Request {
             id: "connect-ovpn".into(),
@@ -231,6 +231,10 @@ fn linux_controller_loads_profiles_refuses_connection_and_stops() {
                 "--nocapture",
             ])
             .env("VPNT_CONTROLLER_TEST_CHILD", "1")
+            .env("HOME", &f.0)
+            .env("USERPROFILE", &f.0)
+            .env("XDG_CONFIG_HOME", &f.0)
+            .env("TMPDIR", &f.0)
             .env("XDG_DATA_HOME", &f.0)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())

@@ -529,6 +529,50 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_ike_identity_must_be_canonical_unicast_and_in_the_grant_transport() {
+        let mut grant = ipsec();
+        grant["transport_ipv4"] = json!(["192.0.2.20", "192.0.2.10"]);
+        grant["peer_identity"] = json!("ipv4:192.0.2.10");
+        let bytes = snapshot(grant.clone()).expect("an IPv4 identity in the transport is allowed");
+        assert_eq!(
+            Policy::parse(&bytes, MAX_SNAPSHOT)
+                .unwrap()
+                .bytes()
+                .unwrap(),
+            bytes
+        );
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["entries"][0]["peer_identity"], "ipv4:192.0.2.10");
+        assert_eq!(
+            parsed["entries"][0]["transport_ipv4"],
+            json!(["192.0.2.10", "192.0.2.20"])
+        );
+        for rejected in [
+            "ipv4:192.0.2.11",
+            "ipv4:192.0.002.10",
+            "ipv4:0300.0.2.012",
+            "ipv4: 192.0.2.10",
+            "ipv4:192.0.2.10 ",
+            "ipv4:192.0.2.10\n",
+            "ipv4:192.0.2.10/32",
+            "ipv4:::ffff:192.0.2.10",
+            "ipv4:224.0.0.1",
+            "ipv4:0.0.0.0",
+            "ipv4:255.255.255.255",
+            "192.0.2.10",
+        ] {
+            grant["peer_identity"] = json!(rejected);
+            assert!(snapshot(grant.clone()).is_err(), "accepted {rejected:?}");
+        }
+        for accepted in ["fqdn:vpn.example", "email:fixture@example.test"] {
+            grant["peer_identity"] = json!(accepted);
+            let bytes = snapshot(grant.clone()).unwrap();
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["entries"][0]["peer_identity"], accepted);
+        }
+    }
+
+    #[test]
     fn backend_pin_identity_and_dns_are_bound_to_fortinet() {
         let control = fortinet();
         assert!(snapshot(control.clone()).is_ok());
