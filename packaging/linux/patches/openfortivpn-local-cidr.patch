@@ -1,0 +1,387 @@
+Check the approved Fortinet IPv4 local scope on every inbound IPCP frame.
+
+diff --git a/Makefile.am b/Makefile.am
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -6,7 +6,8 @@
+ 			   src/http_server.c src/ipv4.c \
+ 		       src/ipv4.h src/log.c src/log.h src/tunnel.c \
+ 		       src/tunnel.h src/main.c src/ssl.h src/xml.c \
+-		       src/xml.h src/userinput.c src/userinput.h
++		       src/xml.h src/userinput.c src/userinput.h \
++		       src/vpnt_ipcp_policy.c src/vpnt_ipcp_policy.h
+ openfortivpn_CPPFLAGS = -DSYSCONFDIR=\"$(sysconfdir)\" \
+ 			-DPPP_PATH=\"@PPP_PATH@\" \
+ 			-DNETSTAT_PATH=\"@NETSTAT_PATH@\" \
+diff --git a/src/config.h b/src/config.h
+--- a/src/config.h
++++ b/src/config.h
+@@ -83,7 +83,10 @@
+ #define MAX_DOMAIN_LENGTH 256
+ #define MAX_SAML_SESSION_ID_LENGTH 1024
+ 
++#include "vpnt_ipcp_policy.h"
++
+ struct vpn_config {
++	struct vpnt_ipcp_local_scope fortinet_local_cidr;
+ 	char			gateway_host[GATEWAY_HOST_SIZE + 1];
+ 	struct in_addr		gateway_ip;
+ 	uint16_t		gateway_port;
+diff --git a/src/io.c b/src/io.c
+--- a/src/io.c
++++ b/src/io.c
+@@ -365,42 +365,6 @@
+ 	return NULL;
+ }
+ 
+-#define packet_is_ip_plus_dns(packet) \
+-	((packet)->len >= 12 \
+-	 && pkt_data(packet)[0] == 0x80 \
+-	 && pkt_data(packet)[1] == 0x21 \
+-	 && pkt_data(packet)[2] == 0x02 \
+-	 && pkt_data(packet)[6] == 0x03)
+-
+-#define packet_is_end_negociation(packet) \
+-	(((packet)->len == 6 \
+-	  && pkt_data(packet)[0] == 0x80 \
+-	  && pkt_data(packet)[1] == 0x21 \
+-	  && pkt_data(packet)[2] == 0x01 \
+-	  && pkt_data(packet)[4] == 0x00 \
+-	  && pkt_data(packet)[5] == 0x04) || \
+-	 ((packet)->len >= 12 \
+-	  && pkt_data(packet)[0] == 0x80 \
+-	  && pkt_data(packet)[1] == 0x21 \
+-	  && pkt_data(packet)[2] == 0x02))
+-
+-static inline void set_tunnel_ips(struct tunnel *tunnel,
+-                                  struct ppp_packet *packet)
+-{
+-	memcpy(&tunnel->ipv4.ip_addr.s_addr, &pkt_data(packet)[8],
+-	       sizeof(uint32_t));
+-	if (packet->len >= 18 && pkt_data(packet)[12] == 0x81
+-	    && tunnel->config->pppd_use_peerdns) {
+-		memcpy(&tunnel->ipv4.ns1_addr.s_addr, &pkt_data(packet)[14],
+-		       sizeof(uint32_t));
+-	}
+-	if (packet->len >= 24 && pkt_data(packet)[18] == 0x83
+-	    && tunnel->config->pppd_use_peerdns) {
+-		memcpy(&tunnel->ipv4.ns2_addr.s_addr, &pkt_data(packet)[20],
+-		       sizeof(uint32_t));
+-	}
+-}
+-
+ #define printable_char(c) \
+ 	(c == '\t' || c == '\n' || (c >= ' ' && c <= '~'))
+ 
+@@ -495,29 +459,22 @@
+ 		log_debug("gateway ---> %s (%lu bytes)\n", PPP_DAEMON, packet->len);
+ 		log_packet("gtw:    ", packet->len, pkt_data(packet));
+ 
+-		if (tunnel->state == STATE_CONNECTING) {
+-			if (packet_is_ip_plus_dns(packet)) {
+-				char line[ARRAY_SIZE("[xxx.xxx.xxx.xxx], ns [xxx.xxx.xxx.xxx, xxx.xxx.xxx.xxx], ns_suffix []") + MAX_DOMAIN_LENGTH];
+-
+-				set_tunnel_ips(tunnel, packet);
+-				strcpy(line, "[");
+-				strncat(line, inet_ntoa(tunnel->ipv4.ip_addr), 15);
+-				strcat(line, "], ns [");
+-				strncat(line, inet_ntoa(tunnel->ipv4.ns1_addr), 15);
+-				strcat(line, ", ");
+-				strncat(line, inet_ntoa(tunnel->ipv4.ns2_addr), 15);
+-				if (tunnel->ipv4.dns_suffix) {
+-					strcat(line, "], ns_suffix [");
+-					strncat(line, tunnel->ipv4.dns_suffix,
+-					        MAX_DOMAIN_LENGTH);
+-				}
+-				strcat(line, "]");
+-				log_info("Got addresses: %s\n", line);
+-			}
+-			if (packet_is_end_negociation(packet)) {
+-				log_info("Negotiation complete.\n");
+-				SEM_POST(&sem_if_config);
++		struct vpnt_ipcp_ack ack;
++		if (!vpnt_ipcp_check(&tunnel->config->fortinet_local_cidr,
++		                    pkt_data(packet), packet->len, &ack)) {
++			tunnel->vpnt_ipcp_denied = true;
++			log_error("IPCP rejected by the Fortinet local IPv4 policy.\n");
++			free(packet);
++			break;
++		}
++
++		if (tunnel->state == STATE_CONNECTING && ack.local) {
++			tunnel->ipv4.ip_addr.s_addr = htonl(ack.local);
++			if (tunnel->config->pppd_use_peerdns) {
++				tunnel->ipv4.ns1_addr.s_addr = htonl(ack.dns1);
++				tunnel->ipv4.ns2_addr.s_addr = htonl(ack.dns2);
+ 			}
++			SEM_POST(&sem_if_config);
+ 		}
+ 
+ 		pool_push(&tunnel->ssl_to_pty_pool, packet);
+diff --git a/src/main.c b/src/main.c
+--- a/src/main.c
++++ b/src/main.c
+@@ -312,6 +312,7 @@
+ 		{"user-cert",            required_argument, NULL, 0},
+ 		{"user-key",             required_argument, NULL, 0},
+ 		{"pem-passphrase",       required_argument, NULL, 0},
++		{"fortinet-local-cidr",   required_argument, NULL, 0},
+ 		{"trusted-cert",         required_argument, NULL, 0},
+ 		{"insecure-ssl",         no_argument, &cli_cfg.insecure_ssl, 1},
+ 		{"cipher-list",          required_argument, NULL, 0},
+@@ -483,6 +484,16 @@
+ 				break;
+ 			}
+ 			if (strcmp(long_options[option_index].name,
++			           "fortinet-local-cidr") == 0) {
++				if (cfg.fortinet_local_cidr.prefix
++				    || !vpnt_ipcp_local_scope_parse(optarg, &cfg.fortinet_local_cidr)) {
++					log_error("Invalid or repeated Fortinet local IPv4 scope.\n");
++					ret = EXIT_FAILURE;
++					goto exit;
++				}
++				break;
++			}
++			if (strcmp(long_options[option_index].name,
+ 			           "trusted-cert") == 0) {
+ 				// vpnt: a pin that cannot be stored must not fall back to PKI only.
+ 				if (add_trusted_cert(&cli_cfg, optarg)) {
+@@ -801,10 +812,9 @@
+ 	}
+ 
+ 	do {
+-		if (run_tunnel(&cfg) != 0)
+-			ret = EXIT_FAILURE;
+-		else
+-			ret = EXIT_SUCCESS;
++		ret = run_tunnel(&cfg);
++		if (ret == VPNT_IPCP_DENIED_EXIT)
++			break;
+ 		if ((cfg.persistent > 0) && (get_sig_received() == 0))
+ 			sleep(cfg.persistent);
+ 	} while ((get_sig_received() == 0) && (cfg.persistent != 0));
+diff --git a/src/tunnel.c b/src/tunnel.c
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -187,6 +187,14 @@
+ 	static const char ppp_path[] = PPP_PATH;
+ #endif
+ 
++	/* No pppd without an approved local IPv4 scope and a fixed peer. */
++	if (!tunnel->config->fortinet_local_cidr.prefix
++	    || tunnel->config->pppd_call
++	    || tunnel->config->pppd_accept_remote) {
++		log_error("Fortinet requires a local IPv4 scope and fixed PPP peer configuration.\n");
++		return 1;
++	}
++
+ 	if (access(ppp_path, F_OK) != 0) {
+ 		log_error("%s: %s.\n", ppp_path, strerror(errno));
+ 		return 1;
+@@ -1657,5 +1665,7 @@
+ 		free(tunnel.ipv4.split_rt);
+ 		tunnel.ipv4.split_rt = NULL;
+ 	}
+-	return ret;
++	if (tunnel.vpnt_ipcp_denied)
++		return VPNT_IPCP_DENIED_EXIT;
++	return ret == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+ }
+diff --git a/src/tunnel.h b/src/tunnel.h
+--- a/src/tunnel.h
++++ b/src/tunnel.h
+@@ -55,6 +55,7 @@
+ };
+ 
+ struct tunnel {
++	bool vpnt_ipcp_denied;
+ 	struct vpn_config *config;
+ 
+ 	enum tunnel_state state;
+diff --git a/src/vpnt_ipcp_policy.c b/src/vpnt_ipcp_policy.c
+new file mode 100644
+--- /dev/null
++++ b/src/vpnt_ipcp_policy.c
+@@ -0,0 +1,148 @@
++#include "vpnt_ipcp_policy.h"
++
++#include <arpa/inet.h>
++#include <string.h>
++
++/* The scope and the inspection result use host byte order. */
++static uint32_t mask(unsigned prefix)
++{
++	return UINT32_MAX << (32 - prefix);
++}
++
++static uint32_t address(const uint8_t *bytes)
++{
++	uint32_t network_order;
++
++	memcpy(&network_order, bytes, sizeof(network_order));
++	return ntohl(network_order);
++}
++
++bool vpnt_ipcp_local_scope_parse(const char *text,
++                               struct vpnt_ipcp_local_scope *scope)
++{
++	char ipv4[INET_ADDRSTRLEN];
++	const char *slash = strchr(text, '/');
++	struct in_addr parsed;
++	unsigned prefix;
++	uint32_t network;
++	static const struct vpnt_ipcp_local_scope excluded[] = {
++		{ 0x00000000, 8 }, { 0x7f000000, 8 }, { 0xa9fe0000, 16 },
++		{ 0xe0000000, 4 }, { 0xf0000000, 4 },
++	};
++
++	if (!slash || slash == text || (size_t)(slash - text) >= sizeof(ipv4))
++		return false;
++	memcpy(ipv4, text, slash - text);
++	ipv4[slash - text] = '\0';
++	if (inet_pton(AF_INET, ipv4, &parsed) != 1)
++		return false;
++
++	text = slash + 1;
++	if (*text < '1' || *text > '9')
++		return false;
++	prefix = *text++ - '0';
++	if (*text >= '0' && *text <= '9')
++		prefix = prefix * 10 + (*text++ - '0');
++	if (*text || prefix < 8 || prefix > 32)
++		return false;
++
++	network = ntohl(parsed.s_addr);
++	if ((network & mask(prefix)) != network)
++		return false;
++	for (size_t i = 0; i < sizeof(excluded) / sizeof(excluded[0]); i++) {
++		unsigned common = prefix < excluded[i].prefix ? prefix : excluded[i].prefix;
++		if ((network & mask(common)) == (excluded[i].network & mask(common)))
++			return false;
++	}
++	*scope = (struct vpnt_ipcp_local_scope){ network, prefix };
++	return true;
++}
++
++bool vpnt_ipcp_check(const struct vpnt_ipcp_local_scope *scope,
++                    const uint8_t *frame, size_t size,
++                    struct vpnt_ipcp_ack *ack)
++{
++	enum { CONFREQ = 1, CONFACK = 2, CONFNAK = 3 };
++	enum { CI_ADDRS = 1, CI_ADDR = 3, CI_DNS1 = 129, CI_DNS2 = 131 };
++	struct vpnt_ipcp_ack result = {0};
++	bool seen_address = false;
++	uint8_t code;
++
++	*ack = result;
++	/* This payload starts at PPP Protocol; HDLC adds Address/Control. */
++	if (!size || frame[0] == 0xff)
++		return false;
++	if (frame[0] & 1)
++		return true; /* Compressed protocol; IPCP cannot be compressed. */
++	if (size < 2 || !(frame[1] & 1))
++		return false;
++	if (frame[0] != 0x80 || frame[1] != 0x21)
++		return true;
++	if (size < 6 || ((size_t)frame[4] << 8 | frame[5]) != size - 2)
++		return false;
++
++	code = frame[2];
++	if (code != CONFREQ && code != CONFACK && code != CONFNAK)
++		return true;
++
++	for (size_t offset = 6; offset < size; ) {
++		const uint8_t *option = frame + offset;
++		const uint8_t *local = NULL;
++		size_t length;
++
++		if (size - offset < 2)
++			return false;
++		length = option[1];
++		if (length < 2 || length > size - offset)
++			return false;
++		offset += length;
++
++		switch (option[0]) {
++		case CI_ADDRS:
++			if (length != 10 || seen_address)
++				return false;
++			seen_address = true;
++			/* The first address belongs to the Configure-Request sender. */
++			local = option + (code == CONFREQ ? 6 : 2);
++			break;
++		case CI_ADDR:
++			if (length != 6 || seen_address)
++				return false;
++			seen_address = true;
++			if (code != CONFREQ)
++				local = option + 2;
++			break;
++		case CI_DNS1:
++		case CI_DNS2:
++			if (length != 6)
++				return false;
++			if (code == CONFACK) {
++				if (option[0] == CI_DNS1)
++					result.dns1 = address(option + 2);
++				else
++					result.dns2 = address(option + 2);
++			}
++			break;
++		}
++
++		if (local) {
++			uint32_t ip = address(local);
++
++			if (scope->prefix < 8 || scope->prefix > 32
++			    || (ip & mask(scope->prefix)) != scope->network)
++				return false;
++			if (code == CONFACK)
++				result.local = ip;
++		}
++	}
++	*ack = result;
++	return true;
++}
++
++bool vpnt_ipcp_local_scope_allows(const struct vpnt_ipcp_local_scope *scope,
++                                 const uint8_t *frame, size_t size)
++{
++	struct vpnt_ipcp_ack ack;
++
++	return vpnt_ipcp_check(scope, frame, size, &ack);
++}
+diff --git a/src/vpnt_ipcp_policy.h b/src/vpnt_ipcp_policy.h
+new file mode 100644
+--- /dev/null
++++ b/src/vpnt_ipcp_policy.h
+@@ -0,0 +1,29 @@
++#ifndef VPNT_IPCP_POLICY_H
++#define VPNT_IPCP_POLICY_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define VPNT_IPCP_DENIED_EXIT 3
++
++struct vpnt_ipcp_local_scope {
++	uint32_t network;
++	uint8_t prefix;
++};
++
++struct vpnt_ipcp_ack {
++	uint32_t local;
++	uint32_t dns1;
++	uint32_t dns2;
++};
++
++bool vpnt_ipcp_local_scope_parse(const char *text,
++                               struct vpnt_ipcp_local_scope *scope);
++bool vpnt_ipcp_local_scope_allows(const struct vpnt_ipcp_local_scope *scope,
++                                 const uint8_t *frame, size_t size);
++bool vpnt_ipcp_check(const struct vpnt_ipcp_local_scope *scope,
++                    const uint8_t *frame, size_t size,
++                    struct vpnt_ipcp_ack *ack);
++
++#endif

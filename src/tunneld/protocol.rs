@@ -63,6 +63,8 @@ pub enum ErrorCode {
     Timeout,
     Backend,
     CleanupPending,
+    PolicyReapprovalRequired,
+    FortinetLocalAddressDenied,
 }
 
 /// Transport errors expose only the OS error kind, never frame contents.
@@ -348,6 +350,27 @@ impl TryFrom<WireCidr> for CidrV4 {
 
     fn try_from(value: WireCidr) -> Result<Self, Self::Error> {
         Ok(Self::new(value.network, value.prefix)?)
+    }
+}
+
+impl std::str::FromStr for CidrV4 {
+    type Err = ErrorCode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (network, prefix) = value.split_once('/').ok_or(ErrorCode::BadRequest)?;
+        let network = network.parse().map_err(|_| ErrorCode::BadRequest)?;
+        let prefix = prefix.parse().map_err(|_| ErrorCode::BadRequest)?;
+        let cidr = Self::new(network, prefix)?;
+        if cidr.to_string() != value {
+            return Err(ErrorCode::BadRequest);
+        }
+        Ok(cidr)
+    }
+}
+
+impl fmt::Display for CidrV4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
     }
 }
 impl CidrV4 {

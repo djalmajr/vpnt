@@ -34,14 +34,16 @@ fn main() {
         Options::TunnelPolicy {
             profile_id,
             dns_servers,
+            fortinet_local_cidr,
         } => {
             use std::io::Write;
             let result =
-                vpnt::tunnel_policy::for_profile_id(&profile_id, &dns_servers).and_then(|bytes| {
-                    std::io::stdout().lock().write_all(&bytes).map_err(|_| {
-                        std::io::Error::other("Could not write the tunnel policy snapshot.")
-                    })
-                });
+                vpnt::tunnel_policy::for_profile_id(&profile_id, &dns_servers, fortinet_local_cidr)
+                    .and_then(|bytes| {
+                        std::io::stdout().lock().write_all(&bytes).map_err(|_| {
+                            std::io::Error::other("Could not write the tunnel policy snapshot.")
+                        })
+                    });
             if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(2);
