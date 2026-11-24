@@ -36,8 +36,9 @@ use std::{
 };
 
 use serde::Serialize;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
+use super::handshake::Datagram;
 use super::protocol::{Credentials, Endpoint, FortinetRequest};
 use crate::{helper::pinentry_channel::PinentryChild, secrets::Secret};
 
@@ -64,7 +65,7 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 pub trait Channel {
     fn fd(&self) -> io::Result<BorrowedFd<'_>>;
     /// Read one datagram. `WouldBlock` means nothing was pending.
-    fn receive(&mut self) -> io::Result<Vec<u8>>;
+    fn receive(&mut self) -> io::Result<Datagram>;
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
 }
 
@@ -408,8 +409,8 @@ fn supervise(
         }
         if fds[0].revents != 0 {
             match channel.receive() {
-                Ok(bytes) => {
-                    return Ok(match decode(&mut Zeroizing::new(bytes)) {
+                Ok(mut bytes) => {
+                    return Ok(match decode(&mut bytes) {
                         Ok(Message::Stop) => End::Done(Reason::Stop, None),
                         // The only credential was already delivered.
                         Ok(Message::Credential(_)) => End::Violation(io::Error::new(
@@ -543,7 +544,7 @@ enum Waited {
 
 /// One credential datagram: kind 1, `u16` big-endian length, the password.
 /// Stop is kind 2 with no payload. The datagram is zeroed on every path.
-fn decode(bytes: &mut Vec<u8>) -> io::Result<Message> {
+fn decode(bytes: &mut [u8]) -> io::Result<Message> {
     let message = parse(bytes);
     bytes.zeroize();
     message
@@ -578,11 +579,11 @@ fn wait_credential(channel: &mut impl Channel, limit: Duration) -> io::Result<Wa
         if fds[0].revents == 0 {
             continue;
         }
-        let mut bytes = Zeroizing::new(match channel.receive() {
+        let mut bytes = match channel.receive() {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Ok(Waited::Closed(error)),
-        });
+        };
         return Ok(match decode(&mut bytes)? {
             Message::Credential(password) => Waited::Credential(password),
             Message::Stop => Waited::Stop,
@@ -1089,7 +1090,7 @@ impl Channel for super::handshake::AuthenticatedChannel {
         self.readable_fd()
     }
 
-    fn receive(&mut self) -> io::Result<Vec<u8>> {
+    fn receive(&mut self) -> io::Result<Datagram> {
         super::handshake::AuthenticatedChannel::receive(self)
     }
 

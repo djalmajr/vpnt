@@ -7,12 +7,17 @@ use crate::{
 };
 use std::{collections::BTreeSet, fmt::Write, net::IpAddr, time::Duration};
 
+#[cfg(target_os = "linux")]
+#[path = "control/backend.rs"]
+mod linux_backend;
 mod selection;
 /// Request metadata only. Every transport operation must revalidate its
 /// reservation; a built config is neither a live lease nor tunnel evidence.
 #[derive(Clone)]
 pub struct Config {
-    binding: super::namespace::Binding,
+    binding: Option<super::namespace::Binding>,
+    #[cfg(target_os = "linux")]
+    linux_child: Option<(u32, Vec<String>)>,
     name: String,
     child: String,
     pub(super) reqid: u16,
@@ -64,7 +69,9 @@ impl Config {
                 .collect()
         };
         Ok(Self {
-            binding: reservation.binding(),
+            binding: Some(reservation.binding()),
+            #[cfg(target_os = "linux")]
+            linux_child: None,
             child: format!("{name}-child"),
             name,
             reqid: reservation.reqid(),
@@ -76,11 +83,83 @@ impl Config {
             networks,
         })
     }
+    /// The one rule for a literal IKE peer identity on Linux: a typed `fqdn:`,
+    /// `email:` or `ipv4:` value that VICI carries unchanged. Policy admission
+    /// and the instance's VICI adaptation must both use it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn literal_peer_identity(identity: &str) -> bool {
+        let Some((kind, text)) = identity.split_once(':') else {
+            return false;
+        };
+        identity.len() <= 253
+            && match kind {
+                "ipv4" => text
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok_and(|ip| endpoint(ip.into())),
+                "fqdn" | "email" => {
+                    text_identity_username(text) && text.bytes().all(|b| (0x20..0x7f).contains(&b))
+                }
+                _ => false,
+            }
+    }
+    /// The Linux writer already owns the attempt and the reqid reservation.
+    /// This config is usable only with the instance's private VICI adapter.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn linux(
+        remote: std::net::SocketAddrV4,
+        peer_identity: &str,
+        username: &str,
+        if_id: u32,
+        reqid: u16,
+        local_ts: Vec<String>,
+        remote_ts: Vec<String>,
+    ) -> Result<Self, Error> {
+        if !Self::literal_peer_identity(peer_identity)
+            || username.len() > 200
+            || !text_identity_username(username)
+        {
+            return Err(Error::Invalid);
+        }
+        let name = format!("vpnt-{reqid}");
+        Ok(Self {
+            binding: None,
+            linux_child: Some((if_id, local_ts)),
+            child: format!("{name}-child"),
+            name,
+            reqid,
+            gateway: peer_identity.into(),
+            identity: text_identity(username)?,
+            port: remote.port(),
+            local: std::net::Ipv4Addr::UNSPECIFIED.into(),
+            remote: (*remote.ip()).into(),
+            networks: remote_ts,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn admit_linux(version: &Message, stats: &Message) -> Result<(), Error> {
+        let mut parts = version.get_text("version").unwrap_or_default().split('.');
+        if version.get_text("daemon") != Some("charon")
+            || parts.next() != Some("6")
+            || parts.next() != Some("1")
+            || !parts.next().is_some_and(|patch| {
+                !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            || parts.next().is_some()
+        {
+            return Err(Error::Incompatible);
+        }
+        linux_backend::admit(stats)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
     pub(super) fn matches(&self, reservation: &Reservation) -> bool {
-        self.binding.matches(reservation) && self.reqid == reservation.reqid()
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.matches(reservation))
+            && self.reqid == reservation.reqid()
     }
     pub fn child_name(&self) -> &str {
         &self.child
@@ -112,8 +191,24 @@ impl Config {
                     b"aes256-sha1",
                 ],
             )
-            .list("local_ts", [b"dynamic".as_slice()])
             .list("remote_ts", self.networks.iter().map(|n| n.as_bytes()));
+        #[cfg(target_os = "linux")]
+        let linux_child = self.linux_child.as_ref();
+        #[cfg(not(target_os = "linux"))]
+        let linux_child: Option<&(u32, Vec<String>)> = None;
+
+        if let Some((if_id, local_ts)) = linux_child {
+            let if_id = if_id.to_string();
+            child
+                .value("if_id_in", if_id.as_bytes())
+                .value("if_id_out", if_id.as_bytes())
+                .list(
+                    "local_ts",
+                    local_ts.iter().map(|selector| selector.as_bytes()),
+                );
+        } else {
+            child.list("local_ts", [b"dynamic".as_slice()]);
+        }
         let mut children = Message::new();
         children.section(&self.child, child);
         let mut connection = Message::new();
@@ -123,8 +218,10 @@ impl Config {
             .value("dpd_delay", b"30s")
             .value("local_port", b"0")
             .value("remote_port", self.port.to_string().as_bytes());
+        if linux_child.is_none() {
+            connection.list("local_addrs", [self.local.to_string().as_bytes()]);
+        }
         connection
-            .list("local_addrs", [self.local.to_string().as_bytes()])
             .list("remote_addrs", [self.remote.to_string().as_bytes()])
             .list("vips", [b"0.0.0.0".as_slice()])
             .list(

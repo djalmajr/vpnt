@@ -1,10 +1,12 @@
 //! Version-one administrative tunnel grants and canonical snapshots.
 use super::protocol::{self, CidrV4, Endpoint, Prepare};
+use crate::connection::ipsec::Config;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{fmt, io, net::Ipv4Addr, str::FromStr};
 
 pub(super) const MAX_SNAPSHOT: usize = 16 * 1024;
 pub(super) const MAX_POLICY: usize = 1024 * 1024;
+pub(super) const MAX_IPSEC_ROUTES: usize = 64;
 const MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -153,22 +155,11 @@ fn validate_addresses(addresses: &mut [Ipv4Addr], maximum: usize) -> io::Result<
 }
 
 fn literal_ike_identity(identity: &str, transport_ipv4: &[Ipv4Addr]) -> bool {
-    let Some((kind, text)) = identity.split_once(':') else {
-        return false;
-    };
-    if kind == "ipv4" {
-        return text.parse::<Ipv4Addr>().is_ok_and(|address| {
-            address.to_string() == text
-                && CidrV4::new(address, 32).is_ok()
-                && transport_ipv4.contains(&address)
-        });
-    }
-    matches!(kind, "fqdn" | "email")
-        && !text.is_empty()
-        && !text.starts_with('#')
-        && !(text.starts_with('^') && text.ends_with('$'))
-        && !text.contains('*')
-        && !text.chars().any(char::is_control)
+    Config::literal_peer_identity(identity)
+        && identity.strip_prefix("ipv4:").is_none_or(|text| {
+            text.parse::<Ipv4Addr>()
+                .is_ok_and(|address| transport_ipv4.contains(&address))
+        })
 }
 
 impl Entry {
@@ -338,6 +329,14 @@ impl Policy {
         Ok(policy.entries.pop().expect("one snapshot entry").0)
     }
 
+    pub(super) fn apply_snapshot(bytes: &[u8]) -> io::Result<Entry> {
+        let entry = Self::snapshot(bytes)?;
+        if entry.backend == Backend::Ipsec && entry.route_cidrs.len() > MAX_IPSEC_ROUTES {
+            return Err(invalid("IPsec policy supports at most 64 route CIDRs"));
+        }
+        Ok(entry)
+    }
+
     pub(super) fn from_disk(bytes: &[u8]) -> io::Result<Self> {
         let policy = Self::parse(bytes, MAX_POLICY)?;
         if policy.bytes()? != bytes {
@@ -421,6 +420,50 @@ mod tests {
 
     fn snapshot(entry: Value) -> io::Result<Vec<u8>> {
         canonical_snapshot(&document(vec![entry]))
+    }
+
+    #[test]
+    fn policy_and_config_share_literal_ike_identity() {
+        use crate::connection::ipsec::Config;
+        let too_long = format!("fqdn:{}", "a".repeat(249));
+        for (identity, expected) in [
+            ("fqdn:vpn.example", true),
+            ("email:user@example.test", true),
+            ("ipv4:192.0.2.20", true),
+            ("ipv4:192.0.2.22", true),
+            ("ipv4:192.0.02.20", false),
+            ("ipv4:0.0.0.0", false),
+            ("fqdn:", false),
+            ("fqdn:vpn.éxample", false),
+            ("fqdn:vpn\nexample", false),
+            ("fqdn:*", false),
+            ("email:#hex", false),
+            ("email:^user@example.test$", false),
+            ("vpn.example", false),
+            (&too_long, false),
+        ] {
+            let config = Config::linux(
+                "192.0.2.20:500".parse().unwrap(),
+                identity,
+                "fixture",
+                1,
+                1,
+                vec!["dynamic".into()],
+                vec!["10.20.0.0/15".into()],
+            );
+            assert_eq!(config.is_ok(), expected, "config {identity:?}");
+            let mut grant = ipsec();
+            grant["peer_identity"] = json!(identity);
+            assert_eq!(snapshot(grant).is_ok(), expected, "policy {identity:?}");
+        }
+
+        let mut grant = ipsec();
+        grant["peer_identity"] = json!("ipv4:192.0.2.21");
+        assert!(Config::literal_peer_identity("ipv4:192.0.2.21"));
+        assert!(
+            snapshot(grant).is_err(),
+            "policy must bind IPv4 identity to approved transport"
+        );
     }
 
     #[test]

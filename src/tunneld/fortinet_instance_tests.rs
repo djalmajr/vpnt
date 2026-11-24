@@ -197,8 +197,9 @@ impl Channel for Seq {
         Ok(self.0.as_fd())
     }
 
-    fn receive(&mut self) -> io::Result<Vec<u8>> {
+    fn receive(&mut self) -> io::Result<Datagram> {
         self.take(Duration::ZERO)?
+            .map(Datagram::from_vec)
             .ok_or_else(|| io::ErrorKind::WouldBlock.into())
     }
 
@@ -1244,18 +1245,15 @@ fn credential_datagram_is_zeroed_on_every_path() {
         vec![7; 40],
     ];
     for case in cases {
-        let mut bytes = Vec::with_capacity(512);
-        bytes.extend_from_slice(&case);
-        let pointer = bytes.as_ptr();
-        let capacity = bytes.capacity();
+        // The datagram arrives in the wiping buffer of the channel: `decode`
+        // wipes the whole message, and the buffer wipes its capacity on release.
+        let mut bytes = Datagram::from_vec(case.clone());
         let message = decode(&mut bytes);
-        // SAFETY: `bytes` is alive; zeroize wrote zeros over its whole capacity.
-        let memory = unsafe { std::slice::from_raw_parts(pointer, capacity) };
+        assert_eq!(bytes.len(), case.len());
         assert!(
-            memory.iter().all(|&byte| byte == 0),
+            bytes.iter().all(|&byte| byte == 0),
             "{case:?} left bytes behind"
         );
-        assert!(bytes.is_empty());
         if case[0] == MESSAGE_CREDENTIAL && case.len() == 3 + PASSWORD.len() {
             let Ok(Message::Credential(secret)) = message else {
                 panic!("good frame refused")
