@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod attest;
 pub mod client;
+pub mod fortinet_instance;
 pub mod handshake;
 pub mod ipsec_instance;
 pub mod policy;
