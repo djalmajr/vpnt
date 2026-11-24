@@ -8,7 +8,7 @@ use crate::{
     tunnel_policy::certificate_pin,
     tunneld::{
         SOCKET_PATH,
-        client::Client,
+        client::{Client, Confirmation},
         protocol::{
             CidrV4, CleanupState, Credentials as WireCredentials, Endpoint, ErrorCode as WireError,
             FortinetRequest, FrameError, Generation, IpsecRequest, Prepare, ProbeBinding, State,
@@ -33,6 +33,8 @@ use std::{
 
 const STATUS_INTERVAL: Duration = Duration::from_millis(500);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
+const CONFIRMATION_RESERVE: Duration = Duration::from_millis(250);
+const CONFIRMATION_DRAIN: Duration = Duration::from_millis(10);
 const CLEANUP_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROBE_DESTINATIONS: usize = 64;
 
@@ -124,6 +126,31 @@ impl TunnelAttempt {
     fn observe_cleanup(&mut self) {
         self.session = Session::Observing;
         self.probe_binding = None;
+    }
+
+    fn confirm_binding(&mut self, deadline: Instant, step: Step) -> Result<bool, Failure> {
+        let Session::Active(client) = &mut self.session else {
+            return Err(Failure::at(step));
+        };
+        self.next_status = Instant::now() + STATUS_INTERVAL;
+        let fresh = match client.confirm(deadline) {
+            Ok(Confirmation::Fresh(binding)) if self.probe_binding.as_ref() == Some(&binding) => {
+                true
+            }
+            Ok(Confirmation::Late(binding)) if self.probe_binding.as_ref() == Some(&binding) => {
+                false
+            }
+            Ok(Confirmation::Unavailable) => false,
+            Ok(_) => {
+                self.observe_cleanup();
+                return Err(Failure::at(step));
+            }
+            Err(error) => {
+                self.observe_cleanup();
+                return Err(wire_failure(error, step));
+            }
+        };
+        Ok(fresh)
     }
 
     fn cleaned(&mut self) {
@@ -260,18 +287,24 @@ impl Attempt for TunnelAttempt {
     }
 
     fn healthy(&mut self) -> Result<(), Failure> {
+        let now = Instant::now();
+        if matches!(&self.session, Session::Active(client) if client.confirmation_pending()) {
+            return self
+                .confirm_binding(now + CONFIRMATION_DRAIN, Step::Health)
+                .map(|_| ());
+        }
         if Instant::now() < self.next_status {
             return Ok(());
         }
-        match self.status(Instant::now() + CONTROL_TIMEOUT, Step::Health)? {
-            State::NetworkReady => Ok(()),
-            _ => Err(Failure::at(Step::Health)),
-        }
+        self.confirm_binding(now + CONFIRMATION_RESERVE, Step::Health)
+            .map(|_| ())
     }
 
     fn probe(&mut self, canceled: &AtomicBool, timeout: Duration) -> Result<bool, Failure> {
         let deadline = Instant::now() + timeout;
-        if timeout.is_zero() || canceled.load(Ordering::Acquire) {
+        let reserve = (timeout / 2).min(CONFIRMATION_RESERVE);
+        let tcp_deadline = deadline - reserve;
+        if reserve.is_zero() || canceled.load(Ordering::Acquire) {
             return Ok(false);
         }
         self.probe_busy = true;
@@ -284,22 +317,18 @@ impl Attempt for TunnelAttempt {
             .as_ref()
             .ok_or_else(|| Failure::at(Step::Verify))?
             .clone();
-        if !(self.probe)(&self.profile, &binding, canceled, deadline, slot)?
+        if !(self.probe)(&self.profile, &binding, canceled, tcp_deadline, slot)?
             || canceled.load(Ordering::Acquire)
-            || Instant::now() >= deadline
+            || Instant::now() >= tcp_deadline
         {
             return Ok(false);
         }
 
         // Force an authenticated refresh even inside the periodic status interval.
         // Resolution, TCP and the refresh share the caller's absolute budget.
-        let refresh_by = deadline.min(Instant::now() + CONTROL_TIMEOUT);
-        if self.status(refresh_by, Step::Verify)? != State::NetworkReady
-            || self.probe_binding.as_ref() != Some(&binding)
-        {
-            return Err(Failure::at(Step::Verify));
-        }
-        Ok(!canceled.load(Ordering::Acquire) && Instant::now() < deadline)
+        let verified =
+            self.confirm_binding(deadline.min(Instant::now() + reserve), Step::Verify)?;
+        Ok(verified && !canceled.load(Ordering::Acquire) && Instant::now() < deadline)
     }
 
     fn probe_busy(&self) -> bool {

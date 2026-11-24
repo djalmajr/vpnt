@@ -6,8 +6,9 @@ use super::network::SetupCancellation;
 #[cfg(test)]
 use super::protocol::Prepare;
 use super::protocol::{
-    CLEANUP_VERSION, CleanupState, Command, ErrorCode, FrameError, InitialRequest, Request,
-    Response, ServerDecoder, State, decode_request, read_control, timed, write_control,
+    CLEANUP_VERSION, CleanupState, Command, ErrorCode, FrameError, InitialRequest,
+    MAX_CONFIRMATION, Request, Response, ServerDecoder, State, decode_request, monotonic_ms,
+    read_control, timed, write_control,
 };
 use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
 use std::{
@@ -444,6 +445,7 @@ fn watch_setup(
                     decoder.reply_status(State::Starting, Instant::now() + FRAME_TIMEOUT)?;
                 }
                 Command::Status => statuses += 1,
+                Command::Confirm(_) => return Err(ErrorCode::BadRequest.into()),
                 Command::Stop => {
                     if v2 {
                         cancel.cancel();
@@ -542,6 +544,7 @@ fn dialogue(
         let state = match decoder.command(Instant::now() + FRAME_TIMEOUT) {
             Ok(Command::Status) => session.state(),
             Ok(Command::Stop) => session.stop(),
+            Ok(Command::Confirm(_)) => return Err(ErrorCode::BadRequest.into()),
             Err(error) => return Err(error),
         };
         decoder.reply_status(state, Instant::now() + FRAME_TIMEOUT)?;
@@ -574,8 +577,41 @@ fn dialogue_v2(
             }
             let deadline = Instant::now() + FRAME_TIMEOUT;
             match decoder.command(deadline)? {
+                Command::Confirm(expires_ms) => {
+                    let now = Instant::now();
+                    let remaining =
+                        Duration::from_millis(expires_ms.saturating_sub(monotonic_ms()?));
+                    let confirm_by = now + remaining.min(MAX_CONFIRMATION);
+                    if poll_session(None, &*session, 0)?.1 || session.state() != State::NetworkReady
+                    {
+                        return decoder
+                            .reply_status(State::Stopping, Instant::now() + FRAME_TIMEOUT);
+                    }
+                    let binding = if remaining.is_zero() {
+                        Err(io::ErrorKind::TimedOut.into())
+                    } else {
+                        session.probe_binding(confirm_by)
+                    };
+                    let write_by = Instant::now() + FRAME_TIMEOUT;
+                    if poll_session(None, &*session, 0)?.1 {
+                        return decoder.reply_status(State::Stopping, write_by);
+                    }
+                    match binding {
+                        Ok(binding) if binding.generation() == record.generation() => {
+                            if Instant::now() < confirm_by {
+                                decoder.reply_ready(binding, write_by)?;
+                            } else {
+                                decoder.reply_unconfirmed(write_by)?;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            decoder.reply_unconfirmed(write_by)?;
+                        }
+                        _ => return decoder.reject(ErrorCode::Backend, write_by),
+                    }
+                }
                 Command::Status if session.state() == State::NetworkReady => {
-                    let binding = match session.probe_binding() {
+                    let binding = match session.probe_binding(deadline) {
                         Ok(binding) if binding.generation() == record.generation() => binding,
                         _ => {
                             let _ = decoder.reject(ErrorCode::Backend, deadline);

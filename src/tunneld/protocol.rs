@@ -7,7 +7,7 @@ use std::{
     net::Ipv4Addr,
     num::NonZeroU32,
     os::{fd::AsRawFd, unix::net::UnixStream},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -15,6 +15,20 @@ pub const VERSION: u32 = 1;
 pub const CLEANUP_VERSION: u32 = 2;
 /// Maximum encoded control frame size, including LF.
 pub const MAX_LINE: usize = 16 * 1024;
+pub(super) const MAX_CONFIRMATION: Duration = Duration::from_secs(1);
+
+// The endpoints run in the same Linux time namespace as the writer.
+pub(super) fn monotonic_ms() -> io::Result<u64> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into a valid timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000)
+}
 
 const IPSEC_SECRET_LIMIT: usize = 4096;
 const FORTINET_SECRET_LIMIT: usize = 256;
@@ -174,6 +188,7 @@ named_object! {
         PrepareIpsec(IpsecRequest),
         PrepareFortinet(FortinetRequest),
         Status {},
+        Confirm { expires_ms: u64 },
         Stop {},
         CleanupStatus { generation: Generation },
     }
@@ -633,6 +648,7 @@ impl From<Prepare> for Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Status,
+    Confirm(u64),
     Stop,
 }
 
@@ -951,9 +967,11 @@ impl ServerDecoder {
     }
 
     pub fn command(&mut self, deadline: Instant) -> Result<Command, FrameError> {
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(Phase::Active, deadline, |_, io| {
             let command = match read_control(io, decode_request)? {
                 Request::Status {} => Command::Status,
+                Request::Confirm { expires_ms } if v2 => Command::Confirm(expires_ms),
                 Request::Stop {} => Command::Stop,
                 _ => return Err(ErrorCode::BadRequest.into()),
             };
@@ -979,6 +997,18 @@ impl ServerDecoder {
     pub fn reply_status(&mut self, state: State, deadline: Instant) -> Result<(), FrameError> {
         self.in_phase(Phase::Active, deadline, |_, io| {
             write_control(io, &Response::Status { state })?;
+            Ok(((), Phase::Active))
+        })
+    }
+
+    pub(super) fn reply_unconfirmed(&mut self, deadline: Instant) -> Result<(), FrameError> {
+        self.in_phase(Phase::Active, deadline, |_, io| {
+            write_control(
+                io,
+                &Response::Error {
+                    code: ErrorCode::Timeout,
+                },
+            )?;
             Ok(((), Phase::Active))
         })
     }

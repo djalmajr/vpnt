@@ -201,7 +201,9 @@ impl SetupCancellation {
     }
 }
 
-type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>) -> io::Result<Vec<u8>> + Send + Sync;
+type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>, Option<Instant>) -> io::Result<Vec<u8>>
+    + Send
+    + Sync;
 
 pub(super) struct Network(Box<Run>);
 
@@ -342,9 +344,12 @@ impl Network {
     pub(super) fn fake(
         run: impl Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(move |program, args, cancel| match cancel {
-            Some(cancel) => cancel.start(|| run(program, args)),
-            None => run(program, args),
+        Self(Box::new(move |program, args, cancel, deadline| {
+            check_deadline(deadline)?;
+            match cancel {
+                Some(cancel) => cancel.start(|| run(program, args)),
+                None => run(program, args),
+            }
         }))
     }
 
@@ -353,11 +358,19 @@ impl Network {
     }
 
     fn run_ip(&self, args: &[&str], cancel: Option<&SetupCancellation>) -> io::Result<Vec<u8>> {
-        (self.0)("/usr/bin/ip", args, cancel)
+        (self.0)("/usr/bin/ip", args, cancel, None)
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> io::Result<T> {
         decode(&self.ip(args)?)
+    }
+
+    fn json_until<T: DeserializeOwned>(
+        &self,
+        args: &[&str],
+        deadline: Option<Instant>,
+    ) -> io::Result<T> {
+        decode(&(self.0)("/usr/bin/ip", args, None, deadline)?)
     }
 
     pub(super) fn resolve(&self, hostname: &str, approved: &[Ipv4Addr]) -> io::Result<Ipv4Addr> {
@@ -389,6 +402,7 @@ impl Network {
                 "2",
                 "1",
             ],
+            None,
             None,
         )?)?;
         if reply
@@ -678,9 +692,14 @@ impl Network {
     }
 
     fn link(&self, receipt: &Receipt) -> io::Result<Option<Link>> {
+        self.link_until(receipt, None)
+    }
+
+    fn link_until(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Option<Link>> {
         let name = receipt.name();
         let mut owned = None;
-        for link in self.links()? {
+        let links: Vec<Link> = self.json_until(&["-j", "-d", "link", "show"], deadline)?;
+        for link in links {
             if link.ifname == name {
                 if owned.is_some()
                     || link.ifindex == 0
@@ -701,7 +720,15 @@ impl Network {
     }
 
     fn owned_link(&self, receipt: &Receipt) -> io::Result<Option<Link>> {
-        let link = self.link(receipt)?;
+        self.owned_link_until(receipt, None)
+    }
+
+    fn owned_link_until(
+        &self,
+        receipt: &Receipt,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<Link>> {
+        let link = self.link_until(receipt, deadline)?;
         if link.as_ref().is_some_and(|link| {
             link.ifalias.as_deref() != Some(&receipt.marker())
                 || receipt.ifindex.is_some_and(|index| index != link.ifindex)
@@ -716,18 +743,19 @@ impl Network {
         &self,
         _guard: &NetworkGuard,
         receipt: &Receipt,
+        deadline: Instant,
     ) -> io::Result<ProbeBinding> {
         if !receipt.confirmed || receipt.complete || receipt.routes_intended != receipt.routes.len()
         {
             return Err(invalid("XFRM probe scope is unconfirmed"));
         }
         let link = self
-            .owned_link(receipt)?
+            .owned_link_until(receipt, Some(deadline))?
             .filter(|link| {
                 receipt.ifindex == Some(link.ifindex) && link.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("XFRM probe link is unproven"))?;
-        if !self.address_present(receipt, &link)? {
+        if !self.address_present_until(receipt, &link, Some(deadline))? {
             return Err(invalid("XFRM probe address is unproven"));
         }
         let generation = Generation::parse(receipt.generation.clone())
@@ -816,7 +844,17 @@ impl Network {
     }
 
     fn address_present(&self, receipt: &Receipt, link: &Link) -> io::Result<bool> {
-        let result: Vec<AddressList> = self.json(&["-j", "addr", "show", "dev", &link.ifname])?;
+        self.address_present_until(receipt, link, None)
+    }
+
+    fn address_present_until(
+        &self,
+        receipt: &Receipt,
+        link: &Link,
+        deadline: Option<Instant>,
+    ) -> io::Result<bool> {
+        let result: Vec<AddressList> =
+            self.json_until(&["-j", "addr", "show", "dev", &link.ifname], deadline)?;
         let [row] = result.as_slice() else {
             return Err(invalid("ambiguous address inventory"));
         };
@@ -916,12 +954,24 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
 fn run_command(
     program: &str,
     args: &[&str],
     cancel: Option<&SetupCancellation>,
+    deadline: Option<Instant>,
 ) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let ordinary_deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = deadline.map_or(ordinary_deadline, |deadline| {
+        deadline.min(ordinary_deadline)
+    });
+    check_deadline(Some(deadline))?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -963,7 +1013,11 @@ fn run_command(
                 }
                 return Ok(output);
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         }
     })();
     if result.is_err() {

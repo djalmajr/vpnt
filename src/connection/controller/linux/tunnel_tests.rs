@@ -315,6 +315,13 @@ fn reply(decoder: &mut ServerDecoder, command: Command, state: State) {
     reply_state(decoder, state);
 }
 
+fn expect_confirmation(decoder: &mut ServerDecoder) {
+    assert!(matches!(
+        decoder.command(wire_deadline()).unwrap(),
+        Command::Confirm(_)
+    ));
+}
+
 fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
     fn success(
         profile: &Profile,
@@ -783,8 +790,10 @@ fn initial_and_recovery_probes_recheck_before_accepting_tcp_success() {
         let server = scope.spawn(|| {
             let mut decoder = admitted(&fixture, VpnKind::Ssl);
             reply(&mut decoder, Command::Status, State::NetworkReady);
-            reply(&mut decoder, Command::Status, State::NetworkReady);
-            reply(&mut decoder, Command::Status, State::NetworkReady);
+            for _ in 0..2 {
+                expect_confirmation(&mut decoder);
+                reply_state(&mut decoder, State::NetworkReady);
+            }
             reply(&mut decoder, Command::Stop, State::Stopped);
         });
         let mut attempt = fixture.attempt(VpnKind::Ssl, simulated_tcp_success);
@@ -810,7 +819,7 @@ fn changed_generation_link_pending_or_lost_channel_invalidates_probe() {
             let server = scope.spawn(|| {
                 let mut decoder = admitted(&fixture, VpnKind::Ssl);
                 reply(&mut decoder, Command::Status, State::NetworkReady);
-                assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
+                expect_confirmation(&mut decoder);
                 match scenario {
                     "generation" => {
                         let other =
@@ -853,12 +862,18 @@ fn successful_tcp_does_not_extend_the_probe_budget_for_status() {
     let fixture = SocketFixture::new("refresh-budget");
     thread::scope(|scope| {
         let (release, wait) = mpsc::channel();
+        let (replied, late_reply) = mpsc::channel();
         let fixture = &fixture;
         let peer = scope.spawn(move || {
             let mut decoder = admitted(fixture, VpnKind::Ssl);
             reply(&mut decoder, Command::Status, State::NetworkReady);
-            assert_eq!(decoder.command(wire_deadline()).unwrap(), Command::Status);
+            expect_confirmation(&mut decoder);
             wait.recv_timeout(Duration::from_secs(2)).unwrap();
+            reply_state(&mut decoder, State::NetworkReady);
+            replied.send(()).unwrap();
+            expect_confirmation(&mut decoder);
+            reply_state(&mut decoder, State::NetworkReady);
+            reply(&mut decoder, Command::Stop, State::Stopped);
         });
         let mut attempt = fixture.attempt(VpnKind::Ssl, simulated_tcp_success);
         let canceled = AtomicBool::new(false);
@@ -868,9 +883,44 @@ fn successful_tcp_does_not_extend_the_probe_budget_for_status() {
         let result = attempt.probe(&canceled, Duration::from_millis(120));
         let elapsed = started.elapsed();
         release.send(()).unwrap();
-        assert!(result.is_err());
-        assert!(elapsed >= Duration::from_millis(100));
-        assert!(elapsed < Duration::from_millis(750), "{elapsed:?}");
+        assert!(matches!(result, Ok(false)), "{result:?}");
+        assert!(elapsed >= Duration::from_millis(40), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(240), "{elapsed:?}");
+        late_reply.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(attempt.healthy().is_ok());
+        assert!(attempt.probe(&canceled, Duration::from_secs(1)).unwrap());
+        assert!(attempt.cleanup());
+        peer.join().unwrap();
+    });
+}
+
+#[test]
+fn exhausted_tcp_reservation_sends_no_confirmation() {
+    if !wire_fixture("exhausted_tcp_reservation_sends_no_confirmation") {
+        return;
+    }
+    let fixture = SocketFixture::new("no-confirmation-budget");
+    thread::scope(|scope| {
+        let peer = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            reply(&mut decoder, Command::Stop, State::Stopped);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, |_, _, _, cutoff, _| {
+            thread::sleep(cutoff.saturating_duration_since(Instant::now()));
+            Ok(true)
+        });
+        let canceled = AtomicBool::new(false);
+        attempt.start(&canceled, wire_deadline()).unwrap();
+        assert!(attempt.ready().unwrap());
+        let started = Instant::now();
+        assert!(
+            !attempt
+                .probe(&canceled, Duration::from_millis(120))
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_millis(240));
+        assert!(attempt.cleanup());
         peer.join().unwrap();
     });
 }

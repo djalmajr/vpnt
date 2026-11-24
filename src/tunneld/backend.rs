@@ -82,7 +82,7 @@ pub(super) trait Launch: Send + Sync {
 /// One admitted session. Dropping it stops it.
 pub(super) trait Running: Send {
     fn state(&self) -> State;
-    fn probe_binding(&self) -> io::Result<ProbeBinding> {
+    fn probe_binding(&self, _: Instant) -> io::Result<ProbeBinding> {
         Err(io::Error::other("unconfirmed probe binding"))
     }
     fn peer(&self) -> Option<BorrowedFd<'_>> {
@@ -1184,24 +1184,29 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
         self.state
     }
 
-    fn probe_binding(&self) -> io::Result<ProbeBinding> {
+    fn probe_binding(&self, deadline: Instant) -> io::Result<ProbeBinding> {
         if self.state != State::NetworkReady {
             return Err(io::Error::other("network is not ready for probing"));
         }
-        let guard = (self.launcher.lock)(Instant::now() + self.launcher.limits.lock)?;
-        match (
+        super::network::check_deadline(Some(deadline))?;
+        let guard = (self.launcher.lock)(deadline.min(Instant::now() + self.launcher.limits.lock))?;
+        let binding = match (
             self.attempt.backend,
             &self.attempt.receipt,
             &self.attempt.fortinet,
         ) {
             (Backend::Ipsec, Some(receipt), None) => {
-                self.launcher.xfrm.probe_binding(&guard, receipt)
+                self.launcher.xfrm.probe_binding(&guard, receipt, deadline)
             }
             (Backend::Fortinet, None, Some(receipt)) => {
-                self.launcher.fortinet.probe_binding(&guard, receipt)
+                self.launcher
+                    .fortinet
+                    .probe_binding(&guard, receipt, Some(deadline))
             }
             _ => Err(io::Error::other("probe receipt is unproven")),
-        }
+        }?;
+        super::network::check_deadline(Some(deadline))?;
+        Ok(binding)
     }
 
     fn peer(&self) -> Option<BorrowedFd<'_>> {

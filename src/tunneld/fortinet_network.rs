@@ -325,7 +325,9 @@ pub(super) struct Scope<'a> {
 
 /// Every privileged effect carries the setup's cancellation, so that it
 /// begins under the same lock as the cancellation mark.
-type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>) -> io::Result<Vec<u8>> + Send + Sync;
+type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>, Option<Instant>) -> io::Result<Vec<u8>>
+    + Send
+    + Sync;
 
 pub(super) struct FortinetNetwork(Box<Run>);
 
@@ -457,22 +459,33 @@ impl FortinetNetwork {
     pub(super) fn fake(
         run: impl Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(move |program, args, cancel| match cancel {
-            Some(cancel) => cancel.start(|| run(program, args)),
-            None => run(program, args),
+        Self(Box::new(move |program, args, cancel, deadline| {
+            check_deadline(deadline)?;
+            match cancel {
+                Some(cancel) => cancel.start(|| run(program, args)),
+                None => run(program, args),
+            }
         }))
     }
 
     fn ip(&self, args: &[&str]) -> io::Result<Vec<u8>> {
-        (self.0)(IP, args, None)
+        (self.0)(IP, args, None, None)
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> io::Result<T> {
         decode(&self.ip(args)?)
     }
 
+    fn json_until<T: DeserializeOwned>(
+        &self,
+        args: &[&str],
+        deadline: Option<Instant>,
+    ) -> io::Result<T> {
+        decode(&(self.0)(IP, args, None, deadline)?)
+    }
+
     fn resolvectl(&self, args: &[&str], cancel: Option<&SetupCancellation>) -> io::Result<Vec<u8>> {
-        (self.0)(RESOLVECTL, args, cancel)
+        (self.0)(RESOLVECTL, args, cancel, None)
     }
 
     fn links(&self) -> io::Result<Vec<Link>> {
@@ -557,8 +570,13 @@ impl FortinetNetwork {
     /// The link of this attempt as it stands now. A link that answers to the
     /// name under another identity than the recorded one is not ours.
     fn link(&self, receipt: &Receipt) -> io::Result<Option<Link>> {
+        self.link_until(receipt, None)
+    }
+
+    fn link_until(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Option<Link>> {
         let mut found = None;
-        for link in self.links()? {
+        let links: Vec<Link> = self.json_until(&["-j", "-d", "link", "show"], deadline)?;
+        for link in links {
             if link.ifname == receipt.ifname {
                 if found.is_some() || link.ifindex == 0 {
                     return Err(invalid("PPP link identity is ambiguous"));
@@ -570,8 +588,12 @@ impl FortinetNetwork {
     }
 
     fn address(&self, link: &Link) -> io::Result<Ipv4Addr> {
+        self.address_until(link, None)
+    }
+
+    fn address_until(&self, link: &Link, deadline: Option<Instant>) -> io::Result<Ipv4Addr> {
         let result: Vec<AddressList> =
-            self.json(&["-j", "-4", "addr", "show", "dev", &link.ifname])?;
+            self.json_until(&["-j", "-4", "addr", "show", "dev", &link.ifname], deadline)?;
         let [row] = result.as_slice() else {
             return Err(invalid("ambiguous address inventory"));
         };
@@ -618,6 +640,7 @@ impl FortinetNetwork {
                 "link",
             ],
             cancel,
+            None,
         )?;
         Ok(())
     }
@@ -872,20 +895,20 @@ impl FortinetNetwork {
         receipt.save(directory, guard)
     }
 
-    fn probe_link(&self, receipt: &Receipt) -> io::Result<Link> {
+    fn probe_link(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Link> {
         if !receipt.confirmed || receipt.complete || receipt.routes_intended != receipt.routes.len()
         {
             return Err(invalid("PPP probe scope is unconfirmed"));
         }
         let link = self
-            .link(receipt)?
+            .link_until(receipt, deadline)?
             .filter(|link| {
                 receipt.ifindex == Some(link.ifindex)
                     && link.link_type.as_deref() == Some("ppp")
                     && link.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("PPP probe link is unproven"))?;
-        if Some(self.address(&link)?) != receipt.local {
+        if Some(self.address_until(&link, deadline)?) != receipt.local {
             return Err(invalid("PPP probe address is unproven"));
         }
         Ok(link)
@@ -898,7 +921,7 @@ impl FortinetNetwork {
         receipt: &mut Receipt,
         cancel: &SetupCancellation,
     ) -> io::Result<()> {
-        let link = self.probe_link(receipt)?;
+        let link = self.probe_link(receipt, None)?;
         if link.ifalias.is_some() {
             return Err(invalid("PPP probe link is already marked"));
         }
@@ -915,16 +938,18 @@ impl FortinetNetwork {
                 &receipt.marker(),
             ],
             Some(cancel),
+            None,
         )?;
-        self.probe_binding(guard, receipt).map(|_| ())
+        self.probe_binding(guard, receipt, None).map(|_| ())
     }
 
     pub(super) fn probe_binding(
         &self,
         _guard: &NetworkGuard,
         receipt: &Receipt,
+        deadline: Option<Instant>,
     ) -> io::Result<ProbeBinding> {
-        let link = self.probe_link(receipt)?;
+        let link = self.probe_link(receipt, deadline)?;
         if !receipt.probe_marked || link.ifalias.as_deref() != Some(&receipt.marker()) {
             return Err(invalid("PPP probe ownership is unproven"));
         }
@@ -1012,12 +1037,19 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// Fixed program, clean environment, absolute deadline, bounded output.
+use super::network::check_deadline;
+
 fn run_command(
     program: &str,
     args: &[&str],
     cancel: Option<&SetupCancellation>,
+    deadline: Option<Instant>,
 ) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + COMMAND_DEADLINE;
+    let ordinary_deadline = Instant::now() + COMMAND_DEADLINE;
+    let deadline = deadline.map_or(ordinary_deadline, |deadline| {
+        deadline.min(ordinary_deadline)
+    });
+    check_deadline(Some(deadline))?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -1056,7 +1088,11 @@ fn run_command(
                 }
                 return Ok(output);
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         }
     })();
     if result.is_err() {
@@ -1994,13 +2030,13 @@ mod tests {
             )
             .unwrap();
         let saved = Receipt::load(&fixture.directory, &guard).unwrap();
-        let binding = fixture.network.probe_binding(&guard, &saved).unwrap();
+        let binding = fixture.network.probe_binding(&guard, &saved, None).unwrap();
         assert_eq!(binding.ifindex().get(), 9);
         assert_eq!(binding.generation().as_str(), GENERATION);
         assert!(binding.allows("10.20.0.5".parse().unwrap()));
         assert!(!binding.allows("10.22.0.5".parse().unwrap()));
         fixture.kernel.lock().unwrap().ifalias = None;
-        assert!(fixture.network.probe_binding(&guard, &saved).is_err());
+        assert!(fixture.network.probe_binding(&guard, &saved, None).is_err());
         let writes = fixture.writes();
         assert!(
             fixture
