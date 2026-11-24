@@ -882,6 +882,15 @@ impl AuthenticatedChannel {
         &self.invocation
     }
 
+    /// Descriptor to poll for readability before `receive`; it is gone once an
+    /// error has closed the channel.
+    pub fn readable_fd(&self) -> io::Result<BorrowedFd<'_>> {
+        self.transport
+            .as_ref()
+            .map(|transport| transport.socket.as_fd())
+            .ok_or_else(|| io::ErrorKind::NotConnected.into())
+    }
+
     /// Receive one application datagram from the authenticated peer. An error
     /// closes the channel. Application message schemas are checked by callers.
     /// The datagram may carry credentials: every buffer that held received
@@ -1180,6 +1189,61 @@ fn collect_ancillary(message: &libc::msghdr) -> io::Result<(libc::ucred, OwnedFd
         (Some(credentials), Some(pidfd)) if !invalid_control => Ok((credentials, pidfd)),
         _ => Err(invalid("expected exactly one kernel credential and pidfd")),
     }
+}
+
+/// Test seam for other modules: both ends of a real handshake inside this
+/// process, as the current user (the public entry points require root). The
+/// writer side is returned first. Production code never calls this.
+#[cfg(test)]
+pub(crate) fn authenticated_pair_for_tests(
+    directory: &Path,
+    generation: &str,
+    backend: Backend,
+    invocation: &str,
+) -> io::Result<(AuthenticatedChannel, AuthenticatedChannel)> {
+    struct Attestor<'a>(Attempt<'a>, &'a str);
+    impl UnitAttestor for Attestor<'_> {
+        fn attest(&self, pidfd: BorrowedFd<'_>) -> io::Result<UnitIdentity> {
+            live(pidfd)?;
+            Ok(UnitIdentity {
+                name: self.0.unit_name(),
+                invocation: self.1.to_owned(),
+                // SAFETY: getpid takes no arguments.
+                main_pid: unsafe { libc::getpid() },
+            })
+        }
+    }
+    let attempt = Attempt {
+        generation,
+        backend,
+    };
+    // SAFETY: these syscalls take no pointers.
+    let ids = unsafe {
+        Credentials {
+            uid: libc::geteuid(),
+            gid: libc::getegid(),
+        }
+    };
+    let writer = Writer::publish_as(
+        directory,
+        OsStr::new("control"),
+        attempt,
+        ids,
+        PHASE_TIMEOUT,
+    )?;
+    std::thread::scope(|scope| {
+        let accepted = scope.spawn(|| writer.authenticate(&Attestor(attempt, invocation)));
+        let connected = connect_as(
+            &directory.join("control"),
+            &directory.join(generation),
+            attempt,
+            invocation,
+            ids,
+            PHASE_TIMEOUT,
+        );
+        let accepted = accepted.join().expect("writer thread");
+        Ok((accepted?, connected?))
+    })
 }
 
 #[cfg(test)]

@@ -2902,6 +2902,20 @@ segredos por arquivos, argumentos, logs ou snapshots de UI.
 Instalação privilegiada e conexão com configurações reais exigem a autorização
 específica aplicável. Fixtures e simulações devem ser identificadas como tais.
 
+### OpenVPN com token PKCS#11 em nuvem no macOS (21/11/2026)
+
+[real VPN, manual] Foi o primeiro teste real do OpenVPN no macOS. O build saiu da `main` em `a195a6e`.
+- **Runtime:** montado localmente por `build-runtime.py`, com o OpenVPN 2.7.9. A verificação e o oráculo do OpenVPN passaram.
+- **Componente:** preparado por `prepare-installation.py` e incluído no app por `package-app.py --component-payload`. O dono fez o Update do componente e digitou a senha só no diálogo do macOS.
+- **Perfil:** um perfil OpenVPN real, importado pelo formulário. O módulo PKCS#11 do fornecedor do token fica em `/Applications`, a assinatura TLS foi PKCS#1 e o certificado foi escolhido no seletor do app.
+- **Conexão:** o Connect pediu a aprovação no celular. O cartão só passou a Conectado depois da sonda de tráfego pelo túnel, que tenta ping e depois TCP. A rota até o host de teste saía pelo utun do túnel.
+
+Achados:
+- **Ícone da barra:** mostrava o triângulo de atenção com o OpenVPN conectado. O PR #57 corrige.
+- **Falso alarme no cartão:** uma única sonda falhou e o cartão foi para "sem resposta". O host de teste não responde a ICMP, e a tentativa TCP tem 1 s. A sonda seguinte voltou a Conectado. O alarme está em correção.
+
+Não observados nesta rodada: cancelar durante a aprovação, Reconnect manual, renegociação TLS depois de uma hora e convivência com perfis IPsec e Fortinet conectados ao mesmo tempo. Esta evidência não cobre os outros clientes listados acima.
+
 ## Arquivo e estrutura
 
 Na raiz do repositório, com Node.js, Bun e OpenPencil CLI disponíveis:
