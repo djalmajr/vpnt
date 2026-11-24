@@ -27,6 +27,7 @@ prepare() {
         scripts/macos/patches/openfortivpn-split-routes.patch
         scripts/macos/patches/openfortivpn-split-dns.patch
         packaging/linux/patches/openfortivpn-require-pin.patch
+        packaging/linux/patches/openfortivpn-defer-password.patch
     )
 
     cd "$srcdir/openfortivpn-$_openfortivpn_version" || return
