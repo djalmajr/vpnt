@@ -491,6 +491,22 @@ fn argv_is_exact_pins_the_certificate_and_has_no_ca_file() {
 }
 
 #[test]
+fn password_remains_available_when_tls_takes_more_than_five_seconds() {
+    let scratch = Scratch::new();
+    let instance = Instance::start(
+        &scratch,
+        "time.sleep(5.5)\npin('after-tls')\n",
+        params(Some(PIN)),
+        Duration::from_secs(2),
+    );
+    instance.writer.credential(PASSWORD);
+    instance.join().unwrap();
+    let result = scratch.json("pinentry.after-tls");
+    assert_eq!(result["error"], Value::Null);
+    assert_eq!(result["password"], PASSWORD);
+}
+
+#[test]
 fn password_reaches_the_pinentry_once_and_nothing_else() {
     let scratch = Scratch::new();
     let instance = Instance::start(

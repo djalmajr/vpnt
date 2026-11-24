@@ -759,6 +759,14 @@ impl FortinetNetwork {
         Ok(Dns { servers, domains })
     }
 
+    fn dns_default_route_disabled(&self, name: &str) -> io::Result<bool> {
+        let output = self.resolvectl(&["default-route", name], None)?;
+        let text = std::str::from_utf8(&output).map_err(|_| invalid("invalid resolver output"))?;
+        Ok(text
+            .split_once(':')
+            .is_some_and(|(_, value)| value.trim() == "no"))
+    }
+
     /// Apply what policy accepts of what the instance delivered. The receipt is
     /// saved before every write, so cleanup undoes at most what was attempted.
     pub(super) fn apply(
@@ -862,15 +870,16 @@ impl FortinetNetwork {
             receipt.dns_intended = true;
             receipt.save(directory, guard)?;
             self.resolvectl(&["revert", &link.ifname], Some(cancel))?;
-            let mut args = vec!["dns", link.ifname.as_str()];
-            let servers: Vec<String> = dns.servers.iter().map(ToString::to_string).collect();
-            args.extend(servers.iter().map(String::as_str));
-            self.resolvectl(&args, Some(cancel))?;
+            // Publish routing restrictions before the link gains any servers.
+            self.resolvectl(&["default-route", &link.ifname, "false"], Some(cancel))?;
             let mut args = vec!["domain", link.ifname.as_str()];
             let domains: Vec<String> = dns.domains.iter().map(|d| format!("~{d}")).collect();
             args.extend(domains.iter().map(String::as_str));
             self.resolvectl(&args, Some(cancel))?;
-            self.resolvectl(&["default-route", &link.ifname, "false"], Some(cancel))?;
+            let mut args = vec!["dns", link.ifname.as_str()];
+            let servers: Vec<String> = dns.servers.iter().map(ToString::to_string).collect();
+            args.extend(servers.iter().map(String::as_str));
+            self.resolvectl(&args, Some(cancel))?;
         }
 
         let current = self
@@ -885,7 +894,8 @@ impl FortinetNetwork {
             return Err(invalid("network configuration confirmation failed"));
         }
         if let Some(dns) = &dns
-            && self.dns_state(&current.ifname)? != *dns
+            && (self.dns_state(&current.ifname)? != *dns
+                || !self.dns_default_route_disabled(&current.ifname)?)
         {
             return Err(invalid("DNS confirmation failed"));
         }
@@ -1132,6 +1142,8 @@ pub(super) mod fixture {
         pub foreign_after_dns: Option<serde_json::Value>,
         pub dns: Vec<String>,
         pub domains: Vec<String>,
+        pub dns_default_route: bool,
+        pub ignore_dns_default_route: bool,
         pub egress_dev: &'static str,
         pub egress_index: u32,
         pub refuse_delete: bool,
@@ -1166,6 +1178,8 @@ pub(super) mod fixture {
                 foreign_after_dns: None,
                 dns: Vec::new(),
                 domains: Vec::new(),
+                dns_default_route: true,
+                ignore_dns_default_route: false,
                 egress_dev: "eth-fixture",
                 egress_index: 2,
                 refuse_delete: false,
@@ -1211,6 +1225,7 @@ pub(super) mod fixture {
                         if !k.ignore_revert {
                             k.dns.clear();
                             k.domains.clear();
+                            k.dns_default_route = true;
                         }
                         Ok(vec![])
                     }
@@ -1228,15 +1243,22 @@ pub(super) mod fixture {
                     }
                     ["dns", n, servers @ ..] if *n == name => {
                         k.dns = servers.iter().map(|s| (*s).to_owned()).collect();
+                        if let Some(route) = k.foreign_after_dns.take() {
+                            k.foreign.push(route);
+                        }
                         Ok(vec![])
                     }
                     ["domain", n, domains @ ..] if *n == name => {
                         k.domains = domains.iter().map(|s| (*s).to_owned()).collect();
                         Ok(vec![])
                     }
+                    ["default-route", n] if *n == name => {
+                        let value = if k.dns_default_route { "yes" } else { "no" };
+                        Ok(format!("Link {} ({name}): {value}\n", k.ifindex).into_bytes())
+                    }
                     ["default-route", n, "false"] if *n == name => {
-                        if let Some(route) = k.foreign_after_dns.take() {
-                            k.foreign.push(route);
+                        if !k.ignore_dns_default_route {
+                            k.dns_default_route = false;
                         }
                         Ok(vec![])
                     }
@@ -1447,7 +1469,7 @@ mod tests {
                         || op.contains(" revert ")
                         || op.starts_with(&format!("{RESOLVECTL} dns {NAME} "))
                         || op.starts_with(&format!("{RESOLVECTL} domain {NAME} "))
-                        || op.contains("default-route")
+                        || op.starts_with(&format!("{RESOLVECTL} default-route {NAME} "))
                 })
                 .collect()
         }
@@ -1609,9 +1631,9 @@ mod tests {
         let k = fixture.kernel.lock().unwrap();
         assert_eq!(k.dns, ["10.20.1.53"]);
         assert_eq!(k.domains, ["~corp.example"]);
+        assert!(!k.dns_default_route);
         assert_eq!(receipt.report().dns_servers, 1);
         assert_eq!(receipt.report().refused_dns, 1);
-        // The same per-link sequence netd uses: revert, dns, domain, default-route.
         drop(k);
         let writes = fixture.writes();
         let dns: Vec<_> = writes
@@ -1622,11 +1644,33 @@ mod tests {
             dns,
             [
                 &format!("{RESOLVECTL} revert {NAME}"),
-                &format!("{RESOLVECTL} dns {NAME} 10.20.1.53"),
-                &format!("{RESOLVECTL} domain {NAME} ~corp.example"),
                 &format!("{RESOLVECTL} default-route {NAME} false"),
+                &format!("{RESOLVECTL} domain {NAME} ~corp.example"),
+                &format!("{RESOLVECTL} dns {NAME} 10.20.1.53"),
             ]
         );
+    }
+
+    #[test]
+    fn a_resolver_that_leaves_default_route_enabled_is_not_confirmed_and_is_reverted() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        fixture.kernel.lock().unwrap().ignore_dns_default_route = true;
+        let entry = entry(&["10.20.0.0/16"], &[], &["corp.example"]);
+        let delivered = ready(&[("10.20.0.0", 16)], &["10.20.1.53"]);
+        let error = apply(&fixture, &mut receipt, &delivered, &entry).unwrap_err();
+        assert_eq!(error.to_string(), "DNS confirmation failed");
+
+        let guard = fixture.guard();
+        let saved = Receipt::load(&fixture.directory, &guard).unwrap();
+        assert!(saved.dns_intended && !saved.confirmed);
+        fixture
+            .network
+            .clean(&guard, &fixture.directory, &saved)
+            .unwrap();
+        let kernel = fixture.kernel.lock().unwrap();
+        assert!(kernel.dns.is_empty() && kernel.domains.is_empty());
     }
 
     #[test]

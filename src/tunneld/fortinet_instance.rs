@@ -303,6 +303,10 @@ struct Config<'a> {
     own_process: bool,
 }
 
+// Match the writer's establishment window in backend::establish_fortinet.
+// The writer's Stop or EOF also revokes the capability through Client.
+const ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(35);
+
 impl Config<'static> {
     const PRODUCTION: Self = Self {
         client: OPENFORTIVPN,
@@ -836,7 +840,8 @@ struct Stopped {
 
 impl Client {
     fn spawn(command: Command, password: Secret, own_process: bool) -> io::Result<Self> {
-        let mut child = PinentryChild::spawn(command, password)?;
+        let request_deadline = Instant::now() + ESTABLISHMENT_TIMEOUT;
+        let mut child = PinentryChild::spawn_fortinet(command, password, request_deadline)?;
         let group = child.id() as libc::pid_t;
         // The child is not reaped until `poll`, so its pid is still ours.
         let pidfd = match pidfd_open(group) {
