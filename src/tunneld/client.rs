@@ -29,7 +29,7 @@ pub struct Client {
 
 pub(crate) enum Confirmation {
     Fresh(ProbeBinding),
-    Late(ProbeBinding),
+    Late(Option<ProbeBinding>),
     Unavailable,
 }
 
@@ -215,32 +215,39 @@ impl Client {
         if self.phase != Phase::Active || self.version != CLEANUP_VERSION {
             return Err(ErrorCode::BadRequest.into());
         }
-        let mut pending = self.confirmation.take();
-        let late = pending.is_some();
-        if pending.is_none() {
-            let now_ms = monotonic_ms()?;
-            let remaining_ms = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis();
-            if remaining_ms == 0 {
-                return Ok(Confirmation::Unavailable);
+        let (mut pending, late) = match self.confirmation.take() {
+            Some(pending) => (pending, true),
+            None => {
+                let now_ms = monotonic_ms()?;
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                if remaining_ms == 0 {
+                    return Ok(Confirmation::Unavailable);
+                }
+                let expires_ms =
+                    now_ms.saturating_add(remaining_ms.min(u128::from(u64::MAX)) as u64);
+                let mut request = Vec::new();
+                write_control(&mut request, &Request::Confirm { expires_ms })?;
+                (
+                    PendingConfirmation {
+                        request,
+                        written: 0,
+                        response: Vec::new(),
+                    },
+                    false,
+                )
             }
-            let expires_ms = now_ms.saturating_add(remaining_ms.min(u128::from(u64::MAX)) as u64);
-            let mut request = Vec::new();
-            write_control(&mut request, &Request::Confirm { expires_ms })?;
-            pending = Some(PendingConfirmation {
-                request,
-                written: 0,
-                response: Vec::new(),
-            });
-        }
-        let mut pending = pending.expect("confirmation frame");
-        let stream = self.stream.as_ref().ok_or(ErrorCode::BadRequest)?;
-        match pending.exchange(stream, deadline) {
+        };
+        let stream = self.stream.take().ok_or(ErrorCode::BadRequest)?;
+        let result = match pending.exchange(&stream, deadline) {
             Ok(Response::NetworkReady { binding }) if late || Instant::now() >= deadline => {
-                Ok(Confirmation::Late(binding))
+                Ok(Confirmation::Late(Some(binding)))
             }
             Ok(Response::NetworkReady { binding }) => Ok(Confirmation::Fresh(binding)),
+            Ok(Response::Error {
+                code: ErrorCode::Timeout,
+            }) if late => Ok(Confirmation::Late(None)),
             Ok(Response::Error {
                 code: ErrorCode::Timeout,
             }) => Ok(Confirmation::Unavailable),
@@ -254,7 +261,11 @@ impl Client {
             Ok(Response::Error { code }) => Err(code.into()),
             Ok(_) => Err(ErrorCode::Backend.into()),
             Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.stream = Some(stream);
         }
+        result
     }
 
     fn in_phase<T>(

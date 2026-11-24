@@ -542,6 +542,41 @@ fn version_two_hello_and_cleanup_status_are_strict() {
 }
 
 #[test]
+fn confirm_is_an_active_v2_command_and_preserves_v1_status_and_stop() {
+    for version in [VERSION, CLEANUP_VERSION] {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut decoder = ServerDecoder::new(reader);
+        write_control(&mut writer, &Request::Hello { version }).unwrap();
+        decoder.hello(deadline()).unwrap();
+        writer.write_all(&fortinet("u", PIN)).unwrap();
+        decoder.prepare(deadline()).unwrap();
+        let generation = (version == CLEANUP_VERSION)
+            .then(|| Generation::parse("0123456789abcdef0123456789abcdef".into()).unwrap());
+        decoder.acknowledge(generation, deadline()).unwrap();
+        Credentials::fortinet("fixture")
+            .unwrap()
+            .write(&mut writer)
+            .unwrap();
+        decoder.credentials(deadline()).unwrap();
+        writer.write_all(STATUS).unwrap();
+        assert_eq!(decoder.command(deadline()).unwrap(), Command::Status);
+        if version == VERSION {
+            writer.write_all(STOP).unwrap();
+            assert_eq!(decoder.command(deadline()).unwrap(), Command::Stop);
+        }
+        write_control(&mut writer, &Request::Confirm { expires_ms: 42 }).unwrap();
+        if version == CLEANUP_VERSION {
+            assert_eq!(decoder.command(deadline()).unwrap(), Command::Confirm(42));
+        } else {
+            assert_eq!(
+                decoder.command(deadline()),
+                Err(ErrorCode::BadRequest.into())
+            );
+        }
+    }
+}
+
+#[test]
 fn v2_ready_binding_has_a_generation_nonzero_index_and_bounded_ipv4_scope() {
     let frame = |ifindex, local: &str, routes: serde_json::Value| {
         let value = serde_json::json!({

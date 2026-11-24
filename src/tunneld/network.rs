@@ -423,8 +423,8 @@ impl Network {
             .ok_or_else(|| invalid("no resolved transport is authorized"))
     }
 
-    fn links(&self) -> io::Result<Vec<Link>> {
-        self.json(&["-j", "-d", "link", "show"])
+    fn links(&self, deadline: Option<Instant>) -> io::Result<Vec<Link>> {
+        self.json_until(&["-j", "-d", "link", "show"], deadline)
     }
 
     fn routes(&self, family: &str) -> io::Result<Vec<Route>> {
@@ -443,7 +443,7 @@ impl Network {
         let [route] = routes.as_slice() else {
             return Err(invalid("ambiguous egress lookup"));
         };
-        let links = self.links()?;
+        let links = self.links(None)?;
         let link = links
             .iter()
             .find(|link| link.ifname == route.dev && link.flags.iter().any(|flag| flag == "UP"))
@@ -548,7 +548,7 @@ impl Network {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
         self.fib_clear(&routes, None, approved, &egress)?;
-        let links = self.links()?;
+        let links = self.links(None)?;
         let ids = self.xfrm_ids()?;
         let link_ids: Vec<_> = links.iter().map(Link::xfrm_id).collect::<io::Result<_>>()?;
         let reqid = (1..=MAX_REQID)
@@ -698,8 +698,7 @@ impl Network {
     fn link_until(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Option<Link>> {
         let name = receipt.name();
         let mut owned = None;
-        let links: Vec<Link> = self.json_until(&["-j", "-d", "link", "show"], deadline)?;
-        for link in links {
+        for link in self.links(deadline)? {
             if link.ifname == name {
                 if owned.is_some()
                     || link.ifindex == 0
@@ -1011,6 +1010,7 @@ fn run_command(
                 if !diagnostics.is_empty() {
                     return Err(invalid("network command reported diagnostics"));
                 }
+                check_deadline(Some(deadline))?;
                 return Ok(output);
             }
             thread::sleep(

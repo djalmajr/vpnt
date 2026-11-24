@@ -1205,6 +1205,12 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Running for Session<'_, N
             }
             _ => Err(io::Error::other("probe receipt is unproven")),
         }?;
+        // Keep the network observation and final backend liveness check
+        // under the same guard. Socket writes use their own frame budget.
+        super::network::check_deadline(Some(deadline))?;
+        if super::server::probe_session_ended(self, deadline)? {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
         super::network::check_deadline(Some(deadline))?;
         Ok(binding)
     }
@@ -3189,7 +3195,9 @@ mod tests {
         #[test]
         fn v2_stop_and_eof_converge_after_slow_transient_revert() {
             use crate::tunneld::{
-                client::Client, protocol::CleanupState, server::serve_cleanup_fixture,
+                client::{Client, Confirmation},
+                protocol::CleanupState,
+                server::serve_cleanup_fixture,
             };
             use std::os::unix::net::UnixListener;
             if !namespaced_in(
@@ -3235,27 +3243,47 @@ mod tests {
                         )
                         .unwrap();
                     let ready_by = Instant::now() + Duration::from_secs(8);
-                    loop {
+                    let original_binding = loop {
                         match client.status_with_binding(deadline()).unwrap() {
                             (State::NetworkReady, Some(binding)) => {
                                 assert_eq!(binding.generation(), &id);
                                 assert_eq!(binding.ifindex().get(), 7);
                                 assert!(binding.allows("10.20.0.5".parse().unwrap()));
                                 assert!(!binding.allows("10.21.0.5".parse().unwrap()));
-                                break;
+                                break binding;
                             }
                             (State::Starting, None) if Instant::now() < ready_by => {
                                 thread::sleep(Duration::from_millis(10))
                             }
                             state => panic!("unexpected v2 status: {state:?}"),
                         }
-                    }
+                    };
                     assert_eq!(
                         generation_of(&started_unit(&harness.log).unwrap()),
                         id.as_str()
                     );
                     assert_eq!(kernel.lock().unwrap().routes, ["10.20.0.0/16"]);
                     if explicit {
+                        let guard =
+                            NetworkLock::acquire_test(&harness.runtime, deadline()).unwrap();
+                        let started = Instant::now();
+                        assert!(matches!(
+                            client.confirm(started + Duration::from_millis(80)).unwrap(),
+                            Confirmation::Unavailable
+                        ));
+                        assert!(started.elapsed() < Duration::from_millis(400));
+                        if client.confirmation_pending() {
+                            assert!(matches!(
+                                client.confirm(deadline()).unwrap(),
+                                Confirmation::Late(None)
+                            ));
+                        }
+                        assert!(!client.confirmation_pending());
+                        drop(guard);
+                        assert!(matches!(
+                            client.confirm(deadline()).unwrap(),
+                            Confirmation::Fresh(binding) if binding == original_binding
+                        ));
                         assert_eq!(client.stop(deadline()).unwrap(), State::Stopping);
                     }
                     drop(client);

@@ -133,24 +133,35 @@ impl TunnelAttempt {
             return Err(Failure::at(step));
         };
         self.next_status = Instant::now() + STATUS_INTERVAL;
-        let fresh = match client.confirm(deadline) {
-            Ok(Confirmation::Fresh(binding)) if self.probe_binding.as_ref() == Some(&binding) => {
-                true
+        loop {
+            match client.confirm(deadline) {
+                Ok(Confirmation::Fresh(binding))
+                    if self.probe_binding.as_ref() == Some(&binding) =>
+                {
+                    return Ok(true);
+                }
+                Ok(Confirmation::Late(binding))
+                    if binding
+                        .as_ref()
+                        .is_none_or(|binding| self.probe_binding.as_ref() == Some(binding)) =>
+                {
+                    // A new sample can ask for fresh proof after the old frame
+                    // has been drained, using only the remaining sample budget.
+                    if step != Step::Verify || Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                }
+                Ok(Confirmation::Unavailable) => return Ok(false),
+                Ok(_) => {
+                    self.observe_cleanup();
+                    return Err(Failure::at(step));
+                }
+                Err(error) => {
+                    self.observe_cleanup();
+                    return Err(wire_failure(error, step));
+                }
             }
-            Ok(Confirmation::Late(binding)) if self.probe_binding.as_ref() == Some(&binding) => {
-                false
-            }
-            Ok(Confirmation::Unavailable) => false,
-            Ok(_) => {
-                self.observe_cleanup();
-                return Err(Failure::at(step));
-            }
-            Err(error) => {
-                self.observe_cleanup();
-                return Err(wire_failure(error, step));
-            }
-        };
-        Ok(fresh)
+        }
     }
 
     fn cleaned(&mut self) {
@@ -288,13 +299,15 @@ impl Attempt for TunnelAttempt {
 
     fn healthy(&mut self) -> Result<(), Failure> {
         let now = Instant::now();
+        // The worker also calls this immediately after a sample. A pending
+        // frame is drained by the next sample or a later periodic check.
+        if now < self.next_status {
+            return Ok(());
+        }
         if matches!(&self.session, Session::Active(client) if client.confirmation_pending()) {
             return self
                 .confirm_binding(now + CONFIRMATION_DRAIN, Step::Health)
                 .map(|_| ());
-        }
-        if Instant::now() < self.next_status {
-            return Ok(());
         }
         self.confirm_binding(now + CONFIRMATION_RESERVE, Step::Health)
             .map(|_| ())

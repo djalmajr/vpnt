@@ -12,8 +12,8 @@
 use super::{
     fortinet_instance::{Event, Failure},
     network::{
-        SetupCancellation, check_standard_ipv4_rules, cidr_text, overlaps, prefix, route_key,
-        valid_generation,
+        SetupCancellation, check_deadline, check_standard_ipv4_rules, cidr_text, overlaps, prefix,
+        route_key, valid_generation,
     },
     policy::Entry,
     protocol::{CidrV4, Generation, ProbeBinding},
@@ -488,8 +488,8 @@ impl FortinetNetwork {
         (self.0)(RESOLVECTL, args, cancel, None)
     }
 
-    fn links(&self) -> io::Result<Vec<Link>> {
-        self.json(&["-j", "-d", "link", "show"])
+    fn links(&self, deadline: Option<Instant>) -> io::Result<Vec<Link>> {
+        self.json_until(&["-j", "-d", "link", "show"], deadline)
     }
 
     fn egress(&self, remote: Ipv4Addr) -> io::Result<Egress> {
@@ -504,7 +504,7 @@ impl FortinetNetwork {
         let [route] = routes.as_slice() else {
             return Err(invalid("ambiguous egress lookup"));
         };
-        let links = self.links()?;
+        let links = self.links(None)?;
         let link = links
             .iter()
             .find(|link| link.ifname == route.dev && link.flags.iter().any(|flag| flag == "UP"))
@@ -534,7 +534,7 @@ impl FortinetNetwork {
     ) -> io::Result<Receipt> {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
-        let links = self.links()?;
+        let links = self.links(None)?;
         let ordinal = (1..=MAX_ORDINAL)
             .find(|n| !links.iter().any(|link| link.ifname == format!("vpntp{n}")))
             .ok_or_else(|| invalid("no PPP interface name is available"))?;
@@ -575,8 +575,7 @@ impl FortinetNetwork {
 
     fn link_until(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Option<Link>> {
         let mut found = None;
-        let links: Vec<Link> = self.json_until(&["-j", "-d", "link", "show"], deadline)?;
-        for link in links {
+        for link in self.links(deadline)? {
             if link.ifname == receipt.ifname {
                 if found.is_some() || link.ifindex == 0 {
                     return Err(invalid("PPP link identity is ambiguous"));
@@ -965,7 +964,7 @@ impl FortinetNetwork {
     fn cleanup_link(&self, receipt: &Receipt, ifindex: u32) -> io::Result<Option<Link>> {
         let marker = receipt.marker();
         let mut owned = None;
-        for link in self.links()? {
+        for link in self.links(None)? {
             let recorded = link.ifname == receipt.ifname && link.ifindex == ifindex;
             let marked = link.ifalias.as_deref() == Some(marker.as_str());
             if receipt.probe_marked && recorded != marked {
@@ -1037,8 +1036,6 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
 }
 
 /// Fixed program, clean environment, absolute deadline, bounded output.
-use super::network::check_deadline;
-
 fn run_command(
     program: &str,
     args: &[&str],
@@ -1086,6 +1083,7 @@ fn run_command(
                 if !status.success() {
                     return Err(io::Error::other(format!("{program} exited with {status}")));
                 }
+                check_deadline(Some(deadline))?;
                 return Ok(output);
             }
             thread::sleep(

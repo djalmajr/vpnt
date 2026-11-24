@@ -238,7 +238,11 @@ fn no_probe(
 }
 
 fn admitted(fixture: &SocketFixture, kind: VpnKind) -> ServerDecoder {
-    let mut decoder = ServerDecoder::new(fixture.accept());
+    admit_stream(fixture.accept(), kind)
+}
+
+fn admit_stream(stream: UnixStream, kind: VpnKind) -> ServerDecoder {
+    let mut decoder = ServerDecoder::new(stream);
     decoder.hello(wire_deadline()).unwrap();
     let offer = decoder.prepare(wire_deadline()).unwrap();
     match (kind, offer) {
@@ -922,6 +926,115 @@ fn exhausted_tcp_reservation_sends_no_confirmation() {
         assert!(started.elapsed() < Duration::from_millis(240));
         assert!(attempt.cleanup());
         peer.join().unwrap();
+    });
+}
+
+#[test]
+fn worker_recovers_after_unconfirmed_samples_on_the_same_session() {
+    use std::io::Write;
+
+    if !wire_fixture("worker_recovers_after_unconfirmed_samples_on_the_same_session") {
+        return;
+    }
+    static SAMPLES: AtomicUsize = AtomicUsize::new(0);
+    let fixture = SocketFixture::new("worker-reconfirm");
+    thread::scope(|scope| {
+        let (release, wait) = mpsc::channel();
+        let (replied, late_reply) = mpsc::channel();
+        let fixture = &fixture;
+        let peer = scope.spawn(move || {
+            let mut stream = fixture.accept();
+            let mut decoder = admit_stream(stream.try_clone().unwrap(), VpnKind::Ssl);
+            reply(&mut decoder, Command::Status, State::NetworkReady);
+            expect_confirmation(&mut decoder);
+
+            // Retain a partial line across the sample deadline.
+            let response = serde_json::to_vec(&crate::tunneld::protocol::Response::NetworkReady {
+                binding: fixture_binding(fixture_generation(), 7),
+            })
+            .unwrap();
+            let middle = response.len() / 2;
+            stream.write_all(&response[..middle]).unwrap();
+            wait.recv_timeout(wire_deadline().saturating_duration_since(Instant::now()))
+                .unwrap();
+            stream.write_all(&response[middle..]).unwrap();
+            stream.write_all(b"\n").unwrap();
+            replied.send(()).unwrap();
+
+            expect_confirmation(&mut decoder);
+            reply_state(&mut decoder, State::NetworkReady);
+            expect_confirmation(&mut decoder);
+            decoder
+                .reply_ready(fixture_binding(fixture_generation(), 8), wire_deadline())
+                .unwrap();
+            drop((stream, decoder));
+            query(fixture, CleanupState::Stopped);
+        });
+        let attempt = fixture.attempt(VpnKind::Ssl, |_, _, _, cutoff, _| {
+            match SAMPLES.fetch_add(1, Ordering::Relaxed) {
+                0 => thread::sleep(cutoff.saturating_duration_since(Instant::now())),
+                1 => thread::sleep(
+                    cutoff
+                        .saturating_duration_since(Instant::now())
+                        .saturating_sub(Duration::from_millis(35)),
+                ),
+                _ => {}
+            }
+            Ok(true)
+        });
+        let state = Arc::new(Mutex::new(None));
+        let requested = Arc::new(AtomicBool::new(false));
+        let exit = Arc::new(worker::ExitRequested::new(Duration::ZERO));
+        let worker_signals = worker::Signals {
+            canceled: Arc::new(AtomicBool::new(false)),
+            probe: requested.clone(),
+            state: state.clone(),
+            exit: exit.clone(),
+        };
+        let timing = Timing {
+            probe: Duration::from_millis(320),
+            health: Duration::from_secs(30),
+            interval: Duration::from_secs(30),
+            ..Timing::default()
+        };
+        let waiter = scope.spawn(move || {
+            worker::run(
+                attempt,
+                worker_signals,
+                timing,
+                ProbeClock::new(timing.interval),
+            )
+        });
+        let observe = |expected, failures| {
+            let until = wire_deadline();
+            loop {
+                let progress = *state.lock().unwrap();
+                if progress.is_some_and(|p| p.state == expected && p.failures == failures) {
+                    return;
+                }
+                if Instant::now() >= until {
+                    exit.request();
+                    panic!("expected {expected:?}/{failures}, observed {progress:?}");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        observe(ConnectionState::Unresponsive, 1);
+        let started = Instant::now();
+        requested.store(true, Ordering::Release);
+        observe(ConnectionState::Unresponsive, 2);
+        assert!(started.elapsed() < timing.probe + timing.poll * 2 + Duration::from_millis(80));
+        release.send(()).unwrap();
+        late_reply.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        requested.store(true, Ordering::Release);
+        observe(ConnectionState::Connected, 0);
+        requested.store(true, Ordering::Release);
+        let finished = waiter.join().unwrap();
+        assert_eq!(finished.state, ConnectionState::Dropped);
+        assert_eq!(finished.step, Some(Step::Verify));
+        peer.join().unwrap();
+        assert_eq!(SAMPLES.load(Ordering::Relaxed), 4);
     });
 }
 

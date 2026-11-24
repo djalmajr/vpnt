@@ -395,7 +395,7 @@ fn serve(
     }
     let mut deadline = None;
     for _ in 0..statuses + usize::from(stop) {
-        let (_, ended) = poll_session(None, &*session, 0)?;
+        let (_, ended) = poll_session(None, &*session, 0, None)?;
         if ended {
             let cleanup_started = Instant::now();
             session.stop();
@@ -487,6 +487,7 @@ fn poll_session(
     client: Option<&UnixStream>,
     session: &dyn Running,
     timeout: libc::c_int,
+    retry_until: Option<Instant>,
 ) -> io::Result<(bool, bool)> {
     let mut fds = [
         libc::pollfd {
@@ -519,7 +520,12 @@ fn poll_session(
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+        super::network::check_deadline(retry_until)?;
     }
+}
+
+pub(super) fn probe_session_ended(session: &dyn Running, deadline: Instant) -> io::Result<bool> {
+    poll_session(None, session, 0, Some(deadline)).map(|(_, ended)| ended)
 }
 
 /// Answer the client's commands for one admitted session. A stop, a closed
@@ -531,7 +537,7 @@ fn dialogue(
     mut session: Box<dyn Running + '_>,
 ) -> Result<(), FrameError> {
     loop {
-        let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS)?;
+        let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS, None)?;
         if ended {
             session.stop();
         }
@@ -571,7 +577,8 @@ fn dialogue_v2(
 ) -> Result<(), FrameError> {
     let result = (|| {
         loop {
-            let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS)?;
+            let (client_ready, ended) =
+                poll_session(Some(stream), &*session, SESSION_IDLE_MS, None)?;
             if ended || !client_ready {
                 return Ok(());
             }
@@ -582,7 +589,8 @@ fn dialogue_v2(
                     let remaining =
                         Duration::from_millis(expires_ms.saturating_sub(monotonic_ms()?));
                     let confirm_by = now + remaining.min(MAX_CONFIRMATION);
-                    if poll_session(None, &*session, 0)?.1 || session.state() != State::NetworkReady
+                    if probe_session_ended(&*session, deadline)?
+                        || session.state() != State::NetworkReady
                     {
                         return decoder
                             .reply_status(State::Stopping, Instant::now() + FRAME_TIMEOUT);
@@ -593,7 +601,7 @@ fn dialogue_v2(
                         session.probe_binding(confirm_by)
                     };
                     let write_by = Instant::now() + FRAME_TIMEOUT;
-                    if poll_session(None, &*session, 0)?.1 {
+                    if probe_session_ended(&*session, write_by)? {
                         return decoder.reply_status(State::Stopping, write_by);
                     }
                     match binding {
@@ -618,7 +626,7 @@ fn dialogue_v2(
                             return Ok(());
                         }
                     };
-                    if poll_session(None, &*session, 0)?.1 {
+                    if probe_session_ended(&*session, deadline)? {
                         return decoder.reply_status(State::Stopping, deadline);
                     }
                     decoder.reply_ready(binding, deadline)?;
