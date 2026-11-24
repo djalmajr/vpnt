@@ -21,10 +21,11 @@ struct Namespace {
     netns: (u64, u64),
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Phase {
     Prepared,
+    PreparingNetwork,
     Pending,
     Proved { at: u64 },
     Stopped { at: u64 },
@@ -203,10 +204,18 @@ impl Store {
         }
         let generation = Generation::parse(super::backend::generation()?)
             .expect("kernel-generated generation is valid");
-        match fs::symlink_metadata(self.directory.join(generation.as_str())) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
-            Err(error) => return Err(error),
+        let instances = self
+            .directory
+            .with_file_name(super::backend::INSTANCE_DIRECTORY);
+        for path in [
+            self.directory.join(generation.as_str()),
+            instances.join(generation.as_str()),
+        ] {
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+                Err(error) => return Err(error),
+            }
         }
         self.save(&Receipt {
             generation: generation.clone(),
@@ -230,7 +239,10 @@ impl Store {
         // waiting for fsync, a network lock, or a backend teardown.
         match self.read(generation) {
             Ok(receipt) if receipt.uid == uid => match receipt.phase {
-                Phase::Prepared | Phase::Pending | Phase::Proved { .. } => CleanupState::Pending,
+                Phase::Prepared
+                | Phase::PreparingNetwork
+                | Phase::Pending
+                | Phase::Proved { .. } => CleanupState::Pending,
                 Phase::Stopped { at } if (self.clock)().is_ok_and(|now| fresh(at, now)) => {
                     CleanupState::Stopped
                 }
@@ -240,14 +252,31 @@ impl Store {
         }
     }
 
-    fn arm(&self, generation: &Generation, uid: u32) -> io::Result<()> {
+    fn transition(
+        &self,
+        generation: &Generation,
+        uid: u32,
+        expected: Phase,
+        next: Phase,
+    ) -> io::Result<()> {
         let _access = self.access.lock().expect("cleanup receipt store");
         let mut receipt = self.read(generation)?;
-        if receipt.uid != uid || !matches!(receipt.phase, Phase::Prepared) {
+        if receipt.uid != uid || receipt.phase != expected {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        receipt.phase = Phase::Pending;
+        receipt.phase = next;
         self.save(&receipt)
+    }
+
+    /// Before arming, a network receipt can describe a staged plan.
+    pub(super) fn preparing_network(&self, generation: &str) -> io::Result<bool> {
+        let generation =
+            Generation::parse(generation.to_owned()).expect("validated receipt directory");
+        match self.read(&generation) {
+            Ok(receipt) => Ok(receipt.phase == Phase::PreparingNetwork),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The caller has proved teardown or that it never armed this generation.
@@ -256,7 +285,7 @@ impl Store {
         let at = match receipt.phase {
             Phase::Stopped { .. } => return Ok(()),
             Phase::Proved { at } => at,
-            Phase::Prepared | Phase::Pending => {
+            Phase::Prepared | Phase::PreparingNetwork | Phase::Pending => {
                 receipt.phase = Phase::Proved { at };
                 self.save(&receipt)?;
                 at
@@ -326,7 +355,10 @@ impl Store {
 
     /// Called at startup while admissions are closed. An armed receipt
     /// without a completed network receipt or saved proof remains uncertain.
-    pub(super) fn finish_recovery(&self) -> io::Result<()> {
+    pub(super) fn finish_recovery(
+        &self,
+        lease_present: impl Fn(&Generation) -> io::Result<bool>,
+    ) -> io::Result<()> {
         let _access = self.access.lock().expect("cleanup receipt store");
         let mut first_error = None;
         for generation in self.entries()? {
@@ -334,14 +366,15 @@ impl Store {
                 let generation = generation.ok_or(io::ErrorKind::InvalidData)?;
                 let receipt = self.read(&generation)?;
                 match receipt.phase {
-                    Phase::Pending => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "cleanup lacks proof for a generation",
-                    )),
+                    Phase::Pending => Err(missing_proof()),
                     Phase::Stopped { .. } => Ok(()),
-                    Phase::Prepared | Phase::Proved { .. } => {
+                    Phase::Prepared | Phase::PreparingNetwork => {
+                        if lease_present(&generation)? {
+                            return Err(missing_proof());
+                        }
                         self.publish(receipt, (self.clock)()?)
                     }
+                    Phase::Proved { .. } => self.publish(receipt, (self.clock)()?),
                 }
             })();
             if let Err(error) = result {
@@ -352,13 +385,34 @@ impl Store {
     }
 }
 
+fn missing_proof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "cleanup lacks proof for a generation",
+    )
+}
+
 impl Reservation<'_> {
     pub(super) fn generation(&self) -> &Generation {
         &self.generation
     }
 
+    pub(super) fn begin_network(&self) -> io::Result<()> {
+        self.store.transition(
+            &self.generation,
+            self.uid,
+            Phase::Prepared,
+            Phase::PreparingNetwork,
+        )
+    }
+
     pub(super) fn arm(&mut self) -> io::Result<()> {
-        self.store.arm(&self.generation, self.uid)?;
+        self.store.transition(
+            &self.generation,
+            self.uid,
+            Phase::PreparingNetwork,
+            Phase::Pending,
+        )?;
         self.armed = true;
         Ok(())
     }
@@ -454,10 +508,86 @@ mod tests {
     }
 
     #[test]
+    fn malformed_pre_effect_records_cannot_publish_a_terminal_result() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let record = store.reserve(1000).unwrap();
+        record.begin_network().unwrap();
+        let id = record.generation().clone();
+        // Leave the committed file as startup would find it after writer loss.
+        std::mem::forget(record);
+        let path = store.directory.join(id.as_str());
+        let valid = fs::read(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+
+        let mut unknown = parsed.clone();
+        unknown["phase"] = serde_json::json!("unknown_phase");
+        let mut wrong_generation = parsed.clone();
+        wrong_generation["generation"] =
+            serde_json::json!(super::super::backend::generation().unwrap());
+        let mut invalid_uid = parsed;
+        invalid_uid["uid"] = serde_json::json!(0);
+        for (case, bytes) in [
+            ("unknown phase", serde_json::to_vec(&unknown).unwrap()),
+            (
+                "different generation",
+                serde_json::to_vec(&wrong_generation).unwrap(),
+            ),
+            ("invalid UID", serde_json::to_vec(&invalid_uid).unwrap()),
+            ("truncated JSON", valid[..valid.len() - 1].to_vec()),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(store.finish_recovery(|_| Ok(false)).is_err(), "{case}");
+            assert_eq!(store.status(1000, &id), CleanupState::Unknown, "{case}");
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{case}");
+        }
+        fs::write(path, valid).unwrap();
+        store.finish_recovery(|_| Ok(false)).unwrap();
+        assert_eq!(store.status(1000, &id), CleanupState::Stopped);
+        assert_eq!(store.status(1001, &id), CleanupState::Unknown);
+    }
+
+    #[test]
+    fn an_interrupted_arm_does_not_make_a_temporary_record_authoritative() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let mut record = store.reserve(1000).unwrap();
+        record.begin_network().unwrap();
+        let id = record.generation().clone();
+        assert!(
+            store
+                .transition(&id, 1001, Phase::PreparingNetwork, Phase::Pending)
+                .is_err()
+        );
+
+        let staging = store.directory.join(".tmp");
+        fs::create_dir(&staging).unwrap();
+        assert_eq!(
+            record.arm().unwrap_err().kind(),
+            io::ErrorKind::IsADirectory
+        );
+        assert_eq!(store.read(&id).unwrap().phase, Phase::PreparingNetwork);
+        std::mem::forget(record);
+        fs::remove_dir(&staging).unwrap();
+        fs::write(&staging, b"{").unwrap();
+        drop(store);
+
+        let reopened = fixture.store();
+        let error = reopened
+            .finish_recovery(|generation| Ok(*generation == id))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cleanup lacks proof for a generation");
+        assert_eq!(reopened.status(1000, &id), CleanupState::Pending);
+        reopened.finish_recovery(|_| Ok(false)).unwrap();
+        assert_eq!(reopened.status(1000, &id), CleanupState::Stopped);
+    }
+
+    #[test]
     fn a_first_proof_write_failure_is_retried_while_the_writer_lives() {
         let fixture = Fixture::new();
         let store = fixture.store();
         let mut record = store.reserve(1000).unwrap();
+        record.begin_network().unwrap();
         record.arm().unwrap();
         let generation = record.generation().clone();
         let staging = store.directory.join(".tmp");
@@ -484,6 +614,7 @@ mod tests {
         let generation = {
             let store = fixture.store();
             let mut record = store.reserve(1000).unwrap();
+            record.begin_network().unwrap();
             record.arm().unwrap();
             store
                 .fail_terminal_write
@@ -502,7 +633,7 @@ mod tests {
         };
         let mut recovered = fixture.store();
         recovered.clock = || Ok(899);
-        recovered.finish_recovery().unwrap();
+        recovered.finish_recovery(|_| Ok(false)).unwrap();
         assert_eq!(recovered.status(1000, &generation), CleanupState::Stopped);
         recovered.clock = || Ok(900);
         assert_eq!(recovered.status(1000, &generation), CleanupState::Unknown);

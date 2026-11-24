@@ -1,7 +1,7 @@
 //! Admission, authenticated instance control, and lease recovery.
 use super::{
     attest::SystemdAttestor,
-    cleanup::Store,
+    cleanup::{Reservation, Store},
     fortinet_instance::{self, Event},
     fortinet_network::{self, FortinetNetwork},
     handshake::{
@@ -12,8 +12,7 @@ use super::{
     network::{Network, Receipt, SetupCancellation, parse_cidr, valid_generation},
     policy::{Entry, MAX_IPSEC_ROUTES},
     protocol::{
-        self, CidrV4, Credentials, ErrorCode, FortinetRequest, Generation, Prepare, ProbeBinding,
-        State,
+        self, CidrV4, Credentials, ErrorCode, FortinetRequest, Prepare, ProbeBinding, State,
     },
 };
 use crate::{
@@ -72,9 +71,16 @@ pub(super) trait Launch: Send + Sync {
         credentials: Credentials,
         authorization: File,
         cancel: &Arc<SetupCancellation>,
-        generation: &Generation,
+        reservation: &mut Reservation<'_>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
-        let _ = (offer, grant, credentials, authorization, cancel, generation);
+        let _ = (
+            offer,
+            grant,
+            credentials,
+            authorization,
+            cancel,
+            reservation,
+        );
         Err(ErrorCode::Backend)
     }
 }
@@ -290,6 +296,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         authorization: Option<File>,
         channel: &mut Option<AuthenticatedChannel>,
         cancel: &SetupCancellation,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> Result<OwnedFd, Failure> {
         cancel.check().map_err(|e| Failure::io("admission", &e))?;
         let guard = (self.lock)(Instant::now() + self.limits.lock).map_err(|error| {
@@ -352,6 +359,13 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 attempt.fortinet = Some(receipt);
             }
             None => {}
+        }
+        // A dead writer releases the flock. Only a durable, generation-scoped
+        // network receipt and an armed cleanup record may precede a lease.
+        if let Some(record) = reservation {
+            record
+                .arm()
+                .map_err(|e| Failure::io("arm cleanup receipt", &e))?;
         }
         // A sync error after creation can still leave the marker.
         attempt.registered = true;
@@ -612,7 +626,10 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     fn create_directory(&self, generation: &str) -> io::Result<PathBuf> {
         let parent = self.runtime.join(INSTANCE_DIRECTORY);
         match DirBuilder::new().mode(0o700).create(&parent) {
-            Ok(()) => fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?,
+            Ok(()) => {
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+                File::open(&self.runtime)?.sync_all()?;
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
@@ -628,6 +645,19 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
     #[cfg(test)]
     pub(super) fn recover(&self) -> io::Result<()> {
         self.recover_with(None)
+    }
+
+    fn recovery_lease_present(&self, guard: &NetworkGuard, generation: &str) -> io::Result<bool> {
+        // Validate the registry under the writer lock before inspecting the
+        // matching entry. A different writer's lease proves nothing here.
+        if !guard.tunnels_present()? {
+            return Ok(false);
+        }
+        match fs::symlink_metadata(self.runtime.join("tunnel-leases").join(generation)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) fn recover_with(&self, cleanup: Option<&Store>) -> io::Result<()> {
@@ -648,26 +678,38 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             require_private(&directory)?;
             let ipsec = absent_receipt(Receipt::load(&directory, &guard))?;
             let fortinet = absent_receipt(fortinet_network::Receipt::load(&directory, &guard))?;
+            // An unreadable cleanup record cannot establish a staged plan.
+            // Still clean a valid network receipt and surface the read error
+            // when publishing the cleanup result.
+            let staged = (ipsec.is_some() || fortinet.is_some())
+                && cleanup
+                    .is_some_and(|store| store.preparing_network(generation).unwrap_or(false))
+                && !self.recovery_lease_present(&guard, generation)?;
             match (ipsec, fortinet) {
                 (Some(mut receipt), None) => {
                     if !receipt.complete {
-                        let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
-                        // The dead writer may have left the runtime drop-in.
-                        attempt.allowed = true;
-                        self.stop_unit(&attempt)?;
-                        self.revert_unit(&mut attempt)?;
-                        self.xfrm.clean(&guard, &directory, &receipt)?;
+                        if !staged {
+                            let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
+                            // The dead writer may have left the runtime drop-in.
+                            attempt.allowed = true;
+                            self.stop_unit(&attempt)?;
+                            self.revert_unit(&mut attempt)?;
+                            self.xfrm.clean(&guard, &directory, &receipt)?;
+                        }
                         receipt.complete = true;
                         receipt.save(&directory, &guard)?;
                     }
                 }
                 (None, Some(mut receipt)) => {
                     if !receipt.complete {
-                        let mut attempt = Attempt::new(Backend::Fortinet, generation.to_owned());
-                        attempt.allowed = true;
-                        self.stop_unit(&attempt)?;
-                        self.revert_unit(&mut attempt)?;
-                        self.fortinet.clean(&guard, &directory, &receipt)?;
+                        if !staged {
+                            let mut attempt =
+                                Attempt::new(Backend::Fortinet, generation.to_owned());
+                            attempt.allowed = true;
+                            self.stop_unit(&attempt)?;
+                            self.revert_unit(&mut attempt)?;
+                            self.fortinet.clean(&guard, &directory, &receipt)?;
+                        }
                         receipt.complete = true;
                         receipt.save(&directory, &guard)?;
                     }
@@ -686,7 +728,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             }
         }
         if let Some(cleanup) = cleanup {
-            cleanup.finish_recovery()?;
+            cleanup.finish_recovery(|id| self.recovery_lease_present(&guard, id.as_str()))?;
         }
         Ok(())
     }
@@ -875,16 +917,16 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         entry: Option<&Entry>,
         authorization: Option<File>,
         cancel: &SetupCancellation,
-        reserved: Option<&Generation>,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
-        let generation = match reserved {
-            Some(id) => id.as_str().to_owned(),
+        let generation = match reservation.as_ref() {
+            Some(record) => record.generation().as_str().to_owned(),
             None => generation().map_err(|error| {
                 eprintln!("vpnt-tunneld: could not draw a generation: {error}");
                 ErrorCode::Backend
             })?,
         };
-        let managed_cleanup = reserved.is_some();
+        let managed_cleanup = reservation.is_some();
         let mut attempt = Attempt::new(backend, generation);
         attempt.managed_cleanup = managed_cleanup;
         let mut channel = None;
@@ -900,6 +942,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             authorization,
             &mut channel,
             cancel,
+            reservation,
         ) {
             Ok(peer) => Ok(Box::new(Session {
                 launcher: self,
@@ -1040,7 +1083,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
         credentials: Credentials,
         authorization: File,
         cancel: &Arc<SetupCancellation>,
-        generation: &Generation,
+        reservation: &mut Reservation<'_>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         self.launch_for(
             offer,
@@ -1048,7 +1091,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launch for Launcher<N, A>
             credentials,
             authorization,
             cancel,
-            Some(generation),
+            Some(reservation),
         )
     }
 }
@@ -1061,7 +1104,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         credentials: Credentials,
         authorization: File,
         cancel: &SetupCancellation,
-        generation: Option<&Generation>,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         let request = match offer {
             Prepare::Ipsec(request) => request,
@@ -1072,7 +1115,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     &credentials,
                     authorization,
                     cancel,
-                    generation,
+                    reservation,
                 );
             }
         };
@@ -1119,7 +1162,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             None,
             Some(authorization),
             cancel,
-            generation,
+            reservation,
         )
     }
 
@@ -1130,7 +1173,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         credentials: &Credentials,
         authorization: File,
         cancel: &SetupCancellation,
-        generation: Option<&Generation>,
+        reservation: Option<&mut Reservation<'_>>,
     ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
         if credentials.backend() != protocol::Backend::Fortinet {
             return Err(ErrorCode::BadRequest);
@@ -1166,7 +1209,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             Some(grant),
             Some(authorization),
             cancel,
-            generation,
+            reservation,
         )
     }
 }
@@ -2855,7 +2898,7 @@ mod tests {
         use super::*;
         use crate::tunneld::{
             admin::PolicyFixture,
-            protocol::{Response, decode_response, read_control, timed},
+            protocol::{Generation, Response, decode_response, read_control, timed},
             server::serve_fixture,
         };
         use std::{
@@ -3380,6 +3423,281 @@ mod tests {
             assert!(process.0.wait().unwrap().success());
         }
 
+        struct LaunchSnapshot {
+            policy: PolicyFixture,
+            id: Generation,
+            phase: Vec<u8>,
+            plan: Option<Vec<u8>>,
+        }
+
+        fn network_receipt_name(backend: Backend) -> &'static str {
+            match backend {
+                Backend::Ipsec => super::super::super::network::RECEIPT,
+                Backend::Fortinet => fortinet_network::RECEIPT,
+            }
+        }
+
+        fn snapshot_launch(backend: Backend, before_lock: bool) -> LaunchSnapshot {
+            use crate::tunneld::{
+                fortinet_network::fixture, policy::Policy, server::serve_cleanup_fixture,
+            };
+            use serde_json::{Value, json};
+
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            let bytes = fs::read(policy.path()).unwrap();
+            let mut grants = Policy::from_disk(&bytes).unwrap();
+            let mut other: Value = serde_json::from_slice(&bytes).unwrap();
+            other["entries"][0]["uid"] = json!(1001);
+            grants
+                .apply(Policy::snapshot(other.to_string().as_bytes()).unwrap())
+                .unwrap();
+            grants
+                .apply(fixture::entry(&["10.20.0.0/15"], &[], &[]))
+                .unwrap();
+            fs::write(policy.path(), grants.bytes().unwrap()).unwrap();
+
+            let captured = Arc::new(Mutex::new(None));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), Arc::default());
+            launcher.fortinet = fixture::network(Arc::default(), Some(harness.runtime.clone()));
+            harness.flag("fail-set-property", true);
+            let runtime = harness.runtime.clone();
+            let captured_by_launcher = captured.clone();
+            launcher.lock = Box::new(move |deadline| {
+                let snapshot_phase = || {
+                    let receipts = runtime.join("tunneld-cleanup");
+                    let entry = fs::read_dir(receipts).unwrap().next().unwrap().unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                };
+                if before_lock {
+                    let (_, phase) = snapshot_phase();
+                    *captured_by_launcher.lock().unwrap() = Some((phase, None));
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                let guard = NetworkLock::acquire_test(&runtime, deadline)?;
+                if guard.tunnels_present()? {
+                    // At the first cleanup lock, the lease and its plan must
+                    // already exist even when unit setup could not begin.
+                    let (name, phase) = snapshot_phase();
+                    let plan = fs::read(
+                        runtime
+                            .join(INSTANCE_DIRECTORY)
+                            .join(&name)
+                            .join(network_receipt_name(backend)),
+                    )
+                    .unwrap();
+                    assert!(runtime.join("tunnel-leases").join(name).is_file());
+                    *captured_by_launcher.lock().unwrap() = Some((phase, Some(plan)));
+                }
+                Ok(guard)
+            });
+            let cleanup = Store::open(&harness.runtime).unwrap();
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            let id = thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    serve_cleanup_fixture(stream, 1000, &policy.store, &launcher, &cleanup)
+                });
+                let id = match backend {
+                    Backend::Ipsec => {
+                        let id = v2_prepare(&mut client);
+                        client_credentials(&mut client);
+                        id
+                    }
+                    Backend::Fortinet => {
+                        v2_hello(&mut client);
+                        let offer = Prepare::Fortinet(
+                            protocol::FortinetRequest::new(
+                                protocol::Endpoint::new("vpn.example".into(), 443).unwrap(),
+                                "alice".into(),
+                                [0xab; 32],
+                            )
+                            .unwrap(),
+                        );
+                        protocol::write_control(&mut client, &protocol::Request::from(offer))
+                            .unwrap();
+                        let Response::Prepared {
+                            generation: Some(id),
+                        } = response(&client)
+                        else {
+                            panic!("Fortinet preparation failed");
+                        };
+                        Credentials::fortinet("fixture-password")
+                            .unwrap()
+                            .write(&mut client)
+                            .unwrap();
+                        id
+                    }
+                };
+                let expected = if before_lock {
+                    ErrorCode::Busy
+                } else {
+                    ErrorCode::Backend
+                };
+                let reply = response(&client);
+                assert!(
+                    matches!(reply, Response::Error { code } if code == expected),
+                    "{reply:?}"
+                );
+                worker.join().unwrap().unwrap();
+                id
+            });
+            assert!(harness.leases().is_empty());
+            if before_lock {
+                assert!(harness.log().is_empty());
+            }
+            let (phase, plan) = captured.lock().unwrap().take().unwrap();
+            LaunchSnapshot {
+                policy,
+                id,
+                phase,
+                plan,
+            }
+        }
+
+        fn restore_receipt(path: &Path, bytes: &[u8]) {
+            fs::write(path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        #[test]
+        fn v2_launch_persists_recovery_phase_before_taking_the_network_lock() {
+            use crate::tunneld::{protocol::CleanupState, server::serve_recovery_fixture};
+
+            for backend in [Backend::Ipsec, Backend::Fortinet] {
+                let LaunchSnapshot {
+                    policy,
+                    id,
+                    phase: bytes,
+                    ..
+                } = snapshot_launch(backend, true);
+                let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(receipt["phase"], "preparing_network", "{backend:?}");
+
+                // Restore the snapshot without the original writer's teardown.
+                let restarted = Harness::new();
+                let reopened = Store::open(&restarted.runtime).unwrap();
+                restore_receipt(
+                    &restarted.runtime.join("tunneld-cleanup").join(id.as_str()),
+                    &bytes,
+                );
+                let launcher = restarted.launcher(false);
+                for version in [1, 2] {
+                    let (mut client, stream) = UnixStream::pair().unwrap();
+                    thread::scope(|scope| {
+                        let worker = scope.spawn(|| {
+                            serve_recovery_fixture(
+                                stream,
+                                1001,
+                                &policy.store,
+                                &launcher,
+                                &reopened,
+                            )
+                        });
+                        if version == 1 {
+                            client_prepare(&mut client);
+                        } else {
+                            v2_prepare(&mut client);
+                        }
+                        drop(client);
+                        assert!(worker.join().unwrap().is_err());
+                    });
+                }
+                assert_eq!(reopened.status(1000, &id), CleanupState::Stopped);
+                assert_eq!(reopened.status(1001, &id), CleanupState::Unknown);
+                assert!(restarted.log().is_empty() && restarted.leases().is_empty());
+            }
+        }
+
+        #[test]
+        fn v2_recovery_requires_proof_after_publishing_the_network_lease() {
+            use crate::tunneld::{fortinet_network::fixture, protocol::CleanupState};
+
+            for backend in [Backend::Ipsec, Backend::Fortinet] {
+                let LaunchSnapshot {
+                    id,
+                    phase: bytes,
+                    plan,
+                    ..
+                } = snapshot_launch(backend, false);
+                let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(receipt["phase"], "pending", "{backend:?}");
+                let restarted = Harness::new();
+                let reopened = Store::open(&restarted.runtime).unwrap();
+                restore_receipt(
+                    &restarted.runtime.join("tunneld-cleanup").join(id.as_str()),
+                    &bytes,
+                );
+                let mut launcher = restarted.launcher(false);
+                launcher.xfrm = fake_network(restarted.runtime.clone(), Arc::default());
+                launcher.fortinet =
+                    fixture::network(Arc::default(), Some(restarted.runtime.clone()));
+                let guard = (launcher.lock)(Instant::now() + Duration::from_secs(1)).unwrap();
+                guard.register(id.as_str()).unwrap();
+                drop(guard);
+
+                let error = launcher.recover_with(Some(&reopened)).unwrap_err();
+                assert_eq!(error.to_string(), "cleanup lacks proof for a generation");
+                assert_eq!(reopened.status(1000, &id), CleanupState::Pending);
+                assert_eq!(restarted.leases(), [id.as_str()]);
+                assert!(restarted.log().is_empty());
+
+                let directory = launcher.create_directory(id.as_str()).unwrap();
+                let receipt_name = network_receipt_name(backend);
+                restore_receipt(&directory.join(receipt_name), &plan.unwrap());
+                launcher.recover_with(Some(&reopened)).unwrap();
+                assert_eq!(reopened.status(1000, &id), CleanupState::Stopped);
+                assert!(restarted.leases().is_empty());
+                assert!(
+                    restarted
+                        .log()
+                        .iter()
+                        .any(|line| line.starts_with("stop -- "))
+                );
+            }
+        }
+
+        #[test]
+        fn v2_recovery_can_retire_a_staged_plan_without_network_cleanup() {
+            use crate::tunneld::{fortinet_network::fixture, protocol::CleanupState};
+
+            for backend in [Backend::Ipsec, Backend::Fortinet] {
+                let LaunchSnapshot {
+                    id,
+                    phase: bytes,
+                    plan,
+                    ..
+                } = snapshot_launch(backend, false);
+                let mut receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                receipt["phase"] = serde_json::json!("preparing_network");
+                let restarted = Harness::new();
+                let reopened = Store::open(&restarted.runtime).unwrap();
+                let mut launcher = restarted.launcher(false);
+                launcher.xfrm = fake_network(restarted.runtime.clone(), Arc::default());
+                launcher.fortinet =
+                    fixture::network(Arc::default(), Some(restarted.runtime.clone()));
+                restore_receipt(
+                    &restarted.runtime.join("tunneld-cleanup").join(id.as_str()),
+                    &serde_json::to_vec(&receipt).unwrap(),
+                );
+                let directory = launcher.create_directory(id.as_str()).unwrap();
+                let receipt_name = network_receipt_name(backend);
+                restore_receipt(&directory.join(receipt_name), &plan.unwrap());
+                let guard = (launcher.lock)(Instant::now() + Duration::from_secs(1)).unwrap();
+                guard.register("unrelated").unwrap();
+                drop(guard);
+
+                launcher.recover_with(Some(&reopened)).unwrap();
+                assert_eq!(reopened.status(1000, &id), CleanupState::Stopped);
+                assert!(restarted.log().is_empty());
+                assert_eq!(restarted.leases(), ["unrelated"]);
+                let bytes = fs::read(directory.join(receipt_name)).unwrap();
+                let plan: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(plan["complete"], true);
+            }
+        }
+
         #[test]
         fn recovery_only_confirms_an_empty_preparation_not_an_orphaned_pending() {
             use crate::tunneld::protocol::CleanupState;
@@ -3388,6 +3706,7 @@ mod tests {
             let store = Store::open(&harness.runtime).unwrap();
             let fresh = store.reserve(1000).unwrap();
             let mut started = store.reserve(1000).unwrap();
+            started.begin_network().unwrap();
             started.arm().unwrap();
             let started_id = started.generation().clone();
             drop(started);
@@ -3412,6 +3731,7 @@ mod tests {
                 let launcher = harness.launcher(false);
                 let store = Store::open(&harness.runtime).unwrap();
                 let mut record = store.reserve(1000).unwrap();
+                record.begin_network().unwrap();
                 record.arm().unwrap();
                 let generation = record.generation().as_str();
                 let directory = launcher.create_directory(generation).unwrap();

@@ -330,8 +330,8 @@ fn serve(
         let worker = thread::Builder::new().spawn_scoped(scope, || {
             let _signal_on_drop = done;
             if let Some(record) = reservation.as_mut() {
-                if let Err(error) = record.arm() {
-                    eprintln!("vpnt-tunneld: could not arm cleanup receipt: {error}");
+                if let Err(error) = record.begin_network() {
+                    eprintln!("vpnt-tunneld: could not record network preparation: {error}");
                     return Err(ErrorCode::Backend);
                 }
                 launcher.launch_v2(
@@ -340,7 +340,7 @@ fn serve(
                     credentials,
                     authorization,
                     launch_cancel,
-                    record.generation(),
+                    record,
                 )
             } else {
                 launcher.launch(&offer, grant, credentials, authorization, launch_cancel)
@@ -673,6 +673,36 @@ pub(super) fn serve_cleanup_fixture(
         launcher,
         Some(cleanup),
         &AtomicBool::new(true),
+        Instant::now(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn serve_recovery_fixture<N, A>(
+    stream: UnixStream,
+    uid: u32,
+    policy: &PolicyStore,
+    launcher: &Launcher<N, A>,
+    cleanup: &Store,
+) -> Result<(), FrameError>
+where
+    N: crate::netd::iproute::Backend,
+    A: super::handshake::UnitAttestor + Send + Sync,
+{
+    let recovered = AtomicBool::new(false);
+    reconcile(
+        &recovered,
+        || launcher.recover_with(Some(cleanup)),
+        || cleanup.republish(),
+        |_| false,
+    );
+    serve(
+        stream,
+        &Admission::Session(uid),
+        policy,
+        launcher,
+        Some(cleanup),
+        &recovered,
         Instant::now(),
     )
 }
