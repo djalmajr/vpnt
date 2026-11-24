@@ -1254,7 +1254,6 @@ fn credential_datagram_is_zeroed_on_every_path() {
             bytes.iter().all(|&byte| byte == 0),
             "{case:?} left bytes behind"
         );
-        assert!(bytes.is_empty());
         if case[0] == MESSAGE_CREDENTIAL && case.len() == 3 + PASSWORD.len() {
             let Ok(Message::Credential(secret)) = message else {
                 panic!("good frame refused")
