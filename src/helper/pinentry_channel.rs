@@ -44,12 +44,13 @@ impl PinentryChild {
         command: Command,
         password: Secret,
         request_deadline: Instant,
+        login_timer: OwnedFd,
     ) -> io::Result<Self> {
         Self::spawn_in(
             command,
             password,
             Environment::System,
-            None,
+            Some(login_timer),
             Some(request_deadline),
         )
     }
@@ -190,12 +191,14 @@ impl Lease {
             Some(deadline) => Budget::until(deadline, None)?,
             None => Budget::new(TIMEOUT)?,
         };
-        let exchange_socket = request_deadline.map(|_| socket.try_clone()).transpose()?;
+        let exchange = request_deadline
+            .map(|deadline| socket.try_clone().map(|socket| (socket, deadline)))
+            .transpose()?;
         let mut stream = TimedStream::with_budget(socket, budget, 9)?;
         let worker = thread::Builder::new()
             .name("vpnt-pinentry".into())
             .spawn(move || {
-                let _ = deliver(&mut stream, exchange_socket, pid, password);
+                let _ = deliver(&mut stream, exchange, pid, password);
                 // Darwin may return ENOTCONN for SHUT_RDWR after the peer has
                 // half-closed its request. Close every server-side descriptor
                 // after delivery instead of relying on shutdown to signal EOF.
@@ -228,17 +231,18 @@ fn close_control(control: &Mutex<Option<UnixStream>>) {
 
 fn deliver(
     stream: &mut TimedStream,
-    exchange_socket: Option<UnixStream>,
+    exchange_socket: Option<(UnixStream, Instant)>,
     pid: u32,
     password: Secret,
 ) -> io::Result<()> {
     let mut request = [0; 8];
     let mut exchange;
-    let stream = if let Some(socket) = exchange_socket {
+    let stream = if let Some((socket, deadline)) = exchange_socket {
         // The Linux client can wait for TLS before asking. Once its request
         // starts, even a peer that stalls partway through gets only TIMEOUT.
         stream.read_exact(&mut request[..1])?;
-        exchange = TimedStream::new(socket, TIMEOUT, 8)?;
+        let exchange_deadline = deadline.min(Instant::now() + TIMEOUT);
+        exchange = TimedStream::with_budget(socket, Budget::until(exchange_deadline, None)?, 8)?;
         exchange.read_exact(&mut request[1..])?;
         &mut exchange
     } else {
@@ -347,23 +351,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fortinet_request_started_before_deadline_has_a_separate_exchange_window() {
+    fn fortinet_partial_request_cannot_outlive_the_establishment_deadline() {
         let (server, mut peer) = UnixStream::pair().unwrap();
-        peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let pid = 42_u32;
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut lease = Lease::start(server, pid, Secret::from("fixture"), Some(deadline)).unwrap();
 
         peer.write_all(&MAGIC[..1]).unwrap();
-        thread::sleep(deadline.saturating_duration_since(Instant::now()));
-        peer.write_all(&MAGIC[1..]).unwrap();
-        peer.write_all(&pid.to_be_bytes()).unwrap();
-        peer.shutdown(Shutdown::Write).unwrap();
-
-        let mut response = Vec::new();
-        peer.read_to_end(&mut response).unwrap();
+        let mut response = [0];
+        let read = peer.read(&mut response);
+        let closed_at = Instant::now();
         lease.revoke();
-        assert_eq!(response, b"\0\x07fixture");
+        assert_eq!(read.unwrap(), 0);
+        assert!(closed_at >= deadline);
     }
 
     #[test]
