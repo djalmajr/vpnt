@@ -51,7 +51,7 @@ build() {
     cd "$srcdir/$pkgname-$pkgver" || return
     (cd ui && bun install --frozen-lockfile && bun run build) || return
     CARGO_TARGET_DIR="$srcdir/target" cargo build --release --locked \
-        --bin vpnt --bin vpnt-helper --bin vpnt-tunneld
+        --bin vpnt --bin vpnt-helper --bin vpnt-tunneld --bin vpnt-pinentry
 }
 
 package() {
@@ -60,6 +60,7 @@ package() {
     install -Dm755 "$srcdir/target/release/vpnt" "$pkgdir/usr/bin/vpnt"
     install -Dm755 "$srcdir/target/release/vpnt-helper" "$pkgdir/usr/lib/vpnt/vpnt-helper"
     install -Dm755 "$srcdir/target/release/vpnt-tunneld" "$pkgdir/usr/lib/vpnt/vpnt-tunneld"
+    install -Dm755 "$srcdir/target/release/vpnt-pinentry" "$pkgdir/usr/lib/vpnt/vpnt-pinentry"
     install -Dm755 "$srcdir/openfortivpn-$_openfortivpn_version/openfortivpn" "$pkgdir/usr/lib/vpnt/openfortivpn"
     install -d -m755 "$pkgdir/etc/vpnt"
     install -Dm644 packaging/linux/vpnt-helper.service "$pkgdir/usr/lib/systemd/system/vpnt-helper.service"
