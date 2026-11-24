@@ -1,11 +1,19 @@
 use vpnt::cli::{Options, USAGE};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let options = match vpnt::cli::parse(&args) {
+    let args = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string())
+        .collect::<Result<Vec<_>, _>>();
+    let options = match args
+        .map_err(|_| "Invalid argument encoding.")
+        .and_then(|args| vpnt::cli::parse(&args))
+    {
         Ok(options) => options,
         Err(error) => {
             eprintln!("{error}\n{USAGE}");
+            #[cfg(target_os = "linux")]
+            eprintln!("{}", vpnt::cli::TUNNEL_POLICY_USAGE);
             std::process::exit(2);
         }
     };
@@ -22,7 +30,28 @@ fn main() {
                 );
             }
         }
-        Options::Help => println!("{USAGE}"),
+        #[cfg(target_os = "linux")]
+        Options::TunnelPolicy {
+            profile_id,
+            dns_servers,
+        } => {
+            use std::io::Write;
+            let result =
+                vpnt::tunnel_policy::for_profile_id(&profile_id, &dns_servers).and_then(|bytes| {
+                    std::io::stdout().lock().write_all(&bytes).map_err(|_| {
+                        std::io::Error::other("Could not write the tunnel policy snapshot.")
+                    })
+                });
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        Options::Help => {
+            println!("{USAGE}");
+            #[cfg(target_os = "linux")]
+            println!("{}", vpnt::cli::TUNNEL_POLICY_USAGE);
+        }
         Options::Version => println!("vpnt {}", env!("CARGO_PKG_VERSION")),
         Options::InspectComponent => {
             #[cfg(target_os = "macos")]
