@@ -383,36 +383,39 @@ fn check_mode(
     Ok(())
 }
 
-/// `struct open_how` of openat2(2); the `libc` one is non-exhaustive.
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
 fn open_record(path: &Path, owner: libc::uid_t) -> io::Result<Record> {
-    let path = path_cstring(path.as_os_str())?;
-    // RESOLVE_NO_SYMLINKS refuses a link in any component, ancestors included;
-    // O_NOFOLLOW only covers the last one. A kernel without openat2 returns
-    // ENOSYS, and the read fails closed instead of falling back to open.
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        resolve: libc::RESOLVE_NO_SYMLINKS,
+    let path = path
+        .as_os_str()
+        .as_bytes()
+        .strip_prefix(b"/")
+        .ok_or_else(|| invalid("handshake record path must be absolute"))?;
+    // Split raw bytes so empty and dot components are visible for validation.
+    let parts = path.split(|&byte| byte == b'/');
+    if parts.clone().any(|part| matches!(part, b"" | b"." | b"..")) {
+        return Err(invalid("invalid handshake record path component"));
+    }
+    let mut parts = parts.peekable();
+    // systemd's RestrictSUIDSGID blocks openat2. Open each component relative
+    // to a held directory FD so O_NOFOLLOW covers the entire path.
+    let directory_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: open reads a NUL-terminated path and returns a new FD.
+    let mut directory = new_fd(unsafe { libc::open(c"/".as_ptr(), directory_flags) })?;
+    let fd = loop {
+        let part = parts.next().expect("split always yields a component");
+        let name = path_cstring(OsStr::from_bytes(part))?;
+        let last = parts.peek().is_none();
+        let flags = if last {
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            directory_flags | libc::O_NOFOLLOW
+        };
+        // SAFETY: the directory FD is live and name is a NUL-terminated basename.
+        let child = new_fd(unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) })?;
+        if last {
+            break child;
+        }
+        directory = child;
     };
-    // SAFETY: openat2 reads a NUL-terminated path and an open_how of the
-    // stated size, and returns a new FD.
-    let raw = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            ptr::from_ref(&how),
-            size_of::<OpenHow>(),
-        )
-    };
-    let fd = new_fd(RawFd::try_from(raw).map_err(|_| invalid("invalid openat2 result"))?)?;
     check_mode(fd.as_fd(), owner, libc::S_IFREG, 0o600)?;
     let mut data = Vec::new();
     File::from(fd)

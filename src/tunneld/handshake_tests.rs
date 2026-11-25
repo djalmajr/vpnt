@@ -425,11 +425,41 @@ fn open_record_refuses_a_link_in_any_path_component() {
     std::os::unix::fs::symlink(&record, &final_link).unwrap();
     let ancestor_link = fixture.0.join("ancestor-link");
     std::os::unix::fs::symlink(&fixture.0, &ancestor_link).unwrap();
-    for path in [final_link, ancestor_link.join(GENERATION)] {
+    for (path, errno) in [
+        (final_link, libc::ELOOP),
+        (ancestor_link.join(GENERATION), libc::ENOTDIR),
+    ] {
         let error = open_record(&path, ids().uid)
             .err()
-            .expect("a link was read");
-        assert_eq!(error.raw_os_error(), Some(libc::ELOOP), "{path:?}: {error}");
+            .unwrap_or_else(|| panic!("a link was read: {path:?}"));
+        assert_eq!(error.raw_os_error(), Some(errno), "{path:?}: {error}");
+    }
+}
+
+#[test]
+fn open_record_requires_an_absolute_path_with_literal_components() {
+    let fixture = Fixture::new();
+    drop(fixture.publish(ids(), PHASE_TIMEOUT).unwrap());
+    let child = fixture.0.join("child");
+    fs::create_dir(&child).unwrap();
+    let mut repeated_separator = fixture.0.clone().into_os_string();
+    repeated_separator.push(format!("//{GENERATION}"));
+    for path in [
+        fixture.0.join(format!("./{GENERATION}")),
+        child.join(format!("../{GENERATION}")),
+        repeated_separator.into(),
+        fixture.0.join(format!("{GENERATION}/")),
+        Path::new("/").to_owned(),
+        Path::new(GENERATION).to_owned(),
+    ] {
+        let error = open_record(&path, ids().uid)
+            .err()
+            .unwrap_or_else(|| panic!("an invalid path was read: {path:?}"));
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidData,
+            "{path:?}: {error}"
+        );
     }
 }
 
