@@ -77,6 +77,15 @@ impl Message {
         self.insert(key, Element::Value(Zeroizing::new(value.to_vec())));
         self
     }
+    /// Overrides an existing value without weakening duplicate-key checks.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn replace_value(&mut self, key: &str, value: &[u8]) -> Result<(), Error> {
+        let Some(Element::Value(existing)) = self.elements.get_mut(key) else {
+            return Err(Error::InvalidMessage);
+        };
+        *existing = Zeroizing::new(value.to_vec());
+        Ok(())
+    }
     pub fn section(&mut self, key: &str, message: Message) -> &mut Self {
         self.insert(key, Element::Section(message));
         self

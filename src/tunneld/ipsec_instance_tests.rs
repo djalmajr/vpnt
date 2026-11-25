@@ -132,7 +132,9 @@ def serve(conn):
     with conn:
         try:
             packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
+            event = None
             if packet[0] == 3:
+                event = packet[2:2 + packet[1]].decode()
                 reply(conn, 5)
                 packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
             assert packet[0] == 0
@@ -141,7 +143,7 @@ def serve(conn):
             request = decode(packet[end:])
             if command == 'load-shared':
                 request['credential_matches'] = request.pop('data') == {
-                    'EAP': 'synthetic-password', 'IKE': 'synthetic-psk'
+                    'EAP': 'synthetic-orchid', 'IKE': 'synthetic-thistle'
                 }.get(request['type'])
             with (root / 'vici-commands').open('a') as log:
                 log.write(json.dumps([command, request]) + '\n')
@@ -171,8 +173,26 @@ def serve(conn):
                     }},
                 }}, 'list-sa')
                 reply(conn, 1)
+            elif command == 'initiate' and (root / 'log-initiate').exists():
+                if event == 'control-log':
+                    for i in range(300):
+                        reply(conn, 7, {'level': '1', 'msg': 'progress-%03d' % i}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'peer says\nretry\x1b'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'Psk = suppressed-value'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'data: suppressed-field'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'echo synthetic-orchid'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'z' * 250 + 'synthetic-thistle'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'long-' + 'x' * 400}, event)
+                    reply(conn, 7, {'level': '4', 'msg': 'suppressed-cobalt-material'}, event)
+                    reply(conn, 7, {'level': '0', 'msg': 'no proposal chosen'}, event)
+                if (root / 'fail-initiate').exists():
+                    reply(conn, 1, {'success': 'no', 'errmsg': 'peer declined\r' + 'y' * 400})
+                else:
+                    reply(conn, 1, {'success': 'yes'})
             elif command == 'initiate' and (root / 'fail-initiate').exists():
-                reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-psk'})
+                reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-thistle'})
+            elif command == 'terminate' and (root / 'fail-terminate').exists():
+                reply(conn, 1, {'success': 'no', 'errmsg': 'no matching IKE_SA'})
             else:
                 reply(conn, 1, {'success': 'yes'})
         except (EOFError, OSError):
@@ -198,7 +218,7 @@ fn fixture_start(identity: &str) -> Start {
 
 fn fixture_credentials() -> Zeroizing<Vec<u8>> {
     encode_credentials(
-        &protocol::Credentials::ipsec("synthetic-password", "synthetic-psk").unwrap(),
+        &protocol::Credentials::ipsec("synthetic-orchid", "synthetic-thistle").unwrap(),
     )
     .unwrap()
 }
@@ -397,7 +417,7 @@ impl Fixture {
             .collect();
         for log in ["supervisor.stdout", "supervisor.stderr"] {
             let content = fs::read_to_string(self.root.join(log)).unwrap();
-            for secret in ["synthetic-password", "synthetic-psk"] {
+            for secret in ["synthetic-orchid", "synthetic-thistle"] {
                 assert!(!content.contains(secret), "credential in {log}");
             }
         }
@@ -449,7 +469,10 @@ fn supervisor_process() {
     std::hint::black_box(SENTINEL);
     let answer = match result {
         Ok(exit) => format!("{exit:?}"),
-        Err(error) => format!("error: {:?}", error.kind()),
+        Err(error) => {
+            eprintln!("tunnel instance: {error}");
+            format!("error: {:?}", error.kind())
+        }
     };
     channel.0.write_all(answer.as_bytes()).unwrap();
 }
@@ -483,6 +506,10 @@ fn vici_socket_admission_checks_mode_type_and_owner() {
         owner,
         loaded: false,
         cancel: Arc::default(),
+        credentials: &Credentials {
+            password: "".into(),
+            psk: "".into(),
+        },
     };
     let deadline = || Instant::now() + Duration::from_secs(1);
     let assert_rejected = |vici: &PrivateVici<'_>, case| {
@@ -700,6 +727,72 @@ fn failure_and_mismatched_sa_clean_up_before_the_terminal_reply() {
         assert!(names.ends_with(&["terminate", "unload-conn", "unload-shared", "unload-shared"]));
         assert!(fixture.root.join("term").exists());
     }
+}
+
+#[test]
+fn failed_initiate_reports_only_the_bounded_safe_control_log_tail() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "fail-initiate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
+    let diagnostic = log.strip_suffix('\n').unwrap();
+    let mut fields = diagnostic.split(" | control-log: ");
+    let error = fields.next().unwrap();
+    assert_eq!(
+        error,
+        format!(
+            "tunnel instance: IPsec VICI initiate did not succeed: peer declined?{}",
+            "y".repeat(242)
+        )
+    );
+    let lines: Vec<_> = fields.collect();
+    assert_eq!(lines.len(), 8);
+    assert_eq!(lines[0], "progress-295");
+    assert_eq!(lines[4], "progress-299");
+    assert_eq!(lines[5], "peer says?retry?");
+    assert_eq!(lines[6], format!("long-{}", "x".repeat(251)));
+    assert_eq!(lines[7], "no proposal chosen");
+    assert!(
+        diagnostic
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    );
+    assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn successful_initiate_discards_control_log_even_after_many_events() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("log-initiate"), []).unwrap();
+    fixture.start();
+    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    assert!(
+        fs::read(fixture.root.join("supervisor.stderr"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn failed_cleanup_ack_includes_safe_errmsg_and_continues_unloading() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("fail-terminate"), []).unwrap();
+    fixture.start();
+    assert_eq!(fixture.finish(Some(b"T")), "error: Other");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
+        "tunnel instance: IPsec VICI terminate did not succeed: no matching IKE_SA\n"
+    );
+    assert!(names(&fixture.commands()).ends_with(&[
+        "terminate",
+        "unload-conn",
+        "unload-shared",
+        "unload-shared"
+    ]));
 }
 
 fn names(commands: &[serde_json::Value]) -> Vec<&str> {
@@ -979,8 +1072,8 @@ fn bad_start_and_bad_credential_frames_do_not_spawn_charon() {
 fn credential_datagram_is_wiped_after_success_and_rejection() {
     let mut valid = fixture_credentials();
     let credentials = decode_credentials(&mut valid).unwrap();
-    assert_eq!(credentials.password.expose(), "synthetic-password");
-    assert_eq!(credentials.psk.expose(), "synthetic-psk");
+    assert_eq!(credentials.password.expose(), "synthetic-orchid");
+    assert_eq!(credentials.psk.expose(), "synthetic-thistle");
     assert!(valid.iter().all(|byte| *byte == 0));
 
     for mut invalid in [

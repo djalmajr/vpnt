@@ -1,6 +1,6 @@
 //! Lifecycle of the stock charon inside an authenticated Linux IPsec unit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -37,6 +37,9 @@ const STARTUP_INTERVAL: Duration = Duration::from_millis(20);
 // Same manual reqid range as connection/ipsec/namespace.rs.
 const MAX_MANUAL_REQID: u16 = 0x3fff;
 const TERM_GRACE: Duration = Duration::from_secs(3);
+const CONTROL_LOG_LEVEL: &[u8] = b"1";
+const DIAGNOSTIC_LINE_BYTES: usize = 256;
+const CONTROL_LOG_LINES: usize = 8;
 /// How often negotiation re-checks the control channel; also bounds how long
 /// a cancellation takes to reach a VICI exchange in progress.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
@@ -269,19 +272,20 @@ fn run_in_directory(
         owner,
         loaded: false,
         cancel: Arc::default(),
+        credentials: &credentials,
     };
     let result =
-        establish_watched(channel, &mut vici, &attempt, credentials).and_then(|settled| {
-            match settled {
-                Settled::Done(exit) => Ok(exit),
-                Settled::Publish(reply) => channel.send(&reply).and_then(|()| {
-                    match get_order(channel, Some(pidfd.as_fd())) {
+        establish_watched(channel, &mut vici, &attempt).and_then(|settled| match settled {
+            Settled::Done(exit) => Ok(exit),
+            Settled::Publish(reply) => {
+                channel
+                    .send(&reply)
+                    .and_then(|()| match get_order(channel, Some(pidfd.as_fd())) {
                         Ok(Order::Stop {}) => Ok(Exit::Stopped),
                         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
                         Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
                         Err(error) => Err(error),
-                    }
-                }),
+                    })
             }
         });
     let unload = vici.cleanup(&attempt.config);
@@ -311,7 +315,6 @@ fn establish_watched(
     channel: &mut impl InstanceChannel,
     vici: &mut PrivateVici<'_>,
     attempt: &Attempt,
-    credentials: Credentials,
 ) -> io::Result<Settled> {
     let cancel = Arc::clone(&vici.cancel);
     let done = AtomicBool::new(false);
@@ -319,7 +322,7 @@ fn establish_watched(
         let watcher = scope.spawn(|| watch_control(channel, &cancel, &done));
         let established = {
             let _finished = Finished(&done);
-            vici.establish(attempt, credentials)
+            vici.establish(attempt)
         };
         let observed = watcher
             .join()
@@ -543,6 +546,7 @@ struct PrivateVici<'a> {
     loaded: bool,
     /// Observed by every exchange of the negotiation. Cleanup uses its own.
     cancel: Arc<AtomicBool>,
+    credentials: &'a Credentials,
 }
 
 impl PrivateVici<'_> {
@@ -590,7 +594,7 @@ impl PrivateVici<'_> {
             .map_err(vici_error)
     }
 
-    fn establish(&mut self, attempt: &Attempt, credentials: Credentials) -> io::Result<Reply> {
+    fn establish(&mut self, attempt: &Attempt) -> io::Result<Reply> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let version = loop {
             match self.open(deadline) {
@@ -626,8 +630,13 @@ impl PrivateVici<'_> {
         Config::admit_linux(&version, &stats)
             .map_err(|_| io::Error::other("incompatible IPsec VICI backend"))?;
         let config = &attempt.config;
+        // Keep the original zeroizing credentials available to filter replies,
+        // including ACKs received during cleanup.
         let shared = config
-            .shared(credentials)
+            .shared(Credentials {
+                password: self.credentials.password.expose().into(),
+                psk: self.credentials.psk.expose().into(),
+            })
             .map_err(|_| invalid("invalid IPsec credentials"))?;
         // A lost ACK leaves the load uncertain. Clean up even if it failed.
         self.loaded = true;
@@ -635,10 +644,7 @@ impl PrivateVici<'_> {
         for message in shared {
             self.ack(deadline, "load-shared", message)?;
         }
-        let initiate = config
-            .initiate(remaining(deadline)?)
-            .map_err(|_| io::Error::other("invalid IPsec initiate deadline"))?;
-        self.ack(deadline, "initiate", initiate)?;
+        self.initiate(deadline, config)?;
         let mut request = Message::new();
         request.value("ike", config.name().as_bytes());
         attempt.established(self.exchange(deadline, "list-sas", request, &["list-sa"])?)
@@ -656,6 +662,7 @@ impl PrivateVici<'_> {
             owner: self.owner,
             loaded: self.loaded,
             cancel: Arc::default(),
+            credentials: self.credentials,
         };
         let this = &this;
         let deadline = Instant::now() + TERM_GRACE;
@@ -673,12 +680,101 @@ impl PrivateVici<'_> {
 
     fn ack(&self, deadline: Instant, name: &'static str, request: Message) -> io::Result<()> {
         let response = self.exchange(deadline, name, request, &[])?.response;
-        if response.get_text("success") != Some("yes") {
-            return Err(io::Error::other(format!(
-                "IPsec VICI {name} did not succeed"
-            )));
+        self.check_ack(name, &response)
+    }
+
+    fn check_ack(&self, name: &'static str, response: &Message) -> io::Result<()> {
+        if response.get_text("success") == Some("yes") {
+            return Ok(());
         }
-        Ok(())
+        let mut error = format!("IPsec VICI {name} did not succeed");
+        if let Some(detail) = self.diagnostic(response, "errmsg") {
+            error.push_str(": ");
+            error.push_str(&detail);
+        }
+        Err(io::Error::other(error))
+    }
+
+    fn initiate(&self, deadline: Instant, config: &Config) -> io::Result<()> {
+        let mut request = config
+            .initiate(remaining(deadline)?)
+            .map_err(|_| io::Error::other("invalid IPsec initiate deadline"))?;
+        // strongSwan's LEVEL_CTRL excludes raw blobs and private key material.
+        request
+            .replace_value("loglevel", CONTROL_LOG_LEVEL)
+            .map_err(vici_error)?;
+        let mut tail = VecDeque::with_capacity(CONTROL_LOG_LINES);
+        let result = self
+            .open(deadline)?
+            .command_with_events("initiate", request, &["control-log"], |_, event| {
+                if matches!(event.get_text("level"), Some("0" | "1"))
+                    && let Some(line) = self.diagnostic(&event, "msg")
+                {
+                    if tail.len() == CONTROL_LOG_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                Ok(())
+            })
+            .map_err(vici_error)
+            .and_then(|response| self.check_ack("initiate", &response));
+        result.map_err(|error| {
+            if tail.is_empty() || cancel_induced(&error) {
+                return error;
+            }
+            // The instance entry point writes this single error to stderr.
+            let mut diagnostic = error.to_string();
+            for line in tail {
+                diagnostic.push_str(" | control-log: ");
+                diagnostic.push_str(&line);
+            }
+            io::Error::new(error.kind(), diagnostic)
+        })
+    }
+
+    fn diagnostic(&self, message: &Message, field: &str) -> Option<String> {
+        let text = message.get_text(field)?;
+        let credentials = [
+            self.credentials.password.expose(),
+            self.credentials.psk.expose(),
+        ];
+        let contains_credential = |text: &str| {
+            credentials
+                .iter()
+                .any(|secret| !secret.is_empty() && text.contains(secret))
+        };
+        // Check all of the input before truncating so we never log a prefix
+        // of a credential that crosses the byte limit.
+        if contains_credential(text)
+            || text
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|word| {
+                    [
+                        "password", "psk", "ppk", "data", "private", "secret", "keymat",
+                        "skeyseed", "msk", "emsk",
+                    ]
+                    .iter()
+                    .any(|label| word.eq_ignore_ascii_case(label))
+                        || word
+                            .get(..3)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SK_"))
+                })
+        {
+            return None;
+        }
+        let line: String = text
+            .chars()
+            .take(DIAGNOSTIC_LINE_BYTES)
+            .map(|c| {
+                if c.is_ascii_graphic() || c == ' ' {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        (!line.trim().is_empty() && !contains_credential(&line)).then_some(line)
     }
 
     fn exchange(

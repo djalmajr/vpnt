@@ -69,6 +69,25 @@ impl Client {
         message: Message,
         events: &[&str],
     ) -> Result<CommandResult, Error> {
+        let mut received = Vec::new();
+        let response = self.command_with_events(name, message, events, |name, message| {
+            push_event(&mut received, name, message)
+        })?;
+        Ok(CommandResult {
+            response,
+            events: received,
+        })
+    }
+
+    /// Streams subscribed events within the same wire byte and deadline limits.
+    /// The caller bounds any diagnostics it retains across events.
+    pub(crate) fn command_with_events(
+        self,
+        name: &str,
+        message: Message,
+        events: &[&str],
+        mut on_event: impl FnMut(String, Message) -> Result<(), Error>,
+    ) -> Result<Message, Error> {
         if !valid_name(name) || events.iter().any(|name| !valid_name(name)) {
             return Err(Error::InvalidMessage);
         }
@@ -78,7 +97,6 @@ impl Client {
         }
         let budget = self.budget;
         let mut stream = TimedStream::with_budget(self.stream, budget.clone(), MAX_RECEIVED)?;
-        let mut received = Vec::new();
         // Do not expect confirmations before events from subscriptions that
         // have already been confirmed: charon can emit at any time.
         let mut confirmed = BTreeSet::new();
@@ -92,7 +110,7 @@ impl Client {
                     }
                     Packet::UnknownEvent => return Err(Error::UnknownEvent),
                     Packet::Event(name, message) if confirmed.contains(name.as_str()) => {
-                        push_event(&mut received, name, message)?
+                        on_event(name, message)?
                     }
                     _ => return Err(Error::UnexpectedPacket),
                 }
@@ -103,14 +121,11 @@ impl Client {
             match read_packet(&mut stream)? {
                 Packet::Response(response) => {
                     budget.check()?;
-                    return Ok(CommandResult {
-                        response,
-                        events: received,
-                    });
+                    return Ok(response);
                 }
                 Packet::UnknownCommand => return Err(Error::UnknownCommand),
                 Packet::Event(name, message) if registered.contains(name.as_str()) => {
-                    push_event(&mut received, name, message)?
+                    on_event(name, message)?
                 }
                 _ => return Err(Error::UnexpectedPacket),
             }
