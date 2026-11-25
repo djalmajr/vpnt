@@ -690,7 +690,7 @@ fn exec_is_private_and_stop_cleans_up() {
 #[test]
 fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     let mut fixture = Fixture::launch(false);
-    fixture.start();
+    fixture.start_with(fixture_start("fqdn:vpn.example"));
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
     let commands = fixture.commands();
     assert_eq!(
@@ -731,7 +731,7 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     );
     assert_eq!(connection["version"], "2");
     assert_eq!(connection["mobike"], "no");
-    assert_eq!(connection["remote"]["id"], "fqdn:fixture.example");
+    assert_eq!(connection["remote"]["id"], "fqdn:vpn.example");
     let child = connection["children"]
         .as_object()
         .unwrap()
@@ -754,7 +754,7 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     );
     assert_eq!(
         commands[4][1]["owners"],
-        serde_json::json!(["fqdn:fixture.example"])
+        serde_json::json!(["fqdn:vpn.example"])
     );
     assert!(!commands[3][1].as_object().unwrap().contains_key("data"));
     assert!(!commands[4][1].as_object().unwrap().contains_key("data"));
@@ -768,21 +768,23 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
 }
 
 #[test]
-fn sends_typed_ipv4_identity_without_using_it_as_the_transport_address() {
-    let mut fixture = Fixture::launch(false);
-    fixture.start_with(fixture_start("ipv4:192.0.2.99"));
-    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
-    let commands = fixture.commands();
-    let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
-    assert_eq!(connection["remote"]["id"], "ipv4:192.0.2.99");
-    assert_eq!(
-        connection["remote_addrs"],
-        serde_json::json!(["192.0.2.10"])
-    );
-    assert_eq!(
-        commands[4][1]["owners"],
-        serde_json::json!(["ipv4:192.0.2.99"])
-    );
+fn sends_canonical_ipv4_identity_for_ike_auth_and_psk_lookup() {
+    for address in ["192.0.2.10", "192.0.2.99"] {
+        let mut fixture = Fixture::launch(false);
+        fixture.start_with(fixture_start(&format!("ipv4:{address}")));
+        assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+        let commands = fixture.commands();
+        assert_eq!(commands[2][0], "load-conn");
+        let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
+        assert_eq!(connection["remote"]["id"], address);
+        assert_eq!(
+            connection["remote_addrs"],
+            serde_json::json!(["192.0.2.10"])
+        );
+        assert_eq!(commands[4][0], "load-shared");
+        assert_eq!(commands[4][1]["type"], "IKE");
+        assert_eq!(commands[4][1]["owners"], serde_json::json!([address]));
+    }
 }
 
 #[test]
@@ -1161,6 +1163,11 @@ fn peer_identity_rule_is_the_one_policy_applies() {
         "fqdn:",
         "ipv4:0.0.0.0",
         "ipv4:224.0.0.1",
+        "ipv4:",
+        "ipv4:192.0.02.10",
+        "ipv4:192.0.2.256",
+        "ipv4:192.0.2.10/32",
+        "ipv4:#c000020a",
         "ipv6:2001:db8::1",
         "vpn.example",
         &format!("fqdn:{}", "a".repeat(253 - 4)),
@@ -1203,6 +1210,7 @@ fn bad_start_and_bad_credential_frames_do_not_spawn_charon() {
         ("peer_identity", serde_json::json!("fqdn:*")),
         ("peer_identity", serde_json::json!("fqdn:#0102")),
         ("peer_identity", serde_json::json!("fqdn:^fixture$")),
+        ("peer_identity", serde_json::json!("ipv4:192.0.2.10/32")),
         ("peer_identity", serde_json::json!("fixture.example")),
         ("remote_ipv4", serde_json::json!("fixture.example")),
         ("local_ts", serde_json::json!(["::/0"])),
