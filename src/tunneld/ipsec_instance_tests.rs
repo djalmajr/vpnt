@@ -128,25 +128,33 @@ def reply(conn, kind, message=None, event=None):
         frame += encode(message)
     conn.sendall(struct.pack('!I', len(frame)) + frame)
 
+def charon_log(message, level=1):
+    entry = json.dumps(dict(thread=8, group='IKE', level=level, msg=message))
+    os.write(2, (entry + '\n').encode())
+
 def flood_stderr(started):
+    entry = b'{"thread":8,"group":"IKE","level":1,"msg":"peer supports MOBIKE"}\n'
     while True:
-        os.write(2, b'continuous output\n' * 200)
+        os.write(2, entry * 200)
         started.set()
 
 def write_stderr_tail():
-    for i in range(3000):
-        os.write(2, ('stderr-%04d\n' % i).encode())
+    charon_log('remote host is behind NAT')
+    for _ in range(3000):
+        charon_log('peer supports MOBIKE')
     for line in [
-        b'peer says\x1bretry\x00\n',
-        b'Psk = suppressed-value\n',
-        b'PASSWORD = suppressed-field\n',
-        b'echo synthetic-orchid\n',
-        b'z' * 507 + b'synthetic-thistle\n',
-        b'giant-' + b'x' * 25000 + b'\n',
-        b'long-' + b'x' * 800 + b'\n',
-        b'end of stderr\n',
+        'peer says\x1bretry\x00',
+        'Psk = suppressed-value',
+        'PASSWORD = suppressed-field',
+        'echo synthetic-orchid',
+        'z' * 507 + 'synthetic-thistle',
+        'generating ' + 'x' * 25000,
+        'peer text\nremote host is behind NAT',
+        'establishing IKE_SA failed, peer not responding',
     ]:
-        os.write(2, line)
+        charon_log(line)
+    charon_log('remote host is behind NAT', level=4)
+    os.write(2, b'08[IKE] remote host is behind NAT\n')
 
 def serve(conn):
     with conn:
@@ -174,7 +182,7 @@ def serve(conn):
                 if (root / 'foreign-backend').exists():
                     plugins.append('kernel-libipsec')
                 if (root / 'log-stderr-setup').exists():
-                    os.write(2, b'stats from charon\n')
+                    charon_log('Starting IKE charon daemon (strongSwan 6.1.0, Linux fixture, x86_64)')
                 reply(conn, 1, {'plugins': plugins})
             elif command == 'list-sas':
                 if (root / 'slow-list-sas').exists():
@@ -202,9 +210,31 @@ def serve(conn):
                     started = threading.Event()
                     threading.Thread(target=flood_stderr, args=(started,), daemon=True).start()
                     started.wait()
+                if (root / 'peer-log').exists():
+                    import base64
+                    encoded = base64.b64encode(b'synthetic-thistle').decode()
+                    messages = [
+                        "EAP-MS-CHAPv2 failed with error ERROR_AUTHENTICATION_FAILURE: '%s'" % encoded,
+                        "tried 1 shared key for 'local' - 'peer | control-log: fabricated-field', but MAC mismatched",
+                        "client got redirected from notify-marker",
+                        "invalid notify data length for REDIRECT (5)",
+                        "received unknown vendor ID: c0:ff:ee:01",
+                        "remote host is behind NAT",
+                        "generating IKE_AUTH request 1 [ IDi N(INIT_CONTACT) ]",
+                        "generating IKE_AUTH request synthetic-thistle",
+                        "arbitrary peer text\nno acceptable proposal found",
+                    ]
+                    for message in messages:
+                        charon_log(message)
+                        if event == 'control-log':
+                            reply(conn, 7, {'level': '1', 'msg': message}, event)
+                    reply(conn, 1, {'success': 'no',
+                                    'errmsg': 'no matching IKE_SA\ncharon-log: fabricated-field'})
+                    return
                 if event == 'control-log':
-                    for i in range(300):
-                        reply(conn, 7, {'level': '1', 'msg': 'progress-%03d' % i}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'remote host is behind NAT'}, event)
+                    for _ in range(300):
+                        reply(conn, 7, {'level': '1', 'msg': 'peer supports MOBIKE'}, event)
                     reply(conn, 7, {'level': '1', 'msg': 'peer says\nretry\x1b'}, event)
                     reply(conn, 7, {'level': '1', 'msg': 'Psk = suppressed-value'}, event)
                     reply(conn, 7, {'level': '1', 'msg': 'data: suppressed-field'}, event)
@@ -212,15 +242,15 @@ def serve(conn):
                     reply(conn, 7, {'level': '1', 'msg': 'z' * 250 + 'synthetic-thistle'}, event)
                     reply(conn, 7, {'level': '1', 'msg': 'long-' + 'x' * 400}, event)
                     reply(conn, 7, {'level': '4', 'msg': 'suppressed-cobalt-material'}, event)
-                    reply(conn, 7, {'level': '0', 'msg': 'no proposal chosen'}, event)
+                    reply(conn, 7, {'level': '0', 'msg': 'no acceptable proposal found'}, event)
                 if (root / 'fail-initiate').exists():
-                    reply(conn, 1, {'success': 'no', 'errmsg': 'peer declined\r' + 'y' * 400})
+                    reply(conn, 1, {'success': 'no', 'errmsg': "establishing IKE_SA 'vpnt' failed"})
                 else:
                     reply(conn, 1, {'success': 'yes'})
             elif command == 'initiate' and (root / 'fail-initiate').exists():
                 reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-thistle'})
             elif command == 'terminate' and (root / 'fail-terminate').exists():
-                reply(conn, 1, {'success': 'no', 'errmsg': 'no matching IKE_SA'})
+                reply(conn, 1, {'success': 'no', 'errmsg': 'no matching SAs to terminate found'})
             else:
                 reply(conn, 1, {'success': 'yes'})
         except (EOFError, OSError):
@@ -639,7 +669,7 @@ fn exec_is_private_and_stop_cleans_up() {
         .0;
     let settings: BTreeSet<_> = stderr_logger.lines().map(str::trim).collect();
     assert_eq!(settings.len(), 21);
-    assert!(settings.contains("ike_name = yes"));
+    assert!(settings.contains("json = yes"));
     for group in [
         "default", "dmn", "mgr", "ike", "chd", "job", "wch", "cfg", "knl", "net", "asn", "enc",
         "tnc", "imc", "imv", "pts", "tls", "app", "esp", "lib",
@@ -788,29 +818,86 @@ fn failed_initiate_reports_only_the_bounded_safe_control_log_tail() {
     fixture.begin(fixture_start("fqdn:fixture.example"));
     assert_eq!(fixture.collect(), "error: Other");
     let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
-    let diagnostic = log.strip_suffix('\n').unwrap();
-    let mut fields = diagnostic.split(" | control-log: ");
-    let error = fields.next().unwrap();
+    let lines: Vec<_> = log.lines().collect();
     assert_eq!(
-        error,
-        format!(
-            "tunnel instance: IPsec VICI initiate did not succeed: peer declined?{}",
-            "y".repeat(242)
-        )
+        lines[0],
+        "tunnel instance: IPsec VICI initiate did not succeed"
     );
-    let lines: Vec<_> = fields.collect();
-    assert_eq!(lines.len(), 8);
-    assert_eq!(lines[0], "progress-295");
-    assert_eq!(lines[4], "progress-299");
-    assert_eq!(lines[5], "peer says?retry?");
-    assert_eq!(lines[6], format!("long-{}", "x".repeat(251)));
-    assert_eq!(lines[7], "no proposal chosen");
-    assert!(
-        diagnostic
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-    );
+    assert_eq!(lines[1], "errmsg: establishing IKE_SA failed");
+    assert_eq!(&lines[2..9], &["control-log: peer supports MOBIKE"; 7]);
+    assert_eq!(&lines[9..], &["control-log: no acceptable proposal found"]);
     assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn failed_initiate_never_reports_the_encoded_eap_server_message() {
+    let log = peer_diagnostic();
+    assert!(
+        !log.contains("c3ludGhldGljLXRoaXN0bGU="),
+        "encoded EAP server text reached stderr"
+    );
+    for field in ["control-log", "charon-log"] {
+        for message in [
+            "EAP-MS-CHAPv2 failed: <peer-text>",
+            "peer redirect identity: <peer-text>",
+            "received unknown vendor ID: <peer-text>",
+            "remote host is behind NAT",
+            "generating IKE_AUTH request",
+        ] {
+            assert_eq!(
+                log.lines()
+                    .filter(|line| *line == format!("{field}: {message}"))
+                    .count(),
+                1,
+                "{field}: {message}"
+            );
+        }
+    }
+    assert!(!log.contains("notify-marker"));
+    assert!(!log.contains("invalid notify data length"));
+    assert!(!log.contains("c0:ff:ee:01"));
+}
+
+#[test]
+fn failed_initiate_cannot_inject_diagnostic_fields() {
+    let log = peer_diagnostic();
+    assert!(!log.contains("fabricated-field"));
+    assert!(!log.contains("no acceptable proposal found"));
+    let lines: Vec<_> = log.lines().collect();
+    let cleanup = lines
+        .iter()
+        .position(|line| *line == "cleanup: IPsec VICI terminate did not succeed")
+        .unwrap();
+    assert_eq!(
+        lines[cleanup + 1],
+        "errmsg: no matching SAs to terminate found"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("errmsg: "))
+            .count(),
+        1
+    );
+    assert!(log.lines().all(|line| !line.contains(" | control-log: ")));
+    for field in ["control-log", "charon-log"] {
+        assert_eq!(
+            log.lines()
+                .filter(|line| *line == format!("{field}: shared-key MAC mismatch: <peer-text>"))
+                .count(),
+            1
+        );
+    }
+}
+
+fn peer_diagnostic() -> String {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "peer-log", "fail-terminate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap()
 }
 
 #[test]
@@ -842,30 +929,13 @@ fn failed_initiate_emits_the_bounded_safe_stderr_tail_after_control_log() {
     fixture.begin(fixture_start("fqdn:fixture.example"));
     assert_eq!(fixture.collect(), "error: Other");
     let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
-    let mut lines = log.lines();
-    assert!(
-        lines
-            .next()
-            .unwrap()
-            .ends_with(" | control-log: no proposal chosen")
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(lines[9], "control-log: no acceptable proposal found");
+    assert_eq!(&lines[10..69], &["charon-log: peer supports MOBIKE"; 59]);
+    assert_eq!(
+        &lines[69..],
+        &["charon-log: establishing IKE_SA failed, peer not responding"]
     );
-    let charon: Vec<_> = lines
-        .map(|line| line.strip_prefix("charon-log: ").unwrap())
-        .collect();
-    assert!(!log.contains("suppressed-value") && !log.contains("suppressed-field"));
-    assert!(!log.contains("synthetic-orchid") && !log.contains("synthetic-thistle"));
-    assert_eq!(charon.len(), 60);
-    assert_eq!(charon[0], "stderr-2943");
-    assert_eq!(charon[56], "stderr-2999");
-    assert_eq!(charon[57], "peer says?retry?");
-    assert_eq!(charon[58], format!("long-{}", "x".repeat(507)));
-    assert_eq!(charon[59], "end of stderr");
-    assert!(charon.iter().all(|line| {
-        line.len() <= 512
-            && line
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-    }));
 }
 
 #[test]
@@ -878,7 +948,7 @@ fn failed_backend_admission_emits_the_setup_stderr_tail() {
     assert_eq!(fixture.collect(), "error: Other");
     assert_eq!(
         fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
-        "tunnel instance: incompatible IPsec VICI backend\ncharon-log: stats from charon\n"
+        "tunnel instance: incompatible IPsec VICI backend\ncharon-log: Starting IKE charon daemon\n"
     );
     assert_eq!(names(&fixture.commands()), ["version", "stats"]);
 }
@@ -891,7 +961,7 @@ fn failed_cleanup_ack_includes_safe_errmsg_and_continues_unloading() {
     assert_eq!(fixture.finish(Some(b"T")), "error: Other");
     assert_eq!(
         fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
-        "tunnel instance: IPsec VICI terminate did not succeed: no matching IKE_SA\n"
+        "tunnel instance: IPsec VICI terminate did not succeed\nerrmsg: no matching SAs to terminate found\n"
     );
     assert!(names(&fixture.commands()).ends_with(&[
         "terminate",

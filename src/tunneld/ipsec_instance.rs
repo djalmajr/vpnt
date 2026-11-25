@@ -39,12 +39,9 @@ const STARTUP_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_MANUAL_REQID: u16 = 0x3fff;
 const TERM_GRACE: Duration = Duration::from_secs(3);
 const CONTROL_LOG_LEVEL: &[u8] = b"1";
-const DIAGNOSTIC_LINE_BYTES: usize = 256;
 const CONTROL_LOG_LINES: usize = 8;
 const CHARON_LOG_LINES: usize = 60;
-const CHARON_LOG_LINE_BYTES: usize = 512;
-// Inspect the whole line before truncating it. Discard anything too large to
-// inspect in bounded memory, including a secret that may follow the cutoff.
+// Drop oversized records as a whole. Never interpret an incomplete message.
 const CHARON_LOG_INPUT_BYTES: usize = 8 * 1024;
 /// How often negotiation re-checks the control channel; also bounds how long
 /// a cancellation takes to reach a VICI exchange in progress.
@@ -255,7 +252,7 @@ fn run_in_directory(
     filelog {{
         stderr {{
             default = 1
-            ike_name = yes
+            json = yes
             dmn = 1
             mgr = 1
             ike = 1
@@ -433,10 +430,7 @@ fn drain_charon_log(
                 oversized = true;
             }
             if complete.is_some() {
-                if !oversized
-                    && let Ok(text) = std::str::from_utf8(&line[..len])
-                    && let Some(safe) = safe_diagnostic(text, credentials, CHARON_LOG_LINE_BYTES)
-                {
+                if !oversized && let Some(safe) = charon_diagnostic(&line[..len], credentials) {
                     if tail.len() == CHARON_LOG_LINES {
                         tail.pop_front();
                     }
@@ -451,6 +445,26 @@ fn drain_charon_log(
     }
     // An unterminated line may contain only the prefix of a secret.
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CharonLog<'a> {
+    level: u8,
+    msg: &'a str,
+}
+
+fn charon_diagnostic(line: &[u8], credentials: &Credentials) -> Option<String> {
+    // strongSwan's JSON logger keeps embedded newlines within a single record.
+    // Discard escaped records so the parser can borrow directly from the wiping
+    // buffer without creating an unprotected decoded copy of the message.
+    if line.contains(&b'\\') {
+        return None;
+    }
+    let entry: CharonLog<'_> = serde_json::from_slice(line).ok()?;
+    if entry.level > 1 {
+        return None;
+    }
+    safe_diagnostic(entry.msg, credentials, charon_message)
 }
 
 fn append_charon_log(error: io::Error, tail: VecDeque<String>) -> io::Error {
@@ -860,8 +874,11 @@ impl PrivateVici<'_> {
             return Ok(());
         }
         let mut error = format!("IPsec VICI {name} did not succeed");
-        if let Some(detail) = self.diagnostic(response, "errmsg") {
-            error.push_str(": ");
+        if let Some(detail) = response
+            .get_text("errmsg")
+            .and_then(|text| safe_diagnostic(text, self.credentials, ack_message))
+        {
+            error.push_str("\nerrmsg: ");
             error.push_str(&detail);
         }
         Err(io::Error::other(error))
@@ -880,7 +897,8 @@ impl PrivateVici<'_> {
             .open(deadline)?
             .command_with_events("initiate", request, &["control-log"], |_, event| {
                 if matches!(event.get_text("level"), Some("0" | "1"))
-                    && let Some(line) = self.diagnostic(&event, "msg")
+                    && let Some(text) = event.get_text("msg")
+                    && let Some(line) = safe_diagnostic(text, self.credentials, charon_message)
                 {
                     if tail.len() == CONTROL_LOG_LINES {
                         tail.pop_front();
@@ -898,19 +916,11 @@ impl PrivateVici<'_> {
             // The instance entry point writes this single error to stderr.
             let mut diagnostic = error.to_string();
             for line in tail {
-                diagnostic.push_str(" | control-log: ");
+                diagnostic.push_str("\ncontrol-log: ");
                 diagnostic.push_str(&line);
             }
             io::Error::new(error.kind(), diagnostic)
         })
-    }
-
-    fn diagnostic(&self, message: &Message, field: &str) -> Option<String> {
-        safe_diagnostic(
-            message.get_text(field)?,
-            self.credentials,
-            DIAGNOSTIC_LINE_BYTES,
-        )
     }
 
     fn exchange(
@@ -926,15 +936,106 @@ impl PrivateVici<'_> {
     }
 }
 
-fn safe_diagnostic(text: &str, credentials: &Credentials, max_bytes: usize) -> Option<String> {
+// Project strongSwan 6.1 diagnostics onto fixed text. Even prefixes from
+// known formats authorize only the label, never any bytes from the peer.
+fn charon_message(text: &str) -> Option<&'static str> {
+    let label = match text {
+        "no acceptable proposal found" => "no acceptable proposal found",
+        "received AUTHENTICATION_FAILED notify error" => {
+            "received AUTHENTICATION_FAILED notify error"
+        }
+        "received NO_PROPOSAL_CHOSEN notify error" => "received NO_PROPOSAL_CHOSEN notify error",
+        "remote host is behind NAT" => "remote host is behind NAT",
+        "local host is behind NAT, sending keep alives" => {
+            "local host is behind NAT, sending keep alives"
+        }
+        "peer supports MOBIKE" => "peer supports MOBIKE",
+        "establishing IKE_SA failed, peer not responding" => {
+            "establishing IKE_SA failed, peer not responding"
+        }
+        _ => [
+            (
+                "Starting IKE charon daemon (strongSwan ",
+                "Starting IKE charon daemon",
+            ),
+            ("initiating IKE_SA ", "initiating IKE_SA"),
+            (
+                "generating IKE_SA_INIT request ",
+                "generating IKE_SA_INIT request",
+            ),
+            (
+                "parsed IKE_SA_INIT response ",
+                "parsed IKE_SA_INIT response",
+            ),
+            (
+                "generating IKE_AUTH request ",
+                "generating IKE_AUTH request",
+            ),
+            ("parsed IKE_AUTH response ", "parsed IKE_AUTH response"),
+            ("selected proposal: ", "selected proposal"),
+            (
+                "EAP-MS-CHAPv2 failed with error ",
+                "EAP-MS-CHAPv2 failed: <peer-text>",
+            ),
+            (
+                "no shared key found for '",
+                "no shared key found: <peer-text>",
+            ),
+            (
+                "received EAP identity '",
+                "received EAP identity: <peer-text>",
+            ),
+            (
+                "client got redirected from ",
+                "peer redirect identity: <peer-text>",
+            ),
+            (
+                "received unknown vendor ID: ",
+                "received unknown vendor ID: <peer-text>",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(prefix, label)| text.starts_with(prefix).then_some(label))
+        .or_else(|| {
+            let (count, identities) = text.strip_prefix("tried ")?.split_once(" shared key")?;
+            let identities = identities.strip_prefix('s').unwrap_or(identities);
+            (!count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit())
+                && identities.starts_with(" for '")
+                && identities.ends_with("', but MAC mismatched"))
+            .then_some("shared-key MAC mismatch: <peer-text>")
+        })?,
+    };
+    Some(label)
+}
+
+fn ack_message(text: &str) -> Option<&'static str> {
+    match text {
+        "missing configuration name" => Some("missing configuration name"),
+        "no matching SAs to terminate found" => Some("no matching SAs to terminate found"),
+        "terminating SA failed" => Some("terminating SA failed"),
+        "not all matching SAs could be terminated" => {
+            Some("not all matching SAs could be terminated")
+        }
+        _ if text.starts_with("establishing IKE_SA '") && text.ends_with("' failed") => {
+            Some("establishing IKE_SA failed")
+        }
+        _ => None,
+    }
+}
+
+fn safe_diagnostic(
+    text: &str,
+    credentials: &Credentials,
+    known_message: fn(&str) -> Option<&'static str>,
+) -> Option<String> {
     let credentials = [credentials.password.expose(), credentials.psk.expose()];
     let contains_credential = |text: &str| {
         credentials
             .iter()
             .any(|secret| !secret.is_empty() && text.contains(secret))
     };
-    // Check all of the input before truncating so we never log a prefix
-    // of a credential that crosses the byte limit.
+    // Retain the literal credential and sensitive-label checks from the raw log filter.
     if contains_credential(text)
         || text
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -952,18 +1053,8 @@ fn safe_diagnostic(text: &str, credentials: &Credentials, max_bytes: usize) -> O
     {
         return None;
     }
-    let line: String = text
-        .chars()
-        .take(max_bytes)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect();
-    (!line.trim().is_empty() && !contains_credential(&line)).then_some(line)
+    let label = known_message(text)?;
+    (!contains_credential(label)).then(|| label.to_owned())
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -1157,7 +1248,7 @@ fn with_cleanup<T>(result: io::Result<T>, cleanup: io::Result<()>) -> io::Result
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(io::Error::new(
             error.kind(),
-            format!("{error}; cleanup: {cleanup}"),
+            format!("{error}\ncleanup: {cleanup}"),
         )),
     }
 }
