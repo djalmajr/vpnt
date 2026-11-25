@@ -96,26 +96,53 @@ pub(super) fn connect<S: SecretStore>(broker: &mut Broker<S>, peer: &Peer, id: &
 }
 
 pub(super) fn probe<S: SecretStore>(broker: &mut Broker<S>, id: &str, failures: u32) {
-    run(broker, Command::Probe { id: id.into() }).unwrap();
-    // Synchronization guard, not a latency requirement: the peer may take a
-    // 3 s pause, while a stalled poll still fails with the state it observed.
-    let until = Instant::now() + Duration::from_secs(15);
-    while broker.connections[id].failures != failures {
-        broker.poll();
-        assert!(
-            Instant::now() < until,
-            "the helper failure counter did not reach {failures} for {id}: helper={}, states={:?}, generations={:?}",
-            broker.helper,
-            super::states(broker),
-            super::generations(broker),
-        );
-        std::thread::sleep(Duration::from_millis(5));
+    // The fake helper increments its counter by one per Probe. Drive one
+    // command at a time so a test can start from a fresh generation and still
+    // reach the second or third failure without weakening the final state
+    // assertion.
+    while broker.connections[id].failures < failures {
+        let before = broker.connections[id].failures;
+        run(broker, Command::Probe { id: id.into() }).unwrap();
+        // Synchronization guard, not a latency requirement: the peer may take a
+        // 3 s pause, while a stalled poll still fails with the state it saw.
+        let until = Instant::now() + Duration::from_secs(15);
+        while broker.connections[id].failures <= before {
+            broker.poll();
+            assert!(
+                Instant::now() < until,
+                "the helper failure counter did not advance past {before} for {id}: helper={}, states={:?}, generations={:?}",
+                broker.helper,
+                super::states(broker),
+                super::generations(broker),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
+    assert_eq!(broker.connections[id].failures, failures);
     assert_eq!(state(&broker.snapshot(), id), State::Unresponsive);
 }
 
 pub(super) fn automatic<S: SecretStore>(broker: &mut Broker<S>) {
     broker.perform_automatic(|| true);
+}
+
+/// One Probe, then the peer's FIFO diagnostics reply as a deterministic
+/// barrier. It proves the Changed frame was consumed even when that frame
+/// repeats the connected/0 tuple and leaves the observable counters untouched.
+pub(super) fn probe_once_with_barrier<S: SecretStore>(broker: &mut Broker<S>, id: &str) {
+    // A reply armed before this Probe can arrive before its Changed frame, so
+    // drain any earlier request before issuing the command.
+    if let Some(request) = broker.diagnostics.pending.clone() {
+        wait_diagnostics_reply(broker, &request);
+    }
+    run(broker, Command::Probe { id: id.into() }).unwrap();
+    broker.request_diagnostics();
+    let request = broker
+        .diagnostics
+        .pending
+        .clone()
+        .expect("the probe barrier requires a diagnostics request");
+    wait_diagnostics_reply(broker, &request);
 }
 
 /// Any frame the peer sent before it answers this diagnostics request is
@@ -136,6 +163,10 @@ pub(super) fn consume_stale_with_diagnostics<S: SecretStore>(broker: &mut Broker
         .pending
         .clone()
         .expect("the diagnostics barrier requires a pending request");
+    wait_diagnostics_reply(broker, &request);
+}
+
+fn wait_diagnostics_reply<S: SecretStore>(broker: &mut Broker<S>, request: &str) {
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         broker.poll();
@@ -143,7 +174,7 @@ pub(super) fn consume_stale_with_diagnostics<S: SecretStore>(broker: &mut Broker
             broker.helper, "installed",
             "the diagnostics barrier requires an intact helper"
         );
-        if broker.diagnostics.pending.as_deref() != Some(request.as_str()) {
+        if broker.diagnostics.pending.as_deref() != Some(request) {
             return;
         }
         assert!(

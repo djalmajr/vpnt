@@ -978,6 +978,54 @@ impl StreakSignal {
 }
 
 #[test]
+fn first_failed_probe_stays_connected_and_the_second_announces_unresponsive() {
+    let (signal, attempt) = streak([true, false, false, false, true, false]);
+    let (canceled, probe) = (signal.canceled.clone(), signal.probe.clone());
+    let handle = thread::spawn({
+        let signals = signal.spend();
+        move || {
+            run(
+                attempt,
+                signals,
+                timing(Duration::from_secs(5)),
+                clock(3600),
+            )
+        }
+    });
+    use ConnectionState::{Connected, Unresponsive};
+    let checked = std::panic::catch_unwind(|| {
+        for (index, expected) in [
+            (Connected, 0),
+            (Connected, 0),
+            (Unresponsive, 2),
+            (Unresponsive, 3),
+            (Connected, 0),
+            (Connected, 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index > 0 {
+                probe.store(true, Ordering::Release);
+            }
+            let status =
+                signal.progress(index + 1, |p| matches!(p.state, Connected | Unresponsive));
+            assert_eq!(
+                (status.state, status.failures),
+                expected,
+                "probe {}",
+                index + 1
+            );
+        }
+    });
+    canceled.store(true, Ordering::Release);
+    assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+    if let Err(panic) = checked {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
 fn failed_probes_saturate_at_three_and_a_responsive_probe_resets_the_streak() {
     let (signal, attempt) = streak([false, false, false, false, true]);
     let (canceled, probe) = (signal.canceled.clone(), signal.probe.clone());
@@ -992,9 +1040,7 @@ fn failed_probes_saturate_at_three_and_a_responsive_probe_resets_the_streak() {
             )
         }
     });
-    let first = signal.progress(1, |progress| {
-        progress.state == ConnectionState::Unresponsive
-    });
+    let first = signal.progress(1, |progress| progress.failures == 1);
     assert_eq!(first.state, ConnectionState::Unresponsive);
     assert_eq!(first.failures, 1);
     // A command probe is an actual traffic probe: it counts even though the
@@ -1020,7 +1066,7 @@ fn failed_probes_saturate_at_three_and_a_responsive_probe_resets_the_streak() {
 
 #[test]
 fn restart_epoch_resets_the_failure_streak() {
-    let (signal, mut attempt) = streak([false, false]);
+    let (signal, mut attempt) = streak([true, false, false, false]);
     attempt.bump_epoch_after_first = true;
     let epoch_bumped = Arc::clone(&attempt.epoch_bumped);
     let first_read = Arc::clone(&attempt.first_read);
@@ -1035,13 +1081,24 @@ fn restart_epoch_resets_the_failure_streak() {
             )
         }
     });
-    let first = signal.progress(1, |p| p.state == ConnectionState::Unresponsive);
-    assert_eq!(first.failures, 1);
+    let first = signal.progress(1, |p| p.state == ConnectionState::Connected);
+    assert_eq!(
+        (first.state, first.failures),
+        (ConnectionState::Connected, 0)
+    );
     assert_eq!(
         signal.probes.load(Ordering::Acquire),
         1,
         "the epoch changed before the first publication was read"
     );
+    for (target, expected) in [
+        (2, (ConnectionState::Connected, 0)),
+        (3, (ConnectionState::Unresponsive, 2)),
+    ] {
+        signal.probe.store(true, Ordering::Release);
+        let progress = signal.progress(target, |_| true);
+        assert_eq!((progress.state, progress.failures), expected);
+    }
     first_read.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !epoch_bumped.load(Ordering::Acquire) {
@@ -1049,14 +1106,15 @@ fn restart_epoch_resets_the_failure_streak() {
         thread::sleep(Duration::from_millis(1));
     }
     // The new epoch schedules the retry probe by itself on both systems;
-    // asking for one too would start a third probe that races the second.
-    let after_restart = signal.progress(2, |p| p.state == ConnectionState::Unresponsive);
-    assert_eq!(
-        after_restart.failures, 1,
-        "a new epoch must reset the streak"
-    );
+    // a manual request could schedule an extra probe alongside that retry.
+    let after_restart = signal.progress(4, |_| true);
     signal.canceled.store(true, Ordering::Release);
     assert_eq!(handle.join().unwrap().state, ConnectionState::Off);
+    assert_eq!(
+        (after_restart.state, after_restart.failures),
+        (ConnectionState::Unresponsive, 1),
+        "a new epoch must reset the streak and discard the previous proof"
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1292,33 +1350,10 @@ mod connected_phase {
 
     #[test]
     fn connected_approval_clears_existing_failures_without_an_epoch_change() {
-        use ConnectionState::{AwaitingApproval, Unresponsive};
+        use ConnectionState::{AwaitingApproval, Connected, Unresponsive};
 
-        let observations = observe(vec![
-            Tick::default(),
-            Tick {
-                phase: Some(AwaitingApproval),
-                ..Tick::default()
-            },
-            Tick {
-                request: true,
-                ..Tick::default()
-            },
-        ]);
-        assert_eq!(
-            observations,
-            [
-                Observation(1, Some((Unresponsive, 1))),
-                Observation(0, Some((AwaitingApproval, 0))),
-                Observation(1, Some((Unresponsive, 1))),
-            ],
-        );
-    }
-
-    #[test]
-    fn connected_probe_crossing_a_restart_cannot_publish_its_stale_failure() {
-        use ConnectionState::{Connected, Unresponsive};
-
+        // A healthy tunnel tolerates one failure. The phase clears both its
+        // capped streak and its positive proof, even in the same epoch.
         let observations = observe(vec![
             Tick {
                 responsive: true,
@@ -1326,7 +1361,18 @@ mod connected_phase {
             },
             Tick {
                 request: true,
-                restart_during_probe: true,
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
+                ..Tick::default()
+            },
+            Tick {
+                phase: Some(AwaitingApproval),
+                ..Tick::default()
+            },
+            Tick {
+                request: true,
                 ..Tick::default()
             },
             Tick {
@@ -1338,10 +1384,46 @@ mod connected_phase {
             observations,
             [
                 Observation(1, Some((Connected, 0))),
-                Observation(1, None),
+                Observation(1, Some((Connected, 0))),
+                Observation(1, Some((Unresponsive, 2))),
+                Observation(0, Some((AwaitingApproval, 0))),
                 Observation(1, Some((Unresponsive, 1))),
+                Observation(1, Some((Unresponsive, 2))),
             ],
         );
+    }
+
+    #[test]
+    fn connected_probe_crossing_a_restart_cannot_publish_its_stale_sample() {
+        use ConnectionState::{Connected, Unresponsive};
+
+        for responsive in [true, false] {
+            let observations = observe(vec![
+                Tick {
+                    responsive: true,
+                    ..Tick::default()
+                },
+                Tick {
+                    request: true,
+                    responsive,
+                    restart_during_probe: true,
+                    ..Tick::default()
+                },
+                Tick {
+                    request: true,
+                    ..Tick::default()
+                },
+            ]);
+            assert_eq!(
+                observations,
+                [
+                    Observation(1, Some((Connected, 0))),
+                    Observation(1, None),
+                    Observation(1, Some((Unresponsive, 1))),
+                ],
+                "stale probe returned responsive={responsive}"
+            );
+        }
     }
 }
 
