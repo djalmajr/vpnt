@@ -57,8 +57,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -78,11 +76,15 @@ jobs:
         # the fixtures only isolate their own loopback network.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Check the pin and the password descriptor
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: |
           bash scripts/linux/check-openfortivpn-pin.sh "$OPENFORTIVPN_TREE/openfortivpn"
           bash scripts/linux/check-openfortivpn-pinentry.sh "$OPENFORTIVPN_TREE/openfortivpn"
       - name: Check the approved local range
         if: hashFiles('scripts/linux/check-openfortivpn-local-cidr.sh') != ''
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: bash scripts/linux/check-openfortivpn-local-cidr.sh "$OPENFORTIVPN_TREE"
 
   macos:
