@@ -8,6 +8,8 @@ on:
   pull_request:
     paths:
       - packaging/**
+      - Cargo.toml
+      - Cargo.lock
       - scripts/linux/**
       - scripts/macos/patches/**
       - .github/workflows/arch-package.yml
@@ -49,7 +51,12 @@ jobs:
             echo "the package must not install sudoers" >&2
             exit 1
           fi
-          pacman -Qlp "$pkg" | grep -E 'usr/lib/vpnt/(vpnt-tunneld|vpnt-pinentry|openfortivpn)$'
+          for binary in vpnt-tunneld vpnt-pinentry openfortivpn; do
+            if ! pacman -Qlp "$pkg" | grep -qE "usr/lib/vpnt/$binary\$"; then
+              echo "the package is missing usr/lib/vpnt/$binary" >&2
+              exit 1
+            fi
+          done
           namcap "$pkg" || true
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
