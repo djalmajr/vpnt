@@ -2928,7 +2928,9 @@ Achados:
 - **Quit derruba as conexões:** o helper roda como filho do app (`sudo -n -- helper runtime`). Fechar o app encerrou o helper e os três túneis; o app novo abriu um helper novo com tudo desligado. Isso confirma o que R3 e R4 já registravam, mas o dono foi avisado do contrário antes da troca.
 - **Sobras do dev:** a remoção do componente dev deixou `dev.djalmajr.vpnt-dev.runtime` e `dev.djalmajr.vpnt-dev.staging` em `/Library/PrivilegedHelperTools`.
 
-Não observado nesta rodada: o ícone da barra com o OpenVPN ligado no prd (a captura não mostrou o item, que estava oculto) e abertura no login.
+- **Ícone da barra:** o dono confirmou o ícone correto no prd com as três ligadas, incluindo o OpenVPN (a correção do PR #57 está no build).
+
+Não observado nesta rodada: abertura no login.
 
 ## Arquivo e estrutura
 
