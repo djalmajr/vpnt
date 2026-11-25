@@ -5,6 +5,7 @@
 //! openfortivpn with a fixed argv. The password never appears in argv, in the
 //! environment or in a file: the client reads it from the pinentry, which asks
 //! for it over a single-use descriptor 3 created after authentication.
+//! Descriptor 4 carries the writer's absolute monotonic login timer.
 //!
 //! Lifecycle: the client leads its own process group, dies with the supervisor
 //! (`PR_SET_PDEATHSIG`), and is stopped with SIGTERM, then SIGKILL after a grace
@@ -12,7 +13,7 @@
 //! other descendant, tracked by pidfd: the distribution's `pppd`, started by the
 //! client on a pty, runs in its own session and so leaves the group. Descendants
 //! are swept with SIGKILL before the leader is reaped, while the zombie leader
-//! still reserves the group id. In a process dedicated to the client (`run`
+//! still reserves the group id. In a process dedicated to the client (`serve`
 //! makes it a child subreaper), orphaned descendants are adopted, found from
 //! this process, stopped and reaped. A SIGKILL of the supervisor itself reaches
 //! only the client (the kernel offers no tree-wide death signal); descendants
@@ -39,7 +40,7 @@ use zeroize::Zeroize;
 
 use super::{
     handshake::Datagram,
-    protocol::{CidrV4, Credentials, Endpoint, FortinetRequest},
+    protocol::{CidrV4, Credentials, Endpoint, FortinetDeadline, FortinetRequest},
 };
 use crate::{helper::pinentry_channel::PinentryChild, secrets::Secret};
 
@@ -319,18 +320,6 @@ impl Config<'static> {
     };
 }
 
-/// Run one instance until the channel ends, the writer stops it or the client
-/// exits. Call from the supervisor's main thread: the death signal of the
-/// client follows the thread that spawned it.
-pub fn run(
-    channel: &mut impl Channel,
-    params: Params,
-    observer: &mut impl Observer,
-) -> io::Result<Exit> {
-    harden()?;
-    run_with(channel, params, observer, Config::PRODUCTION)
-}
-
 /// First datagram of an instance, from the writer: everything the client needs
 /// except the password. The values come from the policy entry and from the
 /// writer's own egress lookup, never from the user's request text.
@@ -347,6 +336,8 @@ pub struct Start {
     pub index: u32,
     pub gateway: Ipv4Addr,
     pub ppp_ifname: String,
+    /// Absolute CLOCK_MONOTONIC milliseconds from the authenticated writer.
+    pub establishment_deadline_ms: u64,
 }
 
 impl Start {
@@ -388,6 +379,7 @@ impl Start {
 
 /// Entry of `vpnt-tunneld instance fortinet`, after the handshake: wait for the
 /// writer's `Start`, then run the supervisor with the shared parser.
+/// Run on the main thread, which owns the client's parent-death signal.
 pub fn serve(channel: &mut impl Channel, observer: &mut impl Observer) -> io::Result<Exit> {
     harden()?;
     serve_with(channel, observer, Config::PRODUCTION)
@@ -426,7 +418,8 @@ fn serve_with(
         break serde_json::from_slice::<Start>(&bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Start order"))?;
     };
-    run_with(channel, start.params()?, observer, config)
+    let deadline = FortinetDeadline::from_wire(start.establishment_deadline_ms)?;
+    run_until(channel, start.params()?, observer, config, deadline)
 }
 
 /// What the `instance fortinet` subcommand runs after its handshake, with the
@@ -454,23 +447,38 @@ fn harden() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_with(
     channel: &mut impl Channel,
     params: Params,
     observer: &mut impl Observer,
     config: Config<'_>,
 ) -> io::Result<Exit> {
+    run_until(channel, params, observer, config, FortinetDeadline::new()?)
+}
+
+fn run_until(
+    channel: &mut impl Channel,
+    params: Params,
+    observer: &mut impl Observer,
+    config: Config<'_>,
+    deadline: FortinetDeadline,
+) -> io::Result<Exit> {
     // Refuse before reading the credential or starting anything.
     let pin = *params.pin()?;
     let (command, null) = command(&config, &params, &pin)?;
     observer.expect_interface(&params.pppd_ifname)?;
 
-    let password = match wait_credential(channel, config.limits.credential_wait)? {
+    let credential_deadline = deadline
+        .instant
+        .min(Instant::now() + config.limits.credential_wait);
+    let password = match wait_credential(channel, credential_deadline)? {
         Waited::Credential(password) => password,
         Waited::Closed(error) => return Ok(never_started(Reason::ChannelClosed, Some(error))),
         Waited::Stop => return Ok(never_started(Reason::Stop, None)),
     };
-    let spawned = Client::spawn(command, password, config.own_process);
+    super::network::check_deadline(Some(deadline.instant))?;
+    let spawned = Client::spawn(command, password, config.own_process, deadline);
     drop(null);
     let mut client = spawned?;
     for pipe in [client.take_stdout(), client.take_stderr()]
@@ -621,8 +629,8 @@ fn command(config: &Config<'_>, params: &Params, pin: &[u8; 32]) -> io::Result<(
         ));
 
     // The client leads its group, dies with the supervisor, reads nothing from
-    // stdin and keeps no descriptor above 3: the pinentry channel is installed
-    // later, by the spawn layer, on top of this hook.
+    // stdin. The spawn layer installs the pinentry channel and login timer
+    // after this hook marks every other descriptor above 3 close-on-exec.
     let parent = std::process::id() as libc::pid_t;
     let null = descriptor_above_stdio(File::open("/dev/null")?)?;
     let null_fd = null.as_raw_fd();
@@ -719,8 +727,7 @@ fn parse(bytes: &[u8]) -> io::Result<Message> {
     }
 }
 
-fn wait_credential(channel: &mut impl Channel, limit: Duration) -> io::Result<Waited> {
-    let deadline = Instant::now() + limit;
+fn wait_credential(channel: &mut impl Channel, deadline: Instant) -> io::Result<Waited> {
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -731,6 +738,7 @@ fn wait_credential(channel: &mut impl Channel, limit: Duration) -> io::Result<Wa
         if fds[0].revents == 0 {
             continue;
         }
+        super::network::check_deadline(Some(deadline))?;
         let mut bytes = match channel.receive() {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
@@ -855,9 +863,49 @@ struct Stopped {
     descendants_gone: bool,
 }
 
+fn login_timer(deadline_ms: u64) -> io::Result<OwnedFd> {
+    let timer = libc::itimerspec {
+        it_interval: libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
+        it_value: libc::timespec {
+            tv_sec: (deadline_ms / 1_000)
+                .try_into()
+                .map_err(|_| invalid("invalid establishment timer"))?,
+            tv_nsec: ((deadline_ms % 1_000) * 1_000_000) as libc::c_long,
+        },
+    };
+    // SAFETY: timerfd_create returns a fresh descriptor.
+    let fd = unsafe { libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the live owned timer descriptor and the timespec remain valid.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe {
+        libc::timerfd_settime(
+            fd.as_raw_fd(),
+            libc::TFD_TIMER_ABSTIME,
+            &timer,
+            std::ptr::null_mut(),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
 impl Client {
-    fn spawn(command: Command, password: Secret, own_process: bool) -> io::Result<Self> {
-        let mut child = PinentryChild::spawn(command, password)?;
+    fn spawn(
+        command: Command,
+        password: Secret,
+        own_process: bool,
+        deadline: FortinetDeadline,
+    ) -> io::Result<Self> {
+        let timer = login_timer(deadline.monotonic_ms)?;
+        let mut child = PinentryChild::spawn_fortinet(command, password, deadline.instant, timer)?;
         let group = child.id() as libc::pid_t;
         // The child is not reaped until `poll`, so its pid is still ours.
         let pidfd = match pidfd_open(group) {

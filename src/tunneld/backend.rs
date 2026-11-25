@@ -543,6 +543,8 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             .as_mut()
             .expect("Fortinet receipt precedes start");
         let (interface, index, gateway) = receipt.binding();
+        let deadline = protocol::FortinetDeadline::new()
+            .map_err(|e| Failure::io("instance establishment clock", &e))?;
         let start = fortinet_instance::Start {
             host: setup.host.clone(),
             port: setup.port,
@@ -553,6 +555,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             index,
             gateway,
             ppp_ifname: receipt.ifname.clone(),
+            establishment_deadline_ms: deadline.monotonic_ms,
         };
         let start = serde_json::to_vec(&start)
             .map_err(|_| Failure::new(ErrorCode::Backend, "invalid Start order"))?;
@@ -560,12 +563,15 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         cancel
             .start(|| channel.send(&start))
             .map_err(|e| Failure::io("instance Start", &e))?;
-        let sent = cancel.start(|| channel.send(&setup.credentials));
+        let sent = cancel.start(|| {
+            super::network::check_deadline(Some(deadline.instant))?;
+            channel.send(&setup.credentials)
+        });
         zeroize::Zeroize::zeroize(&mut setup.credentials);
         sent.map_err(|e| Failure::io("instance credentials", &e))?;
         attempt.credentials_sent = true;
 
-        let deadline = Instant::now() + ESTABLISHED_TIMEOUT;
+        let deadline = deadline.instant;
         let mut delivered = fortinet_network::Delivered::default();
         loop {
             let event = wait_event(channel, cancel, deadline)
