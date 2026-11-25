@@ -1,11 +1,13 @@
-//! Linux socket activation, bounded admission, and the v1 dialogue.
+//! Linux socket activation, bounded admission, and versioned dialogues.
 use super::admin::PolicyStore;
-use super::backend::{Launch, Launcher, Running};
+use super::backend::{Launch, Launcher, RUNTIME_DIRECTORY, Running, retry_cleanup};
+use super::cleanup::{Reservation, Store};
 use super::network::SetupCancellation;
 #[cfg(test)]
 use super::protocol::Prepare;
 use super::protocol::{
-    Command, ErrorCode, FrameError, Request, Response, ServerDecoder, State, decode_request,
+    CLEANUP_VERSION, CleanupState, Command, ErrorCode, FrameError, InitialRequest,
+    MAX_CONFIRMATION, Request, Response, ServerDecoder, State, decode_request, monotonic_ms,
     read_control, timed, write_control,
 };
 use crate::{helper::local_socket::peer_uid, netd::iproute::IpRoute};
@@ -14,11 +16,16 @@ use std::{
     ffi::OsString,
     fs::File,
     io,
+    net::Shutdown,
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
-    sync::{Arc, Mutex},
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -28,11 +35,15 @@ const SESSION_IDLE_MS: libc::c_int = 24 * 60 * 60 * 1000;
 const MAX_PER_UID: usize = 2;
 const MAX_CONNECTIONS: usize = 8;
 const LISTEN_FD: RawFd = 3;
+const RECONCILE_MIN: Duration = Duration::from_secs(1);
+const RECONCILE_MAX: Duration = Duration::from_secs(8);
 
 struct Server {
     connections: Mutex<Connections>,
     policy: PolicyStore,
-    launcher: Box<dyn Launch>,
+    launcher: Arc<dyn Launch>,
+    cleanup: Option<Arc<Store>>,
+    recovered: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -79,16 +90,41 @@ impl Default for Server {
 
 impl Server {
     fn new(policy: PolicyStore) -> io::Result<Self> {
-        let launcher = Launcher::system(IpRoute::system());
-        launcher.recover()?;
-        Ok(Self::with_launcher(policy, Box::new(launcher)))
+        let launcher = Arc::new(Launcher::system(IpRoute::system()));
+        let cleanup = Arc::new(Store::open(Path::new(RUNTIME_DIRECTORY))?);
+        let recovered = Arc::new(AtomicBool::new(false));
+        let worker = (launcher.clone(), cleanup.clone(), recovered.clone());
+        thread::Builder::new()
+            .name("vpnt-tunneld-recovery".into())
+            .spawn(move || {
+                let (launcher, cleanup, recovered) = worker;
+                reconcile(
+                    &recovered,
+                    || launcher.recover_with(Some(&cleanup)),
+                    || cleanup.republish(),
+                    |delay| {
+                        thread::sleep(delay);
+                        true
+                    },
+                );
+            })?;
+        Ok(Self {
+            connections: Mutex::default(),
+            policy,
+            launcher,
+            cleanup: Some(cleanup),
+            recovered,
+        })
     }
 
+    #[cfg(test)]
     fn with_launcher(policy: PolicyStore, launcher: Box<dyn Launch>) -> Self {
         Self {
             connections: Mutex::default(),
             policy,
-            launcher,
+            launcher: Arc::from(launcher),
+            cleanup: None,
+            recovered: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -133,6 +169,8 @@ impl Server {
                 &slot.admission,
                 &slot.server.policy,
                 &*slot.server.launcher,
+                slot.server.cleanup.as_deref(),
+                &slot.server.recovered,
                 accepted,
             );
             drop(slot);
@@ -146,11 +184,54 @@ impl Server {
     }
 }
 
+/// A single worker owns startup recovery. After admission opens it only
+/// retries publication of already-proved results, never live network teardown.
+fn reconcile(
+    recovered: &AtomicBool,
+    mut recover: impl FnMut() -> io::Result<()>,
+    mut publish: impl FnMut() -> io::Result<()>,
+    mut wait: impl FnMut(Duration) -> bool,
+) {
+    let mut delay = RECONCILE_MIN;
+    let mut reporting_failure = false;
+    loop {
+        let ready = recovered.load(Ordering::Acquire);
+        let result = if ready { publish() } else { recover() };
+        match result {
+            Ok(()) => {
+                recovered.store(true, Ordering::Release);
+                reporting_failure = false;
+                delay = RECONCILE_MIN;
+                if !wait(delay) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !reporting_failure {
+                    let stage = if ready {
+                        "cleanup publication"
+                    } else {
+                        "startup recovery"
+                    };
+                    eprintln!("vpnt-tunneld: {stage} will be retried: {error}");
+                    reporting_failure = true;
+                }
+                if !wait(delay) {
+                    return;
+                }
+                delay = delay.saturating_mul(2).min(RECONCILE_MAX);
+            }
+        }
+    }
+}
+
 fn serve(
     stream: UnixStream,
     admission: &Admission,
     policy: &PolicyStore,
     launcher: &dyn Launch,
+    cleanup: Option<&Store>,
+    recovered: &AtomicBool,
     accepted: Instant,
 ) -> Result<(), FrameError> {
     let hello_deadline = accepted + FRAME_TIMEOUT;
@@ -178,13 +259,23 @@ fn serve(
     }
 
     let prepare_deadline = Instant::now() + FRAME_TIMEOUT;
-    let offer = match decoder.prepare(prepare_deadline) {
-        Ok(offer) => offer,
+    let v2 = decoder.version() == CLEANUP_VERSION;
+    let offer = match decoder.initial_request(prepare_deadline) {
+        Ok(InitialRequest::Prepare(offer)) => offer,
+        Ok(InitialRequest::CleanupStatus(generation)) => {
+            let status = cleanup.map_or(CleanupState::Unknown, |store| {
+                store.status(uid, &generation)
+            });
+            return decoder.reply_cleanup(status, prepare_deadline);
+        }
         Err(FrameError::Protocol(_)) => {
             return reply_error(&stream, ErrorCode::BadRequest, prepare_deadline);
         }
         Err(error) => return Err(error),
     };
+    if !recovered.load(Ordering::Acquire) {
+        return decoder.reject(ErrorCode::Busy, prepare_deadline);
+    }
     let read_policy = || {
         let directory = policy.open()?;
         let _lock = directory.lock_shared()?;
@@ -199,7 +290,22 @@ fn serve(
     }) else {
         return decoder.reject(ErrorCode::PermissionDenied, prepare_deadline);
     };
-    decoder.prepared(prepare_deadline)?;
+    let mut reservation = if v2 {
+        match cleanup.map(|store| store.reserve(uid)) {
+            Some(Ok(reservation)) => Some(reservation),
+            Some(Err(error)) => {
+                eprintln!("vpnt-tunneld: could not reserve cleanup receipt: {error}");
+                return decoder.reject(ErrorCode::Busy, prepare_deadline);
+            }
+            None => return decoder.reject(ErrorCode::Backend, prepare_deadline),
+        }
+    } else {
+        None
+    };
+    let generation = reservation
+        .as_ref()
+        .map(|record| record.generation().clone());
+    decoder.acknowledge(generation.clone(), prepare_deadline)?;
 
     let credential_deadline = Instant::now() + FRAME_TIMEOUT;
     let credentials = decoder.credentials(credential_deadline)?;
@@ -220,20 +326,58 @@ fn serve(
     let (completion, done) = UnixStream::pair()?;
     let cancel = Arc::new(SetupCancellation::default());
     let (commands, result) = thread::scope(|scope| -> Result<_, FrameError> {
+        let launch_cancel = &cancel;
         let worker = thread::Builder::new().spawn_scoped(scope, || {
             let _signal_on_drop = done;
-            launcher.launch(&offer, grant, credentials, authorization, &cancel)
+            if let Some(record) = reservation.as_mut() {
+                if let Err(error) = record.begin_network() {
+                    eprintln!("vpnt-tunneld: could not record network preparation: {error}");
+                    return Err(ErrorCode::Backend);
+                }
+                launcher.launch_v2(
+                    &offer,
+                    grant,
+                    credentials,
+                    authorization,
+                    launch_cancel,
+                    record,
+                )
+            } else {
+                launcher.launch(&offer, grant, credentials, authorization, launch_cancel)
+            }
         })?;
-        let commands = watch_setup(&stream, &completion, &mut decoder);
+        let commands = watch_setup(&stream, &completion, &mut decoder, &cancel, v2);
         if !matches!(commands, Ok((_, false))) {
             cancel.cancel();
         }
         let result = worker
             .join()
             .map_err(|_| io::Error::other("setup worker panicked"))?;
-        Ok((commands?, result))
+        Ok((commands, result))
     })?;
-    let (statuses, stop) = commands;
+    if let Some(record) = reservation {
+        return match result {
+            Ok(session) if matches!(commands, Ok((_, false))) => {
+                dialogue_v2(&stream, decoder, session, &record)
+            }
+            Ok(session) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                finish_v2(session, &record);
+                commands.map(|_| ())
+            }
+            Err(code) => {
+                if code != ErrorCode::CleanupPending {
+                    record_stopped(&record);
+                }
+                if matches!(commands, Ok((_, false))) {
+                    decoder.reject(code, Instant::now() + FRAME_TIMEOUT)
+                } else {
+                    commands.map(|_| ())
+                }
+            }
+        };
+    }
+    let (statuses, stop) = commands?;
     let mut session = match result {
         Ok(session) => session,
         Err(code) if stop => {
@@ -251,7 +395,7 @@ fn serve(
     }
     let mut deadline = None;
     for _ in 0..statuses + usize::from(stop) {
-        let (_, ended) = poll_session(None, &*session, 0)?;
+        let (_, ended) = poll_session(None, &*session, 0, None)?;
         if ended {
             let cleanup_started = Instant::now();
             session.stop();
@@ -270,6 +414,8 @@ fn watch_setup(
     client: &UnixStream,
     completion: &UnixStream,
     decoder: &mut ServerDecoder,
+    cancel: &SetupCancellation,
+    v2: bool,
 ) -> Result<(usize, bool), FrameError> {
     let mut statuses = 0;
     loop {
@@ -295,8 +441,21 @@ fn watch_setup(
         }
         if fds[0].revents != 0 {
             match decoder.command(Instant::now() + FRAME_TIMEOUT)? {
+                Command::Status if v2 => {
+                    decoder.reply_status(State::Starting, Instant::now() + FRAME_TIMEOUT)?;
+                }
                 Command::Status => statuses += 1,
-                Command::Stop => return Ok((statuses, true)),
+                Command::Confirm(_) => return Err(ErrorCode::BadRequest.into()),
+                Command::Stop => {
+                    if v2 {
+                        cancel.cancel();
+                        let result =
+                            decoder.reply_status(State::Stopping, Instant::now() + FRAME_TIMEOUT);
+                        let _ = client.shutdown(Shutdown::Both);
+                        result?;
+                    }
+                    return Ok((statuses, true));
+                }
             }
             // A half-close can follow the last queued Status. Read EOF
             // before releasing the setup worker's result to the client.
@@ -328,6 +487,7 @@ fn poll_session(
     client: Option<&UnixStream>,
     session: &dyn Running,
     timeout: libc::c_int,
+    retry_until: Option<Instant>,
 ) -> io::Result<(bool, bool)> {
     let mut fds = [
         libc::pollfd {
@@ -360,7 +520,12 @@ fn poll_session(
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
+        super::network::check_deadline(retry_until)?;
     }
+}
+
+pub(super) fn probe_session_ended(session: &dyn Running, deadline: Instant) -> io::Result<bool> {
+    poll_session(None, session, 0, Some(deadline)).map(|(_, ended)| ended)
 }
 
 /// Answer the client's commands for one admitted session. A stop, a closed
@@ -372,7 +537,7 @@ fn dialogue(
     mut session: Box<dyn Running + '_>,
 ) -> Result<(), FrameError> {
     loop {
-        let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS)?;
+        let (client_ready, ended) = poll_session(Some(stream), &*session, SESSION_IDLE_MS, None)?;
         if ended {
             session.stop();
         }
@@ -385,10 +550,95 @@ fn dialogue(
         let state = match decoder.command(Instant::now() + FRAME_TIMEOUT) {
             Ok(Command::Status) => session.state(),
             Ok(Command::Stop) => session.stop(),
+            Ok(Command::Confirm(_)) => return Err(ErrorCode::BadRequest.into()),
             Err(error) => return Err(error),
         };
         decoder.reply_status(state, Instant::now() + FRAME_TIMEOUT)?;
     }
+}
+
+fn record_stopped(record: &Reservation<'_>) {
+    if let Err(error) = record.stopped() {
+        eprintln!("vpnt-tunneld: could not publish completed cleanup: {error}");
+    }
+}
+
+fn finish_v2(mut session: Box<dyn Running + '_>, record: &Reservation<'_>) {
+    if retry_cleanup(|| session.stop() == State::Stopped) {
+        record_stopped(record);
+    }
+}
+
+fn dialogue_v2(
+    stream: &UnixStream,
+    mut decoder: ServerDecoder,
+    session: Box<dyn Running + '_>,
+    record: &Reservation<'_>,
+) -> Result<(), FrameError> {
+    let result = (|| {
+        loop {
+            let (client_ready, ended) =
+                poll_session(Some(stream), &*session, SESSION_IDLE_MS, None)?;
+            if ended || !client_ready {
+                return Ok(());
+            }
+            let deadline = Instant::now() + FRAME_TIMEOUT;
+            match decoder.command(deadline)? {
+                Command::Confirm(expires_ms) => {
+                    let now = Instant::now();
+                    let remaining =
+                        Duration::from_millis(expires_ms.saturating_sub(monotonic_ms()?));
+                    let confirm_by = now + remaining.min(MAX_CONFIRMATION);
+                    if probe_session_ended(&*session, deadline)?
+                        || session.state() != State::NetworkReady
+                    {
+                        return decoder
+                            .reply_status(State::Stopping, Instant::now() + FRAME_TIMEOUT);
+                    }
+                    let binding = if remaining.is_zero() {
+                        Err(io::ErrorKind::TimedOut.into())
+                    } else {
+                        session.probe_binding(confirm_by)
+                    };
+                    let write_by = Instant::now() + FRAME_TIMEOUT;
+                    if probe_session_ended(&*session, write_by)? {
+                        return decoder.reply_status(State::Stopping, write_by);
+                    }
+                    match binding {
+                        Ok(binding) if binding.generation() == record.generation() => {
+                            if Instant::now() < confirm_by {
+                                decoder.reply_ready(binding, write_by)?;
+                            } else {
+                                decoder.reply_unconfirmed(write_by)?;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            decoder.reply_unconfirmed(write_by)?;
+                        }
+                        _ => return decoder.reject(ErrorCode::Backend, write_by),
+                    }
+                }
+                Command::Status if session.state() == State::NetworkReady => {
+                    let binding = match session.probe_binding(deadline) {
+                        Ok(binding) if binding.generation() == record.generation() => binding,
+                        _ => {
+                            let _ = decoder.reject(ErrorCode::Backend, deadline);
+                            return Ok(());
+                        }
+                    };
+                    if probe_session_ended(&*session, deadline)? {
+                        return decoder.reply_status(State::Stopping, deadline);
+                    }
+                    decoder.reply_ready(binding, deadline)?;
+                }
+                Command::Status => decoder.reply_status(session.state(), deadline)?,
+                Command::Stop => return decoder.reply_status(State::Stopping, deadline),
+            }
+        }
+    })();
+    let _ = stream.shutdown(Shutdown::Both);
+    finish_v2(session, record);
+    result
 }
 
 #[cfg(test)]
@@ -402,6 +652,57 @@ pub(super) fn serve_fixture(
         &Admission::Session(1000),
         policy,
         launcher,
+        None,
+        &AtomicBool::new(true),
+        Instant::now(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn serve_cleanup_fixture(
+    stream: UnixStream,
+    uid: u32,
+    policy: &PolicyStore,
+    launcher: &dyn Launch,
+    cleanup: &Store,
+) -> Result<(), FrameError> {
+    serve(
+        stream,
+        &Admission::Session(uid),
+        policy,
+        launcher,
+        Some(cleanup),
+        &AtomicBool::new(true),
+        Instant::now(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn serve_recovery_fixture<N, A>(
+    stream: UnixStream,
+    uid: u32,
+    policy: &PolicyStore,
+    launcher: &Launcher<N, A>,
+    cleanup: &Store,
+) -> Result<(), FrameError>
+where
+    N: crate::netd::iproute::Backend,
+    A: super::handshake::UnitAttestor + Send + Sync,
+{
+    let recovered = AtomicBool::new(false);
+    reconcile(
+        &recovered,
+        || launcher.recover_with(Some(cleanup)),
+        || cleanup.republish(),
+        |_| false,
+    );
+    serve(
+        stream,
+        &Admission::Session(uid),
+        policy,
+        launcher,
+        Some(cleanup),
+        &recovered,
         Instant::now(),
     )
 }
@@ -553,7 +854,7 @@ mod policy_dialogue_tests {
         assert!(matches!(tests_receive(&client), Response::Version { .. }));
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":{port}}},"username":"fixture","networks":[{{"network":"{network}","prefix":16}}]}}"#).unwrap();
         let mut response = tests_receive(&client);
-        if matches!(response, Response::Prepared {}) {
+        if matches!(response, Response::Prepared { generation: None }) {
             after_prepared();
             Credentials::ipsec("fixture-password", "fixture-psk")
                 .unwrap()
@@ -581,6 +882,105 @@ mod policy_dialogue_tests {
             super::super::protocol::decode_response,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn background_recovery_keeps_status_available_and_retries_until_proved() {
+        let policy = PolicyFixture::new();
+        policy.install();
+        let mut server = Server::with_launcher(policy.store.clone(), Box::new(Unavailable));
+        server.recovered.store(false, Ordering::Release);
+        let store = Arc::new(Store::open(policy.path().parent().unwrap()).unwrap());
+        let reservation = store.reserve(1000).unwrap();
+        let id = reservation.generation().clone();
+        drop(reservation);
+        server.cleanup = Some(store);
+        let server = Arc::new(server);
+        let (observed, next) = std::sync::mpsc::channel();
+        let (resume, continued) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let recovered = &server.recovered;
+            let scheduler = scope.spawn(move || {
+                let mut attempts = 0;
+                reconcile(
+                    recovered,
+                    || {
+                        attempts += 1;
+                        if attempts <= 5 {
+                            Err(io::ErrorKind::WouldBlock.into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || Ok(()),
+                    |delay| {
+                        observed.send(delay).unwrap();
+                        continued
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap_or(false)
+                    },
+                );
+                attempts
+            });
+            let open = |version| {
+                let (mut client, stream) = UnixStream::pair().unwrap();
+                let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
+                writeln!(client, r#"{{"op":"hello","version":{version}}}"#).unwrap();
+                assert!(
+                    matches!(tests_receive(&client), Response::Version { version: received } if received == version)
+                );
+                (client, worker)
+            };
+            let offer = br#"{"op":"prepare_ipsec","endpoint":{"host":"vpn.example","port":500},"username":"fixture","networks":[{"network":"10.20.0.0","prefix":16}]}"#;
+            for seconds in [1, 2, 4, 8, 8] {
+                assert_eq!(
+                    next.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Duration::from_secs(seconds)
+                );
+                let (mut client, worker) = open(2);
+                write_control(
+                    &mut client,
+                    &Request::CleanupStatus {
+                        generation: id.clone(),
+                    },
+                )
+                .unwrap();
+                assert!(matches!(
+                    tests_receive(&client),
+                    Response::CleanupStatus {
+                        state: CleanupState::Stopped
+                    }
+                ));
+                worker.join().unwrap();
+
+                let (mut client, worker) = open(1);
+                client.write_all(offer).unwrap();
+                client.write_all(b"\n").unwrap();
+                assert!(matches!(
+                    tests_receive(&client),
+                    Response::Error {
+                        code: ErrorCode::Busy
+                    }
+                ));
+                worker.join().unwrap();
+                resume.send(true).unwrap();
+            }
+            assert_eq!(
+                next.recv_timeout(Duration::from_secs(5)).unwrap(),
+                RECONCILE_MIN
+            );
+            let (mut client, worker) = open(1);
+            client.write_all(offer).unwrap();
+            client.write_all(b"\n").unwrap();
+            assert!(matches!(
+                tests_receive(&client),
+                Response::Prepared { generation: None }
+            ));
+            drop(client);
+            worker.join().unwrap();
+            resume.send(false).unwrap();
+            assert_eq!(scheduler.join().unwrap(), 6);
+        });
     }
 
     #[test]
@@ -826,7 +1226,10 @@ mod policy_dialogue_tests {
             .unwrap();
         assert!(matches!(tests_receive(&client), Response::Version { .. }));
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
-        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        assert!(matches!(
+            tests_receive(&client),
+            Response::Prepared { generation: None }
+        ));
         let mut credentials = Vec::new();
         Credentials::ipsec("fixture-password", "fixture-psk")
             .unwrap()
@@ -1043,7 +1446,10 @@ mod policy_dialogue_tests {
             .unwrap();
         tests_receive(&client);
         writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
-        assert!(matches!(tests_receive(&client), Response::Prepared {}));
+        assert!(matches!(
+            tests_receive(&client),
+            Response::Prepared { generation: None }
+        ));
         fixture.revoke();
         let directory = fixture.store.open().unwrap();
         drop(acquire_eventually(|| directory.lock_shared()).unwrap());

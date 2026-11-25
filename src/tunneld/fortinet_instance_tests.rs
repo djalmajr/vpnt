@@ -1493,9 +1493,10 @@ idle()
     });
     writer.credential(PASSWORD);
     scratch.json("done");
-    writer.stop();
+    // The rejected-password line is a fatal event: the supervisor ends the run
+    // by itself, so no Stop is sent (one would race the fatal exit).
     let events = writer.events();
-    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Stop);
+    assert_eq!(thread.join().unwrap().unwrap().reason, Reason::Fatal);
     let mut seen: Vec<String> = events.iter().map(Value::to_string).collect();
     seen.sort();
     let mut expected: Vec<String> = [
@@ -1771,7 +1772,9 @@ fn a_listed_pid_that_is_not_the_leaders_child_is_never_held_or_signalled() {
     assert!(alive(alien_pid), "the alien was signalled");
 }
 
-fn real_parser_events(body: &str) -> Vec<Value> {
+/// Events of a run with the real parser. `ends_alone`: the supervisor is
+/// expected to end the run by itself (a fatal event), so no Stop is sent.
+fn real_parser_events(body: &str, ends_alone: bool) -> (Vec<Value>, Exit) {
     let scratch = Scratch::new();
     let instance = Instance::start_with(
         &scratch,
@@ -1782,10 +1785,12 @@ fn real_parser_events(body: &str) -> Vec<Value> {
     );
     instance.writer.credential(PASSWORD);
     scratch.json("done");
-    instance.writer.stop();
+    if !ends_alone {
+        instance.writer.stop();
+    }
     let events = instance.writer.events();
-    instance.join().unwrap();
-    events
+    let exit = instance.join().unwrap();
+    (events, exit)
 }
 
 fn has(events: &[Value], wanted: Value) -> bool {
@@ -1794,11 +1799,13 @@ fn has(events: &[Value], wanted: Value) -> bool {
 
 #[test]
 fn the_real_parser_reports_the_interface_the_supervisor_configured() {
-    let events = real_parser_events(
+    let (events, exit) = real_parser_events(
         "print('INFO:   Interface vpntp1 is UP.', flush=True)\n\
          print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
          put('done', {})\nidle()\n",
+        false,
     );
+    assert_eq!(exit.reason, Reason::Stop, "a good interface is not fatal");
     assert!(has(
         &events,
         json!({"event": "interface", "name": "vpntp1"})
@@ -1813,13 +1820,18 @@ fn the_real_parser_reports_the_interface_the_supervisor_configured() {
 #[test]
 fn the_real_parser_types_any_other_interface_as_a_mismatch() {
     for other in ["ppp0", "vpntp2", "vpntp10", "eth0"] {
-        let events = real_parser_events(&format!(
-            "print('INFO:   Interface {other} is UP.', flush=True)\n\
-             time.sleep(0.3)\n\
-             print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
-             print('INFO:   vpnt: dns-server 10.1.1.1', flush=True)\n\
-             put('done', {{}})\nidle()\n"
-        ));
+        let (events, exit) = real_parser_events(
+            &format!(
+                "print('INFO:   Interface {other} is UP.', flush=True)\n\
+                 print('INFO:   vpnt: split-route 10.0.0.0/255.0.0.0', flush=True)\n\
+                 print('INFO:   vpnt: dns-server 10.1.1.1', flush=True)\n\
+                 put('done', {{}})\nidle()\n"
+            ),
+            true,
+        );
+        // The mismatch ends the instance by itself: the client was stopped.
+        assert_eq!(exit.reason, Reason::Fatal, "{other}");
+        assert!(exit.status.is_some(), "{other}: the client was reaped");
         assert!(
             has(&events, json!({"event": "interface_mismatch"})),
             "{other}: {events:?}"
@@ -1862,4 +1874,292 @@ fn the_sweep_reports_a_kill_of_a_live_process_and_only_then() {
     // Reaped here, as `terminate` does after its sweep.
     assert!(client.child.poll().unwrap().is_some());
     client.reaped = true;
+}
+
+fn start_order() -> Start {
+    Start {
+        host: "vpn.example.test".into(),
+        port: 10443,
+        username: "alice".into(),
+        certificate_sha256: "ab".repeat(32),
+        interface: "eth0".into(),
+        index: 7,
+        gateway: Ipv4Addr::new(192, 0, 2, 10),
+        ppp_ifname: "vpntp1".into(),
+    }
+}
+
+/// `serve` against fixtures; returns the supervisor's result and the events.
+fn serve_fixture(
+    scratch: &Scratch,
+    first: &[u8],
+    then_credential: bool,
+) -> (io::Result<Exit>, Seq) {
+    let (client, pinentry) = fixtures(scratch, "put('done', {})\nidle()\n");
+    let (mut instance, writer) = Seq::pair();
+    writer.put(first);
+    if then_credential {
+        writer.credential(PASSWORD);
+        // A build that runs the client ends here instead of hanging.
+        writer.stop();
+    }
+    let result = serve_with(
+        &mut instance,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: Limits {
+                credential_wait: Duration::from_millis(300),
+                ..limits(Duration::from_secs(1))
+            },
+            own_process: false,
+        },
+    );
+    (result, writer)
+}
+
+#[test]
+fn the_start_order_becomes_exactly_the_parameters_the_supervisor_runs_with() {
+    let params = start_order().params().unwrap();
+    assert_eq!(params.endpoint.host(), "vpn.example.test");
+    assert_eq!(params.endpoint.port(), 10443);
+    assert_eq!(params.username, "alice");
+    assert_eq!(params.certificate_sha256, Some([0xab; 32]));
+    assert_eq!(
+        params.binding,
+        Binding {
+            interface: "eth0".into(),
+            index: 7,
+            gateway: Ipv4Addr::new(192, 0, 2, 10),
+        }
+    );
+    assert_eq!(params.pppd_ifname, "vpntp1");
+    let wire = serde_json::to_string(&start_order()).unwrap();
+    assert!(!wire.contains(PASSWORD));
+}
+
+#[test]
+fn hostile_start_orders_are_refused_before_anything_starts() {
+    type Change = fn(&mut Start);
+    let hostile: [(&str, Change); 14] = [
+        ("short pin", |s| s.certificate_sha256 = "ab".repeat(31)),
+        ("long pin", |s| s.certificate_sha256 = "ab".repeat(33)),
+        ("upper-case pin", |s| s.certificate_sha256 = "AB".repeat(32)),
+        ("non-hex pin", |s| s.certificate_sha256 = "zz".repeat(32)),
+        ("zero pin", |s| s.certificate_sha256 = "00".repeat(32)),
+        ("empty pin", |s| s.certificate_sha256 = String::new()),
+        ("flag as host", |s| s.host = "--ca-file=/x".into()),
+        ("host with a slash", |s| s.host = "a/b".into()),
+        ("empty user", |s| s.username = String::new()),
+        ("control in user", |s| s.username = "a\nb".into()),
+        ("path as interface", |s| s.interface = "../eth0".into()),
+        ("zero index", |s| s.index = 0),
+        ("multicast gateway", |s| {
+            s.gateway = Ipv4Addr::new(224, 0, 0, 1)
+        }),
+        ("foreign ppp name", |s| s.ppp_ifname = "ppp0;x".into()),
+    ];
+    for (label, change) in hostile {
+        let mut start = start_order();
+        change(&mut start);
+        let scratch = Scratch::new();
+        let (result, _) = serve_fixture(&scratch, &serde_json::to_vec(&start).unwrap(), true);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput,
+            "{label}"
+        );
+        assert!(
+            !scratch.path("client").exists(),
+            "{label}: the client must not start"
+        );
+    }
+    // Control: the same path with the good order does start the client.
+    let scratch = Scratch::new();
+    let (result, writer) =
+        serve_fixture(&scratch, &serde_json::to_vec(&start_order()).unwrap(), true);
+    let exit = result.unwrap();
+    assert_eq!(exit.reason, Reason::Stop);
+    // `started` is sent only after the client was spawned.
+    let events = writer.events();
+    assert_eq!(events.first().unwrap(), &json!({"event": "started"}));
+    assert_eq!(events.last().unwrap()["event"], "exited");
+}
+
+#[test]
+fn only_a_well_formed_start_object_is_accepted_as_the_first_datagram() {
+    let scratch = Scratch::new();
+    let good = serde_json::to_value(start_order()).unwrap();
+    let mut extra = good.clone();
+    extra["extra"] = json!(1);
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("gateway");
+    for (label, bytes) in [
+        ("unknown field", serde_json::to_vec(&extra).unwrap()),
+        ("missing field", serde_json::to_vec(&missing).unwrap()),
+        ("a credential frame first", credential_frame_of(PASSWORD)),
+        ("garbage", b"{not json".to_vec()),
+        ("not an object", b"[1]".to_vec()),
+    ] {
+        let (result, _) = serve_fixture(&scratch, &bytes, false);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "{label}"
+        );
+    }
+    assert!(!scratch.path("client").exists());
+}
+
+fn credential_frame_of(password: &str) -> Vec<u8> {
+    super::credential_frame(password).unwrap().to_vec()
+}
+
+#[test]
+fn stop_or_eof_before_the_start_order_ends_without_a_client() {
+    let scratch = Scratch::new();
+    let (result, _) = serve_fixture(&scratch, &[MESSAGE_STOP], false);
+    let exit = result.unwrap();
+    assert_eq!((exit.reason, exit.status.is_none()), (Reason::Stop, true));
+    // EOF: the writer goes away before sending anything.
+    let (client, pinentry) = fixtures(&scratch, "idle()\n");
+    let (mut instance, writer) = Seq::pair();
+    drop(writer);
+    let exit = serve_with(
+        &mut instance,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: limits(Duration::from_secs(1)),
+            own_process: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(exit.reason, Reason::ChannelClosed);
+    // Silence ends in a timeout, not a hang.
+    let (_instance_end, writer) = Seq::pair();
+    let mut silent = _instance_end;
+    let error = serve_with(
+        &mut silent,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: Limits {
+                credential_wait: Duration::from_millis(150),
+                ..limits(Duration::from_secs(1))
+            },
+            own_process: false,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    drop(writer);
+    assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn the_writers_credential_frame_is_what_the_supervisor_decodes() {
+    let mut frame = Datagram::from_vec(credential_frame_of(PASSWORD));
+    let Ok(Message::Credential(secret)) = decode(&mut frame) else {
+        panic!("the writer's frame was refused");
+    };
+    assert_eq!(secret.expose(), PASSWORD);
+    for bad in ["", &"p".repeat(257)] {
+        assert!(super::credential_frame(bad).is_err(), "{} bytes", bad.len());
+    }
+    assert!(super::credential_frame(&"p".repeat(256)).is_ok());
+}
+
+#[test]
+fn events_round_trip_and_unknown_ones_are_refused() {
+    for event in [
+        Event::Started,
+        Event::Interface {
+            name: "vpntp1".into(),
+        },
+        Event::Failure {
+            kind: Failure::GatewayTimeout,
+        },
+        Event::SplitRoute {
+            network: Ipv4Addr::new(10, 0, 0, 0),
+            prefix: 8,
+        },
+        Event::SplitRoutes { count: 1 },
+        Event::SplitInvalid,
+        Event::InterfaceMismatch,
+        Event::DnsServer {
+            address: Ipv4Addr::new(10, 1, 1, 1),
+        },
+        Event::DnsDomain {
+            name: "corp.example.test".into(),
+        },
+        Event::DnsCount {
+            servers: 1,
+            domains: 1,
+        },
+        Event::DnsInvalid,
+        Event::Exited {
+            code: Some(1),
+            signal: None,
+        },
+    ] {
+        let wire = serde_json::to_vec(&event).unwrap();
+        assert_eq!(serde_json::from_slice::<Event>(&wire).unwrap(), event);
+    }
+    for bad in [
+        r#"{"event":"interface","name":"vpntp1","extra":1}"#,
+        r#"{"event":"unknown"}"#,
+        r#"{"event":"failure","kind":"nope"}"#,
+        r#"{"name":"vpntp1"}"#,
+    ] {
+        assert!(serde_json::from_str::<Event>(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_fatal_event_makes_the_supervisor_stop_the_client_and_exit_by_itself() {
+    // The writer sends nothing: the instance ends on its own, after reporting.
+    let cases: [(&str, &str, &str); 2] = [
+        (
+            "interface_mismatch",
+            "print('INFO:   Interface ppp0 is UP.', flush=True)\n",
+            "interface_mismatch",
+        ),
+        (
+            "credentials_rejected",
+            "print('ERROR:  Could not authenticate to gateway. Please check the password, client certificate, etc.', flush=True)\n",
+            "failure",
+        ),
+    ];
+    for (label, line, event) in cases {
+        let scratch = Scratch::new();
+        let body = format!("{line}put('done', {{}})\nidle()\n");
+        let instance = Instance::start(&scratch, &body, params(Some(PIN)), Duration::from_secs(2));
+        instance.writer.credential(PASSWORD);
+        scratch.json("done");
+        let pid = pids(&scratch);
+        let events = instance.writer.events();
+        let exit = instance.join().unwrap();
+        assert_eq!(exit.reason, Reason::Fatal, "{label}");
+        assert!(
+            events.iter().any(|e| e["event"] == event),
+            "{label}: {events:?}"
+        );
+        assert_eq!(events.last().unwrap()["event"], "exited", "{label}");
+        assert!(exit.descendants_gone, "{label}");
+        assert!(gone(pid), "{label}: the client outlived the fatal event");
+    }
+    // Control: observations that are not fatal keep the run going until Stop.
+    let scratch = Scratch::new();
+    let body = "print('INFO:   Interface vpntp1 is UP.', flush=True)\nput('done', {})\nidle()\n";
+    let instance = Instance::start(&scratch, body, params(Some(PIN)), Duration::from_secs(2));
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    thread::sleep(Duration::from_millis(300));
+    assert!(!instance.thread.is_finished(), "a good run ended by itself");
+    instance.writer.stop();
+    assert_eq!(instance.join().unwrap().reason, Reason::Stop);
 }

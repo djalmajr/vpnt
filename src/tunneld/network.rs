@@ -1,5 +1,5 @@
 //! Journaled Linux XFRM effects serialized by the shared network writer lock.
-use super::protocol::CidrV4;
+use super::protocol::{CidrV4, Generation, ProbeBinding};
 use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -201,7 +201,9 @@ impl SetupCancellation {
     }
 }
 
-type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>) -> io::Result<Vec<u8>> + Send + Sync;
+type Run = dyn Fn(&str, &[&str], Option<&SetupCancellation>, Option<Instant>) -> io::Result<Vec<u8>>
+    + Send
+    + Sync;
 
 pub(super) struct Network(Box<Run>);
 
@@ -294,7 +296,7 @@ pub(super) fn cidr_text(cidr: &CidrV4) -> String {
     format!("{}/{}", cidr.network(), cidr.prefix())
 }
 
-fn prefix(text: &str) -> io::Result<(u32, u8)> {
+pub(super) fn prefix(text: &str) -> io::Result<(u32, u8)> {
     let (address, length) = text.split_once('/').unwrap_or((text, "32"));
     let addr = address
         .parse::<Ipv4Addr>()
@@ -312,12 +314,12 @@ pub(super) fn parse_cidr(text: &str) -> io::Result<CidrV4> {
     CidrV4::new(base.into(), length).map_err(|_| invalid("invalid policy route"))
 }
 
-fn overlaps(a: (u32, u8), b: (u32, u8)) -> bool {
+pub(super) fn overlaps(a: (u32, u8), b: (u32, u8)) -> bool {
     let shift = 32 - a.1.min(b.1);
     shift == 32 || (a.0 >> shift) == (b.0 >> shift)
 }
 
-fn route_key(route: &CidrV4) -> (u32, u8) {
+pub(super) fn route_key(route: &CidrV4) -> (u32, u8) {
     (route.network().into(), route.prefix())
 }
 
@@ -325,14 +327,29 @@ fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
 }
 
+pub(super) fn check_standard_ipv4_rules(rules: &[serde_json::Value]) -> io::Result<()> {
+    let standard = serde_json::json!([
+        {"priority":0,"src":"all","table":"local"},
+        {"priority":32766,"src":"all","table":"main"},
+        {"priority":32767,"src":"all","table":"default"}
+    ]);
+    if rules != standard.as_array().expect("rules array").as_slice() {
+        return Err(invalid("nonstandard IPv4 policy rules"));
+    }
+    Ok(())
+}
+
 impl Network {
     #[cfg(test)]
     pub(super) fn fake(
         run: impl Fn(&str, &[&str]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
     ) -> Self {
-        Self(Box::new(move |program, args, cancel| match cancel {
-            Some(cancel) => cancel.start(|| run(program, args)),
-            None => run(program, args),
+        Self(Box::new(move |program, args, cancel, deadline| {
+            check_deadline(deadline)?;
+            match cancel {
+                Some(cancel) => cancel.start(|| run(program, args)),
+                None => run(program, args),
+            }
         }))
     }
 
@@ -341,11 +358,19 @@ impl Network {
     }
 
     fn run_ip(&self, args: &[&str], cancel: Option<&SetupCancellation>) -> io::Result<Vec<u8>> {
-        (self.0)("/usr/bin/ip", args, cancel)
+        (self.0)("/usr/bin/ip", args, cancel, None)
     }
 
     fn json<T: DeserializeOwned>(&self, args: &[&str]) -> io::Result<T> {
         decode(&self.ip(args)?)
+    }
+
+    fn json_until<T: DeserializeOwned>(
+        &self,
+        args: &[&str],
+        deadline: Option<Instant>,
+    ) -> io::Result<T> {
+        decode(&(self.0)("/usr/bin/ip", args, None, deadline)?)
     }
 
     pub(super) fn resolve(&self, hostname: &str, approved: &[Ipv4Addr]) -> io::Result<Ipv4Addr> {
@@ -378,6 +403,7 @@ impl Network {
                 "1",
             ],
             None,
+            None,
         )?)?;
         if reply
             .data
@@ -397,8 +423,8 @@ impl Network {
             .ok_or_else(|| invalid("no resolved transport is authorized"))
     }
 
-    fn links(&self) -> io::Result<Vec<Link>> {
-        self.json(&["-j", "-d", "link", "show"])
+    fn links(&self, deadline: Option<Instant>) -> io::Result<Vec<Link>> {
+        self.json_until(&["-j", "-d", "link", "show"], deadline)
     }
 
     fn routes(&self, family: &str) -> io::Result<Vec<Route>> {
@@ -417,7 +443,7 @@ impl Network {
         let [route] = routes.as_slice() else {
             return Err(invalid("ambiguous egress lookup"));
         };
-        let links = self.links()?;
+        let links = self.links(None)?;
         let link = links
             .iter()
             .find(|link| link.ifname == route.dev && link.flags.iter().any(|flag| flag == "UP"))
@@ -470,14 +496,7 @@ impl Network {
         egress: &Egress,
     ) -> io::Result<()> {
         let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        let standard = serde_json::json!([
-            {"priority":0,"src":"all","table":"local"},
-            {"priority":32766,"src":"all","table":"main"},
-            {"priority":32767,"src":"all","table":"default"}
-        ]);
-        if rules != standard.as_array().expect("rules array").as_slice() {
-            return Err(invalid("nonstandard IPv4 policy rules"));
-        }
+        check_standard_ipv4_rules(&rules)?;
         let protected = approved
             .iter()
             .copied()
@@ -529,7 +548,7 @@ impl Network {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
         self.fib_clear(&routes, None, approved, &egress)?;
-        let links = self.links()?;
+        let links = self.links(None)?;
         let ids = self.xfrm_ids()?;
         let link_ids: Vec<_> = links.iter().map(Link::xfrm_id).collect::<io::Result<_>>()?;
         let reqid = (1..=MAX_REQID)
@@ -673,9 +692,13 @@ impl Network {
     }
 
     fn link(&self, receipt: &Receipt) -> io::Result<Option<Link>> {
+        self.link_until(receipt, None)
+    }
+
+    fn link_until(&self, receipt: &Receipt, deadline: Option<Instant>) -> io::Result<Option<Link>> {
         let name = receipt.name();
         let mut owned = None;
-        for link in self.links()? {
+        for link in self.links(deadline)? {
             if link.ifname == name {
                 if owned.is_some()
                     || link.ifindex == 0
@@ -696,7 +719,15 @@ impl Network {
     }
 
     fn owned_link(&self, receipt: &Receipt) -> io::Result<Option<Link>> {
-        let link = self.link(receipt)?;
+        self.owned_link_until(receipt, None)
+    }
+
+    fn owned_link_until(
+        &self,
+        receipt: &Receipt,
+        deadline: Option<Instant>,
+    ) -> io::Result<Option<Link>> {
+        let link = self.link_until(receipt, deadline)?;
         if link.as_ref().is_some_and(|link| {
             link.ifalias.as_deref() != Some(&receipt.marker())
                 || receipt.ifindex.is_some_and(|index| index != link.ifindex)
@@ -704,6 +735,35 @@ impl Network {
             return Err(invalid("XFRM link ownership cannot be proven"));
         }
         Ok(link)
+    }
+
+    /// A fresh identity observation for the already confirmed receipt.
+    pub(super) fn probe_binding(
+        &self,
+        _guard: &NetworkGuard,
+        receipt: &Receipt,
+        deadline: Instant,
+    ) -> io::Result<ProbeBinding> {
+        if !receipt.confirmed || receipt.complete || receipt.routes_intended != receipt.routes.len()
+        {
+            return Err(invalid("XFRM probe scope is unconfirmed"));
+        }
+        let link = self
+            .owned_link_until(receipt, Some(deadline))?
+            .filter(|link| {
+                receipt.ifindex == Some(link.ifindex) && link.flags.iter().any(|flag| flag == "UP")
+            })
+            .ok_or_else(|| invalid("XFRM probe link is unproven"))?;
+        if !self.address_present_until(receipt, &link, Some(deadline))? {
+            return Err(invalid("XFRM probe address is unproven"));
+        }
+        let generation = Generation::parse(receipt.generation.clone())
+            .ok_or_else(|| invalid("invalid probe generation"))?;
+        let local = receipt
+            .vip
+            .ok_or_else(|| invalid("missing probe address"))?;
+        ProbeBinding::new(generation, link.ifindex, local, receipt.routes.clone())
+            .ok_or_else(|| invalid("invalid XFRM probe scope"))
     }
 
     fn route_change(
@@ -783,7 +843,17 @@ impl Network {
     }
 
     fn address_present(&self, receipt: &Receipt, link: &Link) -> io::Result<bool> {
-        let result: Vec<AddressList> = self.json(&["-j", "addr", "show", "dev", &link.ifname])?;
+        self.address_present_until(receipt, link, None)
+    }
+
+    fn address_present_until(
+        &self,
+        receipt: &Receipt,
+        link: &Link,
+        deadline: Option<Instant>,
+    ) -> io::Result<bool> {
+        let result: Vec<AddressList> =
+            self.json_until(&["-j", "addr", "show", "dev", &link.ifname], deadline)?;
         let [row] = result.as_slice() else {
             return Err(invalid("ambiguous address inventory"));
         };
@@ -883,12 +953,24 @@ fn drain(pipe: &mut impl Read, captured: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn check_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(())
+}
+
 fn run_command(
     program: &str,
     args: &[&str],
     cancel: Option<&SetupCancellation>,
+    deadline: Option<Instant>,
 ) -> io::Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let ordinary_deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = deadline.map_or(ordinary_deadline, |deadline| {
+        deadline.min(ordinary_deadline)
+    });
+    check_deadline(Some(deadline))?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -928,9 +1010,14 @@ fn run_command(
                 if !diagnostics.is_empty() {
                     return Err(invalid("network command reported diagnostics"));
                 }
+                check_deadline(Some(deadline))?;
                 return Ok(output);
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(5)),
+            );
         }
     })();
     if result.is_err() {

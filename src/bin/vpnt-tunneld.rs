@@ -6,6 +6,7 @@ use std::{
 };
 #[cfg(target_os = "linux")]
 use vpnt::tunneld::{
+    fortinet_instance,
     handshake::{self, Backend},
     ipsec_instance,
     protocol::ErrorCode,
@@ -86,14 +87,19 @@ fn instance_handshake_paths() -> (PathBuf, PathBuf) {
 #[cfg(target_os = "linux")]
 fn run_instance(args: &[OsString]) -> Result<(), InstanceError> {
     let (backend, generation) = parse_instance(args)?;
+    let invocation = std::env::var("INVOCATION_ID")
+        .map_err(|_| InstanceError::Io(io::Error::other("missing or invalid INVOCATION_ID")))?;
     if backend == Backend::Fortinet {
-        return Err(InstanceError::Refused(ErrorCode::MissingProgram));
+        let (socket, record) = instance_handshake_paths();
+        let channel =
+            handshake::connect_instance(&socket, &record, generation, backend, &invocation, 0)
+                .map_err(InstanceError::Io)?;
+        fortinet_instance::run_instance(channel).map_err(InstanceError::Io)?;
+        return Ok(());
     }
     let runtime_directory = std::env::var_os("RUNTIME_DIRECTORY")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| InstanceError::Io(io::Error::other("missing RUNTIME_DIRECTORY")))?;
-    let invocation = std::env::var("INVOCATION_ID")
-        .map_err(|_| InstanceError::Io(io::Error::other("missing or invalid INVOCATION_ID")))?;
     let (socket, record) = instance_handshake_paths();
     let channel =
         handshake::connect_instance(&socket, &record, generation, backend, &invocation, 0)
@@ -146,14 +152,21 @@ mod tunneld_tests {
     }
 
     #[test]
-    fn tunneld_instance_contract_matches_units_and_fortinet_fails_closed() {
+    fn tunneld_instance_contract_matches_units_and_fortinet_needs_its_handshake() {
         assert_eq!(
             parse_instance(&["ipsec".into(), GENERATION.into()]).unwrap(),
             (Backend::Ipsec, GENERATION)
         );
+        assert_eq!(
+            parse_instance(&["fortinet".into(), GENERATION.into()]).unwrap(),
+            (Backend::Fortinet, GENERATION)
+        );
+        // Fortinet now runs the supervisor: without the unit's invocation and
+        // handshake directory it fails closed with an I/O error, never as
+        // "program missing" and never by starting anything.
         assert!(matches!(
             run_instance(&["fortinet".into(), GENERATION.into()]),
-            Err(InstanceError::Refused(ErrorCode::MissingProgram))
+            Err(InstanceError::Io(_))
         ));
         let (socket, record) = instance_handshake_paths();
         assert_eq!(socket, Path::new("/run/vpnt-instance/control.sock"));

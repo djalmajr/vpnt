@@ -24,6 +24,8 @@ BindPaths=/dev/ppp
 DeviceAllow=/dev/ppp rw
 ProtectSystem=strict
 ProtectHome=yes
+# Keep system pppd options and hooks out of the fixed client configuration.
+TemporaryFileSystem=/etc/ppp:ro
 UMask=0077
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

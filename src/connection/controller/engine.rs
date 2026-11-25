@@ -3,7 +3,7 @@ mod metadata;
 #[cfg(target_os = "macos")]
 use super::native::remote_signer::RemoteSigners;
 use super::{
-    worker::{self, ExitRequested, Finished, Signals},
+    worker::{self, ExitRequested, Finished, Progress, Signals},
     *,
 };
 #[cfg(test)]
@@ -136,6 +136,32 @@ impl Slot<'_> {
         if let Some(worker) = &self.worker {
             worker.signals.canceled.store(true, Ordering::Release);
         }
+    }
+    fn worker_progress(&self) -> Option<Progress> {
+        let worker = self.worker.as_ref()?;
+        let mut latest = worker
+            .signals
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let progress = (*latest)?;
+        let cleanup_unconfirmed = progress.state == ConnectionState::CleanupUnconfirmed
+            && progress.failure.is_some()
+            && worker.signals.canceled.load(Ordering::Acquire);
+        if cleanup_unconfirmed {
+            // The owner reports this once. Keep it available for another Disconnect.
+            if self.state == ConnectionState::CleanupUnconfirmed {
+                return None;
+            }
+        } else {
+            latest.take();
+        }
+        let current = worker.generation == self.generation;
+        let disconnect_cleanup = cleanup_unconfirmed
+            && worker.generation < self.generation
+            && self.state == ConnectionState::Disconnecting
+            && self.pending.is_none();
+        (current || disconnect_cleanup).then_some(progress)
     }
     /// `notes`: the peer announced `FAILURE_NOTE_PROBE_SNAPSHOT_ID`.
     fn changed(&self, notes: bool) -> Message {
@@ -389,20 +415,14 @@ fn run_with_exit<F: Factory>(
                 }
             }
             for slot in slots.values_mut() {
-                if !closing
-                    && let Some(worker) = &slot.worker
-                    && worker.generation == slot.generation
-                    && let Some(progress) = worker
-                        .signals
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .take()
-                {
+                if !closing && let Some(progress) = slot.worker_progress() {
                     slot.state = progress.state;
                     slot.failures = progress.failures;
                     slot.cleaning = progress.cleaning;
-                    slot.failure = progress.failure;
+                    // Changed and Snapshot allow this state without a failure note.
+                    slot.failure = progress
+                        .failure
+                        .filter(|_| progress.state != ConnectionState::CleanupUnconfirmed);
                     outgoing.push_back(slot.changed(failure_capable));
                 }
                 if closing {

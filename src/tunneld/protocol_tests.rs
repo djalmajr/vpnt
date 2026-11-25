@@ -159,7 +159,7 @@ fn json_frames_are_closed_and_bounded() {
         Ok(Request::Hello { version: VERSION })
     ));
     assert_eq!(
-        decode_request(b"{\"op\":\"hello\",\"version\":2}\n").unwrap_err(),
+        decode_request(b"{\"op\":\"hello\",\"version\":3}\n").unwrap_err(),
         ErrorCode::UnsupportedVersion
     );
     for line in [
@@ -509,5 +509,119 @@ fn accepts_credential_limits_and_reports_partial_write() {
         assert!(Credentials::ipsec(value, "s").is_err());
         assert!(Credentials::ipsec("p", value).is_err());
         assert!(Credentials::fortinet(value).is_err());
+    }
+}
+
+#[test]
+fn version_two_hello_and_cleanup_status_are_strict() {
+    assert!(decode_request(b"{\"op\":\"hello\",\"version\":2}\n").is_ok());
+    assert!(
+        decode_request(
+            b"{\"op\":\"cleanup_status\",\"generation\":\"0123456789abcdef0123456789abcdef\"}\n"
+        )
+        .is_ok()
+    );
+    for invalid in ["../generation", "0123456789ABCDEF0123456789ABCDEF", "", "0"] {
+        let request = format!("{{\"op\":\"cleanup_status\",\"generation\":\"{invalid}\"}}\n");
+        assert_eq!(
+            decode_request(request.as_bytes()).unwrap_err(),
+            ErrorCode::BadRequest
+        );
+    }
+    for malformed in [
+        b"{\"op\":\"cleanup_status\",\"generation\":[]}\n".as_slice(),
+        b"{\"op\":\"cleanup_status\"}\n",
+        b"{\"op\":\"cleanup_status\",\"generation\":\"0123456789abcdef0123456789abcdef\",\"path\":\"/run\"}\n",
+    ] {
+        assert_eq!(decode_request(malformed).unwrap_err(), ErrorCode::BadRequest);
+    }
+    let mut prepared = Vec::new();
+    write_control(&mut prepared, &Response::Prepared { generation: None }).unwrap();
+    assert_eq!(prepared, b"{\"op\":\"prepared\"}\n");
+    assert!(decode_response(b"{\"op\":\"prepared\",\"generation\":null}\n").is_err());
+}
+
+#[test]
+fn confirm_is_an_active_v2_command_and_preserves_v1_status_and_stop() {
+    for version in [VERSION, CLEANUP_VERSION] {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut decoder = ServerDecoder::new(reader);
+        write_control(&mut writer, &Request::Hello { version }).unwrap();
+        decoder.hello(deadline()).unwrap();
+        writer.write_all(&fortinet("u", PIN)).unwrap();
+        decoder.prepare(deadline()).unwrap();
+        let generation = (version == CLEANUP_VERSION)
+            .then(|| Generation::parse("0123456789abcdef0123456789abcdef".into()).unwrap());
+        decoder.acknowledge(generation, deadline()).unwrap();
+        Credentials::fortinet("fixture")
+            .unwrap()
+            .write(&mut writer)
+            .unwrap();
+        decoder.credentials(deadline()).unwrap();
+        writer.write_all(STATUS).unwrap();
+        assert_eq!(decoder.command(deadline()).unwrap(), Command::Status);
+        if version == VERSION {
+            writer.write_all(STOP).unwrap();
+            assert_eq!(decoder.command(deadline()).unwrap(), Command::Stop);
+        }
+        write_control(&mut writer, &Request::Confirm { expires_ms: 42 }).unwrap();
+        if version == CLEANUP_VERSION {
+            assert_eq!(decoder.command(deadline()).unwrap(), Command::Confirm(42));
+        } else {
+            assert_eq!(
+                decoder.command(deadline()),
+                Err(ErrorCode::BadRequest.into())
+            );
+        }
+    }
+}
+
+#[test]
+fn v2_ready_binding_has_a_generation_nonzero_index_and_bounded_ipv4_scope() {
+    let frame = |ifindex, local: &str, routes: serde_json::Value| {
+        let value = serde_json::json!({
+            "op": "network_ready",
+            "binding": {
+                "generation": "0123456789abcdef0123456789abcdef",
+                "ifindex": ifindex,
+                "local": local,
+                "routes": routes,
+            }
+        });
+        format!("{value}\n")
+    };
+    let scope = serde_json::json!([{"network": "10.20.0.0", "prefix": 16}]);
+    let routes = |count| {
+        serde_json::Value::Array(
+            (0..count)
+                .map(|i| serde_json::json!({"network": format!("10.20.0.{i}"), "prefix": 32}))
+                .collect(),
+        )
+    };
+    let largest = frame(7, "10.99.0.2", routes(64));
+    assert!(largest.len() <= MAX_LINE);
+    assert!(decode_response(largest.as_bytes()).is_ok());
+    let mut legacy = Vec::new();
+    write_control(
+        &mut legacy,
+        &Response::Status {
+            state: State::NetworkReady,
+        },
+    )
+    .unwrap();
+    assert_eq!(legacy, b"{\"op\":\"status\",\"state\":\"network_ready\"}\n");
+    assert!(decode_response(frame(7, "10.99.0.2", scope.clone()).as_bytes()).is_ok());
+    for invalid in [
+        frame(0, "10.99.0.2", scope.clone()),
+        frame(7, "::1", scope.clone()),
+        frame(7, "0.0.0.0", scope.clone()),
+        frame(
+            7,
+            "10.99.0.2",
+            serde_json::json!([{"network":"169.254.2.1", "prefix":32}]),
+        ),
+        frame(7, "10.99.0.2", routes(65)),
+    ] {
+        assert!(decode_response(invalid.as_bytes()).is_err());
     }
 }

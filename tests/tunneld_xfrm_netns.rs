@@ -16,8 +16,44 @@ mod netlease;
 #[allow(dead_code)]
 #[path = "../src/tunneld/network.rs"]
 mod network;
+#[allow(dead_code)]
 mod protocol {
+    use std::net::Ipv4Addr;
+
     pub use vpnt::tunneld::protocol::CidrV4;
+
+    // The probe types are crate-private in the library; the writer test only
+    // needs them to carry the observed scope, so it keeps minimal stand-ins.
+    pub struct Generation(String);
+
+    impl Generation {
+        pub fn parse(text: String) -> Option<Self> {
+            (!text.is_empty()).then_some(Self(text))
+        }
+    }
+
+    pub struct ProbeBinding {
+        pub generation: Generation,
+        pub ifindex: u32,
+        pub local: Ipv4Addr,
+        pub routes: Vec<CidrV4>,
+    }
+
+    impl ProbeBinding {
+        pub fn new(
+            generation: Generation,
+            ifindex: u32,
+            local: Ipv4Addr,
+            routes: Vec<CidrV4>,
+        ) -> Option<Self> {
+            Some(Self {
+                generation,
+                ifindex,
+                local,
+                routes,
+            })
+        }
+    }
 }
 
 const OPT_IN: &str = "VPNT_TEST_NETNS";
