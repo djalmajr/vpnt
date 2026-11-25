@@ -262,8 +262,91 @@ read -r pid && kill -USR1 "$pid"
    até o host interno funcionaram, e o `SIGKILL` no app deixou o diff vazio
    contra o estado guardado depois da remoção.
 
-IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
-fixture não substitui essa validação com VPN real.
+IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
+seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
+
+## Linux: IPsec (strongSwan) e SSL (Fortinet) pelo vpnt-tunneld
+
+O `vpnt-tunneld.service`, ativado por `vpnt-tunneld.socket`
+(`/run/vpnt/tunneld.sock`, `0660 root:vpnt`), inicia por geração uma instância
+`vpnt-tunneld-ipsec@` (charon privado) ou `vpnt-tunneld-fortinet@`
+(openfortivpn 1.24.1 com os patches do vpnt). A rede, com a interface XFRM ou
+`pppN`, as rotas e o DNS por link, fica no próprio `vpnt-tunneld`. A política
+root `/etc/vpnt/tunnel-policy.json` autoriza cada perfil uma vez. O pacote não
+instala sudoers.
+
+### Gates
+
+Os mesmos da seção Linux anterior. A CI roda também:
+
+- o job `linux-openfortivpn`: `scripts/linux/build-openfortivpn.sh` compila o
+  openfortivpn 1.24.1 com os oito patches, na ordem do `PKGBUILD`, e roda
+  `check-openfortivpn-pin.sh`, `check-openfortivpn-pinentry.sh` e
+  `check-openfortivpn-local-cidr.sh` contra fixtures TLS em loopback;
+- o workflow `arch-package.yml`, que gera o pacote num container Arch como
+  usuário comum, exige `vpnt-tunneld`, `vpnt-pinentry` e `openfortivpn` em
+  `/usr/lib/vpnt/`, recusa sudoers e publica o pacote como artefato.
+
+### Autorizar um perfil
+
+```sh
+vpnt tunnel-policy <profile-id> [--dns-server <ipv4>]... [--fortinet-local-cidr <ipv4-cidr>] \
+  | sudo /usr/lib/vpnt/vpnt-tunneld policy apply
+```
+
+- O snapshot não tem segredo. O `policy apply` mostra o documento no terminal
+  e grava sob lock.
+- Um gateway IPsec com IPv4 literal ganha a identidade IKE `ipv4:`, aceita só
+  quando corresponde a um endereço de transporte da mesma entrada.
+- Uma entrada Fortinet precisa de `fortinet_local_cidr`. Entradas antigas sem o
+  campo continuam legíveis, mas não conectam até a nova aprovação. A barreira
+  IPCP do openfortivpn descarta o quadro que daria ao PPP um IPv4 local fora da
+  faixa antes de ele chegar ao `pppd`.
+
+### Evidência nativa (Linux, sem VPN real)
+
+Na CI Linux da `main` em `a9d05ea` (Ubuntu 24.04, Rust 1.99.0),
+`cargo test --locked --all-targets --all-features` passou com 883 testes na
+biblioteca (2 ignorados), entre eles 286 do `tunneld` (servidor, handshake,
+backends IPsec e Fortinet, política, recuperação e limpeza) e os de
+`tunnel_policy`. O caso do handshake com namespace de PID privado roda à parte
+com `VPNT_REQUIRE_USERNS=1`.
+
+```sh
+VPNT_TEST_NETNS=1 cargo test --locked --test tunneld_xfrm_netns -- --nocapture
+```
+
+Exercita o escritor XFRM real num namespace de rede e usuário privado: cria a
+interface XFRM, o endereço virtual e as rotas, e confere que a retirada remove
+tudo. Exige `unshare` sem privilégio e o módulo `xfrm_interface` carregado. Sem
+`VPNT_TEST_NETNS=1`, o caso sai sem tocar o kernel. A CI o roda com o opt-in
+desde este PR.
+
+### Evidência simulada
+
+Charon e VICI falsos, openfortivpn e pppd falsos e efeitos de rede simulados
+cobrem conexão, sonda ligada à geração, prazo de confirmação,
+`CleanupUnconfirmed`, recuperação depois de queda do escritor (fase
+`PreparingNetwork`) e limpeza.
+
+### Evidência de fixture (cliente real em loopback)
+
+- Pin TLS obrigatório; senha pelo fd 3 de uso único, pedida só depois do pin;
+  prazo comum de estabelecimento (`timerfd` no fd 4) que cobre o login
+  inteiro, inclusive o reenvio depois de reconexão TLS.
+- Barreira IPCP: formatos `CI_ADDR` e `CI_ADDRS`, quadros truncados e
+  malformados, CCP e compressão recusados, e um oráculo comportamental no
+  binário real.
+
+### Validação real manual
+
+VALIDACAO_REAL
+
+### Limites conhecidos
+
+- Só split tunnel IPv4. IPv6, rota padrão pelo túnel, OTP/2FA/SAML e
+  coexistência gerenciada com o OVPN ficam fora.
+- Follow-ups no Cinzel: VPT-34 a VPT-41.
 
 ## Checkpoint atual — 14/11/2026
 
