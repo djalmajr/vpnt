@@ -270,10 +270,10 @@ seção seguinte. Um teste de fixture não substitui essa validação com VPN re
 O `vpnt-tunneld.service`, ativado por `vpnt-tunneld.socket`
 (`/run/vpnt/tunneld.sock`, `0660 root:vpnt`), inicia por geração uma instância
 `vpnt-tunneld-ipsec@` (charon privado) ou `vpnt-tunneld-fortinet@`
-(openfortivpn 1.24.1 com os patches do vpnt). A rede, com a interface XFRM ou
-`pppN`, as rotas e o DNS por link, fica no próprio `vpnt-tunneld`. A política
-root `/etc/vpnt/tunnel-policy.json` autoriza cada perfil uma vez. O pacote não
-instala sudoers.
+(openfortivpn 1.24.1 com os patches do vpnt). A rede fica no próprio
+`vpnt-tunneld`: a interface `vpntiN` (XFRM) ou `vpntpN` (PPP), as rotas e, no
+Fortinet, o DNS por link. A política root `/etc/vpnt/tunnel-policy.json` guarda
+as aprovações. O pacote não instala sudoers.
 
 ### Gates
 
@@ -290,12 +290,19 @@ Os mesmos da seção Linux anterior. A CI roda também:
 ### Autorizar um perfil
 
 ```sh
-vpnt tunnel-policy <profile-id> [--dns-server <ipv4>]... [--fortinet-local-cidr <ipv4-cidr>] \
+vpnt tunnel-policy <profile-id> [--dns-server <ipv4>]... \
+  [--fortinet-local-cidr <ipv4-cidr>] \
   | sudo /usr/lib/vpnt/vpnt-tunneld policy apply
 ```
 
-- O snapshot não tem segredo. O `policy apply` mostra o documento no terminal
-  e grava sob lock.
+- O snapshot é gerado a partir do perfil e não tem segredo. O `policy apply`
+  mostra o documento no terminal e grava sob lock.
+- A chave da aprovação é o usuário, o backend, o gateway e a porta. Reaplicar
+  com a mesma chave, inclusive a partir de outro perfil, substitui a
+  aprovação anterior.
+- `--dns-server` vale só para o Fortinet; uma entrada IPsec exige listas de DNS
+  vazias. No Fortinet, o DNS por link é publicado quando a política tem
+  domínios e um servidor alcançável pelas rotas aceitas.
 - Um gateway IPsec com IPv4 literal ganha a identidade IKE `ipv4:`, aceita só
   quando corresponde a um endereço de transporte da mesma entrada.
 - Uma entrada Fortinet precisa de `fortinet_local_cidr`. Entradas antigas sem o
@@ -307,10 +314,10 @@ vpnt tunnel-policy <profile-id> [--dns-server <ipv4>]... [--fortinet-local-cidr 
 
 Na CI Linux da `main` em `a9d05ea` (Ubuntu 24.04, Rust 1.99.0),
 `cargo test --locked --all-targets --all-features` passou com 883 testes na
-biblioteca (2 ignorados), entre eles 286 do `tunneld` (servidor, handshake,
-backends IPsec e Fortinet, política, recuperação e limpeza) e os de
-`tunnel_policy`. O caso do handshake com namespace de PID privado roda à parte
-com `VPNT_REQUIRE_USERNS=1`.
+biblioteca (2 ignorados). Entre eles, 270 casos distintos do `tunneld` (269
+aprovados e 1 ignorado: servidor, handshake, backends IPsec e Fortinet,
+política, recuperação e limpeza) e 6 de `tunnel_policy`. O caso do handshake
+com namespace de PID privado roda à parte com `VPNT_REQUIRE_USERNS=1`.
 
 ```sh
 VPNT_TEST_NETNS=1 cargo test --locked --test tunneld_xfrm_netns -- --nocapture

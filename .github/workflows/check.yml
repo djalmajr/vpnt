@@ -45,7 +45,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           VPNT_TEST_NETNS=1 cargo +1.99.0 test --locked --test netd_netns
           # The tunnel daemon's XFRM writer creates and removes a real xfrm
-          # interface, routes and a rule inside a private network namespace.
+          # interface, its address and routes inside a private network namespace.
           sudo modprobe xfrm_interface
           VPNT_TEST_NETNS=1 cargo +1.99.0 test --locked --test tunneld_xfrm_netns -- --nocapture
           # The handshake case with a private PID namespace skips while the
