@@ -1709,7 +1709,7 @@ cargo build --locked --bins
 python3 scripts/macos/build-askpass.py
 python3 scripts/macos/prepare-installation.py
 python3 scripts/macos/package-app.py --replace --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
-target/vpnt.app/Contents/MacOS/vpnt --inspect-component
+"target/VPN Tray.app/Contents/MacOS/vpnt" --inspect-component
 ```
 
 [executed, filesystem/byte binding] Sete testes do leitor Rust vinculam versão,

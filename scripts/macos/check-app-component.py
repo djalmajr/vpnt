@@ -69,6 +69,7 @@ def main():
     scripts = ['identifiers.py', 'check-installation.py', 'check-app-component.py', 'prepare-installation.py', 'package-installation.py', 'installation_package.py', 'package-app.py', 'app_component.py']
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts]
     inputs += [ROOT / 'scripts/macos' / name for name in scripts]
+    inputs.append(ROOT / 'assets/macos/AppIcon.icns')
     inputs += build_inputs.source_files(ROOT)
     unique, seen = [], set()
     for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
