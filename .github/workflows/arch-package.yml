@@ -1,0 +1,59 @@
+name: Arch package
+
+# Builds the Linux package with packaging/arch/build.sh in an Arch container and
+# keeps it as an artifact, so the package is built in CI rather than on a
+# developer machine. Runs on demand and when the packaging changes.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packaging/**
+      - scripts/linux/**
+      - scripts/macos/patches/**
+      - .github/workflows/arch-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  arch-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git unzip namcap rust \
+            webkit2gtk-4.1 gtk3 libayatana-appindicator autoconf automake pkgconf openssl \
+            openvpn libsecret iproute2 systemd xdg-utils strongswan ppp
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Build the package as an unprivileged user
+        # makepkg refuses to run as root; the builder owns only the checkout.
+        run: |
+          useradd --create-home builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
+          bun_dir=$(dirname "$(command -v bun)")
+          su builder -c "export PATH='$bun_dir':\$PATH; cd '$GITHUB_WORKSPACE' && bash packaging/arch/build.sh"
+      - name: Inspect the package
+        run: |
+          pkg=$(ls packaging/arch/vpnt-*.pkg.tar.zst)
+          sha256sum "$pkg"
+          if pacman -Qlp "$pkg" | grep -i sudoers; then
+            echo "the package must not install sudoers" >&2
+            exit 1
+          fi
+          pacman -Qlp "$pkg" | grep -E 'usr/lib/vpnt/(vpnt-tunneld|vpnt-pinentry|openfortivpn)$'
+          namcap "$pkg" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vpnt-arch-package
+          path: packaging/arch/vpnt-*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
