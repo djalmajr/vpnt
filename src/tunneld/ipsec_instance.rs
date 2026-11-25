@@ -551,9 +551,11 @@ impl PrivateVici<'_> {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "charon exited"));
         }
         let metadata = fs::symlink_metadata(self.path)?;
+        // strongSwan 6.1.0 binds with umask 0117, yielding 0660 inside the
+        // private 0700 runtime directory. A socket restricted to 0600 also works.
         if !metadata.file_type().is_socket()
             || (metadata.uid(), metadata.gid()) != self.owner
-            || metadata.mode() & 0o7777 != 0o600
+            || !matches!(metadata.mode() & 0o7777, 0o600 | 0o660)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

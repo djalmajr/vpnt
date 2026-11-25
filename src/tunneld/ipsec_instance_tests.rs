@@ -5,7 +5,7 @@ use crate::{
 };
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zeroize::Zeroizing;
@@ -38,7 +38,11 @@ else:
 
 path = re.search(r'socket = "unix://([^"]+)"', text)[1]
 vici = socket.socket(socket.AF_UNIX)
-vici.bind(path)
+old_umask = os.umask(0o117)
+try:
+    vici.bind(path)
+finally:
+    os.umask(old_umask)
 vici.listen()
 def term(*_):
     (root / 'term').touch()
@@ -451,6 +455,78 @@ fn supervisor_process() {
 }
 
 #[test]
+fn vici_socket_admission_checks_mode_type_and_owner() {
+    struct SocketDirectory(PathBuf);
+
+    impl Drop for SocketDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    let pid = std::process::id();
+    let directory = std::env::temp_dir().join(format!("vpnt-vici-mode-{pid}"));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let directory = SocketDirectory(directory);
+    let path = directory.0.join(VICI_SOCKET_NAME);
+    let listener = UnixListener::bind(&path).unwrap();
+    let child = pidfd_open(pid).unwrap();
+    // SAFETY: these calls take no arguments or pointers.
+    let owner = unsafe { (libc::geteuid(), libc::getegid()) };
+    let mut vici = PrivateVici {
+        path: &path,
+        child: &child,
+        pid,
+        owner,
+        loaded: false,
+        cancel: Arc::default(),
+    };
+    let deadline = || Instant::now() + Duration::from_secs(1);
+    let assert_rejected = |vici: &PrivateVici<'_>, case| {
+        let error = vici.open(deadline()).err().expect(case);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{case}");
+        assert_eq!(error.to_string(), "unsafe IPsec VICI socket", "{case}");
+    };
+
+    for mode in [0o600, 0o660] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        if let Err(error) = vici.open(deadline()) {
+            panic!("VICI socket mode {mode:#o} rejected: {error}");
+        }
+        listener.accept().unwrap();
+    }
+
+    for (mode, case) in [
+        (0o606, "other read/write"),
+        (0o604, "other read"),
+        (0o700, "owner execute"),
+        (0o770, "owner and group execute"),
+        (0o4600, "setuid"),
+        (0o2600, "setgid"),
+        (0o1600, "sticky"),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, mode);
+        assert_rejected(&vici, case);
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    vici.owner = (owner.0 ^ 1, owner.1);
+    assert_rejected(&vici, "wrong uid");
+    vici.owner = (owner.0, owner.1 ^ 1);
+    assert_rejected(&vici, "wrong gid");
+
+    vici.owner = owner;
+    drop(listener);
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, []).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    assert_rejected(&vici, "regular file");
+}
+
+#[test]
 fn exec_is_private_and_stop_cleans_up() {
     let mut fixture = Fixture::launch(false);
     let ready = fixture.start();
@@ -475,7 +551,7 @@ fn exec_is_private_and_stop_cleans_up() {
     assert_eq!(ready["pid"], ready["pgid"]);
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     assert_eq!(fs::metadata(&conf).unwrap().mode() & 0o777, 0o600);
-    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o660);
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     let mut contents: Vec<_> = fs::read_dir(&dir)
         .unwrap()
