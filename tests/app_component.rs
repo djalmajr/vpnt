@@ -34,6 +34,12 @@ impl App {
             .unwrap();
         }
         fs::copy(source.join("LICENSE"), repository.root.join("LICENSE")).unwrap();
+        fs::create_dir_all(repository.root.join("assets/macos")).unwrap();
+        fs::copy(
+            source.join("assets/macos/AppIcon.icns"),
+            repository.root.join("assets/macos/AppIcon.icns"),
+        )
+        .unwrap();
         fs::copy(
             env!("CARGO_BIN_EXE_vpnt"),
             repository.root.join("target/debug/vpnt"),

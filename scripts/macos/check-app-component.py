@@ -83,6 +83,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix='vpnt-copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock', 'LICENSE']: shutil.copy2(ROOT / name, copy / name)
+            (copy / 'assets/macos').mkdir(parents=True)
+            shutil.copy2(ROOT / 'assets/macos/AppIcon.icns', copy / 'assets/macos/AppIcon.icns')
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name, ignore=shutil.ignore_patterns('__pycache__'))
             for name in scripts: shutil.copy2(ROOT / 'scripts/macos' / name, copy / 'scripts/macos' / name)
             build_inputs.copy_into(ROOT, copy)
