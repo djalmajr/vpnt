@@ -12,8 +12,8 @@
 use super::{
     fortinet_instance::{Event, Failure},
     network::{
-        SetupCancellation, check_deadline, check_ipv4_rules, cidr_text, overlaps, prefix,
-        rollback_error, route_key, valid_generation, verify_tunnel_routes,
+        PolicyInventory, SetupCancellation, check_deadline, check_ipv4_rules, cidr_text, overlaps,
+        prefix, rollback_error, route_key, valid_generation, verify_tunnel_routes,
     },
     policy::Entry,
     protocol::{CidrV4, Generation, ProbeBinding},
@@ -732,7 +732,7 @@ impl FortinetNetwork {
         Ok(applied)
     }
 
-    fn fib_clear(&self, receipt: &Receipt, grant: &Grant) -> io::Result<()> {
+    fn fib_clear(&self, receipt: &Receipt, grant: &Grant) -> io::Result<PolicyInventory> {
         let local_scope = grant.fortinet_local_cidr;
         let mut policy_scope = grant
             .route_cidrs
@@ -745,7 +745,7 @@ impl FortinetNetwork {
                 .map(|ip| (ip.into(), 32))
                 .chain([PPP_PEER_PREFIX, route_key(&local_scope)]),
         );
-        check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
+        let inventory = check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
         let routes = self.routes()?;
         // Planning has no PPP link. Once identified, the technical peer
         // and all intended routes must be present in this same snapshot.
@@ -828,7 +828,7 @@ impl FortinetNetwork {
         if !has_egress_device || default_count > 1 && !has_egress_default {
             return Err(invalid("default routes do not match the proved egress"));
         }
-        Ok(())
+        Ok(inventory)
     }
 
     fn dns_state(&self, name: &str) -> io::Result<Dns> {
@@ -924,7 +924,7 @@ impl FortinetNetwork {
         }
         receipt.routes = accepted.clone();
         receipt.refused_routes = refused;
-        self.fib_clear(receipt, scope.grant)?;
+        let inventory = self.fib_clear(receipt, scope.grant)?;
 
         // Fixed servers take precedence. Either source must be reachable via
         // an accepted route. Domains always come from policy.
@@ -1015,7 +1015,12 @@ impl FortinetNetwork {
         {
             return Err(invalid("DNS confirmation failed"));
         }
-        self.fib_clear(receipt, scope.grant)?;
+        let confirmation = self
+            .fib_clear(receipt, scope.grant)
+            .and_then(|current_inventory| inventory.require_unchanged(&current_inventory));
+        if let Err(error) = confirmation {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
+        }
         receipt.confirmed = true;
         receipt.save(directory, guard)
     }
@@ -2228,6 +2233,45 @@ mod tests {
     }
 
     #[test]
+    fn ppp_rechecks_additional_tables_before_confirmation() {
+        for (destination, message) in [
+            (
+                "10.20.1.0/24",
+                "IPv4 policy rule priority 5270 table 52: route overlaps protected destinations",
+            ),
+            (
+                "203.0.113.0/24",
+                "IPv4 policy routing inventory changed during configuration",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                kernel.rules = coexistence_tests::tailscale_rules();
+                kernel.foreign.push(external_route("100.64.0.0/10", "52"));
+                kernel.foreign_after_dns = Some(external_route(destination, "52"));
+            }
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &["10.20.0.53"], &["corp.example"]),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert!(!receipt.confirmed);
+            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+            assert!(!saved.confirmed);
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty());
+            assert!(kernel.dns.is_empty() && kernel.domains.is_empty() && kernel.dns_default_route);
+            assert!(kernel.foreign.contains(&external_route(destination, "52")));
+        }
+    }
+
+    #[test]
     fn defaults_must_be_unicast_main_and_include_the_proved_egress() {
         let defaults = coexistence_tests::defaults;
         let mut variants = vec![vec![], defaults("eth-other")];
@@ -2477,11 +2521,10 @@ mod tests {
             );
             {
                 let k = fixture.kernel.lock().unwrap();
-                assert_eq!(k.routes, ["10.20.0.0/16"]);
                 if dns_written {
-                    assert_eq!(k.dns, ["10.20.1.53"]);
-                    assert_eq!(k.domains, ["~corp.example"]);
+                    assert!(k.routes.is_empty() && k.dns.is_empty() && k.domains.is_empty());
                 } else {
+                    assert_eq!(k.routes, ["10.20.0.0/16"]);
                     assert!(k.dns.is_empty() && k.domains.is_empty());
                     assert!(k.ops.iter().all(|op| !op.starts_with(RESOLVECTL)));
                 }

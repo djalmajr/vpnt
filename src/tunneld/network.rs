@@ -4,7 +4,7 @@ use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, btree_map::Entry},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::Ipv4Addr,
@@ -336,19 +336,31 @@ fn rule_word(value: &Value) -> Option<u32> {
         .or_else(|| number(value.as_str()?).ok())
 }
 
+#[derive(PartialEq)]
+pub(super) struct PolicyInventory {
+    rules: Vec<Value>,
+    additional_tables: BTreeMap<String, Vec<Value>>,
+}
+
+impl PolicyInventory {
+    pub(super) fn require_unchanged(&self, current: &Self) -> io::Result<()> {
+        if self != current {
+            return Err(invalid(
+                "IPv4 policy routing inventory changed during configuration",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn check_ipv4_rules(
     read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
     protected: &[(u32, u8)],
-) -> io::Result<()> {
-    #[derive(Deserialize)]
-    struct Destination {
-        dst: String,
-    }
-
+) -> io::Result<PolicyInventory> {
     let rules: Vec<Value> = decode(&read_ip(&["-4", "-j", "rule", "show"])?)?;
     let standard = [(0, "local"), (32766, "main"), (32767, "default")];
     let mut seen = [false; 3];
-    let mut checked_tables = BTreeSet::new();
+    let mut additional_tables = BTreeMap::new();
     for rule in &rules {
         let priority = rule.get("priority").and_then(Value::as_u64);
         let table = rule.get("table").and_then(Value::as_str).filter(|name| {
@@ -424,15 +436,18 @@ pub(super) fn check_ipv4_rules(
         if !fields.keys().all(|key| plain(key)) {
             return Err(reject("unsupported rule fields"));
         }
-        if checked_tables.insert(table) {
-            let routes: Vec<Destination> = read_ip(&["-4", "-j", "route", "show", "table", table])
+        if let Entry::Vacant(entry) = additional_tables.entry(table.to_owned()) {
+            let routes: Vec<Value> = read_ip(&["-4", "-j", "route", "show", "table", table])
                 .and_then(|bytes| decode(&bytes))
                 .map_err(|_| reject("could not read the routing table"))?;
-            for route in routes {
-                if route.dst == "default" {
+            for route in &routes {
+                let dst = route["dst"]
+                    .as_str()
+                    .ok_or_else(|| reject("could not read the routing table"))?;
+                if dst == "default" {
                     return Err(reject("default route in an additional table"));
                 }
-                let dst = prefix(&route.dst).map_err(|_| reject("invalid route destination"))?;
+                let dst = prefix(dst).map_err(|_| reject("invalid route destination"))?;
                 if dst.1 == 0 {
                     return Err(reject("default route in an additional table"));
                 }
@@ -440,6 +455,7 @@ pub(super) fn check_ipv4_rules(
                     return Err(reject("route overlaps protected destinations"));
                 }
             }
+            entry.insert(routes);
         }
     }
     if let Some(index) = seen.iter().position(|present| !present) {
@@ -449,7 +465,10 @@ pub(super) fn check_ipv4_rules(
             format!("missing IPv4 policy rule priority {priority} table {table}"),
         ));
     }
-    Ok(())
+    Ok(PolicyInventory {
+        rules,
+        additional_tables,
+    })
 }
 
 pub(super) fn verify_tunnel_routes(
@@ -643,30 +662,39 @@ impl Network {
         Ok(ids)
     }
 
-    fn fib_clear(
+    fn policy_inventory(
         &self,
-        routes: &[CidrV4],
+        requested: &[(u32, u8)],
         vip: Option<Ipv4Addr>,
         approved: &[Ipv4Addr],
         remote: Ipv4Addr,
         egress: &Egress,
-    ) -> io::Result<()> {
+    ) -> io::Result<PolicyInventory> {
         let protected = approved
             .iter()
             .copied()
             .chain([remote, egress.prefsrc])
             .chain(egress.gateway);
-        let requested: Vec<_> = routes.iter().map(route_key).collect();
         if protected
             .clone()
             .any(|ip| requested.iter().any(|r| overlaps(*r, (ip.into(), 32))) || vip == Some(ip))
         {
             return Err(invalid("VPN scope conflicts with protected transport"));
         }
-        let mut policy_scope = requested.clone();
+        let mut policy_scope = requested.to_vec();
         policy_scope.extend(protected.chain(vip).map(|ip| (ip.into(), 32)));
-        check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
+        check_ipv4_rules(|args| self.ip(args), &policy_scope)
+    }
 
+    fn fib_clear(
+        &self,
+        requested: &[(u32, u8)],
+        vip: Option<Ipv4Addr>,
+        approved: &[Ipv4Addr],
+        remote: Ipv4Addr,
+        egress: &Egress,
+    ) -> io::Result<PolicyInventory> {
+        let inventory = self.policy_inventory(requested, vip, approved, remote, egress)?;
         let mut default_count = 0;
         let mut has_egress_device = false;
         let mut has_egress_default = false;
@@ -719,7 +747,7 @@ impl Network {
         if default_count > 0 && (!has_egress_device || default_count > 1 && !has_egress_default) {
             return Err(invalid("default routes do not match the proved egress"));
         }
-        Ok(())
+        Ok(inventory)
     }
 
     pub(super) fn plan(
@@ -732,7 +760,8 @@ impl Network {
     ) -> io::Result<Receipt> {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
-        self.fib_clear(&routes, None, approved, remote, &egress)?;
+        let requested: Vec<_> = routes.iter().map(route_key).collect();
+        self.fib_clear(&requested, None, approved, remote, &egress)?;
         let links = self.links(None)?;
         let ids = self.xfrm_ids()?;
         let link_ids: Vec<_> = links.iter().map(Link::xfrm_id).collect::<io::Result<_>>()?;
@@ -799,8 +828,9 @@ impl Network {
         if self.egress(receipt.remote)? != receipt.egress {
             return Err(invalid("egress changed between start and establishment"));
         }
-        self.fib_clear(
-            &receipt.routes,
+        let requested: Vec<_> = receipt.routes.iter().map(route_key).collect();
+        let inventory = self.fib_clear(
+            &requested,
             Some(vip),
             approved,
             receipt.remote,
@@ -880,7 +910,16 @@ impl Network {
             if self.egress(receipt.remote)? != receipt.egress {
                 return Err(invalid("network configuration confirmation failed"));
             }
-            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &name)
+            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &name)?;
+            // Recheck the entire protected scope after the sampled lookups.
+            let current_inventory = self.policy_inventory(
+                &requested,
+                Some(vip),
+                approved,
+                receipt.remote,
+                &receipt.egress,
+            )?;
+            inventory.require_unchanged(&current_inventory)
         })();
         if let Err(error) = paths {
             return Err(rollback_error(error, self.clean_link(receipt)));
@@ -1463,14 +1502,18 @@ pub(super) mod coexistence_tests {
         plan(standard_rules(), vec![], defaults("eth-fixture")).unwrap();
     }
 
-    #[test]
-    fn a_policy_lookup_outside_xfrm_after_installation_rolls_back() {
+    fn check_xfrm_confirmation(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        expected_error: Option<&str>,
+    ) {
         #[derive(Default)]
         struct Kernel {
             alias: Option<String>,
             link: bool,
             address: bool,
             route: bool,
+            late_destination: Option<String>,
             ops: Vec<String>,
         }
 
@@ -1483,15 +1526,24 @@ pub(super) mod coexistence_tests {
         let guard = root.guard();
         let kernel = Arc::new(Mutex::new(Kernel::default()));
         let state = kernel.clone();
+        let tunnel_device = tunnel_device.to_owned();
+        let destination_on_add = late_destination.map(str::to_owned);
         let network = Network::fake(move |_, args| {
             let mut state = state.lock().unwrap();
             state.ops.push(args.join(" "));
+            let extra_routes = || {
+                [Some("100.64.0.0/10"), state.late_destination.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|dst| json!({"dst":dst,"table":"52","dev":"tailscale0"}))
+                    .collect::<Vec<_>>()
+            };
             let data = match args {
                 ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
                     {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
                 ]),
                 ["-4", "-j", "route", "get", "10.20.0.0"] if state.route => {
-                    json!([{"dev":"eth-other"}])
+                    json!([{"dev":tunnel_device}])
                 }
                 ["-j", "-d", "link", "show"] => {
                     let mut links =
@@ -1504,10 +1556,12 @@ pub(super) mod coexistence_tests {
                     }
                     json!(links)
                 }
-                ["-4", "-j", "rule", "show"] => json!(standard_rules()),
+                ["-4", "-j", "rule", "show"] => json!(tailscale_rules()),
+                ["-4", "-j", "route", "show", "table", "52"] => json!(extra_routes()),
                 ["-4", "-j", "-d", "route", "show", "table", "all"] => {
                     let mut rows = defaults("eth-fixture");
                     rows.truncate(1);
+                    rows.extend(extra_routes());
                     if state.route {
                         rows.push(json!({
                             "dst":"10.20.0.0/16","dev":"vpnti1","type":"unicast","table":"main",
@@ -1580,6 +1634,7 @@ pub(super) mod coexistence_tests {
                     "link",
                 ] => {
                     state.route = true;
+                    state.late_destination.clone_from(&destination_on_add);
                     return Ok(vec![]);
                 }
                 [
@@ -1616,24 +1671,61 @@ pub(super) mod coexistence_tests {
                 vec![parse_cidr("10.20.0.0/16").unwrap()],
             )
             .unwrap();
-        let error = network
-            .install(
-                &guard,
-                &directory,
-                &mut receipt,
-                "10.99.0.2".parse().unwrap(),
-                APPROVED,
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "tunnel route lookup selected a different interface"
+        let result = network.install(
+            &guard,
+            &directory,
+            &mut receipt,
+            "10.99.0.2".parse().unwrap(),
+            APPROVED,
         );
-        assert!(!receipt.confirmed);
+        if let Some(message) = expected_error {
+            assert_eq!(result.unwrap_err().to_string(), message);
+        } else {
+            result.unwrap();
+        }
+        let confirmed = expected_error.is_none();
+        assert_eq!(receipt.confirmed, confirmed);
+        let persisted = Receipt::load(&directory, &guard).unwrap();
+        assert_eq!(persisted.confirmed, confirmed);
         let state = kernel.lock().unwrap();
-        assert!(!state.link && !state.route && !state.address);
+        assert_eq!(state.late_destination.as_deref(), late_destination);
+        assert_eq!(
+            (state.link, state.route, state.address),
+            (confirmed, confirmed, confirmed)
+        );
         assert!(state.ops.iter().any(|op| op.starts_with("-4 route add ")));
-        assert!(state.ops.iter().any(|op| op.starts_with("-4 route del ")));
+        assert_eq!(
+            state.ops.iter().any(|op| op.starts_with("-4 route del ")),
+            !confirmed
+        );
+    }
+
+    #[test]
+    fn a_policy_lookup_outside_xfrm_after_installation_rolls_back() {
+        check_xfrm_confirmation(
+            "eth-other",
+            None,
+            Some("tunnel route lookup selected a different interface"),
+        );
+    }
+
+    #[test]
+    fn xfrm_rechecks_additional_tables_before_confirmation() {
+        for (destination, error) in [
+            (None, None),
+            (
+                Some("10.20.1.0/24"),
+                Some(
+                    "IPv4 policy rule priority 5270 table 52: route overlaps protected destinations",
+                ),
+            ),
+            (
+                Some("203.0.113.0/24"),
+                Some("IPv4 policy routing inventory changed during configuration"),
+            ),
+        ] {
+            check_xfrm_confirmation("vpnti1", destination, error);
+        }
     }
 
     #[test]
