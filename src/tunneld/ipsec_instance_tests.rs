@@ -128,6 +128,26 @@ def reply(conn, kind, message=None, event=None):
         frame += encode(message)
     conn.sendall(struct.pack('!I', len(frame)) + frame)
 
+def flood_stderr(started):
+    while True:
+        os.write(2, b'continuous output\n' * 200)
+        started.set()
+
+def write_stderr_tail():
+    for i in range(3000):
+        os.write(2, ('stderr-%04d\n' % i).encode())
+    for line in [
+        b'peer says\x1bretry\x00\n',
+        b'Psk = suppressed-value\n',
+        b'PASSWORD = suppressed-field\n',
+        b'echo synthetic-orchid\n',
+        b'z' * 507 + b'synthetic-thistle\n',
+        b'giant-' + b'x' * 25000 + b'\n',
+        b'long-' + b'x' * 800 + b'\n',
+        b'end of stderr\n',
+    ]:
+        os.write(2, line)
+
 def serve(conn):
     with conn:
         try:
@@ -153,6 +173,8 @@ def serve(conn):
                 plugins = ['kernel-netlink', 'socket-default', 'vici']
                 if (root / 'foreign-backend').exists():
                     plugins.append('kernel-libipsec')
+                if (root / 'log-stderr-setup').exists():
+                    os.write(2, b'stats from charon\n')
                 reply(conn, 1, {'plugins': plugins})
             elif command == 'list-sas':
                 if (root / 'slow-list-sas').exists():
@@ -174,6 +196,12 @@ def serve(conn):
                 }}, 'list-sa')
                 reply(conn, 1)
             elif command == 'initiate' and (root / 'log-initiate').exists():
+                if (root / 'log-stderr').exists():
+                    write_stderr_tail()
+                if (root / 'flood-stderr').exists():
+                    started = threading.Event()
+                    threading.Thread(target=flood_stderr, args=(started,), daemon=True).start()
+                    started.wait()
                 if event == 'control-log':
                     for i in range(300):
                         reply(conn, 7, {'level': '1', 'msg': 'progress-%03d' % i}, event)
@@ -568,10 +596,11 @@ fn exec_is_private_and_stop_cleans_up() {
     assert_eq!(ready["conf"], conf.to_str().unwrap());
     assert_eq!(ready["cwd"], dir.to_str().unwrap());
     assert_eq!(ready["env_keys"], serde_json::json!(["STRONGSWAN_CONF"]));
-    assert_eq!(
-        ready["fds"],
-        serde_json::json!({"0":"/dev/null","1":"/dev/null","2":"/dev/null"})
-    );
+    let fds = ready["fds"].as_object().unwrap();
+    assert_eq!(fds.len(), 3);
+    assert_eq!(fds["0"], "/dev/null");
+    assert_eq!(fds["1"], "/dev/null");
+    assert!(fds["2"].as_str().unwrap().starts_with("pipe:["));
     assert!(
         matches!(ready["mem"].as_i64(), Some(errno) if errno == i64::from(libc::EACCES) || errno == i64::from(libc::EPERM))
     );
@@ -601,6 +630,27 @@ fn exec_is_private_and_stop_cleans_up() {
         assert!(config.contains(setting), "missing {setting}");
     }
     assert!(config.contains(&format!("socket = \"unix://{}\"", socket.display())));
+    let stderr_logger = config
+        .split_once("\n    filelog {\n        stderr {\n")
+        .unwrap()
+        .1
+        .split_once("\n        }\n")
+        .unwrap()
+        .0;
+    let settings: BTreeSet<_> = stderr_logger.lines().map(str::trim).collect();
+    assert_eq!(settings.len(), 21);
+    assert!(settings.contains("ike_name = yes"));
+    for group in [
+        "default", "dmn", "mgr", "ike", "chd", "job", "wch", "cfg", "knl", "net", "asn", "enc",
+        "tnc", "imc", "imv", "pts", "tls", "app", "esp", "lib",
+    ] {
+        assert!(
+            settings.contains(format!("{group} = 1").as_str()),
+            "{group}"
+        );
+    }
+    assert!(config.contains("daemon { default = -1 }"));
+    assert!(config.contains("auth { default = -1 }"));
     assert!(!config.contains("include"));
     assert!(!config.contains("/etc/"));
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
@@ -766,15 +816,71 @@ fn failed_initiate_reports_only_the_bounded_safe_control_log_tail() {
 #[test]
 fn successful_initiate_discards_control_log_even_after_many_events() {
     let mut fixture = Fixture::launch(false);
-    fs::write(fixture.root.join("log-initiate"), []).unwrap();
+    for marker in ["log-initiate", "log-stderr", "flood-stderr"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
     fixture.start();
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    assert!(matches!(
+        fixture.replies.as_slice(),
+        [Reply::Established { .. }, Reply::Stopped {}]
+    ));
     assert!(
         fs::read(fixture.root.join("supervisor.stderr"))
             .unwrap()
             .is_empty()
     );
     assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn failed_initiate_emits_the_bounded_safe_stderr_tail_after_control_log() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "log-stderr", "fail-initiate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
+    let mut lines = log.lines();
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .ends_with(" | control-log: no proposal chosen")
+    );
+    let charon: Vec<_> = lines
+        .map(|line| line.strip_prefix("charon-log: ").unwrap())
+        .collect();
+    assert!(!log.contains("suppressed-value") && !log.contains("suppressed-field"));
+    assert!(!log.contains("synthetic-orchid") && !log.contains("synthetic-thistle"));
+    assert_eq!(charon.len(), 60);
+    assert_eq!(charon[0], "stderr-2943");
+    assert_eq!(charon[56], "stderr-2999");
+    assert_eq!(charon[57], "peer says?retry?");
+    assert_eq!(charon[58], format!("long-{}", "x".repeat(507)));
+    assert_eq!(charon[59], "end of stderr");
+    assert!(charon.iter().all(|line| {
+        line.len() <= 512
+            && line
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    }));
+}
+
+#[test]
+fn failed_backend_admission_emits_the_setup_stderr_tail() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["foreign-backend", "log-stderr-setup"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
+        "tunnel instance: incompatible IPsec VICI backend\ncharon-log: stats from charon\n"
+    );
+    assert_eq!(names(&fixture.commands()), ["version", "stats"]);
 }
 
 #[test]

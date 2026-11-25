@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, PipeReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     handshake::{AuthenticatedChannel, Datagram},
@@ -40,6 +41,11 @@ const TERM_GRACE: Duration = Duration::from_secs(3);
 const CONTROL_LOG_LEVEL: &[u8] = b"1";
 const DIAGNOSTIC_LINE_BYTES: usize = 256;
 const CONTROL_LOG_LINES: usize = 8;
+const CHARON_LOG_LINES: usize = 60;
+const CHARON_LOG_LINE_BYTES: usize = 512;
+// Inspect the whole line before truncating it. Discard anything too large to
+// inspect in bounded memory, including a secret that may follow the cutoff.
+const CHARON_LOG_INPUT_BYTES: usize = 8 * 1024;
 /// How often negotiation re-checks the control channel; also bounds how long
 /// a cancellation takes to reach a VICI exchange in progress.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
@@ -246,6 +252,31 @@ fn run_in_directory(
             socket = "unix://{socket}"
         }}
     }}
+    filelog {{
+        stderr {{
+            default = 1
+            ike_name = yes
+            dmn = 1
+            mgr = 1
+            ike = 1
+            chd = 1
+            job = 1
+            wch = 1
+            cfg = 1
+            knl = 1
+            net = 1
+            asn = 1
+            enc = 1
+            tnc = 1
+            imc = 1
+            imv = 1
+            pts = 1
+            tls = 1
+            app = 1
+            esp = 1
+            lib = 1
+        }}
+    }}
     syslog {{
         daemon {{ default = -1 }}
         auth {{ default = -1 }}
@@ -255,7 +286,39 @@ fn run_in_directory(
     )?;
     drop(config);
 
-    let mut child = spawn_charon(program, directory, &path)?;
+    let (stderr, writer) = io::pipe()?;
+    // Only the reader is nonblocking. strongSwan writes a line in multiple
+    // calls, so dropping individual writes would lose its line boundaries.
+    // SAFETY: F_SETFL takes a valid fd and integer flags.
+    checked(unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
+    let (stop, stop_writer) = io::pipe()?;
+    let mut tail = VecDeque::with_capacity(CHARON_LOG_LINES);
+    let result = std::thread::scope(|scope| {
+        let finish = stop_writer;
+        let reader = std::thread::Builder::new().spawn_scoped(scope, || {
+            drain_charon_log(stderr, stop, &credentials, &mut tail)
+        })?;
+        let result =
+            spawn_charon(program, directory, &path, writer.into()).and_then(|mut child| {
+                run_child(channel, socket, attempt, &credentials, owner, &mut child)
+            });
+        drop(finish);
+        let capture = reader
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("charon stderr reader panicked")));
+        with_cleanup(result, capture)
+    });
+    result.map_err(|error| append_charon_log(error, tail))
+}
+
+fn run_child(
+    channel: &mut impl InstanceChannel,
+    socket: &str,
+    attempt: Attempt,
+    credentials: &Credentials,
+    owner: (u32, u32),
+    child: &mut Child,
+) -> io::Result<Exit> {
     let pidfd = match pidfd_open(child.id()) {
         Ok(pidfd) => pidfd,
         Err(error) => {
@@ -272,7 +335,7 @@ fn run_in_directory(
         owner,
         loaded: false,
         cancel: Arc::default(),
-        credentials: &credentials,
+        credentials,
     };
     let result =
         establish_watched(channel, &mut vici, &attempt).and_then(|settled| match settled {
@@ -289,8 +352,117 @@ fn run_in_directory(
             }
         });
     let unload = vici.cleanup(&attempt.config);
-    let stop = stop_child(&mut child, &pidfd);
+    let stop = stop_child(child, &pidfd);
     with_cleanup(result, with_cleanup(unload, stop))
+}
+
+fn drain_charon_log(
+    mut stderr: PipeReader,
+    stop: PipeReader,
+    credentials: &Credentials,
+    tail: &mut VecDeque<String>,
+) -> io::Result<()> {
+    let mut chunk = Zeroizing::new([0; 4096]);
+    let mut line = Zeroizing::new([0; CHARON_LOG_INPUT_BYTES]);
+    let mut len = 0;
+    let mut oversized = false;
+    let mut pending = None;
+    let mut events = [
+        libc::pollfd {
+            fd: stderr.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stop.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        if pending.is_none() {
+            // SAFETY: poll updates only the two supplied entries.
+            let ready = unsafe { libc::poll(events.as_mut_ptr(), 2, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if events
+                .iter()
+                .any(|entry| entry.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+            {
+                return Err(io::Error::other("invalid charon stderr poll result"));
+            }
+        }
+        if pending.is_none() && events[1].revents & libc::POLLHUP != 0 {
+            // The direct child has been stopped. Drain bytes already queued
+            // without waiting for descendants that may still hold the writer.
+            let mut queued: libc::c_int = 0;
+            // SAFETY: FIONREAD writes a single c_int to the supplied pointer.
+            checked(unsafe { libc::ioctl(stderr.as_raw_fd(), libc::FIONREAD, &mut queued) })?;
+            pending = Some(queued as usize);
+        }
+        let count = pending.unwrap_or(chunk.len()).min(chunk.len());
+        if count == 0 {
+            break;
+        }
+        let read = match stderr.read(&mut chunk[..count]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && pending.is_none() => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(remaining) = &mut pending {
+            *remaining -= read;
+        }
+        for part in chunk[..read].split_inclusive(|&byte| byte == b'\n') {
+            let complete = part.strip_suffix(b"\n");
+            let bytes = complete.unwrap_or(part);
+            if !oversized && bytes.len() <= line.len() - len {
+                line[len..len + bytes.len()].copy_from_slice(bytes);
+                len += bytes.len();
+            } else {
+                line[..len].zeroize();
+                len = 0;
+                oversized = true;
+            }
+            if complete.is_some() {
+                if !oversized
+                    && let Ok(text) = std::str::from_utf8(&line[..len])
+                    && let Some(safe) = safe_diagnostic(text, credentials, CHARON_LOG_LINE_BYTES)
+                {
+                    if tail.len() == CHARON_LOG_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(safe);
+                }
+                line[..len].zeroize();
+                oversized = false;
+                len = 0;
+            }
+        }
+        chunk[..read].zeroize();
+    }
+    // An unterminated line may contain only the prefix of a secret.
+    Ok(())
+}
+
+fn append_charon_log(error: io::Error, tail: VecDeque<String>) -> io::Error {
+    if tail.is_empty() {
+        return error;
+    }
+    let mut message = error.to_string();
+    for line in tail {
+        message.push_str("\ncharon-log: ");
+        message.push_str(&line);
+    }
+    io::Error::new(error.kind(), message)
 }
 
 enum Settled {
@@ -734,47 +906,11 @@ impl PrivateVici<'_> {
     }
 
     fn diagnostic(&self, message: &Message, field: &str) -> Option<String> {
-        let text = message.get_text(field)?;
-        let credentials = [
-            self.credentials.password.expose(),
-            self.credentials.psk.expose(),
-        ];
-        let contains_credential = |text: &str| {
-            credentials
-                .iter()
-                .any(|secret| !secret.is_empty() && text.contains(secret))
-        };
-        // Check all of the input before truncating so we never log a prefix
-        // of a credential that crosses the byte limit.
-        if contains_credential(text)
-            || text
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|word| {
-                    [
-                        "password", "psk", "ppk", "data", "private", "secret", "keymat",
-                        "skeyseed", "msk", "emsk",
-                    ]
-                    .iter()
-                    .any(|label| word.eq_ignore_ascii_case(label))
-                        || word
-                            .get(..3)
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SK_"))
-                })
-        {
-            return None;
-        }
-        let line: String = text
-            .chars()
-            .take(DIAGNOSTIC_LINE_BYTES)
-            .map(|c| {
-                if c.is_ascii_graphic() || c == ' ' {
-                    c
-                } else {
-                    '?'
-                }
-            })
-            .collect();
-        (!line.trim().is_empty() && !contains_credential(&line)).then_some(line)
+        safe_diagnostic(
+            message.get_text(field)?,
+            self.credentials,
+            DIAGNOSTIC_LINE_BYTES,
+        )
     }
 
     fn exchange(
@@ -788,6 +924,46 @@ impl PrivateVici<'_> {
             .command(name, request, events)
             .map_err(vici_error)
     }
+}
+
+fn safe_diagnostic(text: &str, credentials: &Credentials, max_bytes: usize) -> Option<String> {
+    let credentials = [credentials.password.expose(), credentials.psk.expose()];
+    let contains_credential = |text: &str| {
+        credentials
+            .iter()
+            .any(|secret| !secret.is_empty() && text.contains(secret))
+    };
+    // Check all of the input before truncating so we never log a prefix
+    // of a credential that crosses the byte limit.
+    if contains_credential(text)
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| {
+                [
+                    "password", "psk", "ppk", "data", "private", "secret", "keymat", "skeyseed",
+                    "msk", "emsk",
+                ]
+                .iter()
+                .any(|label| word.eq_ignore_ascii_case(label))
+                    || word
+                        .get(..3)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SK_"))
+            })
+    {
+        return None;
+    }
+    let line: String = text
+        .chars()
+        .take(max_bytes)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    (!line.trim().is_empty() && !contains_credential(&line)).then_some(line)
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -843,7 +1019,12 @@ fn check_parent(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_charon(program: &Path, directory: &Path, config: &Path) -> io::Result<Child> {
+fn spawn_charon(
+    program: &Path,
+    directory: &Path,
+    config: &Path,
+    stderr: Stdio,
+) -> io::Result<Child> {
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -851,7 +1032,7 @@ fn spawn_charon(program: &Path, directory: &Path, config: &Path) -> io::Result<C
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     // SAFETY: getpid has no arguments.
     let parent = unsafe { libc::getpid() };
