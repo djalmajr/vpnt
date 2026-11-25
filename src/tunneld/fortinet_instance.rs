@@ -35,10 +35,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
-use zeroize::{Zeroize, Zeroizing};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-use super::protocol::{Credentials, Endpoint, FortinetRequest};
+use super::{
+    handshake::Datagram,
+    protocol::{Credentials, Endpoint, FortinetRequest},
+};
 use crate::{helper::pinentry_channel::PinentryChild, secrets::Secret};
 
 /// Packaged client, with the macOS patches and the mandatory pin patch.
@@ -46,9 +49,23 @@ pub const OPENFORTIVPN: &str = "/usr/lib/vpnt/openfortivpn";
 /// Packaged Assuan adapter that asks the supervisor for the password.
 pub const PINENTRY: &str = "/usr/lib/vpnt/vpnt-pinentry";
 
-const MESSAGE_CREDENTIAL: u8 = 1;
-const MESSAGE_STOP: u8 = 2;
+pub(super) const MESSAGE_CREDENTIAL: u8 = 1;
+pub(super) const MESSAGE_STOP: u8 = 2;
 const PASSWORD_LIMIT: usize = 256;
+
+/// The credential datagram the writer sends after `Start`: kind 1, the length
+/// as a big-endian `u16`, the password. The caller keeps the buffer owned
+/// through send so it is wiped on every path.
+pub(super) fn credential_frame(password: &str) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    if !(1..=PASSWORD_LIMIT).contains(&password.len()) {
+        return Err(invalid("invalid password length"));
+    }
+    let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(3 + password.len()));
+    frame.push(MESSAGE_CREDENTIAL);
+    frame.extend_from_slice(&(password.len() as u16).to_be_bytes());
+    frame.extend_from_slice(password.as_bytes());
+    Ok(frame)
+}
 /// Same datagram ceiling as the authenticated channel.
 const MAX_DATAGRAM: usize = 4096;
 const TICK: Duration = Duration::from_millis(50);
@@ -63,8 +80,9 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 /// (`AuthenticatedChannel`) exposes neither yet, see the slice report.
 pub trait Channel {
     fn fd(&self) -> io::Result<BorrowedFd<'_>>;
-    /// Read one datagram. `WouldBlock` means nothing was pending.
-    fn receive(&mut self) -> io::Result<Vec<u8>>;
+    /// Read one datagram, in a buffer that wipes itself when released.
+    /// `WouldBlock` means nothing was pending.
+    fn receive(&mut self) -> io::Result<Datagram>;
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
 }
 
@@ -84,7 +102,7 @@ pub struct Observation {
     pub interface_mismatch: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Failure {
     CredentialsRejected,
@@ -106,8 +124,8 @@ pub trait Observer {
 }
 
 /// Typed observations and lifecycle facts sent to the writer. Nothing raw.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Started,
     Interface {
@@ -241,6 +259,10 @@ pub enum Reason {
     Stop,
     /// The client ended by itself.
     ClientExited,
+    /// A fatal event was reported (`interface_mismatch` or a failure): the
+    /// client was stopped and the instance ends. The writer treats the
+    /// instance's exit as a stop and cleans up.
+    Fatal,
 }
 
 #[derive(Debug)]
@@ -300,6 +322,111 @@ pub fn run(
 ) -> io::Result<Exit> {
     harden()?;
     run_with(channel, params, observer, Config::PRODUCTION)
+}
+
+/// First datagram of an instance, from the writer: everything the client needs
+/// except the password. The values come from the policy entry and from the
+/// writer's own egress lookup, never from the user's request text.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Start {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    /// Lowercase hex SHA-256 of the gateway leaf certificate.
+    pub certificate_sha256: String,
+    pub interface: String,
+    pub index: u32,
+    pub gateway: Ipv4Addr,
+    pub ppp_ifname: String,
+}
+
+impl Start {
+    fn params(&self) -> io::Result<Params> {
+        let pin = (self.certificate_sha256.len() == 64)
+            .then(|| {
+                let mut pin = [0_u8; 32];
+                for (byte, pair) in pin
+                    .iter_mut()
+                    .zip(self.certificate_sha256.as_bytes().chunks(2))
+                {
+                    let text = std::str::from_utf8(pair).ok()?;
+                    if !text
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                    {
+                        return None;
+                    }
+                    *byte = u8::from_str_radix(text, 16).ok()?;
+                }
+                Some(pin)
+            })
+            .flatten()
+            .ok_or_else(|| invalid("invalid certificate pin"))?;
+        Params::new(
+            Endpoint::new(self.host.clone(), self.port).map_err(|_| invalid("invalid endpoint"))?,
+            self.username.clone(),
+            Some(pin),
+            Binding {
+                interface: self.interface.clone(),
+                index: self.index,
+                gateway: self.gateway,
+            },
+            self.ppp_ifname.clone(),
+        )
+    }
+}
+
+/// Entry of `vpnt-tunneld instance fortinet`, after the handshake: wait for the
+/// writer's `Start`, then run the supervisor with the shared parser.
+pub fn serve(channel: &mut impl Channel, observer: &mut impl Observer) -> io::Result<Exit> {
+    harden()?;
+    serve_with(channel, observer, Config::PRODUCTION)
+}
+
+fn serve_with(
+    channel: &mut impl Channel,
+    observer: &mut impl Observer,
+    config: Config<'_>,
+) -> io::Result<Exit> {
+    let deadline = Instant::now() + config.limits.credential_wait;
+    let start = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "start not received"))?;
+        let mut fds = [poll_entry(channel.fd()?.as_raw_fd())];
+        poll_fds(&mut fds, remaining)?;
+        if fds[0].revents == 0 {
+            continue;
+        }
+        let bytes = match channel.receive() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Ok(never_started(Reason::ChannelClosed, Some(error))),
+        };
+        if *bytes == [MESSAGE_STOP] {
+            return Ok(never_started(Reason::Stop, None));
+        }
+        if bytes.first() != Some(&b'{') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected the Start order",
+            ));
+        }
+        break serde_json::from_slice::<Start>(&bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Start order"))?;
+    };
+    run_with(channel, start.params()?, observer, config)
+}
+
+/// What the `instance fortinet` subcommand runs after its handshake, with the
+/// parser shared with macOS.
+pub fn run_instance(mut channel: super::handshake::AuthenticatedChannel) -> io::Result<Exit> {
+    serve(
+        &mut channel,
+        &mut crate::connection::ssl_output::Output::default(),
+    )
 }
 
 /// Other processes of the same UID must not read the supervisor's memory, and
@@ -408,8 +535,8 @@ fn supervise(
         }
         if fds[0].revents != 0 {
             match channel.receive() {
-                Ok(bytes) => {
-                    return Ok(match decode(&mut Zeroizing::new(bytes)) {
+                Ok(mut bytes) => {
+                    return Ok(match decode(&mut bytes) {
                         Ok(Message::Stop) => End::Done(Reason::Stop, None),
                         // The only credential was already delivered.
                         Ok(Message::Credential(_)) => End::Violation(io::Error::new(
@@ -425,6 +552,11 @@ fn supervise(
         }
         if let Err(error) = report(channel, observer, sent) {
             return Ok(End::Done(Reason::ChannelClosed, Some(error)));
+        }
+        // Reported first, then the instance ends: nothing observed after a
+        // wrong interface or a failure is worth keeping the client alive for.
+        if sent.interface_mismatch || sent.failure.is_some() {
+            return Ok(End::Done(Reason::Fatal, None));
         }
     }
 }
@@ -543,7 +675,7 @@ enum Waited {
 
 /// One credential datagram: kind 1, `u16` big-endian length, the password.
 /// Stop is kind 2 with no payload. The datagram is zeroed on every path.
-fn decode(bytes: &mut Vec<u8>) -> io::Result<Message> {
+fn decode(bytes: &mut [u8]) -> io::Result<Message> {
     let message = parse(bytes);
     bytes.zeroize();
     message
@@ -578,11 +710,11 @@ fn wait_credential(channel: &mut impl Channel, limit: Duration) -> io::Result<Wa
         if fds[0].revents == 0 {
             continue;
         }
-        let mut bytes = Zeroizing::new(match channel.receive() {
+        let mut bytes = match channel.receive() {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Ok(Waited::Closed(error)),
-        });
+        };
         return Ok(match decode(&mut bytes)? {
             Message::Credential(password) => Waited::Credential(password),
             Message::Stop => Waited::Stop,
@@ -1089,7 +1221,7 @@ impl Channel for super::handshake::AuthenticatedChannel {
         self.readable_fd()
     }
 
-    fn receive(&mut self) -> io::Result<Vec<u8>> {
+    fn receive(&mut self) -> io::Result<Datagram> {
         super::handshake::AuthenticatedChannel::receive(self)
     }
 

@@ -1,10 +1,15 @@
 //! Linux tunneld protocol and authenticated runtime client.
 pub mod admin;
 pub mod attest;
+mod backend;
+mod cleanup;
 pub mod client;
 pub mod fortinet_instance;
+mod fortinet_network;
 pub mod handshake;
+pub mod instance_protocol;
 pub mod ipsec_instance;
+mod network;
 pub mod policy;
 pub mod protocol;
 pub mod server;

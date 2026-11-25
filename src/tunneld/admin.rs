@@ -387,7 +387,7 @@ impl Change {
 
 fn parse_change(args: &[OsString], input: impl Read) -> io::Result<Change> {
     match args {
-        [apply] if apply == "apply" => Ok(Change::Apply(Policy::snapshot(&read_limited(
+        [apply] if apply == "apply" => Ok(Change::Apply(Policy::apply_snapshot(&read_limited(
             input,
             MAX_SNAPSHOT,
         )?)?)),
@@ -764,6 +764,45 @@ mod tests {
                 assert_eq!(confirmation.join().unwrap().unwrap(), expected);
             });
         }
+    }
+
+    #[test]
+    fn policy_apply_rejects_oversized_ipsec_grants_but_reads_legacy_entries() {
+        let mut input: serde_json::Value = serde_json::from_slice(IPSEC_SNAPSHOT).unwrap();
+        let routes: Vec<_> = (0..65).map(|i| format!("10.25.0.{i}/32")).collect();
+        input["entries"][0]["route_cidrs"] = serde_json::json!(&routes[..64]);
+        let apply = ["apply".into()];
+        assert!(parse_change(&apply, input.to_string().as_bytes()).is_ok());
+
+        input["entries"][0]["route_cidrs"] = serde_json::json!(routes);
+        let input = input.to_string();
+        let fixture = PolicyFixture::new();
+        fixture.install();
+        let legacy = super::super::policy::canonical_snapshot(input.as_bytes()).unwrap();
+        fs::write(fixture.path(), &legacy).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .open()
+                .unwrap()
+                .read()
+                .unwrap()
+                .policy()
+                .bytes()
+                .unwrap(),
+            legacy
+        );
+
+        let Err(error) = parse_change(&apply, input.as_bytes()) else {
+            panic!("policy apply accepted 65 IPsec routes");
+        };
+        let mut stderr = Vec::new();
+        assert_eq!(report_result(Err(error), &mut stderr), 1);
+        assert_eq!(
+            stderr,
+            b"vpnt-tunneld: IPsec policy supports at most 64 route CIDRs\n"
+        );
+        assert_eq!(fs::read(fixture.path()).unwrap(), legacy);
     }
 
     #[test]

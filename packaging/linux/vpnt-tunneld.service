@@ -7,15 +7,15 @@ After=vpnt-tunneld.socket
 [Service]
 Type=simple
 ExecStart=/usr/lib/vpnt/vpnt-tunneld
-# Closed skeleton. I2 and S2 will revise the sandbox using measurements.
-CapabilityBoundingSet=
+# The writer owns host route changes and talks to systemd and DNS services over Unix sockets.
+CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=
 NoNewPrivileges=yes
-PrivateNetwork=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 IPAddressDeny=any
 PrivateDevices=yes
 ProtectSystem=strict
+ReadWritePaths=/run/vpnt
 ProtectHome=yes
 PrivateTmp=yes
 UMask=0077

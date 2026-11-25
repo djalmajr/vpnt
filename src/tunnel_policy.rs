@@ -17,6 +17,7 @@ use std::{
 };
 
 const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
+const FORTINET_PRIVATE_ROUTE_CEILINGS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 
 /// Load the caller's saved profile and return one canonical authorization entry.
 pub fn for_profile_id(id: &str, dns_servers: &[Ipv4Addr]) -> io::Result<Vec<u8>> {
@@ -91,11 +92,6 @@ fn snapshot(
         }
         VpnKind::Ssl => {
             certificate_pin(&profile.certificate)?;
-            if !profile.dns_domains.is_empty() && dns_servers.is_empty() {
-                return Err(invalid(
-                    "The SSL gateway supplies the DNS servers. Pass them with --dns-server.",
-                ));
-            }
             ("fortinet", endpoint.host().to_owned())
         }
         VpnKind::Ovpn => return Err(invalid("OpenVPN does not use the tunneld policy")),
@@ -129,6 +125,9 @@ fn snapshot(
     });
     if profile.kind == VpnKind::Ssl {
         entry["certificate_sha256"] = json!(profile.certificate.to_ascii_lowercase());
+        if profile.networks.is_empty() {
+            entry["route_cidrs"] = json!(FORTINET_PRIVATE_ROUTE_CEILINGS);
+        }
     }
     canonical_snapshot(&serde_json::to_vec(
         &json!({"version": 1, "entries": [entry]}),
@@ -237,7 +236,32 @@ mod tests {
     }
 
     #[test]
-    fn ssl_snapshot_requires_dns_servers_only_for_profiles_with_domains() {
+    fn ssl_snapshot_uses_private_route_ceilings_for_gateway_dns() {
+        let mut ssl = profile("ssl", &"AB".repeat(32));
+        ssl.networks.clear();
+        ssl.dns_domains = vec!["vpn.example.test".into()];
+        let bytes = snapshot(&ssl, 1000, &[], fixture_resolve).unwrap();
+        assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
+        let data: Value = serde_json::from_slice(&bytes).unwrap();
+        let entry = &data["entries"][0];
+        assert_eq!(
+            entry["route_cidrs"],
+            json!(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"])
+        );
+        assert_eq!(entry["dns_domains"], json!(["vpn.example.test"]));
+        assert_eq!(entry["dns_servers"], json!([]));
+
+        ssl.networks = vec!["198.51.100.0/24".into()];
+        let bytes = snapshot(&ssl, 1000, &[], fixture_resolve).unwrap();
+        let data: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            data["entries"][0]["route_cidrs"],
+            json!(["198.51.100.0/24"])
+        );
+    }
+
+    #[test]
+    fn ssl_snapshot_keeps_explicit_dns_servers_for_profiles_with_domains() {
         let mut ssl = profile("ssl", &"AB".repeat(32));
         ssl.gateway = "192.0.2.22".into();
         ssl.dns_domains = vec!["vpn.example.test".into()];
@@ -246,11 +270,6 @@ mod tests {
             "198.51.100.53".parse().unwrap(),
             "192.0.2.53".parse().unwrap(),
         ];
-        let missing = snapshot(&ssl, 1000, &[], no_lookup).unwrap_err();
-        assert_eq!(
-            missing.to_string(),
-            "The SSL gateway supplies the DNS servers. Pass them with --dns-server."
-        );
         let bytes = snapshot(&ssl, 1000, &dns_servers, no_lookup).unwrap();
         assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
         let data: Value = serde_json::from_slice(&bytes).unwrap();

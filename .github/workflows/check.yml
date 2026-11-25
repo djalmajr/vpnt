@@ -49,6 +49,44 @@ jobs:
           VPNT_REQUIRE_USERNS=1 cargo +1.99.0 test --locked --all-features --lib \
             tunneld::handshake::tests::private_pid_namespace_observes_writer_pid_zero -- --exact
 
+  linux-openfortivpn:
+    # The Linux package ships openfortivpn built with the vpnt patches; this job
+    # builds the same client and runs its behavioral checks against loopback.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends autoconf automake pkg-config libssl-dev
+      - name: Build openfortivpn with the vpnt patches
+        run: |
+          bash scripts/linux/build-openfortivpn.sh "$RUNNER_TEMP/openfortivpn" > "$RUNNER_TEMP/openfortivpn-tree"
+          tree=$(tail -n 1 "$RUNNER_TEMP/openfortivpn-tree")
+          test -x "$tree/openfortivpn"
+          echo "OPENFORTIVPN_TREE=$tree" >> "$GITHUB_ENV"
+      - name: Allow the fixtures' private user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor;
+        # the fixtures only isolate their own loopback network.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Check the pin and the password descriptor
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          bash scripts/linux/check-openfortivpn-pin.sh "$OPENFORTIVPN_TREE/openfortivpn"
+          bash scripts/linux/check-openfortivpn-pinentry.sh "$OPENFORTIVPN_TREE/openfortivpn"
+      - name: Check the approved local range
+        if: hashFiles('scripts/linux/check-openfortivpn-local-cidr.sh') != ''
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/linux/check-openfortivpn-local-cidr.sh "$OPENFORTIVPN_TREE"
+
   macos:
     runs-on: macos-15
     timeout-minutes: 180
