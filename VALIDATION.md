@@ -353,7 +353,17 @@ VALIDACAO_REAL
 
 - Só split tunnel IPv4. IPv6, rota padrão pelo túnel, OTP/2FA/SAML e
   coexistência gerenciada com o OVPN ficam fora.
-- Follow-ups no Cinzel: VPT-34 a VPT-41.
+- A admissão de rede aceita regras de política de terceiros só de dois tipos:
+  com `fwmark` e ação `lookup main`/`default` ou terminal, como as do
+  Tailscale; ou `lookup <tabela>` sem rota padrão e sem nada sobre o gateway,
+  os transportes, o VIP, o par PPP, a faixa local ou as rotas do túnel. Aceita
+  várias rotas padrão quando a saída do gateway escolhida pelo kernel é uma
+  delas. Depois de instalar, confere com `ip route get` o gateway e cada rota
+  do túnel e desfaz tudo se algo sair por outra interface.
+- A conferência vale no estabelecimento. Mudanças posteriores nas tabelas de
+  terceiros e tráfego já marcado por firewall do host não são observados
+  durante a sessão (VPT-44).
+- Follow-ups no Cinzel: VPT-34 a VPT-44.
 
 ## Checkpoint atual — 14/11/2026
 
