@@ -246,7 +246,6 @@ struct FortinetStart {
     username: String,
     certificate_sha256: String,
     remote: Ipv4Addr,
-    approved: Vec<Ipv4Addr>,
     grant: fortinet_network::Grant,
     credentials: zeroize::Zeroizing<Vec<u8>>,
 }
@@ -263,6 +262,7 @@ fn fatal_code(fatal: &fortinet_network::Fatal) -> ErrorCode {
     match fatal {
         Fatal::Failure(Reported::CredentialsRejected) => ErrorCode::PermissionDenied,
         Fatal::Failure(Reported::GatewayTimeout) => ErrorCode::Timeout,
+        Fatal::Failure(Reported::LocalAddressDenied) => ErrorCode::FortinetLocalAddressDenied,
         Fatal::InterfaceMismatch | Fatal::Exited | Fatal::Invalid => ErrorCode::Backend,
     }
 }
@@ -347,7 +347,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             Some(Setup::Fortinet(setup)) => {
                 let receipt = self
                     .fortinet
-                    .plan(&guard, &attempt.generation, setup.remote, &setup.approved)
+                    .plan(&guard, &attempt.generation, setup.remote, &setup.grant)
                     .map_err(|e| Failure::io("network admission", &e))?;
                 cancel.check().map_err(|e| Failure::io("lease setup", &e))?;
                 receipt
@@ -550,6 +550,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             port: setup.port,
             username: setup.username.clone(),
             certificate_sha256: setup.certificate_sha256.clone(),
+            fortinet_local_cidr: setup.grant.fortinet_local_cidr,
             interface: interface.to_owned(),
             index,
             gateway,
@@ -1184,6 +1185,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         if credentials.backend() != protocol::Backend::Fortinet {
             return Err(ErrorCode::BadRequest);
         }
+        if grant.fortinet_local_cidr().is_none() {
+            return Err(ErrorCode::PolicyReapprovalRequired);
+        }
         let projection =
             fortinet_network::Grant::from_entry(grant).map_err(|_| ErrorCode::Backend)?;
         // The pin and the endpoint come from the policy entry, which the offer
@@ -1205,7 +1209,6 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             username: request.username().into(),
             certificate_sha256: projection.certificate_sha256.clone(),
             remote,
-            approved: projection.transport_ipv4.clone(),
             grant: projection,
             credentials,
         };
@@ -2634,9 +2637,9 @@ mod tests {
         }
 
         #[test]
-        fn a_rejected_password_or_a_gateway_timeout_ends_the_attempt_with_its_code() {
+        fn a_reported_fortinet_failure_ends_the_attempt_with_its_code() {
             if !namespaced_in(
-                "a_rejected_password_or_a_gateway_timeout_ends_the_attempt_with_its_code",
+                "a_reported_fortinet_failure_ends_the_attempt_with_its_code",
                 "tests::fortinet_tests",
             ) {
                 return;
@@ -2644,6 +2647,10 @@ mod tests {
             for (kind, code) in [
                 (Reported::CredentialsRejected, ErrorCode::PermissionDenied),
                 (Reported::GatewayTimeout, ErrorCode::Timeout),
+                (
+                    Reported::LocalAddressDenied,
+                    ErrorCode::FortinetLocalAddressDenied,
+                ),
             ] {
                 let rig = Rig::new();
                 rig.instance(Script::Report(vec![
@@ -2658,6 +2665,21 @@ mod tests {
                 assert!(rig.harness.log().contains(&format!("stop -- {unit}")));
                 assert_reverted_after_stop(&rig, &unit);
             }
+        }
+
+        #[test]
+        fn legacy_fortinet_grant_requires_reapproval_before_launch() {
+            let rig = Rig::new();
+            let launcher = rig.launcher(false);
+            let mut value = serde_json::to_value(policy(&[])).unwrap();
+            value.as_object_mut().unwrap().remove("fortinet_local_cidr");
+            let entry = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                rig.launch(&launcher, &entry).err(),
+                Some(ErrorCode::PolicyReapprovalRequired)
+            );
+            assert!(rig.harness.log().is_empty());
+            assert!(rig.kernel.lock().unwrap().ops.is_empty());
         }
 
         #[test]

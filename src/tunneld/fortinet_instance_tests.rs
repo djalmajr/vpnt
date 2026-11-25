@@ -286,6 +286,7 @@ fn params(pin: Option<[u8; 32]>) -> Params {
             gateway: Ipv4Addr::new(192, 0, 2, 10),
         },
         Params::default_pppd_ifname(1),
+        "10.99.0.0/24".parse().unwrap(),
     )
     .unwrap()
 }
@@ -437,6 +438,7 @@ fn expected_argv(pinentry: &Path) -> Vec<String> {
         "--pppd-no-peerdns",
         "--pppd-accept-remote=0",
         "--pppd-ifname=vpntp1",
+        "--fortinet-local-cidr=10.99.0.0/24",
         "--persistent=0",
         "--username=alice",
     ]
@@ -816,7 +818,7 @@ fn descendants_that_outlive_the_leader_are_swept_before_it_is_reaped() {
 }
 
 #[test]
-fn client_exit_is_reported_with_its_status() {
+fn client_scope_denial_is_reported_before_its_exit_status() {
     let scratch = Scratch::new();
     let instance = Instance::start(
         &scratch,
@@ -830,6 +832,10 @@ fn client_exit_is_reported_with_its_status() {
     assert_eq!(exit.reason, Reason::ClientExited);
     assert_eq!(exit.status.unwrap().code(), Some(3));
     assert!(!exit.escalated);
+    assert_eq!(
+        &events[events.len() - 2],
+        &json!({"event": "failure", "kind": "local_address_denied"})
+    );
     assert_eq!(
         events.last().unwrap(),
         &json!({"event": "exited", "code": 3, "signal": null})
@@ -1455,6 +1461,7 @@ fn parameters_refuse_hostile_values() {
             Some(PIN),
             binding.clone(),
             interface.clone(),
+            "10.99.0.0/24".parse().unwrap(),
         );
         assert!(result.is_err(), "{username:?} {binding:?} {interface:?}");
     }
@@ -1470,7 +1477,8 @@ fn parameters_refuse_hostile_values() {
                 "alice".into(),
                 Some(PIN),
                 binding("eth0", 1, ok),
-                interface.clone()
+                interface.clone(),
+                "10.99.0.0/24".parse().unwrap(),
             )
             .is_ok(),
             "{interface}"
@@ -1912,6 +1920,7 @@ fn start_order() -> Start {
         port: 10443,
         username: "alice".into(),
         certificate_sha256: "ab".repeat(32),
+        fortinet_local_cidr: "10.99.0.0/24".parse().unwrap(),
         interface: "eth0".into(),
         index: 7,
         gateway: Ipv4Addr::new(192, 0, 2, 10),
@@ -1966,6 +1975,7 @@ fn the_start_order_becomes_exactly_the_parameters_the_supervisor_runs_with() {
         }
     );
     assert_eq!(params.pppd_ifname, "vpntp1");
+    assert_eq!(params.fortinet_local_cidr, "10.99.0.0/24".parse().unwrap());
     let wire = serde_json::to_string(&start_order()).unwrap();
     assert!(!wire.contains(PASSWORD));
 }

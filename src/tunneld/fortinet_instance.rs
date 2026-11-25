@@ -19,9 +19,8 @@
 //! only the client (the kernel offers no tree-wide death signal); descendants
 //! that left its group rely on the unit's `KillMode=control-group`.
 //!
-//! There is no PPP fence on Linux: the client runs the distribution's `pppd`
-//! (`--with-pppd`) with its default argv, and the macOS `vpnt-pppd` wrapper is
-//! not used. The supervisor only fixes the interface name (`--pppd-ifname`).
+//! The Linux client checks the approved local IPv4 scope before forwarding
+//! IPCP to the distribution's `pppd`.
 
 use std::{
     fs::{self, File},
@@ -41,7 +40,7 @@ use zeroize::Zeroize;
 
 use super::{
     handshake::Datagram,
-    protocol::{Credentials, Endpoint, FortinetDeadline, FortinetRequest},
+    protocol::{CidrV4, Credentials, Endpoint, FortinetDeadline, FortinetRequest},
 };
 use crate::{helper::pinentry_channel::PinentryChild, secrets::Secret};
 
@@ -52,6 +51,8 @@ pub const PINENTRY: &str = "/usr/lib/vpnt/vpnt-pinentry";
 
 pub(super) const MESSAGE_CREDENTIAL: u8 = 1;
 pub(super) const MESSAGE_STOP: u8 = 2;
+// Reserved by the Linux openfortivpn local CIDR patch.
+const LOCAL_ADDRESS_DENIED_EXIT: i32 = 3;
 const PASSWORD_LIMIT: usize = 256;
 
 /// The credential datagram the writer sends after `Start`: kind 1, the length
@@ -108,6 +109,7 @@ pub struct Observation {
 pub enum Failure {
     CredentialsRejected,
     GatewayTimeout,
+    LocalAddressDenied,
 }
 
 /// Parser of the client output. The production implementation is the
@@ -180,6 +182,7 @@ pub struct Params {
     certificate_sha256: Option<[u8; 32]>,
     binding: Binding,
     pppd_ifname: String,
+    fortinet_local_cidr: CidrV4,
 }
 
 impl Params {
@@ -194,6 +197,7 @@ impl Params {
         certificate_sha256: Option<[u8; 32]>,
         binding: Binding,
         pppd_ifname: String,
+        fortinet_local_cidr: CidrV4,
     ) -> io::Result<Self> {
         let interface = &binding.interface;
         if !(1..=64).contains(&username.len())
@@ -220,6 +224,7 @@ impl Params {
             certificate_sha256,
             binding,
             pppd_ifname,
+            fortinet_local_cidr,
         })
     }
 
@@ -227,6 +232,7 @@ impl Params {
         request: &FortinetRequest,
         binding: Binding,
         pppd_ifname: String,
+        fortinet_local_cidr: CidrV4,
     ) -> io::Result<Self> {
         let endpoint = Endpoint::new(
             request.endpoint().host().to_owned(),
@@ -239,6 +245,7 @@ impl Params {
             Some(*request.certificate_sha256()),
             binding,
             pppd_ifname,
+            fortinet_local_cidr,
         )
     }
 
@@ -324,6 +331,7 @@ pub struct Start {
     pub username: String,
     /// Lowercase hex SHA-256 of the gateway leaf certificate.
     pub certificate_sha256: String,
+    pub fortinet_local_cidr: CidrV4,
     pub interface: String,
     pub index: u32,
     pub gateway: Ipv4Addr,
@@ -364,6 +372,7 @@ impl Start {
                 gateway: self.gateway,
             },
             self.ppp_ifname.clone(),
+            self.fortinet_local_cidr,
         )
     }
 }
@@ -499,6 +508,14 @@ fn run_until(
     if reason != Reason::ChannelClosed {
         // The writer is still there: the last observations, then the exit.
         report(channel, observer, &mut sent)?;
+        if stopped.status.code() == Some(LOCAL_ADDRESS_DENIED_EXIT) {
+            send(
+                channel,
+                &Event::Failure {
+                    kind: Failure::LocalAddressDenied,
+                },
+            )?;
+        }
         send(
             channel,
             &Event::Exited {
@@ -592,6 +609,10 @@ fn command(config: &Config<'_>, params: &Params, pin: &[u8; 32]) -> io::Result<(
             "--pppd-accept-remote=0",
         ])
         .arg(format!("--pppd-ifname={}", params.pppd_ifname))
+        .arg(format!(
+            "--fortinet-local-cidr={}",
+            params.fortinet_local_cidr
+        ))
         .arg("--persistent=0")
         .arg(format!("--username={}", params.username))
         .arg(format!("--pinentry={}", config.pinentry))

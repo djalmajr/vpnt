@@ -20,7 +20,11 @@ const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
 const FORTINET_PRIVATE_ROUTE_CEILINGS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 
 /// Load the caller's saved profile and return one canonical authorization entry.
-pub fn for_profile_id(id: &str, dns_servers: &[Ipv4Addr]) -> io::Result<Vec<u8>> {
+pub fn for_profile_id(
+    id: &str,
+    dns_servers: &[Ipv4Addr],
+    fortinet_local_cidr: Option<CidrV4>,
+) -> io::Result<Vec<u8>> {
     if !valid_profile_id(id) {
         return Err(invalid("invalid profile ID"));
     }
@@ -37,6 +41,7 @@ pub fn for_profile_id(id: &str, dns_servers: &[Ipv4Addr]) -> io::Result<Vec<u8>>
         &profile,
         unsafe { libc::geteuid() },
         dns_servers,
+        fortinet_local_cidr,
         resolve_ipv4,
     )
 }
@@ -61,9 +66,15 @@ fn snapshot(
     profile: &Profile,
     uid: u32,
     dns_servers: &[Ipv4Addr],
+    fortinet_local_cidr: Option<CidrV4>,
     resolve: impl FnOnce(&str, u16) -> io::Result<Vec<Ipv4Addr>>,
 ) -> io::Result<Vec<u8>> {
     profile.validate().map_err(invalid)?;
+    if fortinet_local_cidr.is_some() && profile.kind != VpnKind::Ssl {
+        return Err(invalid(
+            "Only a Fortinet profile accepts a local IPv4 scope",
+        ));
+    }
     let endpoint = Endpoint::new(profile.gateway.clone(), profile.port)
         .map_err(|_| invalid("invalid tunneld endpoint"))?;
     if uid == 0 || uid == u32::MAX {
@@ -125,6 +136,9 @@ fn snapshot(
     });
     if profile.kind == VpnKind::Ssl {
         entry["certificate_sha256"] = json!(profile.certificate.to_ascii_lowercase());
+        if let Some(cidr) = fortinet_local_cidr {
+            entry["fortinet_local_cidr"] = json!(cidr.to_string());
+        }
         if profile.networks.is_empty() {
             entry["route_cidrs"] = json!(FORTINET_PRIVATE_ROUTE_CEILINGS);
         }
@@ -200,7 +214,7 @@ mod tests {
             ("ipsec", String::new(), "ipsec", "fqdn:vpn.example.test"),
             ("ssl", "AB".repeat(32), "fortinet", "vpn.example.test"),
         ] {
-            let bytes = snapshot(&profile(kind, &pin), 1000, &[], fixture_resolve).unwrap();
+            let bytes = snapshot(&profile(kind, &pin), 1000, &[], None, fixture_resolve).unwrap();
             assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
             assert!(bytes.ends_with(b"\n"));
             let doc: Value = serde_json::from_slice(&bytes).unwrap();
@@ -224,10 +238,46 @@ mod tests {
     }
 
     #[test]
+    fn fortinet_scope_is_written_canonically_and_refused_for_other_kinds() {
+        let scope: CidrV4 = "10.99.0.0/24".parse().unwrap();
+        let bytes = snapshot(
+            &profile("ssl", &"AB".repeat(32)),
+            1000,
+            &[],
+            Some(scope),
+            fixture_resolve,
+        )
+        .unwrap();
+        assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
+        let data: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(data["entries"][0]["fortinet_local_cidr"], "10.99.0.0/24");
+        let without = snapshot(
+            &profile("ssl", &"AB".repeat(32)),
+            1000,
+            &[],
+            None,
+            fixture_resolve,
+        )
+        .unwrap();
+        let data: Value = serde_json::from_slice(&without).unwrap();
+        assert!(data["entries"][0].get("fortinet_local_cidr").is_none());
+        assert!(
+            snapshot(
+                &profile("ipsec", ""),
+                1000,
+                &[],
+                Some(scope),
+                |_, _| panic!("unexpected DNS")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn validates_backend_pin_before_resolving() {
         for (kind, pin) in [("ipsec", "ab".repeat(32)), ("ssl", String::new())] {
             assert!(
-                snapshot(&profile(kind, &pin), 1000, &[], |_, _| panic!(
+                snapshot(&profile(kind, &pin), 1000, &[], None, |_, _| panic!(
                     "unexpected DNS"
                 ))
                 .is_err()
@@ -240,7 +290,7 @@ mod tests {
         let mut ssl = profile("ssl", &"AB".repeat(32));
         ssl.networks.clear();
         ssl.dns_domains = vec!["vpn.example.test".into()];
-        let bytes = snapshot(&ssl, 1000, &[], fixture_resolve).unwrap();
+        let bytes = snapshot(&ssl, 1000, &[], None, fixture_resolve).unwrap();
         assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
         let data: Value = serde_json::from_slice(&bytes).unwrap();
         let entry = &data["entries"][0];
@@ -252,7 +302,7 @@ mod tests {
         assert_eq!(entry["dns_servers"], json!([]));
 
         ssl.networks = vec!["198.51.100.0/24".into()];
-        let bytes = snapshot(&ssl, 1000, &[], fixture_resolve).unwrap();
+        let bytes = snapshot(&ssl, 1000, &[], None, fixture_resolve).unwrap();
         let data: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             data["entries"][0]["route_cidrs"],
@@ -270,7 +320,7 @@ mod tests {
             "198.51.100.53".parse().unwrap(),
             "192.0.2.53".parse().unwrap(),
         ];
-        let bytes = snapshot(&ssl, 1000, &dns_servers, no_lookup).unwrap();
+        let bytes = snapshot(&ssl, 1000, &dns_servers, None, no_lookup).unwrap();
         assert_eq!(bytes, canonical_snapshot(&bytes).unwrap());
         let data: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
@@ -289,11 +339,11 @@ mod tests {
             vec![dns_servers[0]; 2],
             (1..=5).map(|n| Ipv4Addr::new(192, 0, 2, n)).collect(),
         ] {
-            assert!(snapshot(&ssl, 1000, &servers, no_lookup).is_err());
+            assert!(snapshot(&ssl, 1000, &servers, None, no_lookup).is_err());
         }
 
         ssl.dns_domains.clear();
-        let bytes = snapshot(&ssl, 1000, &dns_servers, no_lookup).unwrap();
+        let bytes = snapshot(&ssl, 1000, &dns_servers, None, no_lookup).unwrap();
         let data: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(data["entries"][0]["dns_domains"], json!([]));
         assert_eq!(data["entries"][0]["dns_servers"], json!([]));
@@ -303,7 +353,7 @@ mod tests {
     fn ipv4_ipsec_snapshot_uses_the_typed_literal_without_resolving() {
         let mut ipsec = profile("ipsec", "");
         ipsec.gateway = "192.0.2.10".into();
-        let bytes = snapshot(&ipsec, 1000, &[], |_, _| {
+        let bytes = snapshot(&ipsec, 1000, &[], None, |_, _| {
             panic!("unexpected lookup for a literal")
         })
         .unwrap();

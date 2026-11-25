@@ -85,16 +85,22 @@ pub(super) struct Entry {
     port: u16,
     #[serde(
         default,
-        deserialize_with = "present_pin",
+        deserialize_with = "present_string",
         skip_serializing_if = "Option::is_none"
     )]
     certificate_sha256: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    fortinet_local_cidr: Option<String>,
     route_cidrs: Vec<String>,
     dns_domains: Vec<String>,
     dns_servers: Vec<Ipv4Addr>,
 }
 
-fn present_pin<'de, D: Deserializer<'de>>(input: D) -> Result<Option<String>, D::Error> {
+fn present_string<'de, D: Deserializer<'de>>(input: D) -> Result<Option<String>, D::Error> {
     String::deserialize(input).map(Some)
 }
 
@@ -183,6 +189,11 @@ impl Entry {
 
     fn canonicalize(&mut self) -> io::Result<()> {
         self.key().validate()?;
+        if let Some(cidr) = &self.fortinet_local_cidr
+            && (self.backend != Backend::Fortinet || cidr.parse::<CidrV4>().is_err())
+        {
+            return Err(invalid("invalid Fortinet local IPv4 scope"));
+        }
         match (self.backend, self.certificate_sha256.as_deref()) {
             (Backend::Ipsec, None)
                 if self.dns_domains.is_empty()
@@ -220,6 +231,10 @@ impl Entry {
             return Err(invalid("invalid DNS scope"));
         }
         Ok(())
+    }
+
+    pub(super) fn fortinet_local_cidr(&self) -> Option<CidrV4> {
+        self.fortinet_local_cidr.as_deref()?.parse().ok()
     }
 
     fn networks(&self) -> impl Iterator<Item = io::Result<Network>> + '_ {
@@ -356,6 +371,9 @@ impl Policy {
 
     pub(super) fn apply_snapshot(bytes: &[u8]) -> io::Result<Entry> {
         let entry = Self::snapshot(bytes)?;
+        if entry.backend == Backend::Fortinet && entry.fortinet_local_cidr().is_none() {
+            return Err(invalid("Fortinet policy requires fortinet_local_cidr"));
+        }
         if entry.backend == Backend::Ipsec && entry.route_cidrs.len() > MAX_IPSEC_ROUTES {
             return Err(invalid("IPsec policy supports at most 64 route CIDRs"));
         }
@@ -434,6 +452,7 @@ mod tests {
         entry["port"] = json!(443);
         entry["peer_identity"] = entry["hostname"].clone();
         entry["certificate_sha256"] = json!("a".repeat(64));
+        entry["fortinet_local_cidr"] = json!("10.99.0.0/24");
         entry["dns_domains"] = json!(["internal.example"]);
         entry["dns_servers"] = json!(["10.20.0.53"]);
         entry
@@ -445,6 +464,42 @@ mod tests {
 
     fn snapshot(entry: Value) -> io::Result<Vec<u8>> {
         canonical_snapshot(&document(vec![entry]))
+    }
+
+    #[test]
+    fn fortinet_snapshot_cannot_approve_a_missing_local_scope() {
+        let mut entry = fortinet();
+        entry.as_object_mut().unwrap().remove("fortinet_local_cidr");
+        let legacy = snapshot(entry.clone()).unwrap();
+        assert_eq!(Policy::from_disk(&legacy).unwrap().bytes().unwrap(), legacy);
+        assert!(Policy::apply_snapshot(&document(vec![entry])).is_err());
+    }
+
+    #[test]
+    fn local_scope_is_canonical_ipv4_and_exclusive_to_fortinet() {
+        for cidr in [
+            json!("10.0.0.0/8"),
+            json!("10.99.0.2/32"),
+            json!("10.99.0.2/24"),
+            json!("10.0.0.0/08"),
+            json!("10.0.0.0/7"),
+            json!("10.0.0.0/33"),
+            json!("169.254.2.1/32"),
+            json!("127.0.0.0/8"),
+            json!(null),
+        ] {
+            let valid = cidr == "10.0.0.0/8" || cidr == "10.99.0.2/32";
+            let mut entry = fortinet();
+            entry["fortinet_local_cidr"] = cidr.clone();
+            assert_eq!(
+                Policy::apply_snapshot(&document(vec![entry])).is_ok(),
+                valid,
+                "{cidr}"
+            );
+            let mut entry = ipsec();
+            entry["fortinet_local_cidr"] = cidr;
+            assert!(Policy::apply_snapshot(&document(vec![entry])).is_err());
+        }
     }
 
     #[test]
