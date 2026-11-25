@@ -491,6 +491,22 @@ fn argv_is_exact_pins_the_certificate_and_has_no_ca_file() {
 }
 
 #[test]
+fn password_remains_available_when_tls_takes_more_than_five_seconds() {
+    let scratch = Scratch::new();
+    let instance = Instance::start(
+        &scratch,
+        "time.sleep(5.5)\npin('after-tls')\n",
+        params(Some(PIN)),
+        Duration::from_secs(2),
+    );
+    instance.writer.credential(PASSWORD);
+    instance.join().unwrap();
+    let result = scratch.json("pinentry.after-tls");
+    assert_eq!(result["error"], Value::Null);
+    assert_eq!(result["password"], PASSWORD);
+}
+
+#[test]
 fn password_reaches_the_pinentry_once_and_nothing_else() {
     let scratch = Scratch::new();
     let instance = Instance::start(
@@ -542,7 +558,7 @@ fn password_reaches_the_pinentry_once_and_nothing_else() {
 }
 
 #[test]
-fn only_stdio_and_the_pinentry_descriptor_reach_the_client() {
+fn only_stdio_and_the_two_owned_descriptors_reach_the_client() {
     // A descriptor the supervisor process happens to hold, not close-on-exec.
     // SAFETY: duplicates stdin above 20, without close-on-exec.
     let leaked = unsafe { libc::fcntl(0, libc::F_DUPFD, 20) };
@@ -566,13 +582,14 @@ fn only_stdio_and_the_pinentry_descriptor_reach_the_client() {
     let numbers: BTreeSet<_> = client["fds"].as_object().unwrap().keys().cloned().collect();
     assert_eq!(
         numbers,
-        ["0", "1", "2", "3"].map(String::from).into(),
+        ["0", "1", "2", "3", "4"].map(String::from).into(),
         "{client}"
     );
     assert_eq!(client["stdin"], "/dev/null");
     assert!(client["fds"]["1"].as_str().unwrap().starts_with("pipe:"));
     assert!(client["fds"]["2"].as_str().unwrap().starts_with("pipe:"));
     assert!(client["fds"]["3"].as_str().unwrap().starts_with("socket:"));
+    assert_eq!(client["fds"]["4"], "anon_inode:[timerfd]");
     assert_eq!(
         client["pgid"], client["pid"],
         "the client leads its own group"
@@ -925,7 +942,7 @@ fn helper_supervisor() {
     if mode == "dumpable" {
         // SAFETY: prctl query takes integers only.
         let before = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
-        let error = run(&mut channel, params(None), &mut LineObserver::default()).unwrap_err();
+        let error = serve(&mut channel, &mut LineObserver::default()).unwrap_err();
         // SAFETY: as above.
         let after = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
         let mut subreaper: libc::c_int = -1;
@@ -1029,9 +1046,12 @@ fn the_client_dies_with_its_supervisor() {
 }
 
 #[test]
-fn run_makes_the_supervisor_non_dumpable_before_anything_else() {
+fn serve_makes_the_supervisor_non_dumpable_before_anything_else() {
     let scratch = Scratch::new();
-    let (instance, _writer) = Seq::pair();
+    let (instance, writer) = Seq::pair();
+    let mut start = start_order();
+    start.certificate_sha256 = "00".repeat(32);
+    writer.put(&serde_json::to_vec(&start).unwrap());
     let mut helper = spawn_helper("dumpable", &scratch, "", &instance);
     assert!(helper.wait().unwrap().success());
     assert_eq!(
@@ -1678,7 +1698,7 @@ fn fake_pppd_fds(scratch: &Scratch, close_capability: bool) -> BTreeSet<String> 
     let leaked = unsafe { libc::fcntl(0, libc::F_DUPFD, 20) };
     assert!(leaked >= 20);
     let body = format!(
-        "pin('only')\n{close}\
+        "pin('only')\n{close}os.close(4)  # the login timer is consumed before PPP starts\n\
          subprocess.Popen([D + '/fake-pppd'], close_fds=False).wait()\nput('done', {{}})\nidle()\n",
         close = if close_capability {
             "os.close(3)  # what the patched client does after the read\n"
@@ -1700,10 +1720,8 @@ fn fake_pppd_fds(scratch: &Scratch, close_capability: bool) -> BTreeSet<String> 
 
 #[test]
 fn the_pppd_inherits_only_stdio_once_the_client_closed_the_pinentry_descriptor() {
-    // The fixture client plays the patched client (it closes descriptor 3 after
-    // the pinentry read); the real client is proven by
-    // scripts/linux/check-openfortivpn-pinentry.sh. What this proves is that
-    // nothing else of the supervisor reaches the daemon.
+    // The fixture models both closes in the patched client. The daemon then
+    // checks what it actually inherited from the supervisor and the client.
     let closed = fake_pppd_fds(&Scratch::new(), true);
     assert_eq!(closed, ["0", "1", "2"].map(String::from).into());
     // Control: a client that keeps 3 hands it to the daemon, and the probe sees it.
@@ -1737,7 +1755,13 @@ fn a_listed_pid_that_is_not_the_leaders_child_is_never_held_or_signalled() {
         own_process: false,
     };
     let (spawn, null) = command(&config, &params(Some(PIN)), &PIN).unwrap();
-    let mut client = Client::spawn(spawn, Secret::from(PASSWORD), false).unwrap();
+    let mut client = Client::spawn(
+        spawn,
+        Secret::from(PASSWORD),
+        false,
+        FortinetDeadline::new().unwrap(),
+    )
+    .unwrap();
     drop(null);
     scratch.json("done");
     let real = scratch.json("child")["pid"].as_i64().unwrap() as libc::pid_t;
@@ -1861,7 +1885,13 @@ fn the_sweep_reports_a_kill_of_a_live_process_and_only_then() {
         own_process: false,
     };
     let (spawn, null) = command(&config, &params(Some(PIN)), &PIN).unwrap();
-    let mut client = Client::spawn(spawn, Secret::from(PASSWORD), false).unwrap();
+    let mut client = Client::spawn(
+        spawn,
+        Secret::from(PASSWORD),
+        false,
+        FortinetDeadline::new().unwrap(),
+    )
+    .unwrap();
     drop(null);
     scratch.json("done");
     assert!(client.alive(), "control: the leader is running");
@@ -1886,6 +1916,7 @@ fn start_order() -> Start {
         index: 7,
         gateway: Ipv4Addr::new(192, 0, 2, 10),
         ppp_ifname: "vpntp1".into(),
+        establishment_deadline_ms: FortinetDeadline::new().unwrap().monotonic_ms,
     }
 }
 
@@ -2010,6 +2041,85 @@ fn only_a_well_formed_start_object_is_accepted_as_the_first_datagram() {
         );
     }
     assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn start_requires_the_authenticated_establishment_deadline() {
+    let scratch = Scratch::new();
+    let mut order = serde_json::to_value(start_order()).unwrap();
+    order
+        .as_object_mut()
+        .unwrap()
+        .remove("establishment_deadline_ms");
+    let (result, _) = serve_fixture(&scratch, &serde_json::to_vec(&order).unwrap(), true);
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn start_rejects_an_expired_establishment_deadline() {
+    let scratch = Scratch::new();
+    let mut order = serde_json::to_value(start_order()).unwrap();
+    order["establishment_deadline_ms"] = json!(crate::tunneld::protocol::monotonic_ms().unwrap());
+    let (result, _) = serve_fixture(&scratch, &serde_json::to_vec(&order).unwrap(), true);
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn establishment_deadline_ceiling_is_inclusive_and_expiry_is_exclusive() {
+    let now = Duration::from_millis(100_000);
+    let instant = Instant::now();
+    let ceiling = FortinetDeadline::from_sample(135_000, now, instant).unwrap();
+    assert_eq!(ceiling.instant, instant + Duration::from_secs(35));
+    assert_eq!(
+        FortinetDeadline::from_sample(135_001, now, instant)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        FortinetDeadline::from_sample(100_000, now, instant)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+
+    let scratch = Scratch::new();
+    let mut order = start_order();
+    order.establishment_deadline_ms = u64::MAX;
+    let (result, _) = serve_fixture(&scratch, &serde_json::to_vec(&order).unwrap(), true);
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert!(!scratch.path("client").exists());
+}
+
+#[test]
+fn instance_uses_the_writers_establishment_deadline_after_tls() {
+    let scratch = Scratch::new();
+    let (client, pinentry) = fixtures(&scratch, "time.sleep(1.5)\npin('after-cutoff')\n");
+    let (mut writer, mut instance) = real_pair(&scratch);
+    let mut order = serde_json::to_value(start_order()).unwrap();
+    order["establishment_deadline_ms"] =
+        json!(crate::tunneld::protocol::monotonic_ms().unwrap() + 1_000);
+    writer.send(&serde_json::to_vec(&order).unwrap()).unwrap();
+    writer.send(&credential_frame(PASSWORD)).unwrap();
+    let exit = serve_with(
+        &mut instance,
+        &mut LineObserver::default(),
+        Config {
+            client: client.to_str().unwrap(),
+            pinentry: pinentry.to_str().unwrap(),
+            limits: limits(Duration::from_secs(1)),
+            own_process: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(exit.reason, Reason::ClientExited);
+    let result = scratch.json("pinentry.after-cutoff");
+    assert_eq!(result["password"], Value::Null, "{result}");
+    assert!(result["error"].is_string(), "{result}");
 }
 
 fn credential_frame_of(password: &str) -> Vec<u8> {

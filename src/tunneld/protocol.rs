@@ -19,6 +19,10 @@ pub(super) const MAX_CONFIRMATION: Duration = Duration::from_secs(1);
 
 // The endpoints run in the same Linux time namespace as the writer.
 pub(super) fn monotonic_ms() -> io::Result<u64> {
+    Ok(monotonic()?.as_millis() as u64)
+}
+
+fn monotonic() -> io::Result<Duration> {
     let mut now = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -27,7 +31,51 @@ pub(super) fn monotonic_ms() -> io::Result<u64> {
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(now.tv_sec as u64 * 1000 + now.tv_nsec as u64 / 1_000_000)
+    Ok(Duration::new(now.tv_sec as u64, now.tv_nsec as u32))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FortinetDeadline {
+    pub monotonic_ms: u64,
+    pub instant: Instant,
+}
+
+impl FortinetDeadline {
+    const LIMIT: Duration = Duration::from_secs(35);
+
+    pub(super) fn new() -> io::Result<Self> {
+        let instant = Instant::now();
+        let now = monotonic()?;
+        let monotonic_ms = (now + Self::LIMIT).as_millis() as u64;
+        Self::from_sample(monotonic_ms, now, instant)
+    }
+
+    pub(super) fn from_wire(monotonic_ms: u64) -> io::Result<Self> {
+        let instant = Instant::now();
+        Self::from_sample(monotonic_ms, monotonic()?, instant)
+    }
+
+    pub(super) fn from_sample(
+        monotonic_ms: u64,
+        now: Duration,
+        instant: Instant,
+    ) -> io::Result<Self> {
+        let remaining = Duration::from_millis(monotonic_ms)
+            .checked_sub(now)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Fortinet Start expired"))?;
+        if remaining > Self::LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fortinet Start exceeds the establishment window",
+            ));
+        }
+        // Sample Instant first so projection cannot extend the wire deadline.
+        Ok(Self {
+            monotonic_ms,
+            instant: instant + remaining,
+        })
+    }
 }
 
 const IPSEC_SECRET_LIMIT: usize = 4096;
