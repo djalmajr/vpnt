@@ -2977,6 +2977,9 @@ mod tests {
                 ["-4", "-j", "route", "get", "192.0.2.20"] => serde_json::json!([
                     {"dev":"eth-fixture","prefsrc":"192.0.2.2","gateway":"192.0.2.1"}
                 ]),
+                ["-4", "-j", "route", "get", dst] if dst.parse::<Ipv4Addr>().is_ok_and(|address| {
+                    k.routes.iter().any(|route| parse_cidr(route).unwrap().network() == address)
+                }) => serde_json::json!([{"dev":"vpnti1"}]),
                 ["-j", "-d", "link", "show"] => {
                     // Plan and install each read egress and then inventory.
                     let link_reads = k.ops.iter().filter(|op| op.as_str() == "-j -d link show").count();

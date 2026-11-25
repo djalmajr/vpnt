@@ -2,7 +2,9 @@
 use super::protocol::{CidrV4, Generation, ProbeBinding};
 use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use std::{
+    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     net::Ipv4Addr,
@@ -327,16 +329,169 @@ fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
 }
 
-pub(super) fn check_standard_ipv4_rules(rules: &[serde_json::Value]) -> io::Result<()> {
-    let standard = serde_json::json!([
-        {"priority":0,"src":"all","table":"local"},
-        {"priority":32766,"src":"all","table":"main"},
-        {"priority":32767,"src":"all","table":"default"}
-    ]);
-    if rules != standard.as_array().expect("rules array").as_slice() {
-        return Err(invalid("nonstandard IPv4 policy rules"));
+fn rule_word(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| number(value.as_str()?).ok())
+}
+
+pub(super) fn check_ipv4_rules(
+    read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
+    protected: &[(u32, u8)],
+) -> io::Result<()> {
+    #[derive(Deserialize)]
+    struct Destination {
+        dst: String,
+    }
+
+    let rules: Vec<Value> = decode(&read_ip(&["-4", "-j", "rule", "show"])?)?;
+    let standard = [(0, "local"), (32766, "main"), (32767, "default")];
+    let mut seen = [false; 3];
+    let mut checked_tables = BTreeSet::new();
+    for rule in &rules {
+        let priority = rule.get("priority").and_then(Value::as_u64);
+        let table = rule.get("table").and_then(Value::as_str).filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                && name.as_bytes()[0].is_ascii_alphanumeric()
+        });
+        let reject = |reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IPv4 policy rule priority {} table {}: {reason}",
+                    priority.map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    table.unwrap_or("-")
+                ),
+            )
+        };
+        let Some(fields) = rule.as_object() else {
+            return Err(reject("invalid rule"));
+        };
+        if !priority.is_some_and(|n| u32::try_from(n).is_ok())
+            || rule["src"] != "all"
+            || rule.get("dst").is_some_and(|dst| dst != "all")
+        {
+            return Err(reject("unsupported selector"));
+        }
+        if fields.len() == 3
+            && let Some(index) = standard
+                .iter()
+                .position(|&(pref, name)| priority == Some(pref) && table == Some(name))
+        {
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(reject("duplicate standard rule"));
+            }
+            continue;
+        }
+
+        let plain = |key: &str| matches!(key, "priority" | "src" | "dst" | "table");
+        if let Some(mark) = rule.get("fwmark") {
+            // iproute2 omits the mask for an exact mark match. The effective
+            // mark must exclude zero, and the rule must not negate the match.
+            let mask = rule.get("fwmask").map_or(Some(u32::MAX), rule_word);
+            let marked_only = rule_word(mark)
+                .zip(mask)
+                .is_some_and(|(mark, mask)| mark & mask != 0);
+            let has_table = rule.get("table").is_some();
+            let has_action = rule.get("action").is_some();
+            let lookup = !has_action && matches!(table, Some("main" | "default" | "254" | "253"));
+            let terminal = !has_table
+                && matches!(
+                    rule["action"].as_str(),
+                    Some("unreachable" | "blackhole" | "prohibit")
+                );
+            if marked_only
+                && (lookup || terminal)
+                && fields
+                    .keys()
+                    .all(|key| plain(key) || matches!(key.as_str(), "fwmark" | "fwmask" | "action"))
+            {
+                continue;
+            }
+            return Err(reject("unsupported marked rule"));
+        }
+
+        let Some(table) = table.filter(|name| {
+            !matches!(*name, "local" | "main" | "default" | "all" | "unspec")
+                && !matches!(name.parse::<u32>(), Ok(0 | 253..=255))
+        }) else {
+            return Err(reject("unsupported table"));
+        };
+        if !fields.keys().all(|key| plain(key)) {
+            return Err(reject("unsupported rule fields"));
+        }
+        if checked_tables.insert(table) {
+            let routes: Vec<Destination> = read_ip(&["-4", "-j", "route", "show", "table", table])
+                .and_then(|bytes| decode(&bytes))
+                .map_err(|_| reject("could not read the routing table"))?;
+            for route in routes {
+                if route.dst == "default" {
+                    return Err(reject("default route in an additional table"));
+                }
+                let dst = prefix(&route.dst).map_err(|_| reject("invalid route destination"))?;
+                if dst.1 == 0 {
+                    return Err(reject("default route in an additional table"));
+                }
+                if protected.iter().any(|scope| overlaps(*scope, dst)) {
+                    return Err(reject("route overlaps protected destinations"));
+                }
+            }
+        }
+    }
+    if let Some(index) = seen.iter().position(|present| !present) {
+        let (priority, table) = standard[index];
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing IPv4 policy rule priority {priority} table {table}"),
+        ));
     }
     Ok(())
+}
+
+pub(super) fn verify_tunnel_routes(
+    read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
+    routes: &[CidrV4],
+    interface: &str,
+) -> io::Result<()> {
+    #[derive(Deserialize)]
+    struct SelectedDevice {
+        dev: String,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    for route in routes {
+        let first = route.network().to_string();
+        let selected: Vec<SelectedDevice> =
+            decode(&read_ip(&["-4", "-j", "route", "get", &first])?)?;
+        let [selected] = selected.as_slice() else {
+            return Err(invalid("ambiguous tunnel route lookup"));
+        };
+        if selected.dev != interface
+            || selected
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kind != "unicast")
+        {
+            return Err(invalid(
+                "tunnel route lookup selected a different interface",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn rollback_error(error: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => io::Error::new(
+            error.kind(),
+            format!("{error}; network rollback failed: {cleanup}"),
+        ),
+    }
 }
 
 impl Network {
@@ -493,30 +648,36 @@ impl Network {
         routes: &[CidrV4],
         vip: Option<Ipv4Addr>,
         approved: &[Ipv4Addr],
+        remote: Ipv4Addr,
         egress: &Egress,
     ) -> io::Result<()> {
-        let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        check_standard_ipv4_rules(&rules)?;
         let protected = approved
             .iter()
             .copied()
-            .chain([egress.prefsrc])
+            .chain([remote, egress.prefsrc])
             .chain(egress.gateway);
         let requested: Vec<_> = routes.iter().map(route_key).collect();
         if protected
-            .into_iter()
+            .clone()
             .any(|ip| requested.iter().any(|r| overlaps(*r, (ip.into(), 32))) || vip == Some(ip))
         {
             return Err(invalid("VPN scope conflicts with protected transport"));
         }
-        let mut has_default = false;
+        let mut policy_scope = requested.clone();
+        policy_scope.extend(protected.chain(vip).map(|ip| (ip.into(), 32)));
+        check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
+
+        let mut default_count = 0;
+        let mut has_egress_device = false;
+        let mut has_egress_default = false;
         for existing in self.routes("-4")? {
-            if existing.dst == "default" {
-                if has_default
-                    || existing.kind.as_deref() != Some("unicast")
+            if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
+                if existing.kind.as_deref() != Some("unicast")
+                    || existing.dev.as_deref().is_none_or(str::is_empty)
                     || existing.nexthops.is_some()
                     || existing.nhid.is_some()
-                    || existing.dev.as_deref() != Some(&egress.dev)
+                    || existing.encap.is_some()
+                    || existing.via.is_some()
                     || existing
                         .table
                         .as_deref()
@@ -524,7 +685,26 @@ impl Network {
                 {
                     return Err(invalid("nonstandard default route"));
                 }
-                has_default = true;
+                for address in existing.gateway.into_iter().chain(existing.prefsrc) {
+                    let std::net::IpAddr::V4(ip) = address else {
+                        return Err(invalid("nonstandard default route"));
+                    };
+                    if requested
+                        .iter()
+                        .any(|route| overlaps(*route, (ip.into(), 32)))
+                        || vip == Some(ip)
+                    {
+                        return Err(invalid("VPN scope conflicts with protected transport"));
+                    }
+                }
+                default_count += 1;
+                let same_device = existing.dev.as_deref() == Some(&egress.dev);
+                has_egress_device |= same_device;
+                has_egress_default |= same_device
+                    && existing.gateway == egress.gateway.map(Into::into)
+                    && existing
+                        .prefsrc
+                        .is_none_or(|src| src == std::net::IpAddr::V4(egress.prefsrc));
                 continue;
             }
             let existing = prefix(&existing.dst)?;
@@ -533,6 +713,11 @@ impl Network {
             {
                 return Err(invalid("VPN scope conflicts with an existing route"));
             }
+        }
+        // Preserve the direct/no-default cases; with competing defaults the
+        // full egress must identify one of the default paths.
+        if default_count > 0 && (!has_egress_device || default_count > 1 && !has_egress_default) {
+            return Err(invalid("default routes do not match the proved egress"));
         }
         Ok(())
     }
@@ -547,7 +732,7 @@ impl Network {
     ) -> io::Result<Receipt> {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
-        self.fib_clear(&routes, None, approved, &egress)?;
+        self.fib_clear(&routes, None, approved, remote, &egress)?;
         let links = self.links(None)?;
         let ids = self.xfrm_ids()?;
         let link_ids: Vec<_> = links.iter().map(Link::xfrm_id).collect::<io::Result<_>>()?;
@@ -614,7 +799,13 @@ impl Network {
         if self.egress(receipt.remote)? != receipt.egress {
             return Err(invalid("egress changed between start and establishment"));
         }
-        self.fib_clear(&receipt.routes, Some(vip), approved, &receipt.egress)?;
+        self.fib_clear(
+            &receipt.routes,
+            Some(vip),
+            approved,
+            receipt.remote,
+            &receipt.egress,
+        )?;
         let name = receipt.name();
         if self.link(receipt)?.is_some() {
             return Err(invalid("reserved interface name is already in use"));
@@ -682,9 +873,17 @@ impl Network {
         if !current.flags.iter().any(|flag| flag == "UP")
             || !self.address_present(receipt, &current)?
             || self.applied_routes(receipt)?.len() != receipt.routes.len()
-            || self.egress(receipt.remote)? != receipt.egress
         {
             return Err(invalid("network configuration confirmation failed"));
+        }
+        let paths = (|| {
+            if self.egress(receipt.remote)? != receipt.egress {
+                return Err(invalid("network configuration confirmation failed"));
+            }
+            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &name)
+        })();
+        if let Err(error) = paths {
+            return Err(rollback_error(error, self.clean_link(receipt)));
         }
         cancel.check()?;
         receipt.confirmed = true;
@@ -882,6 +1081,13 @@ impl Network {
     ) -> io::Result<()> {
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
+        self.clean_link(receipt)?;
+        self.verify_xfrm_clear(receipt)
+    }
+
+    // State and policies belong to the still-running instance. The immediate
+    // rollback only removes the link, address and routes owned by this writer.
+    fn clean_link(&self, receipt: &Receipt) -> io::Result<()> {
         if receipt.creating {
             if let Some(link) = self.owned_link(receipt)? {
                 let routes = self.applied_routes(receipt)?;
@@ -925,7 +1131,7 @@ impl Network {
                 return Err(invalid("XFRM interface or route remains after deletion"));
             }
         }
-        self.verify_xfrm_clear(receipt)
+        Ok(())
     }
 
     pub(super) fn verify_xfrm_clear(&self, receipt: &Receipt) -> io::Result<()> {
@@ -1085,5 +1291,365 @@ mod cancellation_tests {
                 io::ErrorKind::ConnectionAborted
             );
         });
+    }
+}
+
+#[cfg(test)]
+pub(super) mod coexistence_tests {
+    use super::*;
+    use crate::netlease::NetworkLock;
+    use serde_json::{Value, json};
+
+    const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+    const REMOTE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
+    const APPROVED: &[Ipv4Addr] = &[REMOTE, Ipv4Addr::new(192, 0, 2, 21)];
+
+    pub(super) fn standard_rules() -> Vec<Value> {
+        vec![
+            json!({"priority":0,"src":"all","table":"local"}),
+            json!({"priority":32766,"src":"all","table":"main"}),
+            json!({"priority":32767,"src":"all","table":"default"}),
+        ]
+    }
+
+    pub(crate) fn tailscale_rules() -> Vec<Value> {
+        let mut rules = standard_rules();
+        rules.splice(1..1, [
+            json!({"priority":5210,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","table":"main"}),
+            json!({"priority":5230,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","table":"default"}),
+            json!({"priority":5250,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","action":"unreachable"}),
+            json!({"priority":5270,"src":"all","table":"52"}),
+        ]);
+        rules
+    }
+
+    pub(crate) fn unsupported_rules() -> Vec<Value> {
+        vec![
+            json!({"priority":500,"src":"all","table":"52","iif":"eth-other"}),
+            json!({"priority":500,"src":"all","table":"52","oif":"eth-other"}),
+            json!({"priority":500,"src":"all","table":"52","uid_start":1000,"uid_end":1000}),
+            json!({"priority":500,"src":"all","goto":32766}),
+            json!({"priority":500,"src":"203.0.113.0/24","table":"main"}),
+            json!({"priority":500,"src":"all","dst":"203.0.113.0/24","table":"main"}),
+            json!({"priority":500,"src":"all","table":"52","suppress_prefixlen":0}),
+            json!({"priority":500,"src":"all","table":"52","protocol":"static"}),
+            json!({"priority":500,"src":"all","l3mdev":null}),
+            json!({"priority":500,"src":"all","nop":null}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x0"}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x80000","fwmask":"0x0"}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x80000","not":null}),
+        ]
+    }
+
+    pub(crate) fn defaults(dev: &str) -> Vec<Value> {
+        vec![
+            json!({"dst":"default","type":"unicast","table":"main","dev":dev,"gateway":"192.0.2.1","metric":100}),
+            json!({"dst":"default","type":"unicast","table":"main","dev":"wlan-fixture","gateway":"198.51.100.1","metric":600}),
+        ]
+    }
+
+    struct Root(std::path::PathBuf);
+
+    impl Root {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vpnt-xfrm-coexistence-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+
+        fn guard(&self) -> NetworkGuard {
+            NetworkLock::acquire_test(&self.0, Instant::now() + Duration::from_secs(2)).unwrap()
+        }
+    }
+
+    fn plan(rules: Vec<Value>, extra: Vec<Value>, defaults: Vec<Value>) -> io::Result<Receipt> {
+        let root = Root::new();
+        let network = Network::fake(move |_, args| {
+            let data = match args {
+                ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
+                    {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
+                ]),
+                ["-j", "-d", "link", "show"] => {
+                    json!([{"ifname":"eth-fixture","ifindex":2,"flags":["UP"]}])
+                }
+                ["-4", "-j", "rule", "show"] => json!(rules),
+                ["-4", "-j", "route", "show", "table", "52"] => json!(extra),
+                ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                    json!(defaults.iter().chain(&extra).collect::<Vec<_>>())
+                }
+                ["xfrm", "state", "list", "nokeys"] | ["xfrm", "policy", "list"] => {
+                    return Ok(vec![]);
+                }
+                _ => panic!("unexpected command: {args:?}"),
+            };
+            Ok(serde_json::to_vec(&data).unwrap())
+        });
+        network.plan(
+            &root.guard(),
+            GENERATION,
+            REMOTE,
+            APPROVED,
+            vec![parse_cidr("10.20.0.0/16").unwrap()],
+        )
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn tailscale_rules_admit_disjoint_routes_in_table_52() {
+        assert!(
+            plan(
+                tailscale_rules(),
+                vec![
+                    json!({"dst":"100.64.0.0/10","dev":"tailscale0","table":"52"}),
+                    json!({"dst":"100.110.20.1","dev":"tailscale0","table":"52"}),
+                ],
+                defaults("eth-fixture")[..1].to_vec()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn extra_policy_tables_refuse_default_and_protected_destinations() {
+        for (dst, kind) in [
+            ("default", "unicast"),
+            ("0.0.0.0/0", "throw"),
+            ("192.0.2.1", "unicast"),
+            ("192.0.2.20", "unicast"),
+            ("192.0.2.21", "unreachable"),
+            ("10.20.1.0/24", "throw"),
+        ] {
+            let error = plan(
+                tailscale_rules(),
+                vec![json!({"dst":dst,"type":kind,"table":"52"})],
+                defaults("eth-fixture")[..1].to_vec(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("priority 5270 table 52"),
+                "{error}"
+            );
+            if dst != "default" {
+                assert!(!error.to_string().contains(dst));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_policy_rules_identify_priority_without_selector_addresses() {
+        for rule in unsupported_rules() {
+            let mut rules = standard_rules();
+            rules.insert(1, rule);
+            let error = plan(rules, vec![], defaults("eth-fixture")).unwrap_err();
+            assert!(error.to_string().contains("priority 500 table"), "{error}");
+            assert!(!error.to_string().contains("203.0.113.0"));
+        }
+    }
+
+    #[test]
+    fn distinct_defaults_are_admitted_when_the_kernel_egress_matches() {
+        plan(standard_rules(), vec![], defaults("eth-fixture")).unwrap();
+    }
+
+    #[test]
+    fn a_policy_lookup_outside_xfrm_after_installation_rolls_back() {
+        #[derive(Default)]
+        struct Kernel {
+            alias: Option<String>,
+            link: bool,
+            address: bool,
+            route: bool,
+            ops: Vec<String>,
+        }
+
+        let root = Root::new();
+        let directory = root.0.join(GENERATION);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let guard = root.guard();
+        let kernel = Arc::new(Mutex::new(Kernel::default()));
+        let state = kernel.clone();
+        let network = Network::fake(move |_, args| {
+            let mut state = state.lock().unwrap();
+            state.ops.push(args.join(" "));
+            let data = match args {
+                ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
+                    {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
+                ]),
+                ["-4", "-j", "route", "get", "10.20.0.0"] if state.route => {
+                    json!([{"dev":"eth-other"}])
+                }
+                ["-j", "-d", "link", "show"] => {
+                    let mut links =
+                        vec![json!({"ifname":"eth-fixture","ifindex":2,"flags":["UP"]})];
+                    if state.link {
+                        links.push(json!({
+                            "ifname":"vpnti1","ifindex":3,"flags":["UP"],"link":"eth-fixture",
+                            "ifalias":state.alias,"linkinfo":{"info_kind":"xfrm","info_data":{"if_id":"0x1"}}
+                        }));
+                    }
+                    json!(links)
+                }
+                ["-4", "-j", "rule", "show"] => json!(standard_rules()),
+                ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                    let mut rows = defaults("eth-fixture");
+                    rows.truncate(1);
+                    if state.route {
+                        rows.push(json!({
+                            "dst":"10.20.0.0/16","dev":"vpnti1","type":"unicast","table":"main",
+                            "scope":"link","protocol":"boot"
+                        }));
+                    }
+                    json!(rows)
+                }
+                ["-6", "-j", "-d", "route", "show", "table", "all"] => json!([]),
+                ["-j", "addr", "show", "dev", "vpnti1"] => {
+                    let addresses = if state.address {
+                        vec![json!({"family":"inet","local":"10.99.0.2","prefixlen":32})]
+                    } else {
+                        vec![]
+                    };
+                    json!([{"ifindex":3,"addr_info":addresses}])
+                }
+                ["xfrm", "state", "list", "nokeys"] | ["xfrm", "policy", "list"] => {
+                    return Ok(vec![]);
+                }
+                [
+                    "link",
+                    "add",
+                    "name",
+                    "vpnti1",
+                    "type",
+                    "xfrm",
+                    "dev",
+                    "eth-fixture",
+                    "if_id",
+                    "1",
+                ] => {
+                    state.link = true;
+                    return Ok(vec![]);
+                }
+                ["link", "set", "dev", "vpnti1", "alias", alias] => {
+                    state.alias = Some((*alias).into());
+                    return Ok(vec![]);
+                }
+                ["link", "set", "dev", "vpnti1", "addrgenmode", "none"]
+                | ["link", "set", "dev", "vpnti1", "up"] => return Ok(vec![]),
+                [
+                    "-4",
+                    "addr",
+                    "add",
+                    "10.99.0.2/32",
+                    "dev",
+                    "vpnti1",
+                    "noprefixroute",
+                ] => {
+                    state.address = true;
+                    return Ok(vec![]);
+                }
+                ["-4", "addr", "del", "10.99.0.2/32", "dev", "vpnti1"] => {
+                    state.address = false;
+                    return Ok(vec![]);
+                }
+                [
+                    "-4",
+                    "route",
+                    "add",
+                    "10.20.0.0/16",
+                    "dev",
+                    "vpnti1",
+                    "table",
+                    "main",
+                    "proto",
+                    "boot",
+                    "scope",
+                    "link",
+                ] => {
+                    state.route = true;
+                    return Ok(vec![]);
+                }
+                [
+                    "-4",
+                    "route",
+                    "del",
+                    "10.20.0.0/16",
+                    "dev",
+                    "vpnti1",
+                    "table",
+                    "main",
+                    "proto",
+                    "boot",
+                    "scope",
+                    "link",
+                ] => {
+                    state.route = false;
+                    return Ok(vec![]);
+                }
+                ["link", "del", "dev", "vpnti1"] if !state.route && !state.address => {
+                    state.link = false;
+                    return Ok(vec![]);
+                }
+                _ => panic!("unexpected command: {args:?}"),
+            };
+            Ok(serde_json::to_vec(&data).unwrap())
+        });
+        let mut receipt = network
+            .plan(
+                &guard,
+                GENERATION,
+                REMOTE,
+                APPROVED,
+                vec![parse_cidr("10.20.0.0/16").unwrap()],
+            )
+            .unwrap();
+        let error = network
+            .install(
+                &guard,
+                &directory,
+                &mut receipt,
+                "10.99.0.2".parse().unwrap(),
+                APPROVED,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        assert!(!receipt.confirmed);
+        let state = kernel.lock().unwrap();
+        assert!(!state.link && !state.route && !state.address);
+        assert!(state.ops.iter().any(|op| op.starts_with("-4 route add ")));
+        assert!(state.ops.iter().any(|op| op.starts_with("-4 route del ")));
+    }
+
+    #[test]
+    fn every_default_must_be_simple_and_its_addresses_clear_of_the_tunnel_scope() {
+        for (field, value) in [
+            ("nhid", json!(8)),
+            ("nexthops", json!([{"dev":"wlan-fixture"}])),
+            ("encap", json!({"type":"mpls"})),
+            ("table", json!("52")),
+            ("gateway", json!("10.20.1.1")),
+            ("prefsrc", json!("10.20.1.2")),
+        ] {
+            let mut rows = defaults("eth-fixture");
+            rows[1][field] = value;
+            assert!(plan(standard_rules(), vec![], rows).is_err(), "{field}");
+        }
+        assert!(plan(standard_rules(), vec![], defaults("other-device")).is_err());
     }
 }

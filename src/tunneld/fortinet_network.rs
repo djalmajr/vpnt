@@ -12,8 +12,8 @@
 use super::{
     fortinet_instance::{Event, Failure},
     network::{
-        SetupCancellation, check_deadline, check_standard_ipv4_rules, cidr_text, overlaps, prefix,
-        route_key, valid_generation,
+        SetupCancellation, check_deadline, check_ipv4_rules, cidr_text, overlaps, prefix,
+        rollback_error, route_key, valid_generation, verify_tunnel_routes,
     },
     policy::Entry,
     protocol::{CidrV4, Generation, ProbeBinding},
@@ -225,6 +225,7 @@ pub(super) struct Grant {
     pub certificate_sha256: String,
     #[serde(deserialize_with = "deserialize_local_scope")]
     pub fortinet_local_cidr: CidrV4,
+    route_cidrs: Vec<String>,
     pub dns_domains: Vec<String>,
     pub dns_servers: Vec<Ipv4Addr>,
 }
@@ -415,10 +416,10 @@ impl Route {
             && self.extra.is_empty()
     }
 
-    fn is_egress_default(&self, egress: &Egress) -> bool {
+    fn is_simple_default(&self) -> bool {
         self.main_table()
             && self.kind.as_deref() == Some("unicast")
-            && self.dev.as_deref() == Some(&egress.dev)
+            && self.dev.as_deref().is_some_and(|dev| !dev.is_empty())
             && self
                 .scope
                 .as_deref()
@@ -613,7 +614,7 @@ impl FortinetNetwork {
                 return Err(invalid("Fortinet local scope overlaps a host address"));
             }
         }
-        self.fib_clear(&receipt, scope)?;
+        self.fib_clear(&receipt, grant)?;
         Ok(receipt)
     }
 
@@ -731,9 +732,20 @@ impl FortinetNetwork {
         Ok(applied)
     }
 
-    fn fib_clear(&self, receipt: &Receipt, local_scope: CidrV4) -> io::Result<()> {
-        let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        check_standard_ipv4_rules(&rules)?;
+    fn fib_clear(&self, receipt: &Receipt, grant: &Grant) -> io::Result<()> {
+        let local_scope = grant.fortinet_local_cidr;
+        let mut policy_scope = grant
+            .route_cidrs
+            .iter()
+            .map(|route| prefix(route))
+            .collect::<io::Result<Vec<_>>>()?;
+        policy_scope.extend(
+            receipt
+                .protected_transport()
+                .map(|ip| (ip.into(), 32))
+                .chain([PPP_PEER_PREFIX, route_key(&local_scope)]),
+        );
+        check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
         let routes = self.routes()?;
         // Planning has no PPP link. Once identified, the technical peer
         // and all intended routes must be present in this same snapshot.
@@ -744,13 +756,15 @@ impl FortinetNetwork {
         if applied.routes.len() != receipt.routes_intended {
             return Err(invalid("network configuration confirmation failed"));
         }
-        let mut has_default = false;
+        let mut default_count = 0;
+        let mut has_egress_device = false;
+        let mut has_egress_default = false;
         for existing in routes
             .iter()
             .filter(|r| r.dev.as_deref() != Some(&receipt.ifname))
         {
-            if existing.dst == "default" {
-                if has_default || !existing.is_egress_default(&receipt.egress) {
+            if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
+                if !existing.is_simple_default() {
                     return Err(invalid("nonstandard default route"));
                 }
                 if existing
@@ -772,7 +786,14 @@ impl FortinetNetwork {
                 {
                     return Err(invalid("Fortinet local scope overlaps the default route"));
                 }
-                has_default = true;
+                default_count += 1;
+                let same_device = existing.dev.as_deref() == Some(&receipt.egress.dev);
+                has_egress_device |= same_device;
+                has_egress_default |= same_device
+                    && existing.gateway == receipt.egress.gateway
+                    && existing
+                        .prefsrc
+                        .is_none_or(|src| src == receipt.egress.prefsrc);
                 continue;
             }
             // So are the next hops and sources of every other route.
@@ -801,8 +822,11 @@ impl FortinetNetwork {
                 return Err(invalid("VPN scope conflicts with an existing route"));
             }
         }
-        if !has_default {
+        if default_count == 0 {
             return Err(invalid("missing default route"));
+        }
+        if !has_egress_device || default_count > 1 && !has_egress_default {
+            return Err(invalid("default routes do not match the proved egress"));
         }
         Ok(())
     }
@@ -900,7 +924,7 @@ impl FortinetNetwork {
         }
         receipt.routes = accepted.clone();
         receipt.refused_routes = refused;
-        self.fib_clear(receipt, local_scope)?;
+        self.fib_clear(receipt, scope.grant)?;
 
         // Fixed servers take precedence. Either source must be reachable via
         // an accepted route. Domains always come from policy.
@@ -940,9 +964,16 @@ impl FortinetNetwork {
             receipt.save(directory, guard)?;
             self.route_change("add", route, &link.ifname, Some(cancel))?;
         }
+        if dns.is_some() {
+            // Prove the installed FIB entries before publishing resolver state.
+            self.fib_clear(receipt, scope.grant)?;
+        }
+        if let Err(error) =
+            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &link.ifname)
+        {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
+        }
         if let Some(dns) = &dns {
-            // Prove the installed paths before making them visible to the resolver.
-            self.fib_clear(receipt, local_scope)?;
             receipt.dns_intended = true;
             receipt.save(directory, guard)?;
             self.resolvectl(&["revert", &link.ifname], Some(cancel))?;
@@ -966,8 +997,17 @@ impl FortinetNetwork {
                     && current.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("PPP link changed during configuration"))?;
-        if self.address(&current)? != local || self.egress(receipt.remote)? != receipt.egress {
+        if self.address(&current)? != local {
             return Err(invalid("network configuration confirmation failed"));
+        }
+        let gateway = self.egress(receipt.remote).and_then(|egress| {
+            if egress != receipt.egress {
+                return Err(invalid("network configuration confirmation failed"));
+            }
+            Ok(())
+        });
+        if let Err(error) = gateway {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
         }
         if let Some(dns) = &dns
             && (self.dns_state(&current.ifname)? != *dns
@@ -975,7 +1015,7 @@ impl FortinetNetwork {
         {
             return Err(invalid("DNS confirmation failed"));
         }
-        self.fib_clear(receipt, local_scope)?;
+        self.fib_clear(receipt, scope.grant)?;
         receipt.confirmed = true;
         receipt.save(directory, guard)
     }
@@ -1212,6 +1252,7 @@ pub(super) mod fixture {
         pub routes: Vec<String>,
         pub host_address: &'static str,
         pub foreign: Vec<serde_json::Value>,
+        pub wrong_tunnel_path: bool,
         pub default_override: Option<Vec<serde_json::Value>>,
         pub rules: Vec<serde_json::Value>,
         pub foreign_on_add: Option<serde_json::Value>,
@@ -1245,6 +1286,7 @@ pub(super) mod fixture {
                 routes: Vec::new(),
                 host_address: "192.0.2.2",
                 foreign: Vec::new(),
+                wrong_tunnel_path: false,
                 default_override: None,
                 rules: vec![
                     json!({"priority": 0, "src": "all", "table": "local"}),
@@ -1345,6 +1387,13 @@ pub(super) mod fixture {
             }
             assert_eq!(program, IP);
             match args {
+                ["-4", "-j", "route", "get", dst]
+                    if k.routes.iter().any(|route| {
+                        prefix(route).unwrap().0 == dst.parse::<Ipv4Addr>().unwrap().to_bits()
+                    }) =>
+                {
+                    say(json!([{"dev": if k.wrong_tunnel_path { k.egress_dev } else { NAME }}]))
+                }
                 ["-4", "-j", "route", "get", _] => say(json!([
                     {"dev": k.egress_dev, "prefsrc": "192.0.2.2", "gateway": "192.0.2.1"}
                 ])),
@@ -1374,6 +1423,12 @@ pub(super) mod fixture {
                     "addr_info": [{"family": "inet", "local": k.host_address, "prefixlen": 24}]
                 }])),
                 ["-4", "-j", "rule", "show"] => say(json!(k.rules)),
+                ["-4", "-j", "route", "show", "table", table] => say(json!(
+                    k.foreign
+                        .iter()
+                        .filter(|route| route["table"] == *table)
+                        .collect::<Vec<_>>()
+                )),
                 ["-4", "-j", "-d", "route", "show", "table", "all"] => {
                     let mut routes = k.default_override.clone().unwrap_or_else(|| {
                         vec![json!({
@@ -1475,6 +1530,7 @@ pub(super) mod fixture {
 mod tests {
     use super::{fixture::*, *};
     use crate::netlease::NetworkLock;
+    use crate::tunneld::network::coexistence_tests;
     use serde_json::{Value, json};
     use std::{
         os::unix::fs::PermissionsExt,
@@ -2043,24 +2099,156 @@ mod tests {
     }
 
     #[test]
-    fn the_default_must_be_single_unicast_main_and_use_the_proved_egress() {
-        let standard =
-            json!({"dst": "default", "dev": "eth-fixture", "table": "main", "type": "unicast"});
-        let mut variants = vec![vec![], vec![standard.clone(), standard.clone()]];
+    fn tailscale_rules_admit_disjoint_routes_in_table_52() {
+        let fixture = Fixture::new();
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.rules = coexistence_tests::tailscale_rules();
+            kernel.foreign.push(external_route("100.64.0.0/10", "52"));
+            kernel.foreign.push(external_route("100.110.20.1", "52"));
+        }
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &[], &[]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn extra_policy_tables_refuse_default_and_protected_destinations() {
+        for dst in ["default", "192.0.2.20", "10.20.1.0/24", PEER, "10.99.0.8"] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                kernel.rules = coexistence_tests::tailscale_rules();
+                kernel.foreign.push(external_route(dst, "52"));
+            }
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("priority 5270 table 52"),
+                "{error}"
+            );
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn planning_checks_the_approved_route_ceiling_before_ppp_starts() {
+        let fixture = Fixture::new();
+        let grant = Grant::from_entry(&entry(&["10.20.0.0/15"], &[], &[])).unwrap();
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.rules = coexistence_tests::tailscale_rules();
+            kernel.foreign.push(external_route("10.21.1.0/24", "52"));
+        }
+        let result = fixture
+            .network
+            .plan(&fixture.guard(), GENERATION, REMOTE, &grant);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("priority 5270 table 52")
+        );
+        assert!(!fixture.directory.join(RECEIPT).exists());
+        assert!(fixture.writes().is_empty());
+    }
+
+    #[test]
+    fn unsupported_policy_rules_identify_priority_without_selector_addresses() {
+        for rule in coexistence_tests::unsupported_rules() {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            fixture.kernel.lock().unwrap().rules.insert(1, rule);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("priority 500 table"), "{error}");
+            assert!(!error.to_string().contains("203.0.113.0"));
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn distinct_defaults_are_admitted_when_the_kernel_egress_matches() {
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().default_override =
+            Some(coexistence_tests::defaults("eth-fixture"));
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &[], &[]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_policy_lookup_outside_ppp_after_installation_rolls_back_before_dns() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        fixture.kernel.lock().unwrap().wrong_tunnel_path = true;
+        let error = apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &["10.20.0.53"], &["corp.example"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        let kernel = fixture.kernel.lock().unwrap();
+        assert!(kernel.routes.is_empty());
+        assert!(kernel.dns.is_empty());
+        assert!(kernel.ops.iter().any(|op| op.contains(" route add ")));
+        assert!(kernel.ops.iter().any(|op| op.contains(" route del ")));
+        assert!(!receipt.confirmed);
+    }
+
+    #[test]
+    fn defaults_must_be_unicast_main_and_include_the_proved_egress() {
+        let defaults = coexistence_tests::defaults;
+        let mut variants = vec![vec![], defaults("eth-other")];
         for (key, value) in [
             ("type", json!("blackhole")),
             ("table", json!("default")),
-            ("dev", json!("eth-other")),
             ("nhid", json!(12)),
             ("nexthops", json!([{"dev": "eth-other"}])),
+            ("encap", json!({"type":"mpls"})),
             ("tos", json!("0x10")),
             ("gateway", json!("10.20.1.1")),
+            ("gateway", json!(PEER)),
             ("prefsrc", json!("10.20.1.2")),
         ] {
-            let mut default = standard.clone();
-            default[key] = value;
-            variants.push(vec![default]);
+            let mut rows = defaults("eth-fixture");
+            rows[1][key] = value;
+            variants.push(rows);
         }
+        let mut wrong_gateway = defaults("eth-fixture");
+        wrong_gateway[0]["gateway"] = json!("192.0.2.3");
+        variants.push(wrong_gateway);
         for defaults in variants {
             let fixture = Fixture::new();
             let mut receipt = fixture.plan();
