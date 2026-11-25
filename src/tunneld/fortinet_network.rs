@@ -382,6 +382,28 @@ impl Route {
         self.table.as_deref().is_none_or(|table| table == "main")
     }
 
+    /// Every host address the route names: next hop, source and the next hops
+    /// of a multipath route. A hop that is not an IPv4 address is refused.
+    fn named_addresses(&self) -> io::Result<Vec<Ipv4Addr>> {
+        let mut named: Vec<Ipv4Addr> = self.gateway.into_iter().chain(self.prefsrc).collect();
+        if let Some(hops) = &self.nexthops {
+            let hops = hops
+                .as_array()
+                .ok_or_else(|| invalid("unreadable multipath route"))?;
+            for hop in hops {
+                if let Some(gateway) = hop.get("gateway") {
+                    named.push(
+                        gateway
+                            .as_str()
+                            .and_then(|text| text.parse().ok())
+                            .ok_or_else(|| invalid("unreadable multipath next hop"))?,
+                    );
+                }
+            }
+        }
+        Ok(named)
+    }
+
     fn direct(&self) -> bool {
         self.gateway.is_none()
             && self.metric.is_none()
@@ -741,8 +763,25 @@ impl FortinetNetwork {
                 {
                     return Err(invalid("VPN scope conflicts with protected transport"));
                 }
+                // The default route's next hop and source are host addresses
+                // too: the approved range must not hand one to the PPP peer.
+                if existing
+                    .named_addresses()?
+                    .into_iter()
+                    .any(|ip| contains(&local_scope, ip))
+                {
+                    return Err(invalid("Fortinet local scope overlaps the default route"));
+                }
                 has_default = true;
                 continue;
+            }
+            // So are the next hops and sources of every other route.
+            if existing
+                .named_addresses()?
+                .into_iter()
+                .any(|ip| contains(&local_scope, ip))
+            {
+                return Err(invalid("Fortinet local scope overlaps a host route"));
             }
             let dst = prefix(&existing.dst)?;
             if dst.1 == 0 || dst.0.trailing_zeros() < u32::from(32 - dst.1) {
@@ -1985,6 +2024,168 @@ mod tests {
             fixture.kernel.lock().unwrap().default_override = Some(defaults);
             assert_rejected_before_writes(&fixture, &mut receipt);
         }
+    }
+
+    fn onlink_default(key: &str, address: &str) -> Vec<Value> {
+        let mut default = json!({
+            "dst": "default", "dev": "eth-fixture", "type": "unicast", "table": "main",
+            "protocol": "dhcp", "scope": "global", "gateway": "192.0.2.1",
+            "metric": 100, "flags": ["onlink"]
+        });
+        default[key] = json!(address);
+        vec![default]
+    }
+
+    #[test]
+    fn planning_refuses_a_local_scope_holding_the_default_route_next_hop_or_source() {
+        for (key, address) in [
+            ("gateway", "10.99.0.7"),
+            ("prefsrc", "10.99.0.9"),
+            // First and last address of the approved range.
+            ("gateway", "10.99.0.0"),
+            ("prefsrc", "10.99.0.255"),
+        ] {
+            let fixture = Fixture::new();
+            fixture.kernel.lock().unwrap().default_override = Some(onlink_default(key, address));
+            let error = fixture
+                .network
+                .plan(&fixture.guard(), GENERATION, REMOTE, &fixture.grant())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{key} {address}");
+            assert_eq!(
+                error.to_string(),
+                "Fortinet local scope overlaps the default route"
+            );
+            assert!(!fixture.directory.join(RECEIPT).exists());
+            assert!(fixture.writes().is_empty());
+        }
+    }
+
+    #[test]
+    fn apply_refuses_a_local_scope_holding_the_default_route_next_hop_or_source() {
+        for (key, address) in [("gateway", "10.99.0.7"), ("prefsrc", "10.99.0.9")] {
+            // The default route changes after planning: apply() sees it first.
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            fixture.kernel.lock().unwrap().default_override = Some(onlink_default(key, address));
+            let entry = entry(&["10.20.0.0/15"], &[], &[]);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{key} {address}");
+            assert_eq!(
+                error.to_string(),
+                "Fortinet local scope overlaps the default route"
+            );
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    fn routed_through(key: &str, value: Value) -> Value {
+        let mut route = json!({
+            "dst": "10.50.0.0/16", "dev": "eth-fixture", "type": "unicast", "table": "main",
+            "protocol": "static", "scope": "global", "flags": ["onlink"]
+        });
+        route[key] = value;
+        route
+    }
+
+    #[test]
+    fn a_specific_route_naming_a_local_scope_address_is_refused_by_plan_and_apply() {
+        for (label, route) in [
+            ("gateway", routed_through("gateway", json!("10.99.0.9"))),
+            ("prefsrc", routed_through("prefsrc", json!("10.99.0.9"))),
+            (
+                "multipath hop",
+                routed_through(
+                    "nexthops",
+                    json!([{"gateway": "10.99.0.9", "dev": "eth-fixture"}]),
+                ),
+            ),
+        ] {
+            let fixture = Fixture::new();
+            fixture.kernel.lock().unwrap().foreign.push(route.clone());
+            let error = fixture
+                .network
+                .plan(&fixture.guard(), GENERATION, REMOTE, &fixture.grant())
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Fortinet local scope overlaps a host route",
+                "plan, {label}"
+            );
+            assert!(!fixture.directory.join(RECEIPT).exists());
+            assert!(fixture.writes().is_empty());
+
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            fixture.kernel.lock().unwrap().foreign.push(route);
+            let entry = entry(&["10.20.0.0/15"], &[], &[]);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Fortinet local scope overlaps a host route",
+                "apply, {label}"
+            );
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn a_route_with_an_unreadable_multipath_hop_is_refused_and_one_outside_the_scope_is_not() {
+        for hops in [
+            json!({"gateway": "10.99.0.9"}),
+            json!([{"gateway": "fe80::1"}]),
+            json!([{"gateway": 7}]),
+        ] {
+            let fixture = Fixture::new();
+            fixture
+                .kernel
+                .lock()
+                .unwrap()
+                .foreign
+                .push(routed_through("nexthops", hops));
+            let error = fixture
+                .network
+                .plan(&fixture.guard(), GENERATION, REMOTE, &fixture.grant())
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        // Control: next hop and source outside the approved range.
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().foreign.extend([
+            routed_through("gateway", json!("10.98.255.9")),
+            routed_through(
+                "nexthops",
+                json!([{"gateway": "10.100.0.9", "dev": "eth-fixture"}]),
+            ),
+        ]);
+        fixture.plan();
+    }
+
+    #[test]
+    fn a_default_route_outside_the_local_scope_is_still_accepted() {
+        // Control: the same shape, with the next hop and source outside the range.
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().default_override =
+            Some(onlink_default("gateway", "10.98.255.254"));
+        fixture.plan();
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().default_override =
+            Some(onlink_default("prefsrc", "10.100.0.1"));
+        fixture.plan();
     }
 
     #[test]

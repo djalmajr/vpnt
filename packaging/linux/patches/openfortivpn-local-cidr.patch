@@ -178,7 +178,23 @@ diff --git a/src/tunnel.c b/src/tunnel.c
  	if (access(ppp_path, F_OK) != 0) {
  		log_error("%s: %s.\n", ppp_path, strerror(errno));
  		return 1;
-@@ -1657,5 +1665,7 @@
+@@ -299,6 +307,15 @@
+ 				"noauth",
+ 				"default-asyncmap",
+ 				"nopcomp",
++				/*
++				 * vpnt: no packet compression. With CCP off pppd never
++				 * asks the kernel to decompress, so every control frame
++				 * pppd reads is a frame the IPCP policy already saw.
++				 */
++				"noccp",
++				"nobsdcomp",
++				"nodeflate",
++				"nopredictor1",
+ 				"receive-all",
+ 				"nodefaultroute",
+ 				"nodetach",
+@@ -1657,5 +1674,7 @@
  		free(tunnel.ipv4.split_rt);
  		tunnel.ipv4.split_rt = NULL;
  	}
@@ -202,7 +218,7 @@ diff --git a/src/vpnt_ipcp_policy.c b/src/vpnt_ipcp_policy.c
 new file mode 100644
 --- /dev/null
 +++ b/src/vpnt_ipcp_policy.c
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,170 @@
 +#include "vpnt_ipcp_policy.h"
 +
 +#include <arpa/inet.h>
@@ -263,6 +279,26 @@ new file mode 100644
 +	return true;
 +}
 +
++/*
++ * Protocols that can hand pppd a control frame this barrier never saw:
++ * compression negotiation and its datagrams, and multilink fragments.
++ * pppd runs with CCP off, so a gateway that sends one is not following the
++ * negotiation and the attempt ends. Protocol-field-compressed frames carry
++ * only the low byte.
++ */
++static bool wraps_control(uint16_t protocol)
++{
++	switch (protocol) {
++	case 0x003d: /* Multilink fragment */
++	case 0x00fb: /* Individual-link compressed datagram */
++	case 0x00fd: /* Compressed datagram */
++	case 0x80fb: /* Individual-link CCP */
++	case 0x80fd: /* CCP */
++		return true;
++	}
++	return false;
++}
++
 +bool vpnt_ipcp_check(const struct vpnt_ipcp_local_scope *scope,
 +                    const uint8_t *frame, size_t size,
 +                    struct vpnt_ipcp_ack *ack)
@@ -277,9 +313,11 @@ new file mode 100644
 +	/* This payload starts at PPP Protocol; HDLC adds Address/Control. */
 +	if (!size || frame[0] == 0xff)
 +		return false;
-+	if (frame[0] & 1)
-+		return true; /* Compressed protocol; IPCP cannot be compressed. */
++	if (frame[0] & 1) /* Compressed protocol; IPCP cannot be compressed. */
++		return !wraps_control(frame[0]);
 +	if (size < 2 || !(frame[1] & 1))
++		return false;
++	if (wraps_control((uint16_t)(frame[0] << 8 | frame[1])))
 +		return false;
 +	if (frame[0] != 0x80 || frame[1] != 0x21)
 +		return true;

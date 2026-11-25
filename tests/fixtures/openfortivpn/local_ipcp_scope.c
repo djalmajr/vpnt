@@ -101,6 +101,43 @@ static const uint8_t lcp_echo[] = {
 	0xc0, 0x21, 0x09, 0x01, 0x00, 0x08, 0x12, 0x34, 0x56, 0x78
 };
 
+/*
+ * pppd runs with CCP off. A gateway that sends compression negotiation, a
+ * compressed datagram or a multilink fragment could hand pppd a control frame
+ * this barrier never saw, so each one ends the attempt, in the full and in the
+ * protocol-field-compressed form. Plain data and LCP stay.
+ */
+static const uint8_t ccp_deflate_req[] = {
+	0x80, 0xfd, 0x01, 0x01, 0x00, 0x0c, 0x1a, 0x04, 0x78, 0x00, 0x00, 0x00
+};
+static const uint8_t ccp_link_req[] = {
+	0x80, 0xfb, 0x01, 0x02, 0x00, 0x04
+};
+static const uint8_t compressed_datagram[] = {
+	0x00, 0xfd, 0x00, 0x01, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04
+};
+static const uint8_t compressed_datagram_pfc[] = {
+	0xfd, 0x00, 0x01, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04
+};
+static const uint8_t link_compressed_datagram[] = {
+	0x00, 0xfb, 0x00, 0x01, 0x00, 0x00
+};
+static const uint8_t link_compressed_datagram_pfc[] = {
+	0xfb, 0x00, 0x01, 0x00, 0x00
+};
+static const uint8_t multilink_fragment[] = {
+	0x00, 0x3d, 0xc0, 0x00, 0x00, 0x01, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04
+};
+static const uint8_t multilink_fragment_pfc[] = {
+	0x3d, 0xc0, 0x00, 0x00, 0x01, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04
+};
+static const uint8_t ip_datagram[] = {
+	0x00, 0x21, 0x45, 0x00, 0x00, 0x14
+};
+static const uint8_t ip_datagram_pfc[] = {
+	0x21, 0x45, 0x00, 0x00, 0x14
+};
+
 /* Ambiguous or malformed IPCP must not be mistaken for an allowed local. */
 static const uint8_t truncated_option[] = {
 	0x80, 0x21, 0x01, 0x38, 0x00, 0x0a, 0x03, 0x06, 10, 20
@@ -223,6 +260,25 @@ int main(void)
 		  sizeof(ack_modern_neighbour24), false },
 		{ "DNS-only IPCP transit", dns_only, sizeof(dns_only), true },
 		{ "LCP echo transit", lcp_echo, sizeof(lcp_echo), true },
+		{ "CCP Configure-Request offering Deflate", ccp_deflate_req,
+		  sizeof(ccp_deflate_req), false },
+		{ "individual-link CCP", ccp_link_req, sizeof(ccp_link_req), false },
+		{ "compressed datagram", compressed_datagram,
+		  sizeof(compressed_datagram), false },
+		{ "compressed datagram, protocol field compressed",
+		  compressed_datagram_pfc, sizeof(compressed_datagram_pfc), false },
+		{ "individual-link compressed datagram", link_compressed_datagram,
+		  sizeof(link_compressed_datagram), false },
+		{ "individual-link compressed datagram, protocol field compressed",
+		  link_compressed_datagram_pfc, sizeof(link_compressed_datagram_pfc),
+		  false },
+		{ "multilink fragment", multilink_fragment,
+		  sizeof(multilink_fragment), false },
+		{ "multilink fragment, protocol field compressed",
+		  multilink_fragment_pfc, sizeof(multilink_fragment_pfc), false },
+		{ "IP datagram stays", ip_datagram, sizeof(ip_datagram), true },
+		{ "IP datagram stays, protocol field compressed", ip_datagram_pfc,
+		  sizeof(ip_datagram_pfc), true },
 		{ "truncated address option", truncated_option,
 		  sizeof(truncated_option), false },
 		{ "IPCP length mismatch", length_mismatch,

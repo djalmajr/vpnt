@@ -145,6 +145,20 @@ FRAME(hdlc_address_control_prefix, 0xff, 0x03, 0x80, 0x21, 0x02, 0x15,
       0x00, 0x0a, 0x03, 0x06, 203, 0, 113, 9);
 FRAME(protocol_second_byte_even, 0x80, 0x20, 0x01, 0x16, 0x00, 0x04);
 
+/*
+ * Protocols that wrap control frames end the attempt at every length, down to
+ * the bare protocol field, so nothing is read past a short frame.
+ */
+FRAME(ccp_bare_protocol, 0x80, 0xfd);
+FRAME(ccp_link_bare_protocol, 0x80, 0xfb);
+FRAME(compressed_datagram_bare_protocol, 0x00, 0xfd);
+FRAME(compressed_datagram_pfc_one_byte, 0xfd);
+FRAME(link_compressed_pfc_one_byte, 0xfb);
+FRAME(multilink_pfc_one_byte, 0x3d);
+FRAME(multilink_bare_protocol, 0x00, 0x3d);
+FRAME(ccp_with_address_like_bytes, 0x80, 0xfd, 0x01, 0x23, 0x00, 0x0a,
+      0x03, 0x06, 10, 20, 30, 7);
+
 /* ConfReq: CI_ADDR is the gateway's own address, outside the scope is fine. */
 FRAME(confreq_modern_peer_outside, 0x80, 0x21, 0x01, 0x17, 0x00, 0x0a,
       0x03, 0x06, 203, 0, 113, 9);
@@ -292,6 +306,15 @@ int main(void)
 	CASE(&scope24, lcp_with_address_like_bytes, true);
 	CASE(&scope24, hdlc_address_control_prefix, false);
 	CASE(&scope24, protocol_second_byte_even, false);
+	CASE(&scope24, ccp_bare_protocol, false);
+	CASE(&scope24, ccp_link_bare_protocol, false);
+	CASE(&scope24, compressed_datagram_bare_protocol, false);
+	CASE(&scope24, compressed_datagram_pfc_one_byte, false);
+	CASE(&scope24, link_compressed_pfc_one_byte, false);
+	CASE(&scope24, multilink_pfc_one_byte, false);
+	CASE(&scope24, multilink_bare_protocol, false);
+	CASE(&scope24, ccp_with_address_like_bytes, false);
+	CASE(&none, ccp_with_address_like_bytes, false);
 	CASE(&scope24, confreq_modern_peer_outside, true);
 	CASE(&scope24, confreq_legacy_destination_zero, false);
 	CASE(&scope24, confnak_modern_zero, false);
