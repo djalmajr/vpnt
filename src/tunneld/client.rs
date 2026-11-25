@@ -1,11 +1,13 @@
 //! Authenticated synchronous client for a single tunneld generation.
 use super::protocol::{
-    Backend, Credentials, ErrorCode, FrameError, Prepare, Request, Response, State, VERSION,
-    decode_response, read_control, timed, write_control,
+    Backend, CLEANUP_VERSION, CleanupState, Credentials, ErrorCode, FrameError, Generation,
+    MAX_LINE, Prepare, ProbeBinding, Request, Response, State, VERSION, decode_response,
+    monotonic_ms, read_control, timed, write_control,
 };
 use crate::helper::local_socket::{Budget, connect_deadline, peer_uid};
 use std::{
     fs,
+    io::{self, Read, Write},
     os::unix::{fs::MetadataExt, net::UnixStream},
     path::Path,
     time::Instant,
@@ -21,18 +23,69 @@ enum Phase {
 pub struct Client {
     stream: Option<UnixStream>,
     phase: Phase,
+    version: u32,
+    confirmation: Option<PendingConfirmation>,
+}
+
+pub(crate) enum Confirmation {
+    Fresh(ProbeBinding),
+    Late(Option<ProbeBinding>),
+    Unavailable,
+}
+
+struct PendingConfirmation {
+    request: Vec<u8>,
+    written: usize,
+    response: Vec<u8>,
+}
+
+impl PendingConfirmation {
+    fn exchange(&mut self, stream: &UnixStream, deadline: Instant) -> Result<Response, FrameError> {
+        let mut io = timed(stream, deadline)?;
+        while self.written < self.request.len() {
+            let written = io.write(&self.request[self.written..])?;
+            if written == 0 {
+                return Err(FrameError::Io(io::ErrorKind::WriteZero));
+            }
+            self.written += written;
+        }
+        while self.response.len() < MAX_LINE {
+            let mut byte = [0];
+            io.read_exact(&mut byte)?;
+            self.response.push(byte[0]);
+            if byte[0] == b'\n' {
+                return Ok(decode_response(&self.response)?);
+            }
+        }
+        Err(ErrorCode::BadRequest.into())
+    }
 }
 impl Client {
     pub fn connect(path: &Path, deadline: Instant) -> Result<Self, FrameError> {
-        Self::connect_as(path, deadline, 0, 0)
+        Self::connect_version(path, deadline, 0, 0, VERSION)
     }
 
-    // UID overrides are only reachable by this module and its test fixtures.
+    pub fn connect_v2(path: &Path, deadline: Instant) -> Result<Self, FrameError> {
+        Self::connect_version(path, deadline, 0, 0, CLEANUP_VERSION)
+    }
+
+    #[cfg(test)]
     fn connect_as(
         path: &Path,
         deadline: Instant,
         owner_uid: u32,
         peer: u32,
+    ) -> Result<Self, FrameError> {
+        Self::connect_version(path, deadline, owner_uid, peer, VERSION)
+    }
+
+    // UID overrides are only reachable by this module and its test fixtures.
+    fn connect_version(
+        path: &Path,
+        deadline: Instant,
+        owner_uid: u32,
+        peer: u32,
+        version: u32,
     ) -> Result<Self, FrameError> {
         let budget = Budget::until(deadline, None)?;
         let parent = path.parent().ok_or(ErrorCode::PermissionDenied)?;
@@ -47,26 +100,56 @@ impl Client {
         if before != after || peer_uid(&stream)? != peer {
             return Err(ErrorCode::PermissionDenied.into());
         }
-        match exchange(&stream, Request::Hello { version: VERSION }, deadline)? {
-            Response::Version { version: VERSION } => Ok(Self {
+        match exchange(&stream, Request::Hello { version }, deadline)? {
+            Response::Version {
+                version: negotiated,
+            } if negotiated == version => Ok(Self {
                 stream: Some(stream),
                 phase: Phase::Prepare,
+                version,
+                confirmation: None,
             }),
             Response::Version { .. } => Err(ErrorCode::UnsupportedVersion.into()),
             _ => Err(ErrorCode::BadRequest.into()),
         }
     }
 
-    pub fn prepare(&mut self, request: Prepare, deadline: Instant) -> Result<(), FrameError> {
+    pub fn prepare(
+        &mut self,
+        request: Prepare,
+        deadline: Instant,
+    ) -> Result<Option<Generation>, FrameError> {
         let backend = request.backend();
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(
             Phase::Prepare,
             Phase::Credentials(backend),
             |stream| match exchange(stream, request.into(), deadline)? {
-                Response::Prepared {} => Ok(()),
+                Response::Prepared { generation } if generation.is_some() == v2 => Ok(generation),
                 _ => Err(ErrorCode::BadRequest.into()),
             },
         )
+    }
+
+    pub fn cleanup_status(
+        self,
+        generation: &Generation,
+        deadline: Instant,
+    ) -> Result<CleanupState, FrameError> {
+        if self.phase != Phase::Prepare || self.version != CLEANUP_VERSION {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let stream = self.stream.ok_or(ErrorCode::BadRequest)?;
+        match exchange(
+            &stream,
+            Request::CleanupStatus {
+                generation: generation.clone(),
+            },
+            deadline,
+        )? {
+            Response::CleanupStatus { state } => Ok(state),
+            _ => Err(ErrorCode::BadRequest.into()),
+        }
     }
 
     /// Takes ownership so the write buffers are cleared on success or failure.
@@ -83,20 +166,106 @@ impl Client {
     }
 
     pub fn status(&mut self, deadline: Instant) -> Result<State, FrameError> {
+        self.status_with_binding(deadline).map(|(state, _)| state)
+    }
+
+    pub(crate) fn status_with_binding(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(State, Option<ProbeBinding>), FrameError> {
         self.status_command(Request::Status {}, deadline)
     }
 
     pub fn stop(&mut self, deadline: Instant) -> Result<State, FrameError> {
+        if self.confirmation.is_some() {
+            self.confirm(deadline)?;
+        }
         self.status_command(Request::Stop {}, deadline)
+            .map(|(state, _)| state)
     }
 
-    fn status_command(&mut self, request: Request, deadline: Instant) -> Result<State, FrameError> {
+    fn status_command(
+        &mut self,
+        request: Request,
+        deadline: Instant,
+    ) -> Result<(State, Option<ProbeBinding>), FrameError> {
+        if self.confirmation.is_some() {
+            return Err(FrameError::Io(io::ErrorKind::TimedOut));
+        }
+        let v2 = self.version == CLEANUP_VERSION;
+        let status = matches!(request, Request::Status {});
         self.in_phase(Phase::Active, Phase::Active, |stream| {
             match exchange(stream, request, deadline)? {
-                Response::Status { state } => Ok(state),
+                Response::Status { state } if !v2 || state != State::NetworkReady => {
+                    Ok((state, None))
+                }
+                Response::NetworkReady { binding } if v2 && status => {
+                    Ok((State::NetworkReady, Some(binding)))
+                }
                 _ => Err(ErrorCode::BadRequest.into()),
             }
         })
+    }
+
+    pub(crate) fn confirmation_pending(&self) -> bool {
+        self.confirmation.is_some()
+    }
+
+    pub(crate) fn confirm(&mut self, deadline: Instant) -> Result<Confirmation, FrameError> {
+        if self.phase != Phase::Active || self.version != CLEANUP_VERSION {
+            return Err(ErrorCode::BadRequest.into());
+        }
+        let (mut pending, late) = match self.confirmation.take() {
+            Some(pending) => (pending, true),
+            None => {
+                let now_ms = monotonic_ms()?;
+                let remaining_ms = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                if remaining_ms == 0 {
+                    return Ok(Confirmation::Unavailable);
+                }
+                let expires_ms =
+                    now_ms.saturating_add(remaining_ms.min(u128::from(u64::MAX)) as u64);
+                let mut request = Vec::new();
+                write_control(&mut request, &Request::Confirm { expires_ms })?;
+                (
+                    PendingConfirmation {
+                        request,
+                        written: 0,
+                        response: Vec::new(),
+                    },
+                    false,
+                )
+            }
+        };
+        let stream = self.stream.take().ok_or(ErrorCode::BadRequest)?;
+        let result = match pending.exchange(&stream, deadline) {
+            Ok(Response::NetworkReady { binding }) if late || Instant::now() >= deadline => {
+                Ok(Confirmation::Late(Some(binding)))
+            }
+            Ok(Response::NetworkReady { binding }) => Ok(Confirmation::Fresh(binding)),
+            Ok(Response::Error {
+                code: ErrorCode::Timeout,
+            }) if late => Ok(Confirmation::Late(None)),
+            Ok(Response::Error {
+                code: ErrorCode::Timeout,
+            }) => Ok(Confirmation::Unavailable),
+            Err(FrameError::Io(io::ErrorKind::TimedOut)) => {
+                // Keep partial framing, but never leave an entirely unsent command queued.
+                if pending.written != 0 {
+                    self.confirmation = Some(pending);
+                }
+                Ok(Confirmation::Unavailable)
+            }
+            Ok(Response::Error { code }) => Err(code.into()),
+            Ok(_) => Err(ErrorCode::Backend.into()),
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.stream = Some(stream);
+        }
+        result
     }
 
     fn in_phase<T>(
@@ -130,7 +299,18 @@ fn exchange(
     deadline: Instant,
 ) -> Result<Response, FrameError> {
     let mut io = timed(stream, deadline)?;
-    write_control(&mut io, &request)?;
+    if let Err(write_error) = write_control(&mut io, &request) {
+        // The server can queue a terminal rejection and close before seeing
+        // this request. Use the existing deadline and accept only that error.
+        if matches!(
+            write_error,
+            FrameError::Io(io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset)
+        ) && let Ok(Response::Error { code }) = read_control(&mut io, decode_response)
+        {
+            return Err(code.into());
+        }
+        return Err(write_error);
+    }
     match read_control(&mut io, decode_response)? {
         Response::Error { code } => Err(code.into()),
         response => Ok(response),
@@ -143,6 +323,7 @@ mod tests {
     use crate::tunneld::protocol::{Command, Endpoint, FortinetRequest, ServerDecoder};
     use std::{
         io::{self, Read},
+        net::Shutdown,
         os::unix::{
             fs::{DirBuilderExt, PermissionsExt},
             net::UnixListener,
@@ -314,6 +495,64 @@ mod tests {
             assert_eq!(client.stop(deadline()).unwrap(), State::Stopped);
             server.join().unwrap();
         });
+    }
+
+    #[test]
+    fn status_recovers_terminal_reply_after_server_closes() {
+        let fixture = SocketFixture::new();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let stream = fixture.accept(deadline());
+                let mut decoder = ServerDecoder::new(stream.try_clone().unwrap());
+                decoder.hello(deadline()).unwrap();
+                decoder.prepare(deadline()).unwrap();
+                decoder.prepared(deadline()).unwrap();
+                decoder.credentials(deadline()).unwrap();
+                decoder
+                    .reject(ErrorCode::MissingProgram, deadline())
+                    .unwrap();
+                // Force EPIPE even if another descriptor keeps the socket open.
+                stream.shutdown(Shutdown::Read).unwrap();
+            });
+            let mut client =
+                Client::connect_as(&fixture.path, deadline(), fixture.owner, fixture.peer).unwrap();
+            client.prepare(prepare(), deadline()).unwrap();
+            client
+                .send_credentials(Credentials::fortinet("fixture-only").unwrap(), deadline())
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(
+                client.status(deadline()),
+                Err(FrameError::Protocol(ErrorCode::MissingProgram))
+            );
+        });
+    }
+
+    #[test]
+    fn failed_write_keeps_io_error_without_a_terminal_reply() {
+        for response in [
+            Some(Response::Status {
+                state: State::NetworkReady,
+            }),
+            None,
+        ] {
+            let (stream, mut server) = UnixStream::pair().unwrap();
+            if let Some(response) = response {
+                write_control(&mut server, &response).unwrap();
+            }
+            server.shutdown(Shutdown::Read).unwrap();
+            drop(server);
+            let mut client = Client {
+                stream: Some(stream),
+                phase: Phase::Active,
+                version: VERSION,
+                confirmation: None,
+            };
+            assert_eq!(
+                client.status(deadline()),
+                Err(FrameError::Io(io::ErrorKind::BrokenPipe))
+            );
+        }
     }
 
     #[test]

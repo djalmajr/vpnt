@@ -100,7 +100,7 @@ fn busy_at_per_uid_and_global_limit_and_slots_are_reused() {
 fn unsupported_hello_version_closes_with_typed_error() {
     let (mut client, worker) = connection(&Arc::default(), 1000);
     client
-        .write_all(b"{\"op\":\"hello\",\"version\":2}\n")
+        .write_all(b"{\"op\":\"hello\",\"version\":3}\n")
         .unwrap();
     expect_error(&client, ErrorCode::UnsupportedVersion);
     worker.unwrap().join().unwrap();
@@ -224,6 +224,39 @@ fn a_slow_busy_hello_does_not_block_the_listener_or_grow_the_rejection_path() {
         (pending_busy, busy_worker),
     ] {
         drop(stream);
+        worker.unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn cleanup_queries_are_v2_only_and_fail_closed_for_invalid_or_absent_ids() {
+    let server = Arc::default();
+    for (version, generation, expected_error) in [
+        (1, "0123456789abcdef0123456789abcdef", true),
+        (2, "../not-a-generation", true),
+        (2, "0123456789abcdef0123456789abcdef", false),
+    ] {
+        let (mut client, worker) = connection(&server, 1000);
+        writeln!(client, r#"{{"op":"hello","version":{version}}}"#).unwrap();
+        assert!(
+            matches!(receive(&client), Response::Version {version: actual} if actual == version)
+        );
+        writeln!(
+            client,
+            r#"{{"op":"cleanup_status","generation":"{generation}"}}"#
+        )
+        .unwrap();
+        if expected_error {
+            expect_error(&client, ErrorCode::BadRequest);
+        } else {
+            assert!(matches!(
+                receive(&client),
+                Response::CleanupStatus {
+                    state: CleanupState::Unknown
+                }
+            ));
+            expect_close(&client);
+        }
         worker.unwrap().join().unwrap();
     }
 }

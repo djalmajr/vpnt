@@ -1,7 +1,7 @@
 //! One inherited socket capability per owned SSL child. No filesystem endpoint,
 //! password argument/environment, or hint-based credential lookup is involved.
 use super::{
-    local_socket::{TimedStream, peer_uid},
+    local_socket::{Budget, TimedStream, peer_uid},
     pinentry,
     process::{Environment, ManagedChild, StopOutcome},
 };
@@ -19,7 +19,7 @@ use std::{
     process::{ChildStderr, ChildStdout, Command, ExitStatus},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
@@ -36,7 +36,23 @@ pub struct PinentryChild {
 
 impl PinentryChild {
     pub fn spawn(command: Command, password: Secret) -> io::Result<Self> {
-        Self::spawn_in(command, password, Environment::System, None)
+        Self::spawn_in(command, password, Environment::System, None, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn spawn_fortinet(
+        command: Command,
+        password: Secret,
+        request_deadline: Instant,
+        login_timer: OwnedFd,
+    ) -> io::Result<Self> {
+        Self::spawn_in(
+            command,
+            password,
+            Environment::System,
+            Some(login_timer),
+            Some(request_deadline),
+        )
     }
     /// Owned secondary capability, never a descriptor number supplied by IPC.
     /// Both target slots are installed by the same remapping operation.
@@ -45,7 +61,13 @@ impl PinentryChild {
         password: Secret,
         supervisor: OwnedFd,
     ) -> io::Result<Self> {
-        Self::spawn_in(command, password, Environment::System, Some(supervisor))
+        Self::spawn_in(
+            command,
+            password,
+            Environment::System,
+            Some(supervisor),
+            None,
+        )
     }
 
     pub(crate) fn spawn_private_runtime(
@@ -53,7 +75,13 @@ impl PinentryChild {
         password: Secret,
         supervisor: OwnedFd,
     ) -> io::Result<Self> {
-        Self::spawn_in(command, password, Environment::PrivateVpn, Some(supervisor))
+        Self::spawn_in(
+            command,
+            password,
+            Environment::PrivateVpn,
+            Some(supervisor),
+            None,
+        )
     }
 
     fn spawn_in(
@@ -61,6 +89,7 @@ impl PinentryChild {
         password: Secret,
         environment: Environment,
         supervisor: Option<OwnedFd>,
+        request_deadline: Option<Instant>,
     ) -> io::Result<Self> {
         let credentials = Credentials {
             password,
@@ -103,7 +132,7 @@ impl PinentryChild {
         drop(child_socket);
         // Unexpected interactive input must fail instead of waiting on the UI.
         drop(child.take_stdin());
-        let lease = Lease::start(server, child.id(), credentials.password)?;
+        let lease = Lease::start(server, child.id(), credentials.password, request_deadline)?;
         Ok(Self { child, lease })
     }
     pub fn id(&self) -> u32 {
@@ -150,14 +179,26 @@ struct Lease {
     worker: Option<JoinHandle<()>>,
 }
 impl Lease {
-    fn start(socket: UnixStream, pid: u32, password: Secret) -> io::Result<Self> {
+    fn start(
+        socket: UnixStream,
+        pid: u32,
+        password: Secret,
+        request_deadline: Option<Instant>,
+    ) -> io::Result<Self> {
         let shutdown = Arc::new(Mutex::new(Some(socket.try_clone()?)));
         let worker_shutdown = Arc::clone(&shutdown);
-        let mut stream = TimedStream::new(socket, TIMEOUT, 9)?;
+        let budget = match request_deadline {
+            Some(deadline) => Budget::until(deadline, None)?,
+            None => Budget::new(TIMEOUT)?,
+        };
+        let exchange = request_deadline
+            .map(|deadline| socket.try_clone().map(|socket| (socket, deadline)))
+            .transpose()?;
+        let mut stream = TimedStream::with_budget(socket, budget, 9)?;
         let worker = thread::Builder::new()
             .name("vpnt-pinentry".into())
             .spawn(move || {
-                let _ = deliver(&mut stream, pid, password);
+                let _ = deliver(&mut stream, exchange, pid, password);
                 // Darwin may return ENOTCONN for SHUT_RDWR after the peer has
                 // half-closed its request. Close every server-side descriptor
                 // after delivery instead of relying on shutdown to signal EOF.
@@ -188,9 +229,26 @@ fn close_control(control: &Mutex<Option<UnixStream>>) {
     }
 }
 
-fn deliver(stream: &mut TimedStream, pid: u32, password: Secret) -> io::Result<()> {
+fn deliver(
+    stream: &mut TimedStream,
+    exchange_socket: Option<(UnixStream, Instant)>,
+    pid: u32,
+    password: Secret,
+) -> io::Result<()> {
     let mut request = [0; 8];
-    stream.read_exact(&mut request)?;
+    let mut exchange;
+    let stream = if let Some((socket, deadline)) = exchange_socket {
+        // The Linux client can wait for TLS before asking. Once its request
+        // starts, even a peer that stalls partway through gets only TIMEOUT.
+        stream.read_exact(&mut request[..1])?;
+        let exchange_deadline = deadline.min(Instant::now() + TIMEOUT);
+        exchange = TimedStream::with_budget(socket, Budget::until(exchange_deadline, None)?, 8)?;
+        exchange.read_exact(&mut request[1..])?;
+        &mut exchange
+    } else {
+        stream.read_exact(&mut request)?;
+        stream
+    };
     let mut extra = [0];
     if &request[..4] != MAGIC
         || u32::from_be_bytes(request[4..].try_into().unwrap()) != pid
@@ -286,4 +344,44 @@ fn fetch(socket: UnixStream, owner: u32) -> io::Result<Secret> {
         .validate(VpnKind::Ssl)
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
     Ok(credentials.password)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fortinet_partial_request_cannot_outlive_the_establishment_deadline() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let pid = 42_u32;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut lease = Lease::start(server, pid, Secret::from("fixture"), Some(deadline)).unwrap();
+
+        peer.write_all(&MAGIC[..1]).unwrap();
+        let mut response = [0];
+        let read = peer.read(&mut response);
+        let closed_at = Instant::now();
+        lease.revoke();
+        assert_eq!(read.unwrap(), 0);
+        assert!(closed_at >= deadline);
+    }
+
+    #[test]
+    fn fortinet_partial_request_expires_under_the_short_exchange_budget() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(2 * TIMEOUT)).unwrap();
+        let deadline = Instant::now() + 3 * TIMEOUT;
+        let mut lease = Lease::start(server, 42, Secret::from("fixture"), Some(deadline)).unwrap();
+
+        peer.write_all(&MAGIC[..1]).unwrap();
+        let mut byte = [0];
+        let read = peer.read(&mut byte);
+        lease.revoke();
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "a partial request received a password byte"
+        );
+    }
 }

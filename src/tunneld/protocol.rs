@@ -1,18 +1,82 @@
-//! Version-one control and credential frames for a single tunnel generation.
+//! Versioned control and credential frames for a single tunnel generation.
 use crate::helper::local_socket::{Budget, TimedStream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     fmt,
     io::{self, Read, Write},
     net::Ipv4Addr,
+    num::NonZeroU32,
     os::{fd::AsRawFd, unix::net::UnixStream},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
 pub const VERSION: u32 = 1;
+pub const CLEANUP_VERSION: u32 = 2;
 /// Maximum encoded control frame size, including LF.
 pub const MAX_LINE: usize = 16 * 1024;
+pub(super) const MAX_CONFIRMATION: Duration = Duration::from_secs(1);
+
+// The endpoints run in the same Linux time namespace as the writer.
+pub(super) fn monotonic_ms() -> io::Result<u64> {
+    Ok(monotonic()?.as_millis() as u64)
+}
+
+fn monotonic() -> io::Result<Duration> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into a valid timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Duration::new(now.tv_sec as u64, now.tv_nsec as u32))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct FortinetDeadline {
+    pub monotonic_ms: u64,
+    pub instant: Instant,
+}
+
+impl FortinetDeadline {
+    const LIMIT: Duration = Duration::from_secs(35);
+
+    pub(super) fn new() -> io::Result<Self> {
+        let instant = Instant::now();
+        let now = monotonic()?;
+        let monotonic_ms = (now + Self::LIMIT).as_millis() as u64;
+        Self::from_sample(monotonic_ms, now, instant)
+    }
+
+    pub(super) fn from_wire(monotonic_ms: u64) -> io::Result<Self> {
+        let instant = Instant::now();
+        Self::from_sample(monotonic_ms, monotonic()?, instant)
+    }
+
+    pub(super) fn from_sample(
+        monotonic_ms: u64,
+        now: Duration,
+        instant: Instant,
+    ) -> io::Result<Self> {
+        let remaining = Duration::from_millis(monotonic_ms)
+            .checked_sub(now)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Fortinet Start expired"))?;
+        if remaining > Self::LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Fortinet Start exceeds the establishment window",
+            ));
+        }
+        // Sample Instant first so projection cannot extend the wire deadline.
+        Ok(Self {
+            monotonic_ms,
+            instant: instant + remaining,
+        })
+    }
+}
 
 const IPSEC_SECRET_LIMIT: usize = 4096;
 const FORTINET_SECRET_LIMIT: usize = 256;
@@ -47,6 +111,8 @@ pub enum ErrorCode {
     Timeout,
     Backend,
     CleanupPending,
+    PolicyReapprovalRequired,
+    FortinetLocalAddressDenied,
 }
 
 /// Transport errors expose only the OS error kind, never frame contents.
@@ -118,6 +184,51 @@ macro_rules! named_object {
     };
 }
 
+/// Server-assigned generation, also safe as a single private path component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Generation(String);
+
+impl Generation {
+    pub(crate) fn parse(text: String) -> Option<Self> {
+        (text.len() == 32
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(Self(text))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Generation {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        Self::parse(String::deserialize(decoder)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid generation"))
+    }
+}
+
+fn present_generation<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<Generation>, D::Error> {
+    Generation::deserialize(decoder).map(Some)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupState {
+    Pending,
+    Stopped,
+    Unknown,
+}
+
+pub(crate) enum InitialRequest {
+    Prepare(Prepare),
+    CleanupStatus(Generation),
+}
+
 named_object! {
     #[derive(Debug, Serialize)]
     #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -127,7 +238,9 @@ named_object! {
         PrepareIpsec(IpsecRequest),
         PrepareFortinet(FortinetRequest),
         Status {},
+        Confirm { expires_ms: u64 },
         Stop {},
+        CleanupStatus { generation: Generation },
     }
 }
 
@@ -137,9 +250,106 @@ named_object! {
     serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)
     pub enum Response {
         Version { version: u32 },
-        Prepared {},
+        Prepared {
+            #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_generation")]
+            generation: Option<Generation>,
+        },
+        CleanupStatus { state: CleanupState },
+        NetworkReady { binding: ProbeBinding },
         Status { state: State },
         Error { code: ErrorCode },
+    }
+}
+
+// Both the negotiated IPsec selectors and the Fortinet split-route feed
+// already have a 64-route ceiling.
+const MAX_PROBE_ROUTES: usize = 64;
+
+named_object! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    serde(deny_unknown_fields)
+    pub struct ProbeBinding {
+        generation: Generation,
+        ifindex: NonZeroU32,
+        #[serde(deserialize_with = "deserialize_probe_local")]
+        local: Ipv4Addr,
+        #[serde(deserialize_with = "deserialize_probe_routes")]
+        routes: Vec<CidrV4>,
+    }
+}
+
+impl ProbeBinding {
+    pub(crate) fn new(
+        generation: Generation,
+        ifindex: u32,
+        local: Ipv4Addr,
+        routes: Vec<CidrV4>,
+    ) -> Option<Self> {
+        if !valid_probe_local(local) || !valid_probe_routes(&routes) {
+            return None;
+        }
+        Some(Self {
+            generation,
+            ifindex: NonZeroU32::new(ifindex)?,
+            local,
+            routes,
+        })
+    }
+
+    pub(crate) fn generation(&self) -> &Generation {
+        &self.generation
+    }
+
+    pub(crate) fn ifindex(&self) -> NonZeroU32 {
+        self.ifindex
+    }
+
+    pub(crate) fn allows(&self, destination: Ipv4Addr) -> bool {
+        destination != self.local
+            && CidrV4::new(destination, 32).is_ok()
+            && self.routes.iter().any(|route| {
+                overlaps(
+                    destination.into(),
+                    32,
+                    route.network().into(),
+                    route.prefix(),
+                )
+            })
+    }
+}
+
+fn valid_probe_local(local: Ipv4Addr) -> bool {
+    !local.is_unspecified()
+        && !local.is_loopback()
+        && !local.is_multicast()
+        && !local.is_broadcast()
+}
+
+fn valid_probe_routes(routes: &[CidrV4]) -> bool {
+    routes.len() <= MAX_PROBE_ROUTES
+        && routes
+            .iter()
+            .enumerate()
+            .all(|(index, route)| !routes[..index].contains(route))
+}
+
+fn deserialize_probe_local<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Ipv4Addr, D::Error> {
+    let local = Ipv4Addr::deserialize(decoder)?;
+    valid_probe_local(local)
+        .then_some(local)
+        .ok_or_else(|| serde::de::Error::custom("invalid probe local address"))
+}
+
+fn deserialize_probe_routes<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<CidrV4>, D::Error> {
+    let routes = Vec::deserialize(decoder)?;
+    if valid_probe_routes(&routes) {
+        Ok(routes)
+    } else {
+        Err(serde::de::Error::custom("invalid probe routes"))
     }
 }
 
@@ -188,6 +398,27 @@ impl TryFrom<WireCidr> for CidrV4 {
 
     fn try_from(value: WireCidr) -> Result<Self, Self::Error> {
         Ok(Self::new(value.network, value.prefix)?)
+    }
+}
+
+impl std::str::FromStr for CidrV4 {
+    type Err = ErrorCode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (network, prefix) = value.split_once('/').ok_or(ErrorCode::BadRequest)?;
+        let network = network.parse().map_err(|_| ErrorCode::BadRequest)?;
+        let prefix = prefix.parse().map_err(|_| ErrorCode::BadRequest)?;
+        let cidr = Self::new(network, prefix)?;
+        if cidr.to_string() != value {
+            return Err(ErrorCode::BadRequest);
+        }
+        Ok(cidr)
+    }
+}
+
+impl fmt::Display for CidrV4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
     }
 }
 impl CidrV4 {
@@ -410,7 +641,9 @@ mod pin {
 
 pub fn decode_request(line: &[u8]) -> Result<Request, ErrorCode> {
     match decode(line)? {
-        Request::Hello { version } if version != VERSION => Err(ErrorCode::UnsupportedVersion),
+        Request::Hello { version } if !matches!(version, VERSION | CLEANUP_VERSION) => {
+            Err(ErrorCode::UnsupportedVersion)
+        }
         request => Ok(request),
     }
 }
@@ -486,6 +719,7 @@ impl From<Prepare> for Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Status,
+    Confirm(u64),
     Stop,
 }
 
@@ -654,6 +888,7 @@ enum Phase {
     Prepare,
     Admission(Backend),
     Credentials(Backend),
+    CleanupStatus,
     Active,
 }
 
@@ -663,12 +898,14 @@ enum Phase {
 pub struct ServerDecoder {
     stream: Option<UnixStream>,
     phase: Phase,
+    version: u32,
 }
 impl ServerDecoder {
     pub fn new(stream: UnixStream) -> Self {
         Self {
             stream: Some(stream),
             phase: Phase::Hello,
+            version: VERSION,
         }
     }
 
@@ -689,11 +926,11 @@ impl ServerDecoder {
     }
 
     pub fn hello(&mut self, deadline: Instant) -> Result<(), FrameError> {
-        self.in_phase(Phase::Hello, deadline, |_, io| {
+        let version = self.in_phase(Phase::Hello, deadline, |_, io| {
             match read_control(io, decode_request) {
-                Ok(Request::Hello { .. }) => {
-                    write_control(io, &Response::Version { version: VERSION })?;
-                    Ok(((), Phase::Prepare))
+                Ok(Request::Hello { version }) => {
+                    write_control(io, &Response::Version { version })?;
+                    Ok((version, Phase::Prepare))
                 }
                 Err(FrameError::Protocol(ErrorCode::UnsupportedVersion)) => {
                     write_control(
@@ -707,22 +944,73 @@ impl ServerDecoder {
                 Ok(_) => Err(ErrorCode::BadRequest.into()),
                 Err(error) => Err(error),
             }
-        })
+        })?;
+        self.version = version;
+        Ok(())
     }
 
-    pub fn prepare(&mut self, deadline: Instant) -> Result<Prepare, FrameError> {
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub(crate) fn initial_request(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<InitialRequest, FrameError> {
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(Phase::Prepare, deadline, |_, io| {
             let prepare = match read_control(io, decode_request)? {
                 Request::PrepareIpsec(request) => Prepare::Ipsec(request),
                 Request::PrepareFortinet(request) => Prepare::Fortinet(request),
+                Request::CleanupStatus { generation } if v2 => {
+                    return Ok((
+                        InitialRequest::CleanupStatus(generation),
+                        Phase::CleanupStatus,
+                    ));
+                }
                 _ => return Err(ErrorCode::BadRequest.into()),
             };
             let backend = prepare.backend();
-            Ok((prepare, Phase::Admission(backend)))
+            Ok((InitialRequest::Prepare(prepare), Phase::Admission(backend)))
         })
     }
 
+    pub(crate) fn reply_cleanup(
+        &mut self,
+        state: CleanupState,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        self.in_phase(Phase::CleanupStatus, deadline, |_, io| {
+            write_control(io, &Response::CleanupStatus { state })?;
+            Ok(((), Phase::CleanupStatus))
+        })
+    }
+
+    #[cfg(test)]
+    pub fn prepare(&mut self, deadline: Instant) -> Result<Prepare, FrameError> {
+        match self.initial_request(deadline)? {
+            InitialRequest::Prepare(offer) => Ok(offer),
+            InitialRequest::CleanupStatus(_) => {
+                self.stream.take();
+                Err(ErrorCode::BadRequest.into())
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn prepared(&mut self, deadline: Instant) -> Result<(), FrameError> {
+        self.acknowledge(None, deadline)
+    }
+
+    pub(crate) fn acknowledge(
+        &mut self,
+        generation: Option<Generation>,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        if generation.is_some() != (self.version == CLEANUP_VERSION) {
+            self.stream.take();
+            return Err(ErrorCode::BadRequest.into());
+        }
         let Phase::Admission(backend) = self.phase else {
             self.stream.take();
             return Err(ErrorCode::BadRequest.into());
@@ -733,7 +1021,7 @@ impl ServerDecoder {
             if has_queued_byte(stream, deadline)? {
                 return Err(ErrorCode::BadRequest.into());
             }
-            write_control(io, &Response::Prepared {})?;
+            write_control(io, &Response::Prepared { generation })?;
             Ok(((), Phase::Credentials(backend)))
         })
     }
@@ -750,9 +1038,11 @@ impl ServerDecoder {
     }
 
     pub fn command(&mut self, deadline: Instant) -> Result<Command, FrameError> {
+        let v2 = self.version == CLEANUP_VERSION;
         self.in_phase(Phase::Active, deadline, |_, io| {
             let command = match read_control(io, decode_request)? {
                 Request::Status {} => Command::Status,
+                Request::Confirm { expires_ms } if v2 => Command::Confirm(expires_ms),
                 Request::Stop {} => Command::Stop,
                 _ => return Err(ErrorCode::BadRequest.into()),
             };
@@ -760,9 +1050,36 @@ impl ServerDecoder {
         })
     }
 
+    pub(crate) fn reply_ready(
+        &mut self,
+        binding: ProbeBinding,
+        deadline: Instant,
+    ) -> Result<(), FrameError> {
+        if self.version != CLEANUP_VERSION {
+            self.stream.take();
+            return Err(ErrorCode::BadRequest.into());
+        }
+        self.in_phase(Phase::Active, deadline, |_, io| {
+            write_control(io, &Response::NetworkReady { binding })?;
+            Ok(((), Phase::Active))
+        })
+    }
+
     pub fn reply_status(&mut self, state: State, deadline: Instant) -> Result<(), FrameError> {
         self.in_phase(Phase::Active, deadline, |_, io| {
             write_control(io, &Response::Status { state })?;
+            Ok(((), Phase::Active))
+        })
+    }
+
+    pub(super) fn reply_unconfirmed(&mut self, deadline: Instant) -> Result<(), FrameError> {
+        self.in_phase(Phase::Active, deadline, |_, io| {
+            write_control(
+                io,
+                &Response::Error {
+                    code: ErrorCode::Timeout,
+                },
+            )?;
             Ok(((), Phase::Active))
         })
     }

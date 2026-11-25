@@ -1,7 +1,7 @@
 use super::*;
 use crate::netd::iproute::Existing;
 use crate::netd::protocol::{Config, decode_response};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 type Pause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
@@ -13,12 +13,18 @@ pub(in crate::netd) struct Fake {
     unmarked: Mutex<HashMap<TunName, (NonZeroU32, bool)>>,
     partial_create: Mutex<Option<NonZeroU32>>,
     fail_delete: AtomicBool,
+    fail_all_deletes: AtomicBool,
+    fail_delete_for: Mutex<Option<TunName>>,
+    failed_delete_times: Mutex<Vec<Instant>>,
+    inventory_calls: AtomicUsize,
+    fail_inventory_call: AtomicUsize,
+    slow_inventory_calls: AtomicUsize,
     conflict: AtomicBool,
     fail_create: AtomicBool,
     fail_configure: AtomicBool,
     pause_create: Mutex<Option<Pause>>,
+    pause_inventory: Mutex<Option<Pause>>,
     pause_delete: Mutex<Option<Pause>>,
-    retry_wait: Mutex<Option<Duration>>,
 }
 impl Backend for Arc<Fake> {
     fn create_tun(&self, name: &TunName, owner: u32) -> io::Result<()> {
@@ -63,7 +69,17 @@ impl Backend for Arc<Fake> {
     }
     fn delete_tun(&self, name: &TunName) -> io::Result<()> {
         self.events.lock().unwrap().push(format!("delete {name}"));
+        if self.fail_all_deletes.load(Ordering::SeqCst) {
+            self.failed_delete_times
+                .lock()
+                .unwrap()
+                .push(Instant::now());
+            return Err(io::Error::other("delete failed"));
+        }
         if self.fail_delete.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("delete failed"));
+        }
+        if self.fail_delete_for.lock().unwrap().as_ref() == Some(name) {
             return Err(io::Error::other("delete failed"));
         }
         let pause = self.pause_delete.lock().unwrap().take();
@@ -79,6 +95,18 @@ impl Backend for Arc<Fake> {
         Ok(())
     }
     fn existing(&self) -> io::Result<Vec<Existing>> {
+        let call = self.inventory_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_inventory_call.load(Ordering::SeqCst) {
+            return Err(io::Error::other("inventory failed"));
+        }
+        let pause = self.pause_inventory.lock().unwrap().take();
+        if let Some((started, resume)) = pause {
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        if call <= self.slow_inventory_calls.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(3));
+        }
         let owned = self.names.lock().unwrap().clone();
         let foreign = self.foreign.lock().unwrap().clone();
         Ok(owned
@@ -109,12 +137,6 @@ impl Backend for Arc<Fake> {
             )
             .collect())
     }
-    fn retry_wait(&self) -> Duration {
-        self.retry_wait
-            .lock()
-            .unwrap()
-            .unwrap_or(Duration::from_secs(5))
-    }
 }
 
 pub(in crate::netd) struct Fixture {
@@ -139,6 +161,7 @@ impl Fixture {
         let listener = UnixListener::bind(&path).unwrap();
         let fake = Arc::new(Fake::default());
         let mut server = Server::new(Arc::clone(&fake), hello);
+        server.network_directory = Some(directory);
         server.idle_timeout = idle;
         server.frame_timeout = frame;
         let server = Arc::new(server);
@@ -148,6 +171,11 @@ impl Fixture {
             fake,
             server,
         }
+    }
+    fn network_lock(&self) -> NetworkGuard {
+        self.server
+            .network_lock(self.server.lock_deadline())
+            .unwrap()
     }
     pub(in crate::netd) fn accept(&self, uid: u32) -> Option<thread::JoinHandle<()>> {
         self.server
@@ -171,7 +199,23 @@ const HELLO: &str = "{\"op\":\"hello\",\"version\":1}\n";
 const OPEN: &str = "{\"op\":\"open_tun\"}\n";
 fn exchange(wire: &mut Wire, request: &str) -> Response {
     wire.get_mut().write_all(request.as_bytes()).unwrap();
+    response(wire)
+}
+fn response(wire: &mut Wire) -> Response {
     decode_response(&read_line(wire).unwrap()).unwrap()
+}
+fn assert_waiting(wire: &mut Wire) {
+    let stream = wire.get_ref();
+    let previous = stream.read_timeout().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let result = read_line(wire);
+    wire.get_ref().set_read_timeout(previous).unwrap();
+    assert!(
+        matches!(&result, Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+        "{result:?}"
+    );
 }
 fn hello(wire: &mut Wire) {
     assert!(matches!(exchange(wire, HELLO), Response::Version(1)));
@@ -376,7 +420,7 @@ fn development_arguments_are_exact() {
 }
 
 #[test]
-fn pending_create_reserves_name_before_kernel_inventory_changes() {
+fn concurrent_open_waits_for_create_before_allocating_another_name() {
     use std::sync::mpsc::channel;
     let f = Fixture::new(HELLO_TIMEOUT);
     let (started, pending) = channel();
@@ -389,11 +433,20 @@ fn pending_create_reserves_name_before_kernel_inventory_changes() {
     a.get_mut().write_all(OPEN.as_bytes()).unwrap();
     pending.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(f.fake.names.lock().unwrap().is_empty());
-    open(&mut b, "vpnt1");
-    resume.send(()).unwrap();
     assert!(
-        matches!(decode_response(&read_line(&mut a).unwrap()).unwrap(), Response::Opened(name) if name.as_str() == "vpnt0")
+        f.server
+            .reserved
+            .lock()
+            .unwrap()
+            .contains(&TunName::parse("vpnt0").unwrap())
     );
+    b.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut b);
+    let events = f.fake.events.lock().unwrap().clone();
+    resume.send(()).unwrap();
+    assert!(matches!(response(&mut a), Response::Opened(name) if name.as_str() == "vpnt0"));
+    assert!(matches!(response(&mut b), Response::Opened(name) if name.as_str() == "vpnt1"));
+    assert_eq!(events, ["create vpnt0 1000"]);
     drop((a, b));
     a_thread.unwrap().join().unwrap();
     b_thread.unwrap().join().unwrap();
@@ -561,15 +614,13 @@ fn open_retries_pending_and_never_deletes_missing_or_unmarked_interface() {
 }
 
 #[test]
-fn slow_pending_delete_does_not_hold_open_past_retry_budget() {
+fn open_expires_without_creating_while_background_retry_holds_lock() {
     use std::sync::mpsc::channel;
-    let f = Fixture::new(HELLO_TIMEOUT);
-    *f.fake.retry_wait.lock().unwrap() = Some(Duration::from_millis(40));
+    let mut f = Fixture::new(HELLO_TIMEOUT);
+    Arc::get_mut(&mut f.server).unwrap().open_lock_timeout = Duration::from_millis(100);
     let (mut wire, worker) = f.connection(1000);
     hello(&mut wire);
     open(&mut wire, "vpnt0");
-    let (mut next, next_worker) = f.connection(1001);
-    hello(&mut next);
     f.fake.fail_delete.store(true, Ordering::SeqCst);
     drop(wire);
     worker.unwrap().join().unwrap();
@@ -577,16 +628,22 @@ fn slow_pending_delete_does_not_hold_open_past_retry_budget() {
     let (resume, proceed) = channel();
     *f.fake.pause_delete.lock().unwrap() = Some((started, proceed));
 
-    next.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    let (mut next, next_worker) = f.connection(1001);
+    hello(&mut next);
     arrived.recv_timeout(Duration::from_secs(1)).unwrap();
-    next.get_ref()
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
-    let response = read_line(&mut next);
-    // Release the parked worker before asserting the result, including on a timeout.
+    let denied = exchange(&mut next, OPEN);
+    let events = f.fake.events.lock().unwrap().clone();
     resume.send(()).unwrap();
+    let lock = f.network_lock();
+    assert!(!ovpn_present(&f.fake).unwrap());
+    drop(lock);
     assert!(
-        matches!(decode_response(&response.unwrap()).unwrap(), Response::Opened(name) if name.as_str() == "vpnt1")
+        matches!(denied, Response::Error(ErrorCode::Backend)),
+        "{denied:?}"
+    );
+    assert_eq!(
+        events,
+        ["create vpnt0 1000", "delete vpnt0", "delete vpnt0"]
     );
     open(&mut next, "vpnt0");
     drop(next);
@@ -833,4 +890,469 @@ fn close_retry_releases_a_missing_interface() {
     );
     drop(wire);
     worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn open_refuses_a_registered_tunnel_before_create() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let registry = f.path.parent().unwrap().join("tunnel-leases");
+    DirBuilder::new().mode(0o700).create(&registry).unwrap();
+    fs::write(registry.join("test-tunnel"), []).unwrap();
+    fs::set_permissions(
+        registry.join("test-tunnel"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    let response = exchange(&mut wire, OPEN);
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    assert!(
+        matches!(response, Response::Error(ErrorCode::RouteConflict)),
+        "{response:?}"
+    );
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[test]
+fn open_refuses_an_insecure_registry_before_create() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let registry = f.path.parent().unwrap().join("tunnel-leases");
+    DirBuilder::new().mode(0o700).create(&registry).unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o755)).unwrap();
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    let response = exchange(&mut wire, OPEN);
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    assert!(
+        matches!(response, Response::Error(ErrorCode::Backend)),
+        "{response:?}"
+    );
+    assert!(events.is_empty(), "{events:?}");
+}
+
+#[test]
+fn registration_during_open_wait_blocks_creation() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let lock = f.network_lock();
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut wire);
+    lock.register("test-tunnel").unwrap();
+    drop(lock);
+    assert!(matches!(
+        response(&mut wire),
+        Response::Error(ErrorCode::RouteConflict)
+    ));
+    assert!(f.fake.events.lock().unwrap().is_empty());
+    drop(wire);
+    worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn creation_during_tunnel_admission_wait_blocks_registration() {
+    use std::sync::mpsc::channel;
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (started, creating) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_create.lock().unwrap() = Some((started, proceed));
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    creating.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(!ovpn_present(&f.fake).unwrap());
+
+    thread::scope(|scope| {
+        let (waiting, contender_started) = channel();
+        let (result, admitted) = channel();
+        let f = &f;
+        scope.spawn(move || {
+            waiting.send(()).unwrap();
+            let lock = f.network_lock();
+            let conflict = ovpn_present(&f.fake).unwrap();
+            if !conflict {
+                lock.register("test-tunnel").unwrap();
+            }
+            result.send(conflict).unwrap();
+        });
+        contender_started
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let during_create = admitted.recv_timeout(Duration::from_millis(50));
+        resume.send(()).unwrap();
+        assert!(matches!(
+            during_create,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(admitted.recv_timeout(Duration::from_secs(1)).unwrap());
+    });
+    assert!(matches!(response(&mut wire), Response::Opened(name) if name.as_str() == "vpnt0"));
+    assert!(!f.network_lock().tunnels_present().unwrap());
+    drop(wire);
+    worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn ovpn_receipt_survives_failed_close_and_clears_on_successful_close() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    open(&mut wire, "vpnt0");
+    assert!(ovpn_receipt(&f));
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    let close = "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n";
+    assert!(matches!(
+        exchange(&mut wire, close),
+        Response::Error(ErrorCode::Backend)
+    ));
+    assert!(ovpn_receipt(&f));
+    assert!(matches!(exchange(&mut wire, close), Response::Ok));
+    assert!(!ovpn_receipt(&f));
+    drop(wire);
+    worker.unwrap().join().unwrap();
+}
+
+#[test]
+fn ovpn_receipt_survives_server_restart_until_startup_cleanup() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let name = TunName::parse("vpnt0").unwrap();
+    {
+        let _lock = f.network_lock();
+        f.fake.create_tun(&name, 1000).unwrap();
+    }
+    let mut restarted = Server::new(Arc::clone(&f.fake), HELLO_TIMEOUT);
+    restarted.network_directory = f.server.network_directory.clone();
+    assert!(restarted.reserved.lock().unwrap().is_empty());
+    assert!(ovpn_receipt(&f));
+    f.fake.fail_delete.store(true, Ordering::SeqCst);
+    restarted.startup().unwrap();
+    assert!(restarted.pending.lock().unwrap().contains_key(&name));
+    assert!(ovpn_receipt(&f));
+    let lock = f.network_lock();
+    restarted.retry_inline(&lock, restarted.lock_deadline());
+    assert!(!ovpn_present(&f.fake).unwrap());
+}
+
+fn ovpn_receipt(f: &Fixture) -> bool {
+    let _lock = f.network_lock();
+    ovpn_present(&f.fake).unwrap()
+}
+
+#[test]
+fn lock_deadline_leaves_open_configure_close_and_eof_without_backend_writes() {
+    let mut f = Fixture::new(HELLO_TIMEOUT);
+    let server = Arc::get_mut(&mut f.server).unwrap();
+    server.lock_timeout = Duration::from_millis(80);
+    server.open_lock_timeout = server.lock_timeout;
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    let lock = f.network_lock();
+    assert!(matches!(
+        exchange(&mut wire, OPEN),
+        Response::Error(ErrorCode::Backend)
+    ));
+    assert!(f.fake.events.lock().unwrap().is_empty());
+    drop(lock);
+    open(&mut wire, "vpnt0");
+
+    let lock = f.network_lock();
+    let config = exchange(&mut wire, &configure("vpnt0"));
+    let close = exchange(&mut wire, "{\"op\":\"close_tun\",\"ifname\":\"vpnt0\"}\n");
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    assert!(matches!(config, Response::Error(ErrorCode::Backend)));
+    assert!(matches!(close, Response::Error(ErrorCode::Backend)));
+    assert_eq!(*f.fake.events.lock().unwrap(), ["create vpnt0 1000"]);
+    let name = TunName::parse("vpnt0").unwrap();
+    assert!(f.server.pending.lock().unwrap().contains_key(&name));
+    assert!(ovpn_present(&f.fake).unwrap());
+    f.fake.fail_all_deletes.store(true, Ordering::SeqCst);
+    drop(lock);
+
+    wait_for_cleanup(|| f.fake.failed_delete_times.lock().unwrap().len() >= 2);
+    {
+        let attempts = f.fake.failed_delete_times.lock().unwrap();
+        assert!(attempts[1] - attempts[0] >= Duration::from_millis(500));
+    }
+    assert!(f.server.pending.lock().unwrap().contains_key(&name));
+    assert!(ovpn_receipt(&f));
+    f.fake.fail_all_deletes.store(false, Ordering::SeqCst);
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+    assert!(f.server.pending.lock().unwrap().is_empty());
+    assert!(!ovpn_receipt(&f));
+}
+
+fn wait_for_cleanup(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "background cleanup did not progress"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn enqueue_marked(f: &Fixture, name: &str) -> TunName {
+    let name = TunName::parse(name).unwrap();
+    let _lock = f.network_lock();
+    f.fake.create_tun(&name, 1000).unwrap();
+    f.server.reserved.lock().unwrap().insert(name.clone());
+    f.server.defer(&name, CleanupProof::Marked);
+    name
+}
+
+#[test]
+fn open_acquires_network_lock_between_background_items() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1001);
+    hello(&mut wire);
+    enqueue_marked(&f, "vpnt0");
+    enqueue_marked(&f, "vpnt1");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+    f.fake.slow_inventory_calls.store(2, Ordering::SeqCst);
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut wire);
+    wire.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(9)))
+        .unwrap();
+    resume.send(()).unwrap();
+    let opened = response(&mut wire);
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+
+    assert!(
+        matches!(opened, Response::Opened(ref name) if name.as_str() == "vpnt0"),
+        "{opened:?}"
+    );
+    assert_eq!(
+        events,
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "create vpnt0 1001",
+            "delete vpnt1",
+        ]
+    );
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn background_cleanup_skips_entry_removed_by_inline_retry() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1001);
+    hello(&mut wire);
+    enqueue_marked(&f, "vpnt0");
+    enqueue_marked(&f, "vpnt1");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    assert_waiting(&mut wire);
+    resume.send(()).unwrap();
+    let opened = response(&mut wire);
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+    let events = f.fake.events.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+
+    assert!(matches!(opened, Response::Opened(name) if name.as_str() == "vpnt0"));
+    assert_eq!(
+        events,
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "delete vpnt1",
+            "create vpnt0 1001",
+        ]
+    );
+    assert_eq!(
+        f.fake.inventory_calls.load(Ordering::SeqCst),
+        3,
+        "worker inventories only its first item; inline retry and create each inventory once"
+    );
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn background_cleanup_deletes_after_a_three_second_inventory() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let first = enqueue_marked(&f, "vpnt0");
+    let second = enqueue_marked(&f, "vpnt1");
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+
+    f.server.retry_pending();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread::sleep(Duration::from_secs(3));
+    resume.send(()).unwrap();
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+
+    assert_eq!(
+        f.fake.inventory_calls.load(Ordering::SeqCst),
+        2,
+        "each item must be inventoried exactly once"
+    );
+    assert_eq!(
+        *f.fake.events.lock().unwrap(),
+        [
+            "create vpnt0 1000",
+            "create vpnt1 1000",
+            "delete vpnt0",
+            "delete vpnt1"
+        ]
+    );
+    for name in [first, second] {
+        assert!(!f.fake.names.lock().unwrap().contains(&name));
+        assert!(!f.server.reserved.lock().unwrap().contains(&name));
+    }
+}
+
+#[test]
+fn background_cleanup_resumes_with_first_pending_name_without_attempt() {
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let first = enqueue_marked(&f, "vpnt0");
+    let second = enqueue_marked(&f, "vpnt1");
+    *f.fake.fail_delete_for.lock().unwrap() = Some(first.clone());
+    f.fake.fail_inventory_call.store(2, Ordering::SeqCst);
+
+    f.server.retry_pending();
+    wait_for_cleanup(|| !f.server.pending.lock().unwrap().contains_key(&second));
+    let events = f.fake.events.lock().unwrap().clone();
+    let names = f.fake.names.lock().unwrap().clone();
+    let reserved = f.server.reserved.lock().unwrap().clone();
+    *f.fake.fail_delete_for.lock().unwrap() = None;
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+
+    assert!(
+        events.starts_with(&[
+            "create vpnt0 1000".into(),
+            "create vpnt1 1000".into(),
+            "delete vpnt0".into(),
+            "delete vpnt1".into(),
+        ]),
+        "the next pass must try vpnt1 before retrying vpnt0: {events:?}"
+    );
+    assert!(names.contains(&first) && reserved.contains(&first));
+    assert!(!names.contains(&second) && !reserved.contains(&second));
+}
+
+#[test]
+fn open_with_v1_client_finishes_inventory_after_lock_acquisition_deadline() {
+    use crate::netd::client::Client;
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let lock = f.network_lock();
+    let (before_open, opening) = channel();
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+
+    thread::scope(|scope| {
+        let client = scope.spawn(|| {
+            let mut client = Client::connect(&f.path).unwrap();
+            before_open.send(Instant::now()).unwrap();
+            client.open_tun()
+        });
+        let worker = f.accept(1000).unwrap();
+        let start = opening.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(3250).saturating_sub(start.elapsed()));
+        drop(lock);
+        inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(5400).saturating_sub(start.elapsed()));
+        resume.send(()).unwrap();
+        let opened = client.join().unwrap();
+        worker.join().unwrap();
+        assert_eq!(opened.unwrap().as_str(), "vpnt0");
+    });
+}
+
+#[test]
+fn inline_retry_stops_before_deleting_after_its_own_budget() {
+    use std::sync::mpsc::channel;
+
+    let f = Fixture::new(HELLO_TIMEOUT);
+    let (mut wire, worker) = f.connection(1000);
+    hello(&mut wire);
+    let pending = [
+        TunName::parse("vpnt0").unwrap(),
+        TunName::parse("vpnt1").unwrap(),
+    ];
+    {
+        let _lock = f.network_lock();
+        for name in &pending {
+            f.fake.create_tun(name, 1001).unwrap();
+            f.server.reserved.lock().unwrap().insert(name.clone());
+            f.server.defer(name, CleanupProof::Marked);
+        }
+    }
+    let (in_inventory, inventory) = channel();
+    let (resume, proceed) = channel();
+    *f.fake.pause_inventory.lock().unwrap() = Some((in_inventory, proceed));
+    wire.get_mut().write_all(OPEN.as_bytes()).unwrap();
+    wire.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    inventory.recv_timeout(Duration::from_secs(2)).unwrap();
+    thread::sleep(Duration::from_millis(2100));
+    resume.send(()).unwrap();
+    let opened = response(&mut wire);
+    let events = f.fake.events.lock().unwrap().clone();
+    let retained = f.server.pending.lock().unwrap().clone();
+    let names = f.fake.names.lock().unwrap().clone();
+    drop(wire);
+    worker.unwrap().join().unwrap();
+    wait_for_cleanup(|| !f.server.retry_running.load(Ordering::Relaxed));
+
+    assert!(matches!(opened, Response::Opened(name) if name.as_str() == "vpnt2"));
+    assert_eq!(
+        events,
+        [
+            "create vpnt0 1001",
+            "create vpnt1 1001",
+            "create vpnt2 1000"
+        ]
+    );
+    assert!(pending.iter().all(|name| {
+        matches!(retained.get(name), Some(CleanupProof::Marked)) && names.contains(name)
+    }));
+    assert!(f.server.pending.lock().unwrap().is_empty());
+    assert!(f.fake.names.lock().unwrap().is_empty());
+    assert!(f.server.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cleanup_retry_delays_increase_and_then_stay_at_five_seconds() {
+    let delays: Vec<_> = retry_delays().take(7).collect();
+    assert_eq!(
+        delays,
+        [250, 500, 1000, 2000, 5000, 5000, 5000].map(Duration::from_millis)
+    );
 }

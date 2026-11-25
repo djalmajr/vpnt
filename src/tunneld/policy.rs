@@ -1,10 +1,12 @@
 //! Version-one administrative tunnel grants and canonical snapshots.
 use super::protocol::{self, CidrV4, Endpoint, Prepare};
+use crate::connection::ipsec::Config;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{fmt, io, net::Ipv4Addr, str::FromStr};
 
 pub(super) const MAX_SNAPSHOT: usize = 16 * 1024;
 pub(super) const MAX_POLICY: usize = 1024 * 1024;
+pub(super) const MAX_IPSEC_ROUTES: usize = 64;
 const MAX_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -83,16 +85,22 @@ pub(super) struct Entry {
     port: u16,
     #[serde(
         default,
-        deserialize_with = "present_pin",
+        deserialize_with = "present_string",
         skip_serializing_if = "Option::is_none"
     )]
     certificate_sha256: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    fortinet_local_cidr: Option<String>,
     route_cidrs: Vec<String>,
     dns_domains: Vec<String>,
     dns_servers: Vec<Ipv4Addr>,
 }
 
-fn present_pin<'de, D: Deserializer<'de>>(input: D) -> Result<Option<String>, D::Error> {
+fn present_string<'de, D: Deserializer<'de>>(input: D) -> Result<Option<String>, D::Error> {
     String::deserialize(input).map(Some)
 }
 
@@ -105,6 +113,15 @@ struct Network {
 impl Network {
     fn contains(self, other: Self) -> bool {
         self.prefix <= other.prefix && other.base & mask(self.prefix) == self.base
+    }
+}
+
+impl From<CidrV4> for Network {
+    fn from(route: CidrV4) -> Self {
+        Self {
+            base: u32::from(route.network()),
+            prefix: route.prefix(),
+        }
     }
 }
 
@@ -152,16 +169,12 @@ fn validate_addresses(addresses: &mut [Ipv4Addr], maximum: usize) -> io::Result<
     Ok(())
 }
 
-fn literal_ike_identity(identity: &str) -> bool {
-    let Some((kind, text)) = identity.split_once(':') else {
-        return false;
-    };
-    matches!(kind, "fqdn" | "email")
-        && !text.is_empty()
-        && !text.starts_with('#')
-        && !(text.starts_with('^') && text.ends_with('$'))
-        && !text.contains('*')
-        && !text.chars().any(char::is_control)
+fn literal_ike_identity(identity: &str, transport_ipv4: &[Ipv4Addr]) -> bool {
+    Config::literal_peer_identity(identity)
+        && identity.strip_prefix("ipv4:").is_none_or(|text| {
+            text.parse::<Ipv4Addr>()
+                .is_ok_and(|address| transport_ipv4.contains(&address))
+        })
 }
 
 impl Entry {
@@ -176,11 +189,16 @@ impl Entry {
 
     fn canonicalize(&mut self) -> io::Result<()> {
         self.key().validate()?;
+        if let Some(cidr) = &self.fortinet_local_cidr
+            && (self.backend != Backend::Fortinet || cidr.parse::<CidrV4>().is_err())
+        {
+            return Err(invalid("invalid Fortinet local IPv4 scope"));
+        }
         match (self.backend, self.certificate_sha256.as_deref()) {
             (Backend::Ipsec, None)
                 if self.dns_domains.is_empty()
                     && self.dns_servers.is_empty()
-                    && literal_ike_identity(&self.peer_identity) => {}
+                    && literal_ike_identity(&self.peer_identity, &self.transport_ipv4) => {}
             (Backend::Fortinet, Some(pin))
                 if self.peer_identity == self.hostname
                     && pin.len() == 64
@@ -205,7 +223,7 @@ impl Entry {
         }
         sort_unique(&mut self.dns_domains, 16)?;
         validate_addresses(&mut self.dns_servers, 4)?;
-        if self.dns_domains.is_empty() != self.dns_servers.is_empty()
+        if (self.dns_domains.is_empty() && !self.dns_servers.is_empty())
             || self.dns_domains.iter().any(|domain| {
                 domain.parse::<Ipv4Addr>().is_ok() || Endpoint::new(domain.clone(), 1).is_err()
             })
@@ -215,8 +233,33 @@ impl Entry {
         Ok(())
     }
 
+    pub(super) fn fortinet_local_cidr(&self) -> Option<CidrV4> {
+        self.fortinet_local_cidr.as_deref()?.parse().ok()
+    }
+
     fn networks(&self) -> impl Iterator<Item = io::Result<Network>> + '_ {
         self.route_cidrs.iter().map(|cidr| cidr.parse())
+    }
+
+    pub(super) fn route_allowed(&self, route: CidrV4) -> bool {
+        let route = Network::from(route);
+        self.networks()
+            .flatten()
+            .any(|allowed| allowed.contains(route))
+    }
+
+    // The Fortinet network writer supplies only routes it accepted.
+    #[allow(dead_code, reason = "used by the follow-up Fortinet network writer")]
+    pub(super) fn gateway_dns_allowed(&self, server: Ipv4Addr, accepted_routes: &[CidrV4]) -> bool {
+        self.backend == Backend::Fortinet
+            && self.dns_servers.is_empty()
+            && !self.dns_domains.is_empty()
+            && CidrV4::new(server, 32).is_ok_and(|host| {
+                let host = Network::from(host);
+                accepted_routes
+                    .iter()
+                    .any(|&route| Network::from(route).contains(host))
+            })
     }
 
     fn permits(&self, uid: u32, offer: &Prepare) -> bool {
@@ -234,15 +277,10 @@ impl Entry {
         // The wire offer has no transport or peer identity of its own. They
         // belong to the exact grant returned by authorization.
         match offer {
-            Prepare::Ipsec(offer) => offer.networks().iter().all(|route| {
-                let route = Network {
-                    base: u32::from(route.network()),
-                    prefix: route.prefix(),
-                };
-                self.networks()
-                    .flatten()
-                    .any(|allowed| allowed.contains(route))
-            }),
+            Prepare::Ipsec(offer) => offer
+                .networks()
+                .iter()
+                .all(|&route| self.route_allowed(route)),
             Prepare::Fortinet(offer) => {
                 use std::fmt::Write;
                 let mut pin = String::with_capacity(64);
@@ -331,6 +369,17 @@ impl Policy {
         Ok(policy.entries.pop().expect("one snapshot entry").0)
     }
 
+    pub(super) fn apply_snapshot(bytes: &[u8]) -> io::Result<Entry> {
+        let entry = Self::snapshot(bytes)?;
+        if entry.backend == Backend::Fortinet && entry.fortinet_local_cidr().is_none() {
+            return Err(invalid("Fortinet policy requires fortinet_local_cidr"));
+        }
+        if entry.backend == Backend::Ipsec && entry.route_cidrs.len() > MAX_IPSEC_ROUTES {
+            return Err(invalid("IPsec policy supports at most 64 route CIDRs"));
+        }
+        Ok(entry)
+    }
+
     pub(super) fn from_disk(bytes: &[u8]) -> io::Result<Self> {
         let policy = Self::parse(bytes, MAX_POLICY)?;
         if policy.bytes()? != bytes {
@@ -403,6 +452,7 @@ mod tests {
         entry["port"] = json!(443);
         entry["peer_identity"] = entry["hostname"].clone();
         entry["certificate_sha256"] = json!("a".repeat(64));
+        entry["fortinet_local_cidr"] = json!("10.99.0.0/24");
         entry["dns_domains"] = json!(["internal.example"]);
         entry["dns_servers"] = json!(["10.20.0.53"]);
         entry
@@ -414,6 +464,86 @@ mod tests {
 
     fn snapshot(entry: Value) -> io::Result<Vec<u8>> {
         canonical_snapshot(&document(vec![entry]))
+    }
+
+    #[test]
+    fn fortinet_snapshot_cannot_approve_a_missing_local_scope() {
+        let mut entry = fortinet();
+        entry.as_object_mut().unwrap().remove("fortinet_local_cidr");
+        let legacy = snapshot(entry.clone()).unwrap();
+        assert_eq!(Policy::from_disk(&legacy).unwrap().bytes().unwrap(), legacy);
+        assert!(Policy::apply_snapshot(&document(vec![entry])).is_err());
+    }
+
+    #[test]
+    fn local_scope_is_canonical_ipv4_and_exclusive_to_fortinet() {
+        for cidr in [
+            json!("10.0.0.0/8"),
+            json!("10.99.0.2/32"),
+            json!("10.99.0.2/24"),
+            json!("10.0.0.0/08"),
+            json!("10.0.0.0/7"),
+            json!("10.0.0.0/33"),
+            json!("169.254.2.1/32"),
+            json!("127.0.0.0/8"),
+            json!(null),
+        ] {
+            let valid = cidr == "10.0.0.0/8" || cidr == "10.99.0.2/32";
+            let mut entry = fortinet();
+            entry["fortinet_local_cidr"] = cidr.clone();
+            assert_eq!(
+                Policy::apply_snapshot(&document(vec![entry])).is_ok(),
+                valid,
+                "{cidr}"
+            );
+            let mut entry = ipsec();
+            entry["fortinet_local_cidr"] = cidr;
+            assert!(Policy::apply_snapshot(&document(vec![entry])).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_and_config_share_literal_ike_identity() {
+        use crate::connection::ipsec::Config;
+        let too_long = format!("fqdn:{}", "a".repeat(249));
+        for (identity, expected) in [
+            ("fqdn:vpn.example", true),
+            ("email:user@example.test", true),
+            ("ipv4:192.0.2.20", true),
+            ("ipv4:192.0.2.22", true),
+            ("ipv4:192.0.02.20", false),
+            ("ipv4:0.0.0.0", false),
+            ("fqdn:", false),
+            ("fqdn:vpn.éxample", false),
+            ("fqdn:vpn\nexample", false),
+            ("fqdn:*", false),
+            ("email:#hex", false),
+            ("email:^user@example.test$", false),
+            ("vpn.example", false),
+            (&too_long, false),
+        ] {
+            let config = Config::linux(
+                "192.0.2.20:500".parse().unwrap(),
+                identity,
+                "fixture",
+                1,
+                1,
+                vec!["dynamic".into()],
+                vec!["10.20.0.0/15".into()],
+            );
+            assert_eq!(config.is_ok(), expected, "config {identity:?}");
+            let mut grant = ipsec();
+            grant["peer_identity"] = json!(identity);
+            assert_eq!(snapshot(grant).is_ok(), expected, "policy {identity:?}");
+        }
+
+        let mut grant = ipsec();
+        grant["peer_identity"] = json!("ipv4:192.0.2.21");
+        assert!(Config::literal_peer_identity("ipv4:192.0.2.21"));
+        assert!(
+            snapshot(grant).is_err(),
+            "policy must bind IPv4 identity to approved transport"
+        );
     }
 
     #[test]
@@ -479,6 +609,98 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_ike_identity_must_be_canonical_unicast_and_in_the_grant_transport() {
+        let mut grant = ipsec();
+        grant["transport_ipv4"] = json!(["192.0.2.20", "192.0.2.10"]);
+        grant["peer_identity"] = json!("ipv4:192.0.2.10");
+        let bytes = snapshot(grant.clone()).expect("an IPv4 identity in the transport is allowed");
+        assert_eq!(
+            Policy::parse(&bytes, MAX_SNAPSHOT)
+                .unwrap()
+                .bytes()
+                .unwrap(),
+            bytes
+        );
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["entries"][0]["peer_identity"], "ipv4:192.0.2.10");
+        assert_eq!(
+            parsed["entries"][0]["transport_ipv4"],
+            json!(["192.0.2.10", "192.0.2.20"])
+        );
+        for rejected in [
+            "ipv4:192.0.2.11",
+            "ipv4:192.0.002.10",
+            "ipv4:0300.0.2.012",
+            "ipv4: 192.0.2.10",
+            "ipv4:192.0.2.10 ",
+            "ipv4:192.0.2.10\n",
+            "ipv4:192.0.2.10/32",
+            "ipv4:::ffff:192.0.2.10",
+            "ipv4:224.0.0.1",
+            "ipv4:0.0.0.0",
+            "ipv4:255.255.255.255",
+            "192.0.2.10",
+        ] {
+            grant["peer_identity"] = json!(rejected);
+            assert!(snapshot(grant.clone()).is_err(), "accepted {rejected:?}");
+        }
+        for accepted in ["fqdn:vpn.example", "email:fixture@example.test"] {
+            grant["peer_identity"] = json!(accepted);
+            let bytes = snapshot(grant.clone()).unwrap();
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["entries"][0]["peer_identity"], accepted);
+        }
+    }
+
+    #[test]
+    fn fortinet_gateway_dns_policy_round_trips() {
+        let mut entry = fortinet();
+        entry["dns_servers"] = json!([]);
+        let bytes = snapshot(entry).unwrap();
+        assert_eq!(
+            Policy::parse(&bytes, MAX_POLICY).unwrap().bytes().unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn route_authorization_requires_full_containment() {
+        let mut fixture = fortinet();
+        fixture["route_cidrs"] = json!(["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]);
+        let entry = Policy::snapshot(&document(vec![fixture])).unwrap();
+        let route = |ip: &str, prefix| CidrV4::new(ip.parse().unwrap(), prefix).unwrap();
+
+        assert!(entry.route_allowed(route("10.20.0.0", 24)));
+        assert!(entry.route_allowed(route("10.0.0.0", 8)));
+        assert!(!entry.route_allowed(route("172.0.0.0", 11)));
+        assert!(!entry.route_allowed(route("8.8.8.0", 24)));
+        // Prefixes shorter than /8 cannot reach the policy with a valid CidrV4.
+        assert!(CidrV4::new(Ipv4Addr::UNSPECIFIED, 0).is_err());
+        assert!(CidrV4::new(Ipv4Addr::new(10, 0, 0, 0), 7).is_err());
+    }
+
+    #[test]
+    fn fortinet_gateway_dns_requires_an_accepted_route_and_dynamic_mode() {
+        let mut fixture = fortinet();
+        fixture["route_cidrs"] = json!(["10.0.0.0/8"]);
+        let fixed = Policy::snapshot(&document(vec![fixture.clone()])).unwrap();
+        fixture["dns_servers"] = json!([]);
+        let dynamic = Policy::snapshot(&document(vec![fixture.clone()])).unwrap();
+        fixture["dns_domains"] = json!([]);
+        let disabled = Policy::snapshot(&document(vec![fixture])).unwrap();
+        let routes = [CidrV4::new(Ipv4Addr::new(10, 20, 0, 0), 24).unwrap()];
+        assert!(dynamic.route_allowed(routes[0]));
+        let inside = Ipv4Addr::new(10, 20, 0, 53);
+
+        assert!(dynamic.gateway_dns_allowed(inside, &routes));
+        assert!(!dynamic.gateway_dns_allowed(Ipv4Addr::new(10, 21, 0, 53), &routes));
+        assert!(!dynamic.gateway_dns_allowed(Ipv4Addr::new(198, 51, 100, 53), &routes));
+        assert!(!dynamic.gateway_dns_allowed(inside, &[]));
+        assert!(!fixed.gateway_dns_allowed(inside, &routes));
+        assert!(!disabled.gateway_dns_allowed(inside, &routes));
+    }
+
+    #[test]
     fn backend_pin_identity_and_dns_are_bound_to_fortinet() {
         let control = fortinet();
         assert!(snapshot(control.clone()).is_ok());
@@ -502,7 +724,6 @@ mod tests {
                 json!(["internal.example", "internal.example"]),
             ),
             ("dns_domains", json!(vec!["internal.example"; 17])),
-            ("dns_servers", json!([])),
             ("dns_servers", json!(["10.20.0.53", "10.20.0.53"])),
             ("dns_servers", json!(["255.255.255.255"])),
             ("dns_servers", json!(vec!["10.20.0.53"; 5])),

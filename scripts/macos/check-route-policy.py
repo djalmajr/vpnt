@@ -252,7 +252,7 @@ def main():
          lambda s: replace_once(s, "if !queue.lock().map_err(|_| Error::Unavailable)?.is_empty()", "if false && !queue.lock().map_err(|_| Error::Unavailable)?.is_empty()"),
          ["--lib", "failed_scope_retains_retirement"]),
         ("controller-old-worker-status-accepted", "src/connection/controller/engine.rs",
-         lambda s: replace_once(s, "worker.generation == slot.generation", "true"),
+         lambda s: replace_once(s, "let current = worker.generation == self.generation;", "let current = true;"),
          ["--lib", "reconnect_waits_for_cleanup"]),
         ("controller-replacement-starts-before-cleanup", "src/connection/controller/engine.rs",
          lambda s: replace_once(s, "if !closing && slot.worker.is_none() && slot.pending.is_some()", "if !closing && slot.pending.is_some()"),

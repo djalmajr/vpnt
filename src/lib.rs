@@ -26,6 +26,8 @@ pub mod localization;
 pub mod model;
 #[cfg(target_os = "linux")]
 pub mod netd;
+#[cfg(target_os = "linux")]
+pub mod netlease;
 pub mod notifications;
 pub mod preferences;
 #[cfg(feature = "desktop")]
@@ -36,6 +38,8 @@ pub mod secrets;
 pub mod session;
 #[cfg(unix)]
 pub mod storage;
+#[cfg(target_os = "linux")]
+pub mod tunnel_policy;
 #[cfg(target_os = "linux")]
 pub mod tunneld;
 // Its only callers are Linux fixtures; elsewhere it would be dead code.

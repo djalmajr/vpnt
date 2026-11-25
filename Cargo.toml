@@ -101,6 +101,7 @@ objc2-user-notifications = { version = "0.3.2", optional = true, default-feature
 block2 = { version = "0.6.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "=0.6.3", features = ["all"] }
 toml = { version = "0.8", optional = true }
 glib = { version = "0.18.5", optional = true }
 tao = { version = "0.37", optional = true }

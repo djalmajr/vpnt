@@ -360,7 +360,23 @@ pub(super) fn run(
     signals.canceled.store(true, Ordering::Release);
     let cleanup_started = Instant::now();
     let mut cleanup_poll = timing.poll.min(CLEANUP_MAX_POLL);
+    #[cfg(target_os = "linux")]
+    let mut reported_unconfirmed = false;
     while !attempt.cleanup() {
+        #[cfg(target_os = "linux")]
+        if !reported_unconfirmed && attempt.phase() == Some(ConnectionState::CleanupUnconfirmed) {
+            // Keep the worker's admission fence even after observation ended.
+            send(
+                ConnectionState::CleanupUnconfirmed,
+                0,
+                false,
+                Some(FailureNote {
+                    code: ErrorCode::BackendFailure,
+                    step: Step::Tunnel,
+                }),
+            );
+            reported_unconfirmed = true;
+        }
         let requested = signals.exit.at();
         if let Some(requested) = requested {
             let deadline = cleanup_started.max(requested) + signals.exit.budget;

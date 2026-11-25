@@ -558,6 +558,7 @@ struct Control {
     invalid: bool,
     cleanup_allowed: bool,
     cleanup_calls: usize,
+    cleanup_unconfirmed: bool,
     abandon_result: Option<Result<(), AbandonError>>,
     stopped: bool,
     finished: bool,
@@ -785,6 +786,12 @@ impl Attempt for FixtureAttempt {
         c.stopped = true;
         c.finished = c.cleanup_allowed && !resources;
         c.finished
+    }
+    fn phase(&self) -> Option<ConnectionState> {
+        let kernel = self.kernel.lock().unwrap();
+        let control = &kernel.attempts[&self.key()];
+        (control.cleanup_calls > 0 && control.cleanup_unconfirmed)
+            .then_some(ConnectionState::CleanupUnconfirmed)
     }
     fn abandon(&mut self, _: Reason) -> Result<(), AbandonError> {
         let result = self.kernel.lock().unwrap().attempts[&self.key()]
@@ -1218,6 +1225,86 @@ fn reconnect_waits_for_cleanup_and_rejects_a_late_successful_probe() {
     h.wait(|h| h.state("one", 2, ConnectionState::Connected));
     h.finish();
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn disconnect_reports_unconfirmed_cleanup_without_releasing_the_owner() {
+    use crate::helper::protocol::{FAILURE_NOTE_ACK_SNAPSHOT_ID, FAILURE_NOTE_PROBE_SNAPSHOT_ID};
+
+    let mut h = Harness::new(vec![profile("one")], 64);
+    h.input
+        .as_ref()
+        .unwrap()
+        .send(Request {
+            id: FAILURE_NOTE_PROBE_SNAPSHOT_ID.into(),
+            command: Command::Snapshot {},
+        })
+        .unwrap();
+    h.wait(|h| {
+        h.seen.iter().any(
+            |m| matches!(m, Message::Snapshot { id, .. } if id == FAILURE_NOTE_ACK_SNAPSHOT_ID),
+        )
+    });
+    h.connect("one", 1);
+    h.started("one", 1);
+    h.control("one", 1, |c| {
+        c.ready = true;
+        c.responsive = true;
+    });
+    h.wait(|h| h.state("one", 1, ConnectionState::Connected));
+    let before_disconnect = h.seen.len();
+    h.command(Command::Disconnect {
+        id: "one".into(),
+        generation: 2,
+    });
+    h.wait(|h| h.kernel.lock().unwrap().attempts[&("one".into(), 1)].stopped);
+    h.snapshot_states();
+    h.control("one", 1, |c| c.cleanup_unconfirmed = true);
+    for generation in [2, 3] {
+        if generation == 3 {
+            h.command(Command::Disconnect {
+                id: "one".into(),
+                generation,
+            });
+        }
+        h.wait(|h| h.state("one", generation, ConnectionState::CleanupUnconfirmed));
+        assert!(
+            h.seen
+                .iter()
+                .any(|message| matches!(message, Message::Changed {
+                    profile_id, generation: g, state: ConnectionState::CleanupUnconfirmed,
+                    cleaning: false, failures: 0, failure: None,
+                } if profile_id == "one" && *g == generation))
+        );
+        let states = h.snapshot_states();
+        assert!(states.iter().any(|state| state.id == "one"
+            && state.generation == generation
+            && state.state == ConnectionState::CleanupUnconfirmed
+            && state.failure.is_none()));
+        assert!(!h.state("one", generation, ConnectionState::Off));
+    }
+    h.connect("one", 4);
+    h.wait(|h| h.state("one", 4, ConnectionState::Reconnecting));
+    let states = h.snapshot_states();
+    assert!(states.iter().any(|state| state.id == "one"
+        && state.generation == 4
+        && state.state == ConnectionState::Reconnecting));
+    assert_eq!(h.kernel.lock().unwrap().attempts.len(), 1);
+    assert!(!h.seen[before_disconnect..].iter().any(|message| matches!(
+        message,
+        Message::Changed { profile_id, generation: 1, .. } if profile_id == "one"
+    )));
+    assert_eq!(h.seen[before_disconnect..].iter().filter(|message| matches!(
+        message,
+        Message::Changed { profile_id, generation: 2, state: ConnectionState::Disconnecting, .. }
+            if profile_id == "one"
+    )).count(), 1);
+    h.control("one", 1, |c| c.cleanup_allowed = true);
+    h.started("one", 4);
+    h.control("one", 4, |c| c.cleanup_allowed = true);
+    h.finish();
+}
+
 #[test]
 fn cancel_before_discovery_does_not_forget_cleanup_or_launch_a_queued_replacement() {
     let mut h = Harness::new(vec![profile("one")], 64);

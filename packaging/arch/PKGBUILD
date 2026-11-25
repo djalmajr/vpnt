@@ -4,27 +4,75 @@ pkgrel=1
 pkgdesc='A menu bar app for configurable VPN connections'
 arch=('x86_64')
 url='https://github.com/djalmajr/vpnt'
-license=('MIT')
-depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'openvpn' 'libsecret' 'iproute2' 'systemd' 'xdg-utils')
-makedepends=('cargo' 'bun' 'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator')
+license=('MIT' 'GPL-3.0-or-later')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'openvpn' 'libsecret' 'iproute2' 'systemd' 'xdg-utils' 'strongswan' 'ppp' 'openssl')
+makedepends=('cargo' 'bun' 'webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'autoconf' 'automake' 'pkgconf' 'openssl')
 options=('!debug')
 install=vpnt.install
-source=("vpnt-$pkgver.tar.gz")
+_openfortivpn_version=1.24.1
+source=("vpnt-$pkgver.tar.gz"
+        "openfortivpn-$_openfortivpn_version.tar.gz::https://github.com/adrienverge/openfortivpn/archive/refs/tags/v$_openfortivpn_version.tar.gz")
 # build.sh creates this local tarball from the selected commit.
-sha256sums=('SKIP')
+sha256sums=('SKIP'
+            'c40d33acd97b89c2e943bfd839c19b69e5a7a5997052e2fc9a595602745c0465')
+
+prepare() {
+    local vpnt_source="$srcdir/$pkgname-$pkgver"
+    local patch_file leftovers
+    # Keep the first five patches in the order used by scripts/macos/runtime_sources.py.
+    local patches=(
+        scripts/macos/patches/openfortivpn-no-routes.patch
+        scripts/macos/patches/openfortivpn-bound-transport.patch
+        scripts/macos/patches/openfortivpn-ppp-supervisor.patch
+        scripts/macos/patches/openfortivpn-split-routes.patch
+        scripts/macos/patches/openfortivpn-split-dns.patch
+        packaging/linux/patches/openfortivpn-require-pin.patch
+        packaging/linux/patches/openfortivpn-defer-password.patch
+        packaging/linux/patches/openfortivpn-local-cidr.patch
+    )
+
+    cd "$srcdir/openfortivpn-$_openfortivpn_version" || return
+    for patch_file in "${patches[@]}"; do
+        patch -t -p1 --forward --no-backup-if-mismatch -i "$vpnt_source/$patch_file" || return
+    done
+    leftovers=$(find . \( -name '*.rej' -o -name '*.orig' \) -print) || return
+    if [[ -n $leftovers ]]; then
+        printf 'Unexpected openfortivpn patch artifacts:\n%s\n' "$leftovers" >&2
+        return 1
+    fi
+}
 
 build() {
+    cd "$srcdir/openfortivpn-$_openfortivpn_version" || return
+    sh ./autogen.sh || return
+    ./configure --prefix=/usr --with-pppd=/usr/sbin/pppd --with-resolvconf=DISABLED \
+        --with-systemdsystemunitdir=no --enable-legacy-pppd || return
+    make || return
+
     cd "$srcdir/$pkgname-$pkgver" || return
     (cd ui && bun install --frozen-lockfile && bun run build) || return
-    CARGO_TARGET_DIR="$srcdir/target" cargo build --release --locked --bin vpnt --bin vpnt-helper
+    CARGO_TARGET_DIR="$srcdir/target" cargo build --release --locked \
+        --bin vpnt --bin vpnt-helper --bin vpnt-tunneld --bin vpnt-pinentry
 }
 
 package() {
+    local unit
     cd "$srcdir/$pkgname-$pkgver" || return
     install -Dm755 "$srcdir/target/release/vpnt" "$pkgdir/usr/bin/vpnt"
     install -Dm755 "$srcdir/target/release/vpnt-helper" "$pkgdir/usr/lib/vpnt/vpnt-helper"
+    install -Dm755 "$srcdir/target/release/vpnt-tunneld" "$pkgdir/usr/lib/vpnt/vpnt-tunneld"
+    install -Dm755 "$srcdir/target/release/vpnt-pinentry" "$pkgdir/usr/lib/vpnt/vpnt-pinentry"
+    install -Dm755 "$srcdir/openfortivpn-$_openfortivpn_version/openfortivpn" "$pkgdir/usr/lib/vpnt/openfortivpn"
+    install -d -m755 "$pkgdir/etc/vpnt"
     install -Dm644 packaging/linux/vpnt-helper.service "$pkgdir/usr/lib/systemd/system/vpnt-helper.service"
     install -Dm644 packaging/linux/vpnt-helper.socket "$pkgdir/usr/lib/systemd/system/vpnt-helper.socket"
+    install -Dm644 packaging/linux/vpnt-tunneld.service "$pkgdir/usr/lib/systemd/system/vpnt-tunneld.service"
+    install -Dm644 packaging/linux/vpnt-tunneld.socket "$pkgdir/usr/lib/systemd/system/vpnt-tunneld.socket"
+    for unit in vpnt-tunneld-ipsec@.service vpnt-tunneld-fortinet@.service; do
+        if [[ -f packaging/linux/$unit ]]; then
+            install -Dm644 "packaging/linux/$unit" "$pkgdir/usr/lib/systemd/system/$unit"
+        fi
+    done
     install -Dm644 packaging/linux/vpnt.sysusers "$pkgdir/usr/lib/sysusers.d/vpnt.conf"
     install -Dm644 packaging/linux/vpnt.desktop "$pkgdir/usr/share/applications/vpnt.desktop"
     install -Dm644 packaging/linux/vpnt.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/vpnt.svg"
