@@ -2916,6 +2916,20 @@ Achados:
 
 Não observados nesta rodada: cancelar durante a aprovação, Reconnect manual, renegociação TLS depois de uma hora e convivência com perfis IPsec e Fortinet conectados ao mesmo tempo. Esta evidência não cobre os outros clientes listados acima.
 
+### Canal prd em /Applications com IPsec, Fortinet SSL e OpenVPN (25/11/2026)
+
+[real VPN, manual] Primeiro uso do canal `prd` (`dev.djalmajr.vpnt.app`), com o build da `main` em `2bfc5db`.
+- **Troca de canal:** o dono desconectou as VPNs, removeu o componente dev pelo app dev e instalou o componente prd pelo app prd, com uma senha em cada passo. Depois digitou de novo as senhas dos perfis, porque o chaveiro do prd é outro serviço.
+- **Local:** o app rodou a partir de `/Applications`; a admissão do componente embutido aceitou esse ancestral. Depois, o mesmo binário e o mesmo componente foram reempacotados como `VPN Tray.app` com ícone (branch `feat/app-name-icon`); `cmp` e `diff -r` confirmaram host e componente idênticos, sem nova instalação.
+- **Conexões:** um perfil IPsec IKEv2 (charon), um Fortinet SSL (openfortivpn e pppd) e um OpenVPN com token PKCS#11, todos ligados ao mesmo tempo, com o Tailscale ativo.
+- **Tráfego:** a rota de cada host de teste saía pela interface do próprio túnel. IPsec: ping e TCP respondendo; Fortinet SSL: ping e SSH; OpenVPN: TCP 53. A internet continuou pela rota padrão física, e o Tailscale respondeu ao peer em 1 ms.
+
+Achados:
+- **Quit derruba as conexões:** o helper roda como filho do app (`sudo -n -- helper runtime`). Fechar o app encerrou o helper e os três túneis; o app novo abriu um helper novo com tudo desligado. Isso confirma o que R3 e R4 já registravam, mas o dono foi avisado do contrário antes da troca.
+- **Sobras do dev:** a remoção do componente dev deixou `dev.djalmajr.vpnt-dev.runtime` e `dev.djalmajr.vpnt-dev.staging` em `/Library/PrivilegedHelperTools`.
+
+Não observado nesta rodada: o ícone da barra com o OpenVPN ligado no prd (a captura não mostrou o item, que estava oculto) e abertura no login.
+
 ## Arquivo e estrutura
 
 Na raiz do repositório, com Node.js, Bun e OpenPencil CLI disponíveis:
