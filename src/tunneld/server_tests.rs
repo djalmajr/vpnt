@@ -299,6 +299,7 @@ fn admitted_v2_stop_acknowledges_before_publishing_cleanup_receipt() {
             _: &Arc<SetupCancellation>,
             record: &mut Reservation<'_>,
         ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            record.arm().expect("arm the fixture cleanup receipt");
             Ok(Box::new(FakeSession {
                 launcher: self,
                 binding: ProbeBinding::new(
@@ -410,8 +411,10 @@ fn admitted_v2_stop_acknowledges_before_publishing_cleanup_receipt() {
                 },
             )
             .unwrap();
+            let response = receive(&query);
             assert!(
-                matches!(receive(&query), Response::CleanupStatus { state } if state == expected)
+                matches!(response, Response::CleanupStatus { state } if state == expected),
+                "expected cleanup {expected:?}, got {response:?}"
             );
             expect_close(&query);
             worker.join().unwrap().unwrap();
