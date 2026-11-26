@@ -1,8 +1,8 @@
 //! Lifecycle of the stock charon inside an authenticated Linux IPsec unit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, PipeReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
     handshake::{AuthenticatedChannel, Datagram},
@@ -37,6 +38,11 @@ const STARTUP_INTERVAL: Duration = Duration::from_millis(20);
 // Same manual reqid range as connection/ipsec/namespace.rs.
 const MAX_MANUAL_REQID: u16 = 0x3fff;
 const TERM_GRACE: Duration = Duration::from_secs(3);
+const CONTROL_LOG_LEVEL: &[u8] = b"1";
+const CONTROL_LOG_LINES: usize = 8;
+const CHARON_LOG_LINES: usize = 60;
+// Drop oversized records as a whole. Never interpret an incomplete message.
+const CHARON_LOG_INPUT_BYTES: usize = 8 * 1024;
 /// How often negotiation re-checks the control channel; also bounds how long
 /// a cancellation takes to reach a VICI exchange in progress.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
@@ -243,6 +249,31 @@ fn run_in_directory(
             socket = "unix://{socket}"
         }}
     }}
+    filelog {{
+        stderr {{
+            default = 1
+            json = yes
+            dmn = 1
+            mgr = 1
+            ike = 1
+            chd = 1
+            job = 1
+            wch = 1
+            cfg = 1
+            knl = 1
+            net = 1
+            asn = 1
+            enc = 1
+            tnc = 1
+            imc = 1
+            imv = 1
+            pts = 1
+            tls = 1
+            app = 1
+            esp = 1
+            lib = 1
+        }}
+    }}
     syslog {{
         daemon {{ default = -1 }}
         auth {{ default = -1 }}
@@ -252,7 +283,39 @@ fn run_in_directory(
     )?;
     drop(config);
 
-    let mut child = spawn_charon(program, directory, &path)?;
+    let (stderr, writer) = io::pipe()?;
+    // Only the reader is nonblocking. strongSwan writes a line in multiple
+    // calls, so dropping individual writes would lose its line boundaries.
+    // SAFETY: F_SETFL takes a valid fd and integer flags.
+    checked(unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) })?;
+    let (stop, stop_writer) = io::pipe()?;
+    let mut tail = VecDeque::with_capacity(CHARON_LOG_LINES);
+    let result = std::thread::scope(|scope| {
+        let finish = stop_writer;
+        let reader = std::thread::Builder::new().spawn_scoped(scope, || {
+            drain_charon_log(stderr, stop, &credentials, &mut tail)
+        })?;
+        let result =
+            spawn_charon(program, directory, &path, writer.into()).and_then(|mut child| {
+                run_child(channel, socket, attempt, &credentials, owner, &mut child)
+            });
+        drop(finish);
+        let capture = reader
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("charon stderr reader panicked")));
+        with_cleanup(result, capture)
+    });
+    result.map_err(|error| append_charon_log(error, tail))
+}
+
+fn run_child(
+    channel: &mut impl InstanceChannel,
+    socket: &str,
+    attempt: Attempt,
+    credentials: &Credentials,
+    owner: (u32, u32),
+    child: &mut Child,
+) -> io::Result<Exit> {
     let pidfd = match pidfd_open(child.id()) {
         Ok(pidfd) => pidfd,
         Err(error) => {
@@ -269,24 +332,151 @@ fn run_in_directory(
         owner,
         loaded: false,
         cancel: Arc::default(),
+        credentials,
     };
     let result =
-        establish_watched(channel, &mut vici, &attempt, credentials).and_then(|settled| {
-            match settled {
-                Settled::Done(exit) => Ok(exit),
-                Settled::Publish(reply) => channel.send(&reply).and_then(|()| {
-                    match get_order(channel, Some(pidfd.as_fd())) {
+        establish_watched(channel, &mut vici, &attempt).and_then(|settled| match settled {
+            Settled::Done(exit) => Ok(exit),
+            Settled::Publish(reply) => {
+                channel
+                    .send(&reply)
+                    .and_then(|()| match get_order(channel, Some(pidfd.as_fd())) {
                         Ok(Order::Stop {}) => Ok(Exit::Stopped),
                         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(Exit::Eof),
                         Ok(Order::Start(_)) => Err(invalid("IPsec instance already started")),
                         Err(error) => Err(error),
-                    }
-                }),
+                    })
             }
         });
     let unload = vici.cleanup(&attempt.config);
-    let stop = stop_child(&mut child, &pidfd);
+    let stop = stop_child(child, &pidfd);
     with_cleanup(result, with_cleanup(unload, stop))
+}
+
+fn drain_charon_log(
+    mut stderr: PipeReader,
+    stop: PipeReader,
+    credentials: &Credentials,
+    tail: &mut VecDeque<String>,
+) -> io::Result<()> {
+    let mut chunk = Zeroizing::new([0; 4096]);
+    let mut line = Zeroizing::new([0; CHARON_LOG_INPUT_BYTES]);
+    let mut len = 0;
+    let mut oversized = false;
+    let mut pending = None;
+    let mut events = [
+        libc::pollfd {
+            fd: stderr.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: stop.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        if pending.is_none() {
+            // SAFETY: poll updates only the two supplied entries.
+            let ready = unsafe { libc::poll(events.as_mut_ptr(), 2, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if events
+                .iter()
+                .any(|entry| entry.revents & (libc::POLLERR | libc::POLLNVAL) != 0)
+            {
+                return Err(io::Error::other("invalid charon stderr poll result"));
+            }
+        }
+        if pending.is_none() && events[1].revents & libc::POLLHUP != 0 {
+            // The direct child has been stopped. Drain bytes already queued
+            // without waiting for descendants that may still hold the writer.
+            let mut queued: libc::c_int = 0;
+            // SAFETY: FIONREAD writes a single c_int to the supplied pointer.
+            checked(unsafe { libc::ioctl(stderr.as_raw_fd(), libc::FIONREAD, &mut queued) })?;
+            pending = Some(queued as usize);
+        }
+        let count = pending.unwrap_or(chunk.len()).min(chunk.len());
+        if count == 0 {
+            break;
+        }
+        let read = match stderr.read(&mut chunk[..count]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && pending.is_none() => {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(remaining) = &mut pending {
+            *remaining -= read;
+        }
+        for part in chunk[..read].split_inclusive(|&byte| byte == b'\n') {
+            let complete = part.strip_suffix(b"\n");
+            let bytes = complete.unwrap_or(part);
+            if !oversized && bytes.len() <= line.len() - len {
+                line[len..len + bytes.len()].copy_from_slice(bytes);
+                len += bytes.len();
+            } else {
+                line[..len].zeroize();
+                len = 0;
+                oversized = true;
+            }
+            if complete.is_some() {
+                if !oversized && let Some(safe) = charon_diagnostic(&line[..len], credentials) {
+                    if tail.len() == CHARON_LOG_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(safe);
+                }
+                line[..len].zeroize();
+                oversized = false;
+                len = 0;
+            }
+        }
+        chunk[..read].zeroize();
+    }
+    // An unterminated line may contain only the prefix of a secret.
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CharonLog<'a> {
+    level: u8,
+    msg: &'a str,
+}
+
+fn charon_diagnostic(line: &[u8], credentials: &Credentials) -> Option<String> {
+    // strongSwan's JSON logger keeps embedded newlines within a single record.
+    // Discard escaped records so the parser can borrow directly from the wiping
+    // buffer without creating an unprotected decoded copy of the message.
+    if line.contains(&b'\\') {
+        return None;
+    }
+    let entry: CharonLog<'_> = serde_json::from_slice(line).ok()?;
+    if entry.level > 1 {
+        return None;
+    }
+    safe_diagnostic(entry.msg, credentials, charon_message)
+}
+
+fn append_charon_log(error: io::Error, tail: VecDeque<String>) -> io::Error {
+    if tail.is_empty() {
+        return error;
+    }
+    let mut message = error.to_string();
+    for line in tail {
+        message.push_str("\ncharon-log: ");
+        message.push_str(&line);
+    }
+    io::Error::new(error.kind(), message)
 }
 
 enum Settled {
@@ -311,7 +501,6 @@ fn establish_watched(
     channel: &mut impl InstanceChannel,
     vici: &mut PrivateVici<'_>,
     attempt: &Attempt,
-    credentials: Credentials,
 ) -> io::Result<Settled> {
     let cancel = Arc::clone(&vici.cancel);
     let done = AtomicBool::new(false);
@@ -319,7 +508,7 @@ fn establish_watched(
         let watcher = scope.spawn(|| watch_control(channel, &cancel, &done));
         let established = {
             let _finished = Finished(&done);
-            vici.establish(attempt, credentials)
+            vici.establish(attempt)
         };
         let observed = watcher
             .join()
@@ -543,6 +732,7 @@ struct PrivateVici<'a> {
     loaded: bool,
     /// Observed by every exchange of the negotiation. Cleanup uses its own.
     cancel: Arc<AtomicBool>,
+    credentials: &'a Credentials,
 }
 
 impl PrivateVici<'_> {
@@ -551,9 +741,11 @@ impl PrivateVici<'_> {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "charon exited"));
         }
         let metadata = fs::symlink_metadata(self.path)?;
+        // strongSwan 6.1.0 binds with umask 0117, yielding 0660 inside the
+        // private 0700 runtime directory. A socket restricted to 0600 also works.
         if !metadata.file_type().is_socket()
             || (metadata.uid(), metadata.gid()) != self.owner
-            || metadata.mode() & 0o7777 != 0o600
+            || !matches!(metadata.mode() & 0o7777, 0o600 | 0o660)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -588,7 +780,7 @@ impl PrivateVici<'_> {
             .map_err(vici_error)
     }
 
-    fn establish(&mut self, attempt: &Attempt, credentials: Credentials) -> io::Result<Reply> {
+    fn establish(&mut self, attempt: &Attempt) -> io::Result<Reply> {
         let deadline = Instant::now() + SETUP_TIMEOUT;
         let version = loop {
             match self.open(deadline) {
@@ -624,8 +816,13 @@ impl PrivateVici<'_> {
         Config::admit_linux(&version, &stats)
             .map_err(|_| io::Error::other("incompatible IPsec VICI backend"))?;
         let config = &attempt.config;
+        // Keep the original zeroizing credentials available to filter replies,
+        // including ACKs received during cleanup.
         let shared = config
-            .shared(credentials)
+            .shared(Credentials {
+                password: self.credentials.password.expose().into(),
+                psk: self.credentials.psk.expose().into(),
+            })
             .map_err(|_| invalid("invalid IPsec credentials"))?;
         // A lost ACK leaves the load uncertain. Clean up even if it failed.
         self.loaded = true;
@@ -633,10 +830,7 @@ impl PrivateVici<'_> {
         for message in shared {
             self.ack(deadline, "load-shared", message)?;
         }
-        let initiate = config
-            .initiate(remaining(deadline)?)
-            .map_err(|_| io::Error::other("invalid IPsec initiate deadline"))?;
-        self.ack(deadline, "initiate", initiate)?;
+        self.initiate(deadline, config)?;
         let mut request = Message::new();
         request.value("ike", config.name().as_bytes());
         attempt.established(self.exchange(deadline, "list-sas", request, &["list-sa"])?)
@@ -654,6 +848,7 @@ impl PrivateVici<'_> {
             owner: self.owner,
             loaded: self.loaded,
             cancel: Arc::default(),
+            credentials: self.credentials,
         };
         let this = &this;
         let deadline = Instant::now() + TERM_GRACE;
@@ -671,12 +866,61 @@ impl PrivateVici<'_> {
 
     fn ack(&self, deadline: Instant, name: &'static str, request: Message) -> io::Result<()> {
         let response = self.exchange(deadline, name, request, &[])?.response;
-        if response.get_text("success") != Some("yes") {
-            return Err(io::Error::other(format!(
-                "IPsec VICI {name} did not succeed"
-            )));
+        self.check_ack(name, &response)
+    }
+
+    fn check_ack(&self, name: &'static str, response: &Message) -> io::Result<()> {
+        if response.get_text("success") == Some("yes") {
+            return Ok(());
         }
-        Ok(())
+        let mut error = format!("IPsec VICI {name} did not succeed");
+        if let Some(detail) = response
+            .get_text("errmsg")
+            .and_then(|text| safe_diagnostic(text, self.credentials, ack_message))
+        {
+            error.push_str("\nerrmsg: ");
+            error.push_str(&detail);
+        }
+        Err(io::Error::other(error))
+    }
+
+    fn initiate(&self, deadline: Instant, config: &Config) -> io::Result<()> {
+        let mut request = config
+            .initiate(remaining(deadline)?)
+            .map_err(|_| io::Error::other("invalid IPsec initiate deadline"))?;
+        // strongSwan's LEVEL_CTRL excludes raw blobs and private key material.
+        request
+            .replace_value("loglevel", CONTROL_LOG_LEVEL)
+            .map_err(vici_error)?;
+        let mut tail = VecDeque::with_capacity(CONTROL_LOG_LINES);
+        let result = self
+            .open(deadline)?
+            .command_with_events("initiate", request, &["control-log"], |_, event| {
+                if matches!(event.get_text("level"), Some("0" | "1"))
+                    && let Some(text) = event.get_text("msg")
+                    && let Some(line) = safe_diagnostic(text, self.credentials, charon_message)
+                {
+                    if tail.len() == CONTROL_LOG_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line);
+                }
+                Ok(())
+            })
+            .map_err(vici_error)
+            .and_then(|response| self.check_ack("initiate", &response));
+        result.map_err(|error| {
+            if tail.is_empty() || cancel_induced(&error) {
+                return error;
+            }
+            // The instance entry point writes this single error to stderr.
+            let mut diagnostic = error.to_string();
+            for line in tail {
+                diagnostic.push_str("\ncontrol-log: ");
+                diagnostic.push_str(&line);
+            }
+            io::Error::new(error.kind(), diagnostic)
+        })
     }
 
     fn exchange(
@@ -690,6 +934,127 @@ impl PrivateVici<'_> {
             .command(name, request, events)
             .map_err(vici_error)
     }
+}
+
+// Project strongSwan 6.1 diagnostics onto fixed text. Even prefixes from
+// known formats authorize only the label, never any bytes from the peer.
+fn charon_message(text: &str) -> Option<&'static str> {
+    let label = match text {
+        "no acceptable proposal found" => "no acceptable proposal found",
+        "received AUTHENTICATION_FAILED notify error" => {
+            "received AUTHENTICATION_FAILED notify error"
+        }
+        "received NO_PROPOSAL_CHOSEN notify error" => "received NO_PROPOSAL_CHOSEN notify error",
+        "remote host is behind NAT" => "remote host is behind NAT",
+        "local host is behind NAT, sending keep alives" => {
+            "local host is behind NAT, sending keep alives"
+        }
+        "peer supports MOBIKE" => "peer supports MOBIKE",
+        "establishing IKE_SA failed, peer not responding" => {
+            "establishing IKE_SA failed, peer not responding"
+        }
+        _ => [
+            (
+                "Starting IKE charon daemon (strongSwan ",
+                "Starting IKE charon daemon",
+            ),
+            ("initiating IKE_SA ", "initiating IKE_SA"),
+            (
+                "generating IKE_SA_INIT request ",
+                "generating IKE_SA_INIT request",
+            ),
+            (
+                "parsed IKE_SA_INIT response ",
+                "parsed IKE_SA_INIT response",
+            ),
+            (
+                "generating IKE_AUTH request ",
+                "generating IKE_AUTH request",
+            ),
+            ("parsed IKE_AUTH response ", "parsed IKE_AUTH response"),
+            ("selected proposal: ", "selected proposal"),
+            (
+                "EAP-MS-CHAPv2 failed with error ",
+                "EAP-MS-CHAPv2 failed: <peer-text>",
+            ),
+            (
+                "no shared key found for '",
+                "no shared key found: <peer-text>",
+            ),
+            (
+                "received EAP identity '",
+                "received EAP identity: <peer-text>",
+            ),
+            (
+                "client got redirected from ",
+                "peer redirect identity: <peer-text>",
+            ),
+            (
+                "received unknown vendor ID: ",
+                "received unknown vendor ID: <peer-text>",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(prefix, label)| text.starts_with(prefix).then_some(label))
+        .or_else(|| {
+            let (count, identities) = text.strip_prefix("tried ")?.split_once(" shared key")?;
+            let identities = identities.strip_prefix('s').unwrap_or(identities);
+            (!count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit())
+                && identities.starts_with(" for '")
+                && identities.ends_with("', but MAC mismatched"))
+            .then_some("shared-key MAC mismatch: <peer-text>")
+        })?,
+    };
+    Some(label)
+}
+
+fn ack_message(text: &str) -> Option<&'static str> {
+    match text {
+        "missing configuration name" => Some("missing configuration name"),
+        "no matching SAs to terminate found" => Some("no matching SAs to terminate found"),
+        "terminating SA failed" => Some("terminating SA failed"),
+        "not all matching SAs could be terminated" => {
+            Some("not all matching SAs could be terminated")
+        }
+        _ if text.starts_with("establishing IKE_SA '") && text.ends_with("' failed") => {
+            Some("establishing IKE_SA failed")
+        }
+        _ => None,
+    }
+}
+
+fn safe_diagnostic(
+    text: &str,
+    credentials: &Credentials,
+    known_message: fn(&str) -> Option<&'static str>,
+) -> Option<String> {
+    let credentials = [credentials.password.expose(), credentials.psk.expose()];
+    let contains_credential = |text: &str| {
+        credentials
+            .iter()
+            .any(|secret| !secret.is_empty() && text.contains(secret))
+    };
+    // Retain the literal credential and sensitive-label checks from the raw log filter.
+    if contains_credential(text)
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| {
+                [
+                    "password", "psk", "ppk", "data", "private", "secret", "keymat", "skeyseed",
+                    "msk", "emsk",
+                ]
+                .iter()
+                .any(|label| word.eq_ignore_ascii_case(label))
+                    || word
+                        .get(..3)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SK_"))
+            })
+    {
+        return None;
+    }
+    let label = known_message(text)?;
+    (!contains_credential(label)).then(|| label.to_owned())
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -745,7 +1110,12 @@ fn check_parent(path: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_charon(program: &Path, directory: &Path, config: &Path) -> io::Result<Child> {
+fn spawn_charon(
+    program: &Path,
+    directory: &Path,
+    config: &Path,
+    stderr: Stdio,
+) -> io::Result<Child> {
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -753,7 +1123,7 @@ fn spawn_charon(program: &Path, directory: &Path, config: &Path) -> io::Result<C
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     // SAFETY: getpid has no arguments.
     let parent = unsafe { libc::getpid() };
@@ -878,7 +1248,7 @@ fn with_cleanup<T>(result: io::Result<T>, cleanup: io::Result<()>) -> io::Result
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(io::Error::new(
             error.kind(),
-            format!("{error}; cleanup: {cleanup}"),
+            format!("{error}\ncleanup: {cleanup}"),
         )),
     }
 }

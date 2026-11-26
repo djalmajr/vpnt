@@ -83,9 +83,8 @@ impl Config {
             networks,
         })
     }
-    /// The one rule for a literal IKE peer identity on Linux: a typed `fqdn:`,
-    /// `email:` or `ipv4:` value that VICI carries unchanged. Policy admission
-    /// and the instance's VICI adaptation must both use it.
+    /// The shared admission rule for typed Linux IKE peer identities in policy
+    /// and in the instance protocol.
     #[cfg(target_os = "linux")]
     pub(crate) fn literal_peer_identity(identity: &str) -> bool {
         let Some((kind, text)) = identity.split_once(':') else {
@@ -120,6 +119,9 @@ impl Config {
         {
             return Err(Error::Invalid);
         }
+        // The IPv4 suffix passed strict Ipv4Addr parsing. strongSwan encodes
+        // it as an IP address only when sent without the textual type prefix.
+        let gateway = peer_identity.strip_prefix("ipv4:").unwrap_or(peer_identity);
         let name = format!("vpnt-{reqid}");
         Ok(Self {
             binding: None,
@@ -127,7 +129,7 @@ impl Config {
             child: format!("{name}-child"),
             name,
             reqid,
-            gateway: peer_identity.into(),
+            gateway: gateway.into(),
             identity: text_identity(username)?,
             port: remote.port(),
             local: std::net::Ipv4Addr::UNSPECIFIED.into(),

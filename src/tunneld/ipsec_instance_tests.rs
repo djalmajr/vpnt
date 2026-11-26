@@ -5,7 +5,7 @@ use crate::{
 };
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zeroize::Zeroizing;
@@ -38,7 +38,11 @@ else:
 
 path = re.search(r'socket = "unix://([^"]+)"', text)[1]
 vici = socket.socket(socket.AF_UNIX)
-vici.bind(path)
+old_umask = os.umask(0o117)
+try:
+    vici.bind(path)
+finally:
+    os.umask(old_umask)
 vici.listen()
 def term(*_):
     (root / 'term').touch()
@@ -124,11 +128,41 @@ def reply(conn, kind, message=None, event=None):
         frame += encode(message)
     conn.sendall(struct.pack('!I', len(frame)) + frame)
 
+def charon_log(message, level=1):
+    entry = json.dumps(dict(thread=8, group='IKE', level=level, msg=message))
+    os.write(2, (entry + '\n').encode())
+
+def flood_stderr(started):
+    entry = b'{"thread":8,"group":"IKE","level":1,"msg":"peer supports MOBIKE"}\n'
+    while True:
+        os.write(2, entry * 200)
+        started.set()
+
+def write_stderr_tail():
+    charon_log('remote host is behind NAT')
+    for _ in range(3000):
+        charon_log('peer supports MOBIKE')
+    for line in [
+        'peer says\x1bretry\x00',
+        'Psk = suppressed-value',
+        'PASSWORD = suppressed-field',
+        'echo synthetic-orchid',
+        'z' * 507 + 'synthetic-thistle',
+        'generating ' + 'x' * 25000,
+        'peer text\nremote host is behind NAT',
+        'establishing IKE_SA failed, peer not responding',
+    ]:
+        charon_log(line)
+    charon_log('remote host is behind NAT', level=4)
+    os.write(2, b'08[IKE] remote host is behind NAT\n')
+
 def serve(conn):
     with conn:
         try:
             packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
+            event = None
             if packet[0] == 3:
+                event = packet[2:2 + packet[1]].decode()
                 reply(conn, 5)
                 packet = read_exact(conn, int.from_bytes(read_exact(conn, 4), 'big'))
             assert packet[0] == 0
@@ -137,7 +171,7 @@ def serve(conn):
             request = decode(packet[end:])
             if command == 'load-shared':
                 request['credential_matches'] = request.pop('data') == {
-                    'EAP': 'synthetic-password', 'IKE': 'synthetic-psk'
+                    'EAP': 'synthetic-orchid', 'IKE': 'synthetic-thistle'
                 }.get(request['type'])
             with (root / 'vici-commands').open('a') as log:
                 log.write(json.dumps([command, request]) + '\n')
@@ -147,6 +181,8 @@ def serve(conn):
                 plugins = ['kernel-netlink', 'socket-default', 'vici']
                 if (root / 'foreign-backend').exists():
                     plugins.append('kernel-libipsec')
+                if (root / 'log-stderr-setup').exists():
+                    charon_log('Starting IKE charon daemon (strongSwan 6.1.0, Linux fixture, x86_64)')
                 reply(conn, 1, {'plugins': plugins})
             elif command == 'list-sas':
                 if (root / 'slow-list-sas').exists():
@@ -167,8 +203,54 @@ def serve(conn):
                     }},
                 }}, 'list-sa')
                 reply(conn, 1)
+            elif command == 'initiate' and (root / 'log-initiate').exists():
+                if (root / 'log-stderr').exists():
+                    write_stderr_tail()
+                if (root / 'flood-stderr').exists():
+                    started = threading.Event()
+                    threading.Thread(target=flood_stderr, args=(started,), daemon=True).start()
+                    started.wait()
+                if (root / 'peer-log').exists():
+                    import base64
+                    encoded = base64.b64encode(b'synthetic-thistle').decode()
+                    messages = [
+                        "EAP-MS-CHAPv2 failed with error ERROR_AUTHENTICATION_FAILURE: '%s'" % encoded,
+                        "tried 1 shared key for 'local' - 'peer | control-log: fabricated-field', but MAC mismatched",
+                        "client got redirected from notify-marker",
+                        "invalid notify data length for REDIRECT (5)",
+                        "received unknown vendor ID: c0:ff:ee:01",
+                        "remote host is behind NAT",
+                        "generating IKE_AUTH request 1 [ IDi N(INIT_CONTACT) ]",
+                        "generating IKE_AUTH request synthetic-thistle",
+                        "arbitrary peer text\nno acceptable proposal found",
+                    ]
+                    for message in messages:
+                        charon_log(message)
+                        if event == 'control-log':
+                            reply(conn, 7, {'level': '1', 'msg': message}, event)
+                    reply(conn, 1, {'success': 'no',
+                                    'errmsg': 'no matching IKE_SA\ncharon-log: fabricated-field'})
+                    return
+                if event == 'control-log':
+                    reply(conn, 7, {'level': '1', 'msg': 'remote host is behind NAT'}, event)
+                    for _ in range(300):
+                        reply(conn, 7, {'level': '1', 'msg': 'peer supports MOBIKE'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'peer says\nretry\x1b'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'Psk = suppressed-value'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'data: suppressed-field'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'echo synthetic-orchid'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'z' * 250 + 'synthetic-thistle'}, event)
+                    reply(conn, 7, {'level': '1', 'msg': 'long-' + 'x' * 400}, event)
+                    reply(conn, 7, {'level': '4', 'msg': 'suppressed-cobalt-material'}, event)
+                    reply(conn, 7, {'level': '0', 'msg': 'no acceptable proposal found'}, event)
+                if (root / 'fail-initiate').exists():
+                    reply(conn, 1, {'success': 'no', 'errmsg': "establishing IKE_SA 'vpnt' failed"})
+                else:
+                    reply(conn, 1, {'success': 'yes'})
             elif command == 'initiate' and (root / 'fail-initiate').exists():
-                reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-psk'})
+                reply(conn, 1, {'success': 'no', 'errmsg': 'synthetic-thistle'})
+            elif command == 'terminate' and (root / 'fail-terminate').exists():
+                reply(conn, 1, {'success': 'no', 'errmsg': 'no matching SAs to terminate found'})
             else:
                 reply(conn, 1, {'success': 'yes'})
         except (EOFError, OSError):
@@ -194,7 +276,7 @@ fn fixture_start(identity: &str) -> Start {
 
 fn fixture_credentials() -> Zeroizing<Vec<u8>> {
     encode_credentials(
-        &protocol::Credentials::ipsec("synthetic-password", "synthetic-psk").unwrap(),
+        &protocol::Credentials::ipsec("synthetic-orchid", "synthetic-thistle").unwrap(),
     )
     .unwrap()
 }
@@ -393,7 +475,7 @@ impl Fixture {
             .collect();
         for log in ["supervisor.stdout", "supervisor.stderr"] {
             let content = fs::read_to_string(self.root.join(log)).unwrap();
-            for secret in ["synthetic-password", "synthetic-psk"] {
+            for secret in ["synthetic-orchid", "synthetic-thistle"] {
                 assert!(!content.contains(secret), "credential in {log}");
             }
         }
@@ -445,9 +527,88 @@ fn supervisor_process() {
     std::hint::black_box(SENTINEL);
     let answer = match result {
         Ok(exit) => format!("{exit:?}"),
-        Err(error) => format!("error: {:?}", error.kind()),
+        Err(error) => {
+            eprintln!("tunnel instance: {error}");
+            format!("error: {:?}", error.kind())
+        }
     };
     channel.0.write_all(answer.as_bytes()).unwrap();
+}
+
+#[test]
+fn vici_socket_admission_checks_mode_type_and_owner() {
+    struct SocketDirectory(PathBuf);
+
+    impl Drop for SocketDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    let pid = std::process::id();
+    let directory = std::env::temp_dir().join(format!("vpnt-vici-mode-{pid}"));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let directory = SocketDirectory(directory);
+    let path = directory.0.join(VICI_SOCKET_NAME);
+    let listener = UnixListener::bind(&path).unwrap();
+    let child = pidfd_open(pid).unwrap();
+    // SAFETY: these calls take no arguments or pointers.
+    let owner = unsafe { (libc::geteuid(), libc::getegid()) };
+    let mut vici = PrivateVici {
+        path: &path,
+        child: &child,
+        pid,
+        owner,
+        loaded: false,
+        cancel: Arc::default(),
+        credentials: &Credentials {
+            password: "".into(),
+            psk: "".into(),
+        },
+    };
+    let deadline = || Instant::now() + Duration::from_secs(1);
+    let assert_rejected = |vici: &PrivateVici<'_>, case| {
+        let error = vici.open(deadline()).err().expect(case);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{case}");
+        assert_eq!(error.to_string(), "unsafe IPsec VICI socket", "{case}");
+    };
+
+    for mode in [0o600, 0o660] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        if let Err(error) = vici.open(deadline()) {
+            panic!("VICI socket mode {mode:#o} rejected: {error}");
+        }
+        listener.accept().unwrap();
+    }
+
+    for (mode, case) in [
+        (0o606, "other read/write"),
+        (0o604, "other read"),
+        (0o700, "owner execute"),
+        (0o770, "owner and group execute"),
+        (0o4600, "setuid"),
+        (0o2600, "setgid"),
+        (0o1600, "sticky"),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, mode);
+        assert_rejected(&vici, case);
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    vici.owner = (owner.0 ^ 1, owner.1);
+    assert_rejected(&vici, "wrong uid");
+    vici.owner = (owner.0, owner.1 ^ 1);
+    assert_rejected(&vici, "wrong gid");
+
+    vici.owner = owner;
+    drop(listener);
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, []).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    assert_rejected(&vici, "regular file");
 }
 
 #[test]
@@ -465,17 +626,18 @@ fn exec_is_private_and_stop_cleans_up() {
     assert_eq!(ready["conf"], conf.to_str().unwrap());
     assert_eq!(ready["cwd"], dir.to_str().unwrap());
     assert_eq!(ready["env_keys"], serde_json::json!(["STRONGSWAN_CONF"]));
-    assert_eq!(
-        ready["fds"],
-        serde_json::json!({"0":"/dev/null","1":"/dev/null","2":"/dev/null"})
-    );
+    let fds = ready["fds"].as_object().unwrap();
+    assert_eq!(fds.len(), 3);
+    assert_eq!(fds["0"], "/dev/null");
+    assert_eq!(fds["1"], "/dev/null");
+    assert!(fds["2"].as_str().unwrap().starts_with("pipe:["));
     assert!(
         matches!(ready["mem"].as_i64(), Some(errno) if errno == i64::from(libc::EACCES) || errno == i64::from(libc::EPERM))
     );
     assert_eq!(ready["pid"], ready["pgid"]);
     assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
     assert_eq!(fs::metadata(&conf).unwrap().mode() & 0o777, 0o600);
-    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&socket).unwrap().mode() & 0o777, 0o660);
     assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     let mut contents: Vec<_> = fs::read_dir(&dir)
         .unwrap()
@@ -498,6 +660,27 @@ fn exec_is_private_and_stop_cleans_up() {
         assert!(config.contains(setting), "missing {setting}");
     }
     assert!(config.contains(&format!("socket = \"unix://{}\"", socket.display())));
+    let stderr_logger = config
+        .split_once("\n    filelog {\n        stderr {\n")
+        .unwrap()
+        .1
+        .split_once("\n        }\n")
+        .unwrap()
+        .0;
+    let settings: BTreeSet<_> = stderr_logger.lines().map(str::trim).collect();
+    assert_eq!(settings.len(), 21);
+    assert!(settings.contains("json = yes"));
+    for group in [
+        "default", "dmn", "mgr", "ike", "chd", "job", "wch", "cfg", "knl", "net", "asn", "enc",
+        "tnc", "imc", "imv", "pts", "tls", "app", "esp", "lib",
+    ] {
+        assert!(
+            settings.contains(format!("{group} = 1").as_str()),
+            "{group}"
+        );
+    }
+    assert!(config.contains("daemon { default = -1 }"));
+    assert!(config.contains("auth { default = -1 }"));
     assert!(!config.contains("include"));
     assert!(!config.contains("/etc/"));
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
@@ -507,7 +690,7 @@ fn exec_is_private_and_stop_cleans_up() {
 #[test]
 fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     let mut fixture = Fixture::launch(false);
-    fixture.start();
+    fixture.start_with(fixture_start("fqdn:vpn.example"));
     assert_eq!(fixture.finish(Some(b"T")), "Stopped");
     let commands = fixture.commands();
     assert_eq!(
@@ -548,7 +731,7 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     );
     assert_eq!(connection["version"], "2");
     assert_eq!(connection["mobike"], "no");
-    assert_eq!(connection["remote"]["id"], "fqdn:fixture.example");
+    assert_eq!(connection["remote"]["id"], "fqdn:vpn.example");
     let child = connection["children"]
         .as_object()
         .unwrap()
@@ -571,7 +754,7 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
     );
     assert_eq!(
         commands[4][1]["owners"],
-        serde_json::json!(["fqdn:fixture.example"])
+        serde_json::json!(["fqdn:vpn.example"])
     );
     assert!(!commands[3][1].as_object().unwrap().contains_key("data"));
     assert!(!commands[4][1].as_object().unwrap().contains_key("data"));
@@ -585,21 +768,23 @@ fn loads_frozen_ipv4_and_credentials_before_starting_ipsec() {
 }
 
 #[test]
-fn sends_typed_ipv4_identity_without_using_it_as_the_transport_address() {
-    let mut fixture = Fixture::launch(false);
-    fixture.start_with(fixture_start("ipv4:192.0.2.99"));
-    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
-    let commands = fixture.commands();
-    let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
-    assert_eq!(connection["remote"]["id"], "ipv4:192.0.2.99");
-    assert_eq!(
-        connection["remote_addrs"],
-        serde_json::json!(["192.0.2.10"])
-    );
-    assert_eq!(
-        commands[4][1]["owners"],
-        serde_json::json!(["ipv4:192.0.2.99"])
-    );
+fn sends_canonical_ipv4_identity_for_ike_auth_and_psk_lookup() {
+    for address in ["192.0.2.10", "192.0.2.99"] {
+        let mut fixture = Fixture::launch(false);
+        fixture.start_with(fixture_start(&format!("ipv4:{address}")));
+        assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+        let commands = fixture.commands();
+        assert_eq!(commands[2][0], "load-conn");
+        let connection = commands[2][1].as_object().unwrap().values().next().unwrap();
+        assert_eq!(connection["remote"]["id"], address);
+        assert_eq!(
+            connection["remote_addrs"],
+            serde_json::json!(["192.0.2.10"])
+        );
+        assert_eq!(commands[4][0], "load-shared");
+        assert_eq!(commands[4][1]["type"], "IKE");
+        assert_eq!(commands[4][1]["owners"], serde_json::json!([address]));
+    }
 }
 
 #[test]
@@ -624,6 +809,168 @@ fn failure_and_mismatched_sa_clean_up_before_the_terminal_reply() {
         assert!(names.ends_with(&["terminate", "unload-conn", "unload-shared", "unload-shared"]));
         assert!(fixture.root.join("term").exists());
     }
+}
+
+#[test]
+fn failed_initiate_reports_only_the_bounded_safe_control_log_tail() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "fail-initiate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(
+        lines[0],
+        "tunnel instance: IPsec VICI initiate did not succeed"
+    );
+    assert_eq!(lines[1], "errmsg: establishing IKE_SA failed");
+    assert_eq!(&lines[2..9], &["control-log: peer supports MOBIKE"; 7]);
+    assert_eq!(&lines[9..], &["control-log: no acceptable proposal found"]);
+    assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn failed_initiate_never_reports_the_encoded_eap_server_message() {
+    let log = peer_diagnostic();
+    assert!(
+        !log.contains("c3ludGhldGljLXRoaXN0bGU="),
+        "encoded EAP server text reached stderr"
+    );
+    for field in ["control-log", "charon-log"] {
+        for message in [
+            "EAP-MS-CHAPv2 failed: <peer-text>",
+            "peer redirect identity: <peer-text>",
+            "received unknown vendor ID: <peer-text>",
+            "remote host is behind NAT",
+            "generating IKE_AUTH request",
+        ] {
+            assert_eq!(
+                log.lines()
+                    .filter(|line| *line == format!("{field}: {message}"))
+                    .count(),
+                1,
+                "{field}: {message}"
+            );
+        }
+    }
+    assert!(!log.contains("notify-marker"));
+    assert!(!log.contains("invalid notify data length"));
+    assert!(!log.contains("c0:ff:ee:01"));
+}
+
+#[test]
+fn failed_initiate_cannot_inject_diagnostic_fields() {
+    let log = peer_diagnostic();
+    assert!(!log.contains("fabricated-field"));
+    assert!(!log.contains("no acceptable proposal found"));
+    let lines: Vec<_> = log.lines().collect();
+    let cleanup = lines
+        .iter()
+        .position(|line| *line == "cleanup: IPsec VICI terminate did not succeed")
+        .unwrap();
+    assert_eq!(
+        lines[cleanup + 1],
+        "errmsg: no matching SAs to terminate found"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("errmsg: "))
+            .count(),
+        1
+    );
+    assert!(log.lines().all(|line| !line.contains(" | control-log: ")));
+    for field in ["control-log", "charon-log"] {
+        assert_eq!(
+            log.lines()
+                .filter(|line| *line == format!("{field}: shared-key MAC mismatch: <peer-text>"))
+                .count(),
+            1
+        );
+    }
+}
+
+fn peer_diagnostic() -> String {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "peer-log", "fail-terminate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap()
+}
+
+#[test]
+fn successful_initiate_discards_control_log_even_after_many_events() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "log-stderr", "flood-stderr"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.start();
+    assert_eq!(fixture.finish(Some(b"T")), "Stopped");
+    assert!(matches!(
+        fixture.replies.as_slice(),
+        [Reply::Established { .. }, Reply::Stopped {}]
+    ));
+    assert!(
+        fs::read(fixture.root.join("supervisor.stderr"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.commands()[5][1]["loglevel"], "1");
+}
+
+#[test]
+fn failed_initiate_emits_the_bounded_safe_stderr_tail_after_control_log() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["log-initiate", "log-stderr", "fail-initiate"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    let log = fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(lines[9], "control-log: no acceptable proposal found");
+    assert_eq!(&lines[10..69], &["charon-log: peer supports MOBIKE"; 59]);
+    assert_eq!(
+        &lines[69..],
+        &["charon-log: establishing IKE_SA failed, peer not responding"]
+    );
+}
+
+#[test]
+fn failed_backend_admission_emits_the_setup_stderr_tail() {
+    let mut fixture = Fixture::launch(false);
+    for marker in ["foreign-backend", "log-stderr-setup"] {
+        fs::write(fixture.root.join(marker), []).unwrap();
+    }
+    fixture.begin(fixture_start("fqdn:fixture.example"));
+    assert_eq!(fixture.collect(), "error: Other");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
+        "tunnel instance: incompatible IPsec VICI backend\ncharon-log: Starting IKE charon daemon\n"
+    );
+    assert_eq!(names(&fixture.commands()), ["version", "stats"]);
+}
+
+#[test]
+fn failed_cleanup_ack_includes_safe_errmsg_and_continues_unloading() {
+    let mut fixture = Fixture::launch(false);
+    fs::write(fixture.root.join("fail-terminate"), []).unwrap();
+    fixture.start();
+    assert_eq!(fixture.finish(Some(b"T")), "error: Other");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("supervisor.stderr")).unwrap(),
+        "tunnel instance: IPsec VICI terminate did not succeed\nerrmsg: no matching SAs to terminate found\n"
+    );
+    assert!(names(&fixture.commands()).ends_with(&[
+        "terminate",
+        "unload-conn",
+        "unload-shared",
+        "unload-shared"
+    ]));
 }
 
 fn names(commands: &[serde_json::Value]) -> Vec<&str> {
@@ -816,6 +1163,11 @@ fn peer_identity_rule_is_the_one_policy_applies() {
         "fqdn:",
         "ipv4:0.0.0.0",
         "ipv4:224.0.0.1",
+        "ipv4:",
+        "ipv4:192.0.02.10",
+        "ipv4:192.0.2.256",
+        "ipv4:192.0.2.10/32",
+        "ipv4:#c000020a",
         "ipv6:2001:db8::1",
         "vpn.example",
         &format!("fqdn:{}", "a".repeat(253 - 4)),
@@ -858,6 +1210,7 @@ fn bad_start_and_bad_credential_frames_do_not_spawn_charon() {
         ("peer_identity", serde_json::json!("fqdn:*")),
         ("peer_identity", serde_json::json!("fqdn:#0102")),
         ("peer_identity", serde_json::json!("fqdn:^fixture$")),
+        ("peer_identity", serde_json::json!("ipv4:192.0.2.10/32")),
         ("peer_identity", serde_json::json!("fixture.example")),
         ("remote_ipv4", serde_json::json!("fixture.example")),
         ("local_ts", serde_json::json!(["::/0"])),
@@ -903,8 +1256,8 @@ fn bad_start_and_bad_credential_frames_do_not_spawn_charon() {
 fn credential_datagram_is_wiped_after_success_and_rejection() {
     let mut valid = fixture_credentials();
     let credentials = decode_credentials(&mut valid).unwrap();
-    assert_eq!(credentials.password.expose(), "synthetic-password");
-    assert_eq!(credentials.psk.expose(), "synthetic-psk");
+    assert_eq!(credentials.password.expose(), "synthetic-orchid");
+    assert_eq!(credentials.psk.expose(), "synthetic-thistle");
     assert!(valid.iter().all(|byte| *byte == 0));
 
     for mut invalid in [
