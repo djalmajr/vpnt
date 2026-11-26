@@ -301,6 +301,7 @@ fn xfrm_mark(text: &str) -> io::Result<(u32, u32)> {
     Ok((number(value)?, number(mask)?))
 }
 
+#[derive(PartialEq, Eq)]
 struct EspState {
     src: IpAddr,
     dst: IpAddr,
@@ -308,6 +309,7 @@ struct EspState {
     reqid: u32,
     if_id: Option<u32>,
     mark: Option<(u32, u32)>,
+    tunnel: bool,
 }
 
 fn esp_states(text: &str) -> io::Result<Vec<EspState>> {
@@ -360,6 +362,7 @@ fn esp_states(text: &str) -> io::Result<Vec<EspState>> {
             reqid: field("reqid")?,
             if_id,
             mark,
+            tunnel: fields.windows(2).any(|pair| pair == ["mode", "tunnel"]),
         });
     }
     Ok(states)
@@ -370,10 +373,13 @@ struct XfrmPolicyKey<'a> {
     direction: &'a str,
     if_id: u32,
     policy_type: Option<&'a str>,
-    mark: Option<(u32, u32)>,
 }
 
-fn xfrm_policy_keys(text: &str, owner: u32) -> io::Result<Vec<XfrmPolicyKey<'_>>> {
+fn xfrm_policy_keys<'a>(text: &'a str, receipt: &Receipt) -> io::Result<Vec<XfrmPolicyKey<'a>>> {
+    let Some(vip) = receipt.vip else {
+        return Ok(Vec::new());
+    };
+    let vip = (u32::from(vip), 32);
     let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
     let mut keys = Vec::new();
     while let Some(header) = lines.next() {
@@ -383,21 +389,58 @@ fn xfrm_policy_keys(text: &str, owner: u32) -> io::Result<Vec<XfrmPolicyKey<'_>>
         let mut direction = None;
         let mut mark = None;
         let mut if_id = None;
-        for line in std::iter::from_fn(|| lines.next_if(|line| line.starts_with('\t'))) {
+        let mut templates = 0;
+        let mut owned_template = false;
+        while let Some(line) = lines.next_if(|line| line.starts_with('\t')) {
             let fields: Vec<_> = line.split_ascii_whitespace().collect();
             match fields.as_slice() {
+                ["tmpl", "src", src, "dst", dst] => {
+                    templates += 1;
+                    let details = lines
+                        .next_if(|line| line.starts_with("\t\t"))
+                        .unwrap_or_default();
+                    let details: Vec<_> = details.split_ascii_whitespace().collect();
+                    owned_template = details.starts_with(&["proto", "esp"])
+                        && details.windows(2).any(|pair| pair == ["mode", "tunnel"])
+                        && src
+                            .parse()
+                            .ok()
+                            .zip(dst.parse().ok())
+                            .is_some_and(|(src, dst)| matches_transport(receipt, src, dst));
+                }
+                ["tmpl", ..] => templates += 1,
                 ["if_id", value] if if_id.is_none() => if_id = Some(number(value)?),
                 ["if_id", ..] => return Err(invalid("invalid XFRM policy if_id")),
                 ["dir", ..] if direction.is_none() => direction = Some(fields),
                 ["dir", ..] => return Err(invalid("ambiguous XFRM policy direction")),
-                ["mark", value] if mark.is_none() => mark = Some(*value),
+                ["mark", value, ..] if mark.is_none() => mark = Some(xfrm_mark(value)?),
                 ["mark", ..] => return Err(invalid("invalid XFRM policy mark")),
                 _ => {}
             }
         }
-        let Some(if_id) = if_id.filter(|if_id| *if_id == owner) else {
+        let Some(if_id) = if_id.filter(|if_id| *if_id == receipt.if_id) else {
             continue;
         };
+        if mark.unwrap_or_default() != (0, 0) || templates != 1 || !owned_template {
+            continue;
+        }
+        let selectors: Vec<_> = header.split_ascii_whitespace().collect();
+        let (src, dst) = match selectors.as_slice() {
+            ["src", src, "dst", dst] => (*src, *dst),
+            ["src", src, "dst", dst, "uid", uid] if uid.parse::<u32>().is_ok() => (*src, *dst),
+            _ => continue,
+        };
+        let (Ok(src), Ok(dst)) = (prefix(src), prefix(dst)) else {
+            continue;
+        };
+        if !receipt
+            .routes
+            .iter()
+            .map(route_key)
+            .any(|route| (src == vip && dst == route) || (dst == vip && src == route))
+        {
+            continue;
+        }
         let Some(fields) = direction else {
             return Err(invalid("missing XFRM policy direction"));
         };
@@ -419,16 +462,20 @@ fn xfrm_policy_keys(text: &str, owner: u32) -> io::Result<Vec<XfrmPolicyKey<'_>>
         if !matches!(policy_type, None | Some("main" | "sub")) {
             return Err(invalid("invalid XFRM policy type"));
         }
-        let mark = mark.map(xfrm_mark).transpose()?;
         keys.push(XfrmPolicyKey {
             index,
             direction,
             if_id,
             policy_type,
-            mark,
         });
     }
     Ok(keys)
+}
+
+fn matches_transport(receipt: &Receipt, src: IpAddr, dst: IpAddr) -> bool {
+    let local = IpAddr::V4(receipt.egress.prefsrc);
+    let remote = IpAddr::V4(receipt.remote);
+    (src == local && dst == remote) || (src == remote && dst == local)
 }
 
 pub(super) fn cidr_text(cidr: &CidrV4) -> String {
@@ -1346,7 +1393,7 @@ impl Network {
         self.delete_orphaned_esp(receipt)?;
         let bytes = self.ip(&["-s", "xfrm", "policy", "list", "nosock"])?;
         let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM policy dump"))?;
-        for key in xfrm_policy_keys(text, receipt.if_id)? {
+        for key in xfrm_policy_keys(text, receipt)? {
             // The kernel matches if_id under its policy lock, even if the
             // policy disappeared or its index was reused after the dump.
             let index = key.index.to_string();
@@ -1365,13 +1412,6 @@ impl Network {
             if let Some(policy_type) = key.policy_type {
                 args.extend(["ptype", policy_type]);
             }
-            let mark;
-            let mask;
-            if let Some((value, bits)) = key.mark {
-                mark = value.to_string();
-                mask = bits.to_string();
-                args.extend(["mark", &mark, "mask", &mask]);
-            }
             if let Err(error) = self.ip(&args)
                 && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
             {
@@ -1384,49 +1424,51 @@ impl Network {
         self.verify_xfrm_clear(receipt)
     }
 
-    fn delete_orphaned_esp(&self, receipt: &Receipt) -> io::Result<()> {
+    fn esp_inventory(&self) -> io::Result<Vec<EspState>> {
         let bytes = self.ip(&["xfrm", "state", "list", "nokeys"])?;
         let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM state dump"))?;
-        let states = esp_states(text)?;
-        let owned: Vec<_> = states
-            .iter()
-            .filter(|state| {
-                state.reqid == u32::from(receipt.reqid) && state.if_id == Some(receipt.if_id)
-            })
-            .collect();
-        for state in &owned {
-            let (value, mask) = state.mark.unwrap_or_default();
-            // iproute2 omits zero-effective marks. Older kernels also match
-            // the request against each entry's mask, so reject an alias.
-            if state.spi == 0 || value & mask != value || value == 0 && mask != 0 {
+        esp_states(text)
+    }
+
+    fn delete_orphaned_esp(&self, receipt: &Receipt) -> io::Result<()> {
+        let owned = |state: &EspState| {
+            state.reqid == u32::from(receipt.reqid)
+                && state.if_id == Some(receipt.if_id)
+                && state.tunnel
+                && state.mark.unwrap_or_default() == (0, 0)
+                && matches_transport(receipt, state.src, state.dst)
+        };
+        for state in self.esp_inventory()?.into_iter().filter(owned) {
+            if state.spi == 0 {
                 return Err(invalid("ESP state key is not representable by iproute2"));
             }
-            if states.iter().any(|other| {
-                let (other_value, other_mask) = other.mark.unwrap_or_default();
-                !std::ptr::eq(*state, other)
-                    && state.dst == other.dst
-                    && state.spi == other.spi
-                    && value & other_mask == other_value
-            }) {
+            let fresh = self.esp_inventory()?;
+            if !fresh
+                .iter()
+                .any(|current| current == &state && owned(current))
+            {
+                continue;
+            }
+            if fresh
+                .iter()
+                .filter(|other| {
+                    other.dst == state.dst
+                        && other.spi == state.spi
+                        && other.mark.unwrap_or_default().0 == 0
+                })
+                .count()
+                > 1
+            {
                 return Err(invalid("ambiguous ESP state deletion key"));
             }
-        }
-        for state in owned {
-            // The vpnt lock cannot prevent an external writer from replacing
-            // an SA with the same kernel key between this dump and deletion.
+            // The fresh dump narrows the window. Kernel key replacement and
+            // a privileged XFRM_MSG_MIGRATE can still race the deletion.
             let src = state.src.to_string();
             let dst = state.dst.to_string();
             let spi = format!("{:#x}", state.spi);
-            let mut args = vec![
+            let args = [
                 "xfrm", "state", "delete", "src", &src, "dst", &dst, "proto", "esp", "spi", &spi,
             ];
-            let mark;
-            let mask;
-            if let Some((value, bits)) = state.mark {
-                mark = value.to_string();
-                mask = bits.to_string();
-                args.extend(["mark", &mark, "mask", &mask]);
-            }
             if let Err(error) = self.ip(&args)
                 && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
             {

@@ -90,8 +90,8 @@ impl Default for Server {
 
 impl Server {
     fn new(policy: PolicyStore) -> io::Result<Self> {
-        let launcher = Arc::new(Launcher::system(IpRoute::system()));
         let cleanup = Arc::new(Store::open(Path::new(RUNTIME_DIRECTORY))?);
+        let launcher = Arc::new(Launcher::system(IpRoute::system(), cleanup.clone()));
         let recovered = Arc::new(AtomicBool::new(false));
         let worker = (launcher.clone(), cleanup.clone(), recovered.clone());
         thread::Builder::new()

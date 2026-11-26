@@ -142,16 +142,18 @@ pub(super) struct Launcher<N, A> {
     fortinet: FortinetNetwork,
     lock: AcquireLock,
     pending_cleanup: Mutex<Option<PendingCleanup>>,
+    cleanup: Option<Arc<Store>>,
     limits: Limits,
 }
 
 struct PendingCleanup {
     generation: String,
     allowed: bool,
+    network_recovered: bool,
 }
 
 impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
-    pub(super) fn system(network: N) -> Self {
+    pub(super) fn system(network: N, cleanup: Arc<Store>) -> Self {
         Self {
             runtime: PathBuf::from(RUNTIME_DIRECTORY),
             systemctl: PathBuf::from(SYSTEMCTL),
@@ -161,6 +163,7 @@ impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
             fortinet: FortinetNetwork::default(),
             lock: Box::new(NetworkLock::acquire),
             pending_cleanup: Mutex::default(),
+            cleanup: Some(cleanup),
             limits: Limits::default(),
         }
     }
@@ -323,17 +326,13 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 .tunnels_present()
                 .map_err(|e| Failure::io("lease registry", &e))
         };
-        if tunnels_present()? {
-            let recovered = match self.retry_pending_generation(&guard) {
-                Ok(recovered) => recovered,
-                Err(error) => {
-                    eprintln!("vpnt-tunneld: pending generation cleanup is unproven: {error}");
-                    false
-                }
-            };
-            if !recovered || tunnels_present()? {
-                return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
-            }
+        let present = tunnels_present()?;
+        let recovered = self.retry_pending_generation(&guard).map_err(|error| {
+            eprintln!("vpnt-tunneld: pending generation cleanup is unproven: {error}");
+            Failure::new(ErrorCode::Busy, "pending generation cleanup is unproven")
+        })?;
+        if present && (!recovered || tunnels_present()?) {
+            return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
         }
         cancel
             .check()
@@ -715,7 +714,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         directory: &Path,
         generation: &str,
         cleanup: Option<&Store>,
-        pending: Option<&mut PendingCleanup>,
+        mut pending: Option<&mut PendingCleanup>,
     ) -> io::Result<()> {
         require_private(directory)?;
         let ipsec = absent_receipt(Receipt::load(directory, guard))?;
@@ -730,7 +729,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             (Some(mut receipt), None) => {
                 if !receipt.complete {
                     if !staged {
-                        self.prepare_recovery(Backend::Ipsec, generation, pending)?;
+                        self.prepare_recovery(Backend::Ipsec, generation, pending.as_deref_mut())?;
                         self.xfrm.clean(guard, directory, &receipt)?;
                     }
                     receipt.complete = true;
@@ -740,7 +739,11 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             (None, Some(mut receipt)) => {
                 if !receipt.complete {
                     if !staged {
-                        self.prepare_recovery(Backend::Fortinet, generation, pending)?;
+                        self.prepare_recovery(
+                            Backend::Fortinet,
+                            generation,
+                            pending.as_deref_mut(),
+                        )?;
                         self.fortinet.clean(guard, directory, &receipt)?;
                     }
                     receipt.complete = true;
@@ -754,6 +757,9 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                     "ambiguous network recovery receipt",
                 ));
             }
+        }
+        if let Some(retry) = pending {
+            retry.network_recovered = true;
         }
         guard.withdraw(generation)?;
         if let Some(cleanup) = cleanup {
@@ -796,13 +802,20 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 guard,
                 &parent.join(&generation),
                 &generation,
-                None,
+                self.cleanup.as_deref(),
                 Some(retry),
             )?;
             if self.recovery_lease_present(guard, &generation)? {
                 return Err(io::Error::other(
                     "pending generation lacks a network receipt",
                 ));
+            }
+        } else if retry.network_recovered {
+            // Retry the lease directory sync and publication without touching
+            // XFRM. The completed network receipt was saved before withdrawal.
+            guard.withdraw(&generation)?;
+            if let Some(cleanup) = &self.cleanup {
+                cleanup.recovered(&generation)?;
             }
         }
         *pending = None;
@@ -841,6 +854,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             *pending = Some(PendingCleanup {
                 generation: attempt.generation.clone(),
                 allowed: attempt.allowed,
+                network_recovered: false,
             });
         } else if pending
             .as_ref()
@@ -1543,6 +1557,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             fortinet: FortinetNetwork::default(),
             lock,
             pending_cleanup: Mutex::default(),
+            cleanup: None,
             limits,
         }
     }
@@ -3058,7 +3073,7 @@ mod tests {
 
         const OWNED_STATES: [(&str, &[u8]); 3] = [
             ("0x126", b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x126 reqid 1 mode tunnel\n\tif_id 0x1\n"),
-            ("0x127", b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x127 reqid 1 mode tunnel\n\tmark 0x10/0xff\n\tif_id 0x1\n"),
+            ("0x127", b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x127 reqid 1 mode tunnel\n\tif_id 0x1\n"),
             ("0x128", b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x128 reqid 1 mode tunnel\n\tif_id 0x1\n"),
         ];
 
@@ -3077,7 +3092,11 @@ mod tests {
             leftover_state: bool,
             orphan_states: [bool; 3],
             conflicting_state_ids: bool,
-            overlapping_state_mark: bool,
+            foreign_state: bool,
+            replace_state_after_dumps: Option<usize>,
+            marked_state: bool,
+            foreign_policy: Option<&'static str>,
+            inbound_policy: bool,
             before_install: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         }
 
@@ -3139,6 +3158,13 @@ mod tests {
                     } else { vec![] }
                 }]),
                 ["xfrm", "state", "list", "nokeys"] => {
+                    if k.replace_state_after_dumps == Some(0) {
+                        k.replace_state_after_dumps = None;
+                        k.orphan_states[0] = false;
+                        k.foreign_state = true;
+                    } else if let Some(remaining) = &mut k.replace_state_after_dumps {
+                        *remaining -= 1;
+                    }
                     let mut states = b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x124 reqid 2 mode tunnel\n\tif_id 0x2\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x125 reqid 3 mode tunnel\n".to_vec();
                     if k.leftover_state {
                         states.extend(b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x123 reqid 1 mode tunnel\n\tif_id 0x1\n");
@@ -3151,13 +3177,16 @@ mod tests {
                     if k.conflicting_state_ids {
                         states.extend(b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x129 reqid 1 mode tunnel\n\tif_id 0x2\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x12a reqid 4 mode tunnel\n\tif_id 0x1\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x12b reqid 1 mode tunnel\n");
                     }
-                    if k.overlapping_state_mark {
-                        states.extend(b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x127 reqid 4 mode tunnel\n\tmark 0x10/0xf0\n\tif_id 0x2\n");
+                    if k.marked_state {
+                        states.extend(b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x12c reqid 1 mode tunnel\n\tmark 0x10/0xff\n\tif_id 0x1\n");
+                    }
+                    if k.foreign_state {
+                        states.extend(b"src 192.0.2.77 dst 192.0.2.2\n\tproto esp spi 0x126 reqid 1 mode tunnel\n\tif_id 0x1\n");
                     }
                     return Ok(states);
                 }
                 ["xfrm", "state", "delete", "src", "192.0.2.20", "dst", "192.0.2.2", "proto", "esp", "spi", spi @ ("0x126" | "0x128")]
-                | ["xfrm", "state", "delete", "src", "192.0.2.2", "dst", "192.0.2.20", "proto", "esp", "spi", spi @ "0x127", "mark", "16", "mask", "255"] => {
+                | ["xfrm", "state", "delete", "src", "192.0.2.2", "dst", "192.0.2.20", "proto", "esp", "spi", spi @ "0x127"] => {
                     assert!(fs::read_to_string(runtime.parent().unwrap().join("systemctl.log"))
                         .unwrap().lines().any(|line| line.starts_with("stop -- ")));
                     let index = OWNED_STATES.iter().position(|(id, _)| id == spi).unwrap();
@@ -3167,26 +3196,44 @@ mod tests {
                     }
                     return Ok(vec![]);
                 }
+                ["xfrm", "state", "delete", "src", _, "dst", _, "proto", "esp", "spi", "0x12c", ..] => {
+                    assert!(std::mem::take(&mut k.marked_state));
+                    return Ok(vec![]);
+                }
+                ["xfrm", "state", "delete", "src", "192.0.2.77", "dst", _, "proto", "esp", "spi", "0x126", ..] => {
+                    assert!(std::mem::take(&mut k.foreign_state));
+                    return Ok(vec![]);
+                }
                 ["xfrm", "state", "delete", "src", _, "dst", _, "proto", "esp", "spi", "0x123"] => {
                     return Err(io::Error::from(io::ErrorKind::PermissionDenied));
                 }
                 ["xfrm", "state", "delete", "src", _, "dst", _, "proto", "esp", "spi", spi, ..] => {
                     return Err(io::Error::other(format!("fixture refused deletion of foreign ESP SPI {spi}")));
                 }
-                ["xfrm", "policy", "list"] if k.leftover_policy => return Ok(
-                    b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out priority 1\n\tif_id 0x1\n".to_vec()
-                ),
-                ["xfrm", "policy", "list"] => return Ok(vec![]),
-                ["-s", "xfrm", "policy", "list", "nosock"] => {
+                ["xfrm", "policy", "list"] | ["-s", "xfrm", "policy", "list", "nosock"] => {
                     let mut policies = Vec::new();
                     if k.leftover_policy {
-                        policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 17 priority 1\n\tif_id 0x1\n");
+                        policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/16\n\tdir out priority 1 index 17\n\ttmpl src 192.0.2.2 dst 192.0.2.20\n\t\tproto esp reqid 1 mode tunnel\n\tif_id 0x1\n");
+                    }
+                    if k.inbound_policy {
+                        policies.extend(b"src 10.20.0.0/16 dst 10.99.0.2/32\n\tdir in priority 1 index 24\n\ttmpl src 192.0.2.20 dst 192.0.2.2\n\t\tproto esp reqid 1 mode tunnel\n\tif_id 0x1\n");
                     }
                     if k.disappearing_policy {
-                        policies.extend(b"src 10.20.0.0/15 dst 10.99.0.2/32\n\tdir fwd index 26 priority 1\n\tif_id 0x1\n");
+                        policies.extend(b"src 10.20.0.0/16 dst 10.99.0.2/32\n\tdir fwd priority 1 index 26\n\ttmpl src 192.0.2.20 dst 192.0.2.2\n\t\tproto esp reqid 1 mode tunnel\n\tif_id 0x1\n");
                     }
-                    policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 33 priority 1\n\tif_id 0x2\nsrc 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 49 priority 1\n");
+                    if let Some(policy) = k.foreign_policy {
+                        policies.extend_from_slice(policy.as_bytes());
+                    }
+                    policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/16\n\tdir out index 33 priority 1\n\tif_id 0x2\nsrc 10.99.0.2/32 dst 10.20.0.0/16\n\tdir out index 49 priority 1\n");
                     return Ok(policies);
+                }
+                ["xfrm", "policy", "delete", "index", "24", "dir", "in", "if_id", "1"] => {
+                    assert!(std::mem::take(&mut k.inbound_policy));
+                    return Ok(vec![]);
+                }
+                ["xfrm", "policy", "delete", "index", "57", "dir", "out", "if_id", "1", ..] => {
+                    assert!(k.foreign_policy.take().is_some());
+                    return Ok(vec![]);
                 }
                 ["xfrm", "policy", "delete", "index", "17", "dir", "out", "if_id", "1"] => {
                     assert!(
@@ -3606,11 +3653,23 @@ mod tests {
 
         #[test]
         fn v2_persistent_cleanup_stays_pending_until_recovery_proves_removal() {
-            use crate::tunneld::{protocol::CleanupState, server::serve_cleanup_fixture};
-            if !namespaced_in(
+            exercise_v2_persistent_cleanup(
                 "v2_persistent_cleanup_stays_pending_until_recovery_proves_removal",
-                "tests::xfrm_tests",
-            ) {
+                false,
+            );
+        }
+
+        #[test]
+        fn v2_pending_cleanup_is_published_by_the_next_admission() {
+            exercise_v2_persistent_cleanup(
+                "v2_pending_cleanup_is_published_by_the_next_admission",
+                true,
+            );
+        }
+
+        fn exercise_v2_persistent_cleanup(name: &str, admission: bool) {
+            use crate::tunneld::{protocol::CleanupState, server::serve_cleanup_fixture};
+            if !namespaced_in(name, "tests::xfrm_tests") {
                 return;
             }
             let harness = Harness::new();
@@ -3622,7 +3681,10 @@ mod tests {
             let kernel = Arc::new(Mutex::new(Kernel::default()));
             let mut launcher = harness.launcher(false);
             launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
-            let cleanup = Store::open(&harness.runtime).unwrap();
+            let cleanup = Arc::new(Store::open(&harness.runtime).unwrap());
+            if admission {
+                launcher.cleanup = Some(cleanup.clone());
+            }
             let (mut client, stream) = UnixStream::pair().unwrap();
             let generation = thread::scope(|scope| {
                 let worker = scope.spawn(|| {
@@ -3649,18 +3711,43 @@ mod tests {
                 v2_query(1000, &policy, &launcher, &cleanup, &generation),
                 CleanupState::Pending
             );
-            drop(cleanup);
+            assert!(process.0.wait().unwrap().success());
             harness.flag("fail-revert", false);
-            let reopened = Store::open(&harness.runtime).unwrap();
-            launcher.recover_with(Some(&reopened)).unwrap();
+            if admission {
+                let mut replacement = supervisor(&harness);
+                let (mut client, stream) = UnixStream::pair().unwrap();
+                thread::scope(|scope| {
+                    let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                    client_prepare(&mut client);
+                    client_credentials(&mut client);
+                    command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                    let status = v2_query(1000, &policy, &launcher, &cleanup, &generation);
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                    drop(client);
+                    let result = worker.join().unwrap();
+                    assert!(
+                        result.is_ok()
+                            || matches!(
+                                result,
+                                Err(protocol::FrameError::Io(io::ErrorKind::UnexpectedEof))
+                            ),
+                        "{result:?}"
+                    );
+                    assert_eq!(status, CleanupState::Stopped);
+                });
+                assert!(replacement.0.wait().unwrap().success());
+            } else {
+                drop(cleanup);
+                let reopened = Store::open(&harness.runtime).unwrap();
+                launcher.recover_with(Some(&reopened)).unwrap();
+                assert_eq!(
+                    v2_query(1000, &policy, &launcher, &reopened, &generation),
+                    CleanupState::Stopped
+                );
+            }
             assert!(harness.leases().is_empty());
-            assert_eq!(
-                v2_query(1000, &policy, &launcher, &reopened, &generation),
-                CleanupState::Stopped
-            );
             let kernel = kernel.lock().unwrap();
             assert!(kernel.routes.is_empty() && !kernel.link && !kernel.address);
-            assert!(process.0.wait().unwrap().success());
         }
 
         struct LaunchSnapshot {
@@ -4122,8 +4209,8 @@ mod tests {
             let kernel = Arc::new(Mutex::new(Kernel::default()));
             let mut launcher = harness.launcher(false);
             launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
-            let (mut client, stream) = UnixStream::pair().unwrap();
             thread::scope(|scope| {
+                let (mut client, stream) = UnixStream::pair().unwrap();
                 let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
                 client_prepare(&mut client);
                 client_credentials(&mut client);
@@ -4161,15 +4248,14 @@ mod tests {
                     {
                         let mut k = kernel.lock().unwrap();
                         k.leftover_state = false;
-                        k.orphan_states[1] = true;
-                        k.overlapping_state_mark = true;
+                        k.marked_state = true;
                     }
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
                     assert_eq!(harness.leases().len(), 1);
                     {
                         let mut k = kernel.lock().unwrap();
-                        assert!(k.orphan_states[1], "ambiguous ESP state was deleted");
-                        k.overlapping_state_mark = false;
+                        assert!(k.marked_state, "marked ESP state was deleted");
+                        k.marked_state = false;
                         k.conflicting_state_ids = true;
                     }
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
@@ -4183,10 +4269,7 @@ mod tests {
                                 .filter(|op| op.starts_with("xfrm state delete "))
                                 .map(String::as_str)
                                 .collect::<Vec<_>>(),
-                            [
-                                "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x123",
-                                "xfrm state delete src 192.0.2.2 dst 192.0.2.20 proto esp spi 0x127 mark 16 mask 255",
-                            ]
+                            ["xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x123",]
                         );
                         k.conflicting_state_ids = false;
                     }
@@ -4195,6 +4278,7 @@ mod tests {
                     {
                         let mut k = kernel.lock().unwrap();
                         k.leftover_policy = true;
+                        k.inbound_policy = true;
                         k.disappearing_policy = true;
                         k.orphan_states = [true; 3];
                     }
@@ -4265,9 +4349,10 @@ mod tests {
                         .collect::<Vec<_>>(),
                     [
                         "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x126",
-                        "xfrm state delete src 192.0.2.2 dst 192.0.2.20 proto esp spi 0x127 mark 16 mask 255",
+                        "xfrm state delete src 192.0.2.2 dst 192.0.2.20 proto esp spi 0x127",
                         "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x128",
                         "xfrm policy delete index 17 dir out if_id 1",
+                        "xfrm policy delete index 24 dir in if_id 1",
                         "xfrm policy delete index 26 dir fwd if_id 1",
                     ]
                 );
@@ -4553,6 +4638,78 @@ mod tests {
                 true,
                 true,
             );
+        }
+
+        #[test]
+        fn ownership_mismatches_keep_the_lease_pending() {
+            if !namespaced_in(
+                "ownership_mismatches_keep_the_lease_pending",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("negotiated-route", true);
+            let mut process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            thread::scope(|scope| {
+                let (mut client, stream) = UnixStream::pair().unwrap();
+                let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut client);
+                client_credentials(&mut client);
+                command(&mut client, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                for foreign_policy in [
+                    "src 10.99.0.2/32 dst 10.20.0.0/16\n\tdir out priority 1 index 57\n\ttmpl src 192.0.2.2 dst 192.0.2.77\n\t\tproto esp reqid 1 mode tunnel\n\tif_id 0x1\n",
+                    "src 10.99.0.2/32 dst 10.50.0.0/16\n\tdir out priority 1 index 57\n\ttmpl src 192.0.2.2 dst 192.0.2.20\n\t\tproto esp reqid 1 mode tunnel\n\tif_id 0x1\n",
+                    "src 10.99.0.2/32 dst 10.20.0.0/16\n\tdir out priority 1 index 57\n\ttmpl src 192.0.2.2 dst 192.0.2.20\n\t\tproto esp reqid 1 mode tunnel\n\tmark 0x10/0xff\n\tif_id 0x1\n",
+                ] {
+                    kernel.lock().unwrap().foreign_policy = Some(foreign_policy);
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    assert_eq!(kernel.lock().unwrap().foreign_policy, Some(foreign_policy));
+                }
+                {
+                    let mut k = kernel.lock().unwrap();
+                    k.foreign_policy = None;
+                    k.foreign_state = true;
+                }
+                command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                assert_eq!(harness.leases().len(), 1);
+                assert!(kernel.lock().unwrap().foreign_state);
+                {
+                    let mut k = kernel.lock().unwrap();
+                    k.foreign_state = false;
+                    k.orphan_states[0] = true;
+                    // IDs and the candidate each use one dump. Replace the
+                    // candidate at the dump immediately before deletion.
+                    k.replace_state_after_dumps = Some(2);
+                }
+                command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                {
+                    let mut k = kernel.lock().unwrap();
+                    assert!(k.replace_state_after_dumps.is_none());
+                    assert!(k.foreign_state);
+                    assert!(!k.ops.iter().any(|op| op.starts_with("xfrm state delete ")));
+                    k.foreign_state = false;
+                }
+                command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
+                drop(client);
+                let result = worker.join().unwrap();
+                assert!(
+                    result.is_ok()
+                        || matches!(
+                            result,
+                            Err(protocol::FrameError::Io(io::ErrorKind::UnexpectedEof))
+                        ),
+                    "{result:?}"
+                );
+            });
+            assert!(harness.leases().is_empty());
+            assert!(process.0.wait().unwrap().success());
         }
 
         #[test]
