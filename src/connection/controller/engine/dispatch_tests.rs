@@ -1,6 +1,7 @@
 //! Focused dispatch tests for the controller-wide probe cadence preference.
 //! The factory never creates an attempt here: these tests exercise the slot
 //! bookkeeping that a later launch reads.
+use super::dispatch::dispatch_with_diagnostics;
 use super::*;
 use crate::preferences::ProbeInterval;
 
@@ -45,7 +46,7 @@ fn profile(id: &str) -> Profile {
     serde_json::from_value(serde_json::json!({"id":id,"name":id,"kind":"ssl","gateway":"vpn.example.test","username":"fictional","networks":[],"port":443,"certificate":"","probeHost":"10.20.0.15","probePort":8443,"probeMethod":"tcp"})).unwrap()
 }
 
-fn slot(id: &str, interval: u64) -> Slot<'static> {
+fn slot<'scope>(id: &str, interval: u64) -> Slot<'scope> {
     Slot {
         profile: profile(id),
         generation: 0,
@@ -64,6 +65,139 @@ fn credentials() -> Credentials {
         password: "fictional".into(),
         psk: "".into(),
     }
+}
+
+#[test]
+fn dispatch_diagnostics_record_slot_and_generation_rejections_and_disconnects() {
+    let interval = ProbeClock::new(Duration::from_secs(10));
+    thread::scope(|scope| {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let mut live = slot("one", 10);
+        live.generation = 2;
+        live.state = ConnectionState::Connected;
+        live.worker = Some(Worker {
+            generation: 2,
+            request: "connect".into(),
+            signals: Signals {
+                canceled: canceled.clone(),
+                probe: Arc::default(),
+                state: Arc::default(),
+                exit: Arc::new(ExitRequested::new(Duration::from_secs(1))),
+            },
+            thread: scope.spawn(|| Finished {
+                state: ConnectionState::Off,
+                error: None,
+                step: None,
+            }),
+        });
+        let mut slots = BTreeMap::from([("one".into(), live)]);
+        let mut output = VecDeque::new();
+        let mut diagnostics = Vec::new();
+        let mut run = |command| {
+            dispatch_with_diagnostics(
+                Request {
+                    id: "request".into(),
+                    command,
+                },
+                &InertFactory,
+                &mut slots,
+                &mut output,
+                &interval,
+                false,
+                false,
+                &mut diagnostics,
+            );
+            std::mem::take(&mut output)
+        };
+        for (id, error) in [
+            ("missing", ErrorCode::ProfileNotFound),
+            ("one", ErrorCode::InvalidRequest),
+        ] {
+            for command in [
+                Command::Connect {
+                    id: id.into(),
+                    generation: 1,
+                    interval: ProbeInterval::TEN,
+                    credentials: credentials(),
+                },
+                Command::Disconnect {
+                    id: id.into(),
+                    generation: 1,
+                },
+                Command::Probe {
+                    id: id.into(),
+                    generation: 1,
+                },
+            ] {
+                let messages = run(command);
+                assert!(
+                    matches!(messages.front(), Some(Message::Failed { id, error: code }) if id == "request" && *code == error)
+                );
+                assert_eq!(messages.len(), 1);
+            }
+        }
+        assert!(!canceled.load(Ordering::Acquire));
+        let messages = run(Command::Disconnect {
+            id: "one".into(),
+            generation: 3,
+        });
+        assert!(matches!(messages.front(), Some(Message::Accepted { id }) if id == "request"));
+        assert!(matches!(
+            messages.get(1),
+            Some(Message::Changed {
+                generation: 3,
+                state: ConnectionState::Disconnecting,
+                ..
+            })
+        ));
+        assert!(canceled.load(Ordering::Acquire));
+        slots
+            .get_mut("one")
+            .unwrap()
+            .worker
+            .take()
+            .unwrap()
+            .thread
+            .join()
+            .unwrap();
+        dispatch_with_diagnostics(
+            Request {
+                id: "request".into(),
+                command: Command::Disconnect {
+                    id: "one".into(),
+                    generation: 4,
+                },
+            },
+            &InertFactory,
+            &mut slots,
+            &mut output,
+            &interval,
+            false,
+            false,
+            &mut diagnostics,
+        );
+        assert!(matches!(
+            output.get(1),
+            Some(Message::Changed {
+                generation: 4,
+                state: ConnectionState::Off,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::str::from_utf8(&diagnostics).unwrap(),
+            concat!(
+                "vpnt-helper: engine: command=connect event=failed id=missing generation=1 slot_generation=none error=ProfileNotFound\n",
+                "vpnt-helper: engine: command=disconnect event=failed id=missing generation=1 slot_generation=none error=ProfileNotFound\n",
+                "vpnt-helper: engine: command=probe event=failed id=missing generation=1 slot_generation=none error=ProfileNotFound\n",
+                "vpnt-helper: engine: command=connect event=failed id=one generation=1 slot_generation=2 error=InvalidRequest\n",
+                "vpnt-helper: engine: command=disconnect event=failed id=one generation=1 slot_generation=2 error=InvalidRequest\n",
+                "vpnt-helper: engine: command=probe event=failed id=one generation=1 slot_generation=2 error=InvalidRequest\n",
+                "vpnt-helper: engine: command=disconnect event=accepted id=one generation=3 worker=true\n",
+                "vpnt-helper: engine: command=disconnect event=accepted id=one generation=4 worker=false\n",
+            )
+        );
+    });
 }
 
 #[test]

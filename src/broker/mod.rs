@@ -39,11 +39,13 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
+    io::{self, Write},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct Pending {
     id: String,
+    diagnostic_command: Option<&'static str>,
     /// Generation, state and note restored if the helper rejects the request.
     previous: (u64, State, Option<FailureView>),
     accepted: bool,
@@ -66,6 +68,7 @@ fn needs_credentials(kind: VpnKind) -> bool {
 }
 
 pub struct Broker<S: SecretStore> {
+    diagnostic_output: Box<dyn Write + Send>,
     client: Option<Client>,
     retry: Option<retry::Retry>,
     secrets: S,
@@ -143,6 +146,7 @@ impl<S: SecretStore> Broker<S> {
         #[cfg(target_os = "linux")]
         let expected_build = crate::helper::client::linux_build_identity();
         let mut result = Self {
+            diagnostic_output: Box::new(io::stderr()),
             client,
             retry: None,
             secrets,
@@ -384,10 +388,17 @@ impl<S: SecretStore> Broker<S> {
             }
             Message::Accepted { id } => {
                 self.accept_signing_operation(&id);
-                for c in self.connections.values_mut() {
+                for (profile, c) in &mut self.connections {
                     if let Some(p) = &mut c.pending
                         && p.id == id
                     {
+                        if let Some(command) = p.diagnostic_command {
+                            let generation = c.generation;
+                            let _ = writeln!(
+                                self.diagnostic_output,
+                                "vpnt: broker: command={command} event=accepted id={profile} generation={generation}"
+                            );
+                        }
                         p.accepted = true;
                     }
                 }
@@ -429,9 +440,11 @@ impl<S: SecretStore> Broker<S> {
                     return Ok(());
                 }
                 let mut rejected = false;
-                for c in self.connections.values_mut() {
+                for (profile, c) in &mut self.connections {
                     if c.pending.as_ref().is_some_and(|p| p.id == id) {
                         let pending = c.pending.take().unwrap();
+                        let generation = c.generation;
+                        let mut restored = false;
                         if !pending.accepted {
                             let (state, failure) = (pending.previous.1, pending.previous.2);
                             // Connect advances the generation and sets Connecting or
@@ -447,9 +460,16 @@ impl<S: SecretStore> Broker<S> {
                             } else {
                                 (state, failure)
                             };
+                            restored = (state, failure) == (pending.previous.1, pending.previous.2);
                             c.generation = pending.previous.0;
                             transition(c, state, failure);
                             rejected = true;
+                        }
+                        if let Some(command) = pending.diagnostic_command {
+                            let _ = writeln!(
+                                self.diagnostic_output,
+                                "vpnt: broker: command={command} event=failed id={profile} generation={generation} error={error:?} restored={restored}"
+                            );
                         }
                     }
                 }
