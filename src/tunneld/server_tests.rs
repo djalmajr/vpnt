@@ -1,8 +1,13 @@
 use super::*;
-use crate::tunneld::protocol::decode_response;
+use crate::tunneld::{
+    admin::{PolicyFixture, acquire_eventually},
+    policy::Entry,
+    protocol::{CidrV4, Credentials, ProbeBinding, decode_response},
+};
 use std::{
     io::{Read, Write},
     net::Shutdown,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 const HELLO: &[u8] = b"{\"op\":\"hello\",\"version\":1}\n";
@@ -259,4 +264,162 @@ fn cleanup_queries_are_v2_only_and_fail_closed_for_invalid_or_absent_ids() {
         }
         worker.unwrap().join().unwrap();
     }
+}
+
+#[test]
+fn admitted_v2_stop_acknowledges_before_publishing_cleanup_receipt() {
+    struct FakeLaunch {
+        stops: AtomicUsize,
+        finish: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct FakeSession<'a> {
+        launcher: &'a FakeLaunch,
+        binding: ProbeBinding,
+    }
+
+    impl Launch for FakeLaunch {
+        fn launch<'a>(
+            &'a self,
+            _: &Prepare,
+            _: &Entry,
+            _: Credentials,
+            _: File,
+            _: &Arc<SetupCancellation>,
+        ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            panic!("expected the v2 launch");
+        }
+
+        fn launch_v2<'a>(
+            &'a self,
+            _: &Prepare,
+            _: &Entry,
+            _: Credentials,
+            _: File,
+            _: &Arc<SetupCancellation>,
+            record: &mut Reservation<'_>,
+        ) -> Result<Box<dyn Running + 'a>, ErrorCode> {
+            Ok(Box::new(FakeSession {
+                launcher: self,
+                binding: ProbeBinding::new(
+                    record.generation().clone(),
+                    7,
+                    "10.99.0.2".parse().unwrap(),
+                    vec![CidrV4::new("10.20.0.0".parse().unwrap(), 16).unwrap()],
+                )
+                .unwrap(),
+            }))
+        }
+    }
+
+    impl Running for FakeSession<'_> {
+        fn state(&self) -> State {
+            State::NetworkReady
+        }
+
+        fn probe_binding(&self, _: Instant) -> io::Result<ProbeBinding> {
+            Ok(self.binding.clone())
+        }
+
+        fn stop(&mut self) -> State {
+            self.launcher.stops.fetch_add(1, Ordering::SeqCst);
+            self.launcher
+                .finish
+                .lock()
+                .unwrap()
+                .recv_timeout(FRAME_TIMEOUT)
+                .unwrap();
+            State::Stopped
+        }
+    }
+
+    let policy = PolicyFixture::new();
+    policy.install();
+    let directory = policy.store.open().unwrap();
+    drop(acquire_eventually(|| directory.lock_shared()).unwrap());
+    let store = Store::open(policy.path().parent().unwrap()).unwrap();
+    let (finish, resume) = std::sync::mpsc::channel();
+    let launcher = FakeLaunch {
+        stops: AtomicUsize::new(0),
+        finish: Mutex::new(resume),
+    };
+
+    thread::scope(|scope| {
+        let serve_pair = || {
+            let (mut client, stream) = UnixStream::pair().unwrap();
+            let worker = scope
+                .spawn(|| serve_cleanup_fixture(stream, 1000, &policy.store, &launcher, &store));
+            write_control(
+                &mut client,
+                &Request::Hello {
+                    version: CLEANUP_VERSION,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                receive(&client),
+                Response::Version {
+                    version: CLEANUP_VERSION
+                }
+            ));
+            (client, worker)
+        };
+        let (mut client, worker) = serve_pair();
+        writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
+        let Response::Prepared {
+            generation: Some(generation),
+        } = receive(&client)
+        else {
+            panic!("expected a v2 generation");
+        };
+        Credentials::ipsec("fixture-password", "fixture-psk")
+            .unwrap()
+            .write(&mut client)
+            .unwrap();
+        let ready_by = Instant::now() + FRAME_TIMEOUT;
+        loop {
+            write_control(&mut client, &Request::Status {}).unwrap();
+            match receive(&client) {
+                Response::NetworkReady { binding } => {
+                    assert_eq!(binding.generation(), &generation);
+                    break;
+                }
+                Response::Status {
+                    state: State::Starting,
+                } if Instant::now() < ready_by => {
+                    thread::yield_now();
+                }
+                response => panic!("expected an active dialogue: {response:?}"),
+            }
+        }
+        write_control(&mut client, &Request::Stop {}).unwrap();
+        assert!(matches!(
+            receive(&client),
+            Response::Status {
+                state: State::Stopping
+            }
+        ));
+        expect_close(&client);
+
+        let query = |expected| {
+            let (mut query, worker) = serve_pair();
+            write_control(
+                &mut query,
+                &Request::CleanupStatus {
+                    generation: generation.clone(),
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(receive(&query), Response::CleanupStatus { state } if state == expected)
+            );
+            expect_close(&query);
+            worker.join().unwrap().unwrap();
+        };
+        query(CleanupState::Pending);
+        finish.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(launcher.stops.load(Ordering::SeqCst), 1);
+        query(CleanupState::Stopped);
+    });
 }

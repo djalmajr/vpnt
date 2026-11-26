@@ -356,12 +356,17 @@ fn exercising_worker(fixture: &SocketFixture, kind: VpnKind, responsive: bool) {
             reply_state(&mut decoder, State::NetworkReady);
             loop {
                 if decoder.command(wire_deadline()).unwrap() == Command::Stop {
-                    decoder
-                        .reply_status(State::Stopped, wire_deadline())
-                        .unwrap();
                     break;
                 }
                 reply_state(&mut decoder, State::NetworkReady);
+            }
+            if kind == VpnKind::Ipsec {
+                reply_state(&mut decoder, State::Stopping);
+                drop(decoder);
+                query(fixture, CleanupState::Pending);
+                query(fixture, CleanupState::Stopped);
+            } else {
+                reply_state(&mut decoder, State::Stopped);
             }
         });
         let canceled = Arc::new(AtomicBool::new(false));
@@ -455,6 +460,54 @@ fn stop_waits_for_confirmed_cleanup() {
         assert!(attempt.cleanup());
         server.join().unwrap();
     });
+}
+
+#[test]
+fn stopping_queries_the_receipt_before_returning_from_cleanup() {
+    if !wire_fixture("stopping_queries_the_receipt_before_returning_from_cleanup") {
+        return;
+    }
+    let fixture = SocketFixture::new("stopping");
+    thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            let mut decoder = admitted(&fixture, VpnKind::Ssl);
+            reply(&mut decoder, Command::Stop, State::Stopping);
+            drop(decoder);
+            query(&fixture, CleanupState::Pending);
+            query(&fixture, CleanupState::Stopped);
+        });
+        let mut attempt = fixture.attempt(VpnKind::Ssl, no_probe);
+        attempt
+            .start(&AtomicBool::new(false), wire_deadline())
+            .unwrap();
+
+        assert!(!attempt.cleanup(), "Stopping alone is not a receipt");
+        assert!(attempt.cleanup(), "the first cleanup must consume Pending");
+        assert!(attempt.cleanup(), "confirmed cleanup stays complete");
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn contended_probe_slot_does_not_leave_the_attempt_busy() {
+    let mut profile = profile(VpnKind::Ssl);
+    profile.id = "contended-tunnel-probe".into();
+    let _held = ProbeSlot::acquire(&profile.id).unwrap();
+    let mut attempt = TunnelAttempt::with_socket(
+        profile,
+        Credentials {
+            password: Secret::from(TEST_PASSWORD),
+            psk: Secret::from(""),
+        },
+        PathBuf::new(),
+        no_probe,
+    );
+    assert!(
+        !attempt
+            .probe(&AtomicBool::new(false), CONTROL_TIMEOUT)
+            .unwrap()
+    );
+    assert!(!attempt.probe_busy());
 }
 
 #[test]
@@ -1081,7 +1134,6 @@ fn unknown_cleanup_proof_enters_an_explicit_fence_without_polling_again() {
             .start(&AtomicBool::new(false), wire_deadline())
             .unwrap();
         assert!(!attempt.cleanup());
-        assert!(!attempt.cleanup());
         assert_eq!(attempt.phase(), Some(ConnectionState::CleanupUnconfirmed));
         assert!(!attempt.cleanup());
         server.join().unwrap();
@@ -1109,7 +1161,6 @@ fn expired_observation_budget_keeps_unavailable_cleanup_fenced() {
         attempt
             .start(&AtomicBool::new(false), wire_deadline())
             .unwrap();
-        assert!(!attempt.cleanup());
         assert!(!attempt.cleanup());
         assert_eq!(attempt.phase(), None);
         attempt.cleanup_until = Some(Instant::now());

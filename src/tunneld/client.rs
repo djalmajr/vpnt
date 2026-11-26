@@ -239,8 +239,8 @@ impl Client {
                 )
             }
         };
-        let stream = self.stream.take().ok_or(ErrorCode::BadRequest)?;
-        let result = match pending.exchange(&stream, deadline) {
+        let stream = self.stream.as_ref().ok_or(ErrorCode::BadRequest)?;
+        let result = match pending.exchange(stream, deadline) {
             Ok(Response::NetworkReady { binding }) if late || Instant::now() >= deadline => {
                 Ok(Confirmation::Late(Some(binding)))
             }
@@ -262,8 +262,10 @@ impl Client {
             Ok(_) => Err(ErrorCode::Backend.into()),
             Err(error) => Err(error),
         };
-        if result.is_ok() {
-            self.stream = Some(stream);
+        if result.is_err() {
+            // Fatal I/O and invalid replies end the session. A timeout keeps
+            // the stream and any pending framing for the next operation.
+            self.stream = None;
         }
         result
     }
@@ -553,6 +555,64 @@ mod tests {
                 Err(FrameError::Io(io::ErrorKind::BrokenPipe))
             );
         }
+    }
+
+    #[test]
+    fn confirm_timeout_resumes_partial_reply_on_the_same_stream() {
+        use crate::tunneld::protocol::decode_request;
+
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut peer = timed(&peer, deadline()).unwrap();
+        let mut client = Client {
+            stream: Some(stream),
+            phase: Phase::Active,
+            version: CLEANUP_VERSION,
+            confirmation: None,
+        };
+
+        // Leave a reply in flight across the deadline, with its prefix already
+        // readable so the next operation must keep the decoder's progress.
+        let mut reply = Vec::new();
+        write_control(
+            &mut reply,
+            &Response::Error {
+                code: ErrorCode::Timeout,
+            },
+        )
+        .unwrap();
+        let (prefix, suffix) = reply.split_at(reply.len() / 2);
+        peer.write_all(prefix).unwrap();
+        let expires = Instant::now() + Duration::from_millis(100);
+        assert!(matches!(
+            client.confirm(expires),
+            Ok(Confirmation::Unavailable)
+        ));
+        assert!(Instant::now() >= expires);
+        assert!(client.confirmation_pending());
+        assert!(matches!(
+            read_control(&mut peer, decode_request).unwrap(),
+            Request::Confirm { .. }
+        ));
+
+        peer.write_all(suffix).unwrap();
+        assert!(matches!(
+            client.confirm(deadline()),
+            Ok(Confirmation::Late(None))
+        ));
+        assert!(!client.confirmation_pending());
+
+        write_control(
+            &mut peer,
+            &Response::Status {
+                state: State::Starting,
+            },
+        )
+        .unwrap();
+        assert_eq!(client.status(deadline()), Ok(State::Starting));
+        assert!(matches!(
+            read_control(&mut peer, decode_request).unwrap(),
+            Request::Status {}
+        ));
     }
 
     #[test]
