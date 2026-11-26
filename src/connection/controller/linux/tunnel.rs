@@ -170,6 +170,26 @@ impl TunnelAttempt {
         self.cleanup_until = None;
         self.probe_binding = None;
     }
+
+    fn poll_cleanup(&mut self, deadline: Instant, until: Instant) -> bool {
+        if Instant::now() >= until {
+            self.session = Session::CleanupUnconfirmed;
+            return false;
+        }
+        let Some(generation) = &self.generation else {
+            return false;
+        };
+        match Client::connect_v2(&self.socket_path, deadline)
+            .and_then(|client| client.cleanup_status(generation, deadline))
+        {
+            Ok(CleanupState::Stopped) => true,
+            Ok(CleanupState::Unknown) => {
+                self.session = Session::CleanupUnconfirmed;
+                false
+            }
+            Ok(CleanupState::Pending) | Err(_) => false,
+        }
+    }
 }
 
 fn profile_failure() -> Failure {
@@ -322,6 +342,7 @@ impl Attempt for TunnelAttempt {
         }
         self.probe_busy = true;
         let Some(slot) = ProbeSlot::acquire(&self.profile.id) else {
+            self.probe_busy = false;
             return Ok(false);
         };
         self.probe_busy = false;
@@ -367,29 +388,15 @@ impl Attempt for TunnelAttempt {
                 self.session = Session::CleanupUnconfirmed;
                 false
             }
-            Session::Active(mut client) => matches!(client.stop(deadline), Ok(State::Stopped)),
-            Session::Observing if now >= until => {
-                self.session = Session::CleanupUnconfirmed;
-                false
-            }
-            Session::Observing => {
-                let result = self
-                    .generation
-                    .as_ref()
-                    .ok_or(FrameError::Protocol(WireError::BadRequest))
-                    .and_then(|generation| {
-                        Client::connect_v2(&self.socket_path, deadline)
-                            .and_then(|client| client.cleanup_status(generation, deadline))
-                    });
-                match result {
-                    Ok(CleanupState::Stopped) => true,
-                    Ok(CleanupState::Unknown) => {
-                        self.session = Session::CleanupUnconfirmed;
-                        false
-                    }
-                    Ok(CleanupState::Pending) | Err(_) => false,
+            Session::Active(mut client) => match client.stop(deadline) {
+                Ok(State::Stopped) => true,
+                Ok(State::Stopping) => {
+                    drop(client);
+                    self.poll_cleanup(deadline, until)
                 }
-            }
+                _ => false,
+            },
+            Session::Observing => self.poll_cleanup(deadline, until),
         };
         if stopped {
             self.cleaned();
