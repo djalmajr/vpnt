@@ -1,4 +1,5 @@
 use super::*;
+use crate::diagnostic_sink::{self, Sink};
 
 #[cfg(target_os = "macos")]
 pub(super) fn dispatch_sign_reply(
@@ -37,6 +38,32 @@ pub(super) fn dispatch<F: Factory>(
     interval: &ProbeClock,
     cleanup_capable: bool,
     failure_capable: bool,
+) {
+    dispatch_with_diagnostics(
+        request,
+        factory,
+        slots,
+        output,
+        interval,
+        cleanup_capable,
+        failure_capable,
+        &mut &diagnostic_sink::ENGINE,
+    );
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the diagnostic sink is independent of protocol output"
+)]
+pub(super) fn dispatch_with_diagnostics<F: Factory>(
+    request: Request,
+    factory: &F,
+    slots: &mut BTreeMap<String, Slot<'_>>,
+    output: &mut VecDeque<Message>,
+    interval: &ProbeClock,
+    cleanup_capable: bool,
+    failure_capable: bool,
+    diagnostics: &mut impl Sink,
 ) {
     let fail = |output: &mut VecDeque<_>, error| {
         output.push_back(Message::Failed {
@@ -80,7 +107,7 @@ pub(super) fn dispatch<F: Factory>(
         output.push_back(Message::Accepted { id: request.id });
         return;
     }
-    let (id, generation) = match &request.command {
+    let (command, id, generation) = match &request.command {
         Command::Diagnostics {} => {
             // The authenticated helper handles this before forwarding requests.
             fail(output, ErrorCode::Unavailable);
@@ -102,13 +129,26 @@ pub(super) fn dispatch<F: Factory>(
             fail(output, ErrorCode::InvalidRequest);
             return;
         }
-        Command::Connect { id, generation, .. }
-        | Command::Disconnect { id, generation }
-        | Command::Probe { id, generation } => (id, *generation),
+        Command::Connect { id, generation, .. } => ("connect", id, *generation),
+        Command::Disconnect { id, generation } => ("disconnect", id, *generation),
+        Command::Probe { id, generation } => ("probe", id, *generation),
         Command::SetProbeInterval { .. } | Command::VerifyCleanup { .. } => unreachable!(),
     };
+    let diagnostic_id = if valid_profile_id(id) {
+        id.as_str()
+    } else {
+        "<invalid>"
+    };
+    let mut reject = |output: &mut VecDeque<_>, slot_generation: Option<u64>, error| {
+        fail(output, error);
+        let slot_generation =
+            slot_generation.map_or_else(|| "none".into(), |value| value.to_string());
+        diagnostics.record(format!(
+            "vpnt-helper: engine: command={command} event=failed id={diagnostic_id} generation={generation} slot_generation={slot_generation} error={error:?}"
+        ));
+    };
     let Some(slot) = slots.get_mut(id) else {
-        fail(output, ErrorCode::ProfileNotFound);
+        reject(output, None, ErrorCode::ProfileNotFound);
         return;
     };
     if generation == 0
@@ -117,7 +157,7 @@ pub(super) fn dispatch<F: Factory>(
             _ => generation <= slot.generation,
         }
     {
-        fail(output, ErrorCode::InvalidRequest);
+        reject(output, Some(slot.generation), ErrorCode::InvalidRequest);
         return;
     }
     match request.command {
@@ -158,17 +198,21 @@ pub(super) fn dispatch<F: Factory>(
             };
         }
         Command::Disconnect { .. } => {
+            let worker = slot.worker.is_some();
             slot.cancel();
             slot.pending = None;
             slot.generation = generation;
             slot.failures = 0;
             slot.cleaning = false;
             slot.failure = None;
-            slot.state = if slot.worker.is_some() {
+            slot.state = if worker {
                 ConnectionState::Disconnecting
             } else {
                 ConnectionState::Off
             };
+            diagnostics.record(format!(
+                "vpnt-helper: engine: command=disconnect event=accepted id={diagnostic_id} generation={generation} worker={worker}"
+            ));
         }
         Command::Probe { .. } => {
             if let Some(worker) = &slot.worker

@@ -14,6 +14,8 @@ pub mod desktop;
 pub mod desktop;
 #[cfg(all(any(target_os = "macos", target_os = "linux"), feature = "desktop"))]
 mod desktop_actor;
+#[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
+mod diagnostic_sink;
 #[cfg(unix)]
 mod fs_permissions;
 pub mod helper;
