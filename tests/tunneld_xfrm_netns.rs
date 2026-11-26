@@ -156,10 +156,85 @@ fn isolated_xfrm_writer_creates_and_removes_kernel_objects() {
             .iter()
             .all(|r| r["protocol"] == "boot")
     );
+
+    // This fixture has no charon. Seed the SAD and SPD entries a dead producer
+    // would leave, alongside another interface's state and policy.
+    for (src, dst, spi, reqid, id) in [
+        ("192.0.2.1", "192.0.2.2", "0x126", "1", "1"),
+        ("192.0.2.2", "192.0.2.1", "0x127", "1", "1"),
+        ("192.0.2.1", "192.0.2.2", "0x129", "2", "2"),
+    ] {
+        let mut args = vec![
+            "xfrm",
+            "state",
+            "add",
+            "src",
+            src,
+            "dst",
+            dst,
+            "proto",
+            "esp",
+            "spi",
+            spi,
+            "reqid",
+            reqid,
+            "if_id",
+            id,
+            "mode",
+            "tunnel",
+            "aead",
+            "rfc4106(gcm(aes))",
+            "0x0123456789abcdef0123456789abcdef01234567",
+            "128",
+        ];
+        if spi == "0x127" {
+            args.extend(["mark", "0x10", "mask", "0xff"]);
+        }
+        ip(&args);
+    }
+    let states = ip(&["xfrm", "state", "list", "nokeys"]);
+    let states = String::from_utf8(states.stdout).unwrap();
+    for spi in ["0x00000126", "0x00000127", "0x00000129"] {
+        assert!(states.contains(spi), "{states}");
+    }
+
+    for (direction, id) in [("out", "1"), ("in", "1"), ("fwd", "1"), ("out", "2")] {
+        let mut args = vec![
+            "xfrm",
+            "policy",
+            "add",
+            "src",
+            "10.99.0.2/32",
+            "dst",
+            "10.20.0.0/15",
+            "dir",
+            direction,
+            "if_id",
+            id,
+        ];
+        if direction == "fwd" {
+            args.extend(["mark", "0x10", "mask", "0xff"]);
+        }
+        ip(&args);
+    }
     let receipt = network::Receipt::load(&directory, &guard).unwrap();
+    assert!(backend.verify_xfrm_clear(&receipt).is_err());
     backend.clean(&guard, &directory, &receipt).unwrap();
+    backend.verify_xfrm_clear(&receipt).unwrap();
     guard.withdraw(generation).unwrap();
     assert!(!guard.tunnels_present().unwrap());
+
+    let states = ip(&["xfrm", "state", "list", "nokeys"]);
+    let states = String::from_utf8(states.stdout).unwrap();
+    assert!(states.contains("0x00000129"), "{states}");
+    for spi in ["0x00000126", "0x00000127"] {
+        assert!(!states.contains(spi), "{states}");
+    }
+
+    let policies = ip(&["xfrm", "policy", "list"]);
+    let policies = String::from_utf8(policies.stdout).unwrap();
+    assert!(policies.contains("if_id 0x2"), "{policies}");
+    assert!(!policies.contains("if_id 0x1"), "{policies}");
 
     let links = ip(&["-j", "link", "show"]);
     let links: serde_json::Value = serde_json::from_slice(&links.stdout).unwrap();

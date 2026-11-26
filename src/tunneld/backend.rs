@@ -32,7 +32,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -141,7 +141,13 @@ pub(super) struct Launcher<N, A> {
     xfrm: Network,
     fortinet: FortinetNetwork,
     lock: AcquireLock,
+    pending_cleanup: Mutex<Option<PendingCleanup>>,
     limits: Limits,
+}
+
+struct PendingCleanup {
+    generation: String,
+    allowed: bool,
 }
 
 impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
@@ -154,6 +160,7 @@ impl<N: NetworkBackend> Launcher<N, SystemdAttestor> {
             xfrm: Network::default(),
             fortinet: FortinetNetwork::default(),
             lock: Box::new(NetworkLock::acquire),
+            pending_cleanup: Mutex::default(),
             limits: Limits::default(),
         }
     }
@@ -167,6 +174,7 @@ struct Attempt {
     registered: bool,
     directory: bool,
     started: bool,
+    cleanup_deferred: bool,
     /// A runtime `IPAddressAllow` was requested for the unit: a failed call
     /// may still have written the drop-in, so teardown always reverts it.
     allowed: bool,
@@ -190,6 +198,7 @@ impl Attempt {
             registered: false,
             directory: false,
             started: false,
+            cleanup_deferred: false,
             allowed: false,
             credentials_sent: false,
             managed_cleanup: false,
@@ -309,11 +318,22 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         if ovpn_present(&self.network).map_err(|e| Failure::io("network inventory", &e))? {
             return Err(Failure::new(ErrorCode::Busy, "an OVPN tunnel is present"));
         }
-        if guard
-            .tunnels_present()
-            .map_err(|e| Failure::io("lease registry", &e))?
-        {
-            return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
+        let tunnels_present = || {
+            guard
+                .tunnels_present()
+                .map_err(|e| Failure::io("lease registry", &e))
+        };
+        if tunnels_present()? {
+            let recovered = match self.retry_pending_generation(&guard) {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    eprintln!("vpnt-tunneld: pending generation cleanup is unproven: {error}");
+                    false
+                }
+            };
+            if !recovered || tunnels_present()? {
+                return Err(Failure::new(ErrorCode::Busy, "a tunnel lease is present"));
+            }
         }
         cancel
             .check()
@@ -681,63 +701,154 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             let Some(generation) = filename.to_str().filter(|name| valid_generation(name)) else {
                 continue;
             };
-            let directory = entry.path();
-            require_private(&directory)?;
-            let ipsec = absent_receipt(Receipt::load(&directory, &guard))?;
-            let fortinet = absent_receipt(fortinet_network::Receipt::load(&directory, &guard))?;
-            // An unreadable cleanup record cannot establish a staged plan.
-            // Still clean a valid network receipt and surface the read error
-            // when publishing the cleanup result.
-            let staged = (ipsec.is_some() || fortinet.is_some())
-                && cleanup
-                    .is_some_and(|store| store.preparing_network(generation).unwrap_or(false))
-                && !self.recovery_lease_present(&guard, generation)?;
-            match (ipsec, fortinet) {
-                (Some(mut receipt), None) => {
-                    if !receipt.complete {
-                        if !staged {
-                            let mut attempt = Attempt::new(Backend::Ipsec, generation.to_owned());
-                            // The dead writer may have left the runtime drop-in.
-                            attempt.allowed = true;
-                            self.stop_unit(&attempt)?;
-                            self.revert_unit(&mut attempt)?;
-                            self.xfrm.clean(&guard, &directory, &receipt)?;
-                        }
-                        receipt.complete = true;
-                        receipt.save(&directory, &guard)?;
-                    }
-                }
-                (None, Some(mut receipt)) => {
-                    if !receipt.complete {
-                        if !staged {
-                            let mut attempt =
-                                Attempt::new(Backend::Fortinet, generation.to_owned());
-                            attempt.allowed = true;
-                            self.stop_unit(&attempt)?;
-                            self.revert_unit(&mut attempt)?;
-                            self.fortinet.clean(&guard, &directory, &receipt)?;
-                        }
-                        receipt.complete = true;
-                        receipt.save(&directory, &guard)?;
-                    }
-                }
-                (None, None) => continue,
-                (Some(_), Some(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "ambiguous network recovery receipt",
-                    ));
-                }
-            }
-            guard.withdraw(generation)?;
-            if let Some(cleanup) = cleanup {
-                cleanup.recovered(generation)?;
-            }
+            self.recover_generation(&guard, &entry.path(), generation, cleanup, None)?;
         }
         if let Some(cleanup) = cleanup {
             cleanup.finish_recovery(|id| self.recovery_lease_present(&guard, id.as_str()))?;
         }
         Ok(())
+    }
+
+    fn recover_generation(
+        &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        generation: &str,
+        cleanup: Option<&Store>,
+        pending: Option<&mut PendingCleanup>,
+    ) -> io::Result<()> {
+        require_private(directory)?;
+        let ipsec = absent_receipt(Receipt::load(directory, guard))?;
+        let fortinet = absent_receipt(fortinet_network::Receipt::load(directory, guard))?;
+        // An unreadable cleanup record cannot establish a staged plan.
+        // Still clean a valid network receipt and surface the read error
+        // when publishing the cleanup result.
+        let staged = (ipsec.is_some() || fortinet.is_some())
+            && cleanup.is_some_and(|store| store.preparing_network(generation).unwrap_or(false))
+            && !self.recovery_lease_present(guard, generation)?;
+        match (ipsec, fortinet) {
+            (Some(mut receipt), None) => {
+                if !receipt.complete {
+                    if !staged {
+                        self.prepare_recovery(Backend::Ipsec, generation, pending)?;
+                        self.xfrm.clean(guard, directory, &receipt)?;
+                    }
+                    receipt.complete = true;
+                    receipt.save(directory, guard)?;
+                }
+            }
+            (None, Some(mut receipt)) => {
+                if !receipt.complete {
+                    if !staged {
+                        self.prepare_recovery(Backend::Fortinet, generation, pending)?;
+                        self.fortinet.clean(guard, directory, &receipt)?;
+                    }
+                    receipt.complete = true;
+                    receipt.save(directory, guard)?;
+                }
+            }
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ambiguous network recovery receipt",
+                ));
+            }
+        }
+        guard.withdraw(generation)?;
+        if let Some(cleanup) = cleanup {
+            cleanup.recovered(generation)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_recovery(
+        &self,
+        backend: Backend,
+        generation: &str,
+        pending: Option<&mut PendingCleanup>,
+    ) -> io::Result<()> {
+        let mut attempt = Attempt::new(backend, generation.to_owned());
+        // Startup has no live stop evidence. An in-process retry only exists
+        // once the unit was stopped or the start was never requested.
+        if pending.is_none() {
+            self.stop_unit(&attempt)?;
+        }
+        attempt.allowed = pending.as_ref().is_none_or(|pending| pending.allowed);
+        self.revert_unit(&mut attempt)?;
+        if let Some(pending) = pending {
+            pending.allowed = false;
+        }
+        Ok(())
+    }
+
+    fn retry_pending_generation(&self, guard: &NetworkGuard) -> io::Result<bool> {
+        let mut pending = self.pending_cleanup.lock().expect("pending tunnel cleanup");
+        let Some(retry) = pending.as_mut() else {
+            return Ok(false);
+        };
+        let generation = retry.generation.clone();
+        let present = self.recovery_lease_present(guard, &generation)?;
+        if present {
+            let parent = self.runtime.join(INSTANCE_DIRECTORY);
+            require_private(&parent)?;
+            self.recover_generation(
+                guard,
+                &parent.join(&generation),
+                &generation,
+                None,
+                Some(retry),
+            )?;
+            if self.recovery_lease_present(guard, &generation)? {
+                return Err(io::Error::other(
+                    "pending generation lacks a network receipt",
+                ));
+            }
+        }
+        *pending = None;
+        Ok(present)
+    }
+
+    fn with_cleanup_guard(
+        &self,
+        attempt: &mut Attempt,
+        clean: impl FnOnce(&mut Attempt, &NetworkGuard) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
+        if attempt.cleanup_deferred && !self.recovery_lease_present(&guard, &attempt.generation)? {
+            // A new admission already retired this generation. Its old
+            // dialogue must not touch the replacement's network objects.
+            let directory = self
+                .runtime
+                .join(INSTANCE_DIRECTORY)
+                .join(&attempt.generation);
+            let complete = match attempt.backend {
+                Backend::Ipsec => Receipt::load(&directory, &guard)?.complete,
+                Backend::Fortinet => fortinet_network::Receipt::load(&directory, &guard)?.complete,
+            };
+            return if complete {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "deferred cleanup lacks a completed network receipt",
+                ))
+            };
+        }
+        let result = clean(attempt, &guard);
+        let mut pending = self.pending_cleanup.lock().expect("pending tunnel cleanup");
+        if result.is_err() && attempt.registered && !attempt.started {
+            attempt.cleanup_deferred = true;
+            *pending = Some(PendingCleanup {
+                generation: attempt.generation.clone(),
+                allowed: attempt.allowed,
+            });
+        } else if pending
+            .as_ref()
+            .is_some_and(|pending| pending.generation == attempt.generation)
+        {
+            *pending = None;
+        }
+        result
     }
 
     fn stop_unit(&self, attempt: &Attempt) -> io::Result<()> {
@@ -799,41 +910,46 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             }
             None => false,
         };
-        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
-        if attempt.started && !stopped {
-            self.stop_unit(attempt)?;
-            attempt.started = false;
-        }
-        let receipt = attempt
-            .receipt
-            .as_mut()
-            .expect("IPsec cleanup has a receipt");
-        let clean = if receipt.complete {
-            Ok(())
-        } else {
-            self.xfrm.clean(&guard, &directory, receipt)
-        };
-        // Even when a network read or delete failed, stop the producer.
-        if attempt.started {
-            self.stop_unit(attempt)?;
-            attempt.started = false;
-        }
-        let reverted = self.revert_unit(attempt);
-        clean?;
-        reverted?;
-        let receipt = attempt
-            .receipt
-            .as_mut()
-            .expect("IPsec cleanup has a receipt");
-        if !receipt.complete {
-            self.xfrm.verify_xfrm_clear(receipt)?;
-            receipt.complete = true;
-            if let Err(error) = receipt.save(&directory, &guard) {
-                receipt.complete = false;
-                return Err(error);
+        self.with_cleanup_guard(attempt, |attempt, guard| {
+            if attempt.started && !stopped {
+                self.stop_unit(attempt)?;
+                attempt.started = false;
             }
-        }
-        guard.withdraw(&attempt.generation)
+            let receipt = attempt
+                .receipt
+                .as_mut()
+                .expect("IPsec cleanup has a receipt");
+            let clean = if receipt.complete {
+                Ok(())
+            } else {
+                self.xfrm.clean_interface(guard, &directory, receipt)
+            };
+            // Even when a network read or delete failed, stop the producer.
+            if attempt.started {
+                self.stop_unit(attempt)?;
+                attempt.started = false;
+            }
+            let reverted = self.revert_unit(attempt);
+            clean?;
+            reverted?;
+            let receipt = attempt
+                .receipt
+                .as_mut()
+                .expect("IPsec cleanup has a receipt");
+            if !receipt.complete {
+                if attempt.credentials_sent {
+                    self.xfrm.clean_stopped_xfrm(guard, receipt)?;
+                } else {
+                    self.xfrm.verify_xfrm_clear(receipt)?;
+                }
+                receipt.complete = true;
+                if let Err(error) = receipt.save(&directory, guard) {
+                    receipt.complete = false;
+                    return Err(error);
+                }
+            }
+            guard.withdraw(&attempt.generation)
+        })
     }
 
     /// Stop the instance (it stops the client and reports `exited`), stop the
@@ -859,37 +975,38 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
                 eprintln!("vpnt-tunneld: instance did not confirm Stop: {error}");
             }
         }
-        let guard = (self.lock)(Instant::now() + self.limits.lock)?;
-        // The unit is stopped even when the instance confirmed: that is what
-        // proves no client or pppd outlives the attempt.
-        if attempt.started {
-            self.stop_unit(attempt)?;
-            attempt.started = false;
-        }
-        let reverted = self.revert_unit(attempt);
-        let receipt = attempt
-            .fortinet
-            .as_mut()
-            .expect("Fortinet cleanup has a receipt");
-        let clean = if receipt.complete {
-            Ok(())
-        } else {
-            self.fortinet.clean(&guard, &directory, receipt)
-        };
-        clean?;
-        reverted?;
-        let receipt = attempt
-            .fortinet
-            .as_mut()
-            .expect("Fortinet cleanup has a receipt");
-        if !receipt.complete {
-            receipt.complete = true;
-            if let Err(error) = receipt.save(&directory, &guard) {
-                receipt.complete = false;
-                return Err(error);
+        self.with_cleanup_guard(attempt, |attempt, guard| {
+            // The unit is stopped even when the instance confirmed: that is what
+            // proves no client or pppd outlives the attempt.
+            if attempt.started {
+                self.stop_unit(attempt)?;
+                attempt.started = false;
             }
-        }
-        guard.withdraw(&attempt.generation)
+            let reverted = self.revert_unit(attempt);
+            let receipt = attempt
+                .fortinet
+                .as_mut()
+                .expect("Fortinet cleanup has a receipt");
+            let clean = if receipt.complete {
+                Ok(())
+            } else {
+                self.fortinet.clean(guard, &directory, receipt)
+            };
+            clean?;
+            reverted?;
+            let receipt = attempt
+                .fortinet
+                .as_mut()
+                .expect("Fortinet cleanup has a receipt");
+            if !receipt.complete {
+                receipt.complete = true;
+                if let Err(error) = receipt.save(&directory, guard) {
+                    receipt.complete = false;
+                    return Err(error);
+                }
+            }
+            guard.withdraw(&attempt.generation)
+        })
     }
 
     fn teardown_before_ipsec(&self, attempt: &mut Attempt) -> io::Result<()> {
@@ -1425,6 +1542,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             xfrm: Network::default(),
             fortinet: FortinetNetwork::default(),
             lock,
+            pending_cleanup: Mutex::default(),
             limits,
         }
     }
@@ -2936,6 +3054,13 @@ mod tests {
         };
 
         const CHILD: &str = "VPNT_XFRM_FIXTURE_CHILD";
+        const PREVIOUS_UNIT: &str = "VPNT_XFRM_PREVIOUS_UNIT";
+
+        const OWNED_STATES: [(&str, &[u8]); 3] = [
+            ("0x126", b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x126 reqid 1 mode tunnel\n\tif_id 0x1\n"),
+            ("0x127", b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x127 reqid 1 mode tunnel\n\tmark 0x10/0xff\n\tif_id 0x1\n"),
+            ("0x128", b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x128 reqid 1 mode tunnel\n\tif_id 0x1\n"),
+        ];
 
         #[derive(Default)]
         struct Kernel {
@@ -2948,6 +3073,11 @@ mod tests {
             ignore_delete: bool,
             refuse_delete: bool,
             leftover_policy: bool,
+            disappearing_policy: bool,
+            leftover_state: bool,
+            orphan_states: [bool; 3],
+            conflicting_state_ids: bool,
+            overlapping_state_mark: bool,
             before_install: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
         }
 
@@ -3008,14 +3138,89 @@ mod tests {
                         vec![serde_json::json!({"family":"inet","local":"10.99.0.2","prefixlen":32})]
                     } else { vec![] }
                 }]),
-                ["xfrm", "state", "list", "nokeys"] => return Ok(vec![]),
+                ["xfrm", "state", "list", "nokeys"] => {
+                    let mut states = b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x124 reqid 2 mode tunnel\n\tif_id 0x2\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x125 reqid 3 mode tunnel\n".to_vec();
+                    if k.leftover_state {
+                        states.extend(b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x123 reqid 1 mode tunnel\n\tif_id 0x1\n");
+                    }
+                    for (present, (_, state)) in k.orphan_states.into_iter().zip(OWNED_STATES) {
+                        if present {
+                            states.extend_from_slice(state);
+                        }
+                    }
+                    if k.conflicting_state_ids {
+                        states.extend(b"src 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x129 reqid 1 mode tunnel\n\tif_id 0x2\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x12a reqid 4 mode tunnel\n\tif_id 0x1\nsrc 192.0.2.20 dst 192.0.2.2\n\tproto esp spi 0x12b reqid 1 mode tunnel\n");
+                    }
+                    if k.overlapping_state_mark {
+                        states.extend(b"src 192.0.2.2 dst 192.0.2.20\n\tproto esp spi 0x127 reqid 4 mode tunnel\n\tmark 0x10/0xf0\n\tif_id 0x2\n");
+                    }
+                    return Ok(states);
+                }
+                ["xfrm", "state", "delete", "src", "192.0.2.20", "dst", "192.0.2.2", "proto", "esp", "spi", spi @ ("0x126" | "0x128")]
+                | ["xfrm", "state", "delete", "src", "192.0.2.2", "dst", "192.0.2.20", "proto", "esp", "spi", spi @ "0x127", "mark", "16", "mask", "255"] => {
+                    assert!(fs::read_to_string(runtime.parent().unwrap().join("systemctl.log"))
+                        .unwrap().lines().any(|line| line.starts_with("stop -- ")));
+                    let index = OWNED_STATES.iter().position(|(id, _)| id == spi).unwrap();
+                    assert!(std::mem::take(&mut k.orphan_states[index]));
+                    if *spi == "0x128" {
+                        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                    }
+                    return Ok(vec![]);
+                }
+                ["xfrm", "state", "delete", "src", _, "dst", _, "proto", "esp", "spi", "0x123"] => {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                ["xfrm", "state", "delete", "src", _, "dst", _, "proto", "esp", "spi", spi, ..] => {
+                    return Err(io::Error::other(format!("fixture refused deletion of foreign ESP SPI {spi}")));
+                }
                 ["xfrm", "policy", "list"] if k.leftover_policy => return Ok(
                     b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out priority 1\n\tif_id 0x1\n".to_vec()
                 ),
                 ["xfrm", "policy", "list"] => return Ok(vec![]),
+                ["-s", "xfrm", "policy", "list", "nosock"] => {
+                    let mut policies = Vec::new();
+                    if k.leftover_policy {
+                        policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 17 priority 1\n\tif_id 0x1\n");
+                    }
+                    if k.disappearing_policy {
+                        policies.extend(b"src 10.20.0.0/15 dst 10.99.0.2/32\n\tdir fwd index 26 priority 1\n\tif_id 0x1\n");
+                    }
+                    policies.extend(b"src 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 33 priority 1\n\tif_id 0x2\nsrc 10.99.0.2/32 dst 10.20.0.0/15\n\tdir out index 49 priority 1\n");
+                    return Ok(policies);
+                }
+                ["xfrm", "policy", "delete", "index", "17", "dir", "out", "if_id", "1"] => {
+                    assert!(
+                        fs::read_to_string(runtime.parent().unwrap().join("systemctl.log"))
+                            .unwrap()
+                            .lines()
+                            .any(|line| line.starts_with("stop -- ")),
+                        "policy deletion before unit stop",
+                    );
+                    if k.refuse_delete {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    }
+                    assert!(std::mem::take(&mut k.leftover_policy));
+                    return Ok(vec![]);
+                }
+                ["xfrm", "policy", "delete", "index", "26", "dir", "fwd", "if_id", "1"] => {
+                    assert!(std::mem::take(&mut k.disappearing_policy));
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                ["xfrm", "policy", "delete", "index", "33", "dir", "out", "if_id", "2"] => {
+                    return Err(io::Error::other("fixture refused deletion of foreign if_id 2"));
+                }
                 ["link", "add", "name", "vpnti1", "type", "xfrm", "dev", "eth-fixture", "if_id", "1"] => {
-                    let receipt = fs::read_dir(runtime.join(INSTANCE_DIRECTORY)).unwrap().next().unwrap().unwrap()
-                        .path().join(crate::tunneld::network::RECEIPT);
+                    let parent = runtime.join(INSTANCE_DIRECTORY);
+                    let directory = match started_unit(&runtime.parent().unwrap().join("systemctl.log")) {
+                        Some(unit) => parent.join(generation_of(&unit)),
+                        None => {
+                            let mut entries = fs::read_dir(&parent).unwrap();
+                            let directory = entries.next().unwrap().unwrap().path();
+                            assert!(entries.next().is_none(), "ambiguous fixture receipt");
+                            directory
+                        }
+                    };
+                    let receipt = directory.join(crate::tunneld::network::RECEIPT);
                     let bytes = fs::read(receipt).unwrap();
                     let intent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(intent["creating"], true);
@@ -3051,6 +3256,8 @@ mod tests {
                     assert!(k.routes.is_empty() && !k.address, "delete order");
                     if !k.ignore_delete {
                         k.link = false;
+                        k.alias = None;
+                        k.up = false;
                     }
                     return Ok(vec![]);
                 }
@@ -3067,7 +3274,9 @@ mod tests {
             };
             let deadline = Instant::now() + Duration::from_secs(10);
             let unit = loop {
-                if let Some(unit) = started_unit(&root.join("systemctl.log")) {
+                if let Some(unit) = started_unit(&root.join("systemctl.log"))
+                    && std::env::var(PREVIOUS_UNIT).as_deref() != Ok(unit.as_str())
+                {
                     break unit;
                 }
                 assert!(Instant::now() < deadline, "instance unit never queued");
@@ -3867,6 +4076,7 @@ mod tests {
         }
 
         fn supervisor(harness: &Harness) -> Reaper {
+            let previous = started_unit(&harness.log).unwrap_or_default();
             Reaper(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -3876,6 +4086,7 @@ mod tests {
                     ])
                     .env_clear()
                     .env(CHILD, &harness.root)
+                    .env(PREVIOUS_UNIT, previous)
                     .spawn()
                     .unwrap(),
             )
@@ -3940,11 +4151,56 @@ mod tests {
                     }
                     command(&mut client, b"{\"op\":\"status\"}\n", State::CleanupPending);
                     assert_eq!(harness.leases().len(), 1);
-                    kernel.lock().unwrap().refuse_delete = false;
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        k.refuse_delete = false;
+                        k.leftover_state = true;
+                    }
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        k.leftover_state = false;
+                        k.orphan_states[1] = true;
+                        k.overlapping_state_mark = true;
+                    }
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        assert!(k.orphan_states[1], "ambiguous ESP state was deleted");
+                        k.overlapping_state_mark = false;
+                        k.conflicting_state_ids = true;
+                    }
+                    command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                    assert_eq!(harness.leases().len(), 1);
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        assert!(k.conflicting_state_ids);
+                        assert_eq!(
+                            k.ops
+                                .iter()
+                                .filter(|op| op.starts_with("xfrm state delete "))
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                            [
+                                "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x123",
+                                "xfrm state delete src 192.0.2.2 dst 192.0.2.20 proto esp spi 0x127 mark 16 mask 255",
+                            ]
+                        );
+                        k.conflicting_state_ids = false;
+                    }
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
                 } else if exit {
-                    fs::write(harness.root.join("exit-now"), b"").unwrap();
-                    assert!(process.0.wait().unwrap().success());
+                    {
+                        let mut k = kernel.lock().unwrap();
+                        k.leftover_policy = true;
+                        k.disappearing_policy = true;
+                        k.orphan_states = [true; 3];
+                    }
+                    use std::os::unix::process::ExitStatusExt;
+                    process.0.kill().unwrap();
+                    assert_eq!(process.0.wait().unwrap().signal(), Some(libc::SIGKILL));
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while !harness.leases().is_empty() {
                         assert!(
@@ -3978,10 +4234,11 @@ mod tests {
                         let mut k = kernel.lock().unwrap();
                         k.ignore_delete = false;
                         k.leftover_policy = true;
+                        k.refuse_delete = true;
                     }
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::CleanupPending);
                     assert_eq!(harness.leases().len(), 1);
-                    kernel.lock().unwrap().leftover_policy = false;
+                    kernel.lock().unwrap().refuse_delete = false;
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
                 } else {
                     command(&mut client, b"{\"op\":\"stop\"}\n", State::Stopped);
@@ -3990,9 +4247,31 @@ mod tests {
                 drop(client);
                 assert!(worker.join().is_ok());
             });
-            assert!(process.0.wait().unwrap().success());
+            let status = process.0.wait().unwrap();
+            if !exit || unproven {
+                assert!(status.success());
+            }
             let k = kernel.lock().unwrap();
             assert!(!k.link && !k.address && k.routes.is_empty());
+            assert!(!k.leftover_policy && !k.disappearing_policy);
+            if exit && !unproven {
+                assert_eq!(k.orphan_states, [false; 3]);
+                assert_eq!(
+                    k.ops
+                        .iter()
+                        .filter(|op| op.starts_with("xfrm state delete ")
+                            || op.starts_with("xfrm policy delete "))
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    [
+                        "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x126",
+                        "xfrm state delete src 192.0.2.2 dst 192.0.2.20 proto esp spi 0x127 mark 16 mask 255",
+                        "xfrm state delete src 192.0.2.20 dst 192.0.2.2 proto esp spi 0x128",
+                        "xfrm policy delete index 17 dir out if_id 1",
+                        "xfrm policy delete index 26 dir fwd if_id 1",
+                    ]
+                );
+            }
             assert!(harness.leases().is_empty());
             assert_systemctl_order(&harness);
         }
@@ -4274,6 +4553,88 @@ mod tests {
                 true,
                 true,
             );
+        }
+
+        #[test]
+        fn admission_retries_only_a_stopped_generation_with_pending_cleanup() {
+            if !namespaced_in(
+                "admission_retries_only_a_stopped_generation_with_pending_cleanup",
+                "tests::xfrm_tests",
+            ) {
+                return;
+            }
+            let harness = Harness::new();
+            let policy = PolicyFixture::new();
+            policy.install();
+            harness.flag("negotiated-route", true);
+            let mut first_process = supervisor(&harness);
+            let kernel = Arc::new(Mutex::new(Kernel::default()));
+            let mut launcher = harness.launcher(false);
+            launcher.xfrm = fake_network(harness.runtime.clone(), kernel.clone());
+            thread::scope(|scope| {
+                let connect = || UnixStream::pair().unwrap();
+                let busy = || {
+                    let (mut client, stream) = connect();
+                    let worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                    client_prepare(&mut client);
+                    client_credentials(&mut client);
+                    assert!(matches!(
+                        response(&client),
+                        Response::Error {
+                            code: ErrorCode::Busy
+                        }
+                    ));
+                    worker.join().unwrap().unwrap();
+                };
+                let (mut first, stream) = connect();
+                let first_worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut first);
+                client_credentials(&mut first);
+                command(&mut first, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                let original = harness.leases();
+                let live_log = harness.log();
+                busy();
+                assert_eq!(harness.leases(), original);
+                assert_eq!(harness.log(), live_log);
+
+                kernel.lock().unwrap().leftover_state = true;
+                command(&mut first, b"{\"op\":\"stop\"}\n", State::CleanupPending);
+                assert!(first_process.0.wait().unwrap().success());
+                busy();
+                assert_eq!(harness.leases(), original);
+                kernel.lock().unwrap().leftover_state = false;
+
+                let mut second_process = supervisor(&harness);
+                let (mut second, stream) = connect();
+                let second_worker = scope.spawn(|| serve_fixture(stream, &policy.store, &launcher));
+                client_prepare(&mut second);
+                client_credentials(&mut second);
+                command(&mut second, b"{\"op\":\"status\"}\n", State::NetworkReady);
+                let replacement = harness.leases();
+                assert_eq!(replacement.len(), 1);
+                assert_ne!(replacement, original);
+
+                // The old dialogue can still retry Stop. It cannot delete the
+                // replacement generation's resources even when IDs were reused.
+                command(&mut first, b"{\"op\":\"stop\"}\n", State::Stopped);
+                assert_eq!(harness.leases(), replacement);
+                assert!(kernel.lock().unwrap().link);
+                command(&mut second, b"{\"op\":\"stop\"}\n", State::Stopped);
+                drop(first);
+                drop(second);
+                for result in [first_worker.join().unwrap(), second_worker.join().unwrap()] {
+                    assert!(
+                        result.is_ok()
+                            || matches!(
+                                result,
+                                Err(protocol::FrameError::Io(io::ErrorKind::UnexpectedEof))
+                            ),
+                        "{result:?}"
+                    );
+                }
+                assert!(second_process.0.wait().unwrap().success());
+            });
+            assert!(harness.leases().is_empty());
         }
 
         #[test]

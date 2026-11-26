@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, btree_map::Entry},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
@@ -292,6 +292,143 @@ fn number(s: &str) -> io::Result<u32> {
     s.strip_prefix("0x")
         .map_or_else(|| s.parse(), |hex| u32::from_str_radix(hex, 16))
         .map_err(|_| invalid("invalid XFRM identifier"))
+}
+
+fn xfrm_mark(text: &str) -> io::Result<(u32, u32)> {
+    let (value, mask) = text
+        .split_once('/')
+        .ok_or_else(|| invalid("missing XFRM mark mask"))?;
+    Ok((number(value)?, number(mask)?))
+}
+
+struct EspState {
+    src: IpAddr,
+    dst: IpAddr,
+    spi: u32,
+    reqid: u32,
+    if_id: Option<u32>,
+    mark: Option<(u32, u32)>,
+}
+
+fn esp_states(text: &str) -> io::Result<Vec<EspState>> {
+    let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
+    let mut states = Vec::new();
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_ascii_whitespace().collect();
+        let ["src", src, "dst", dst] = fields.as_slice() else {
+            return Err(invalid("unrecognized XFRM state header"));
+        };
+        let mut identity = None;
+        let mut if_id = None;
+        let mut mark = None;
+        for line in std::iter::from_fn(|| lines.next_if(|line| line.starts_with('\t'))) {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            match fields.as_slice() {
+                ["proto", _, ..] if identity.is_none() => identity = Some(fields),
+                ["proto", ..] => return Err(invalid("ambiguous XFRM state protocol")),
+                ["if_id", value] if if_id.is_none() => if_id = Some(number(value)?),
+                ["if_id", ..] => return Err(invalid("invalid XFRM state if_id")),
+                ["mark", value, ..] if mark.is_none() => mark = Some(xfrm_mark(value)?),
+                ["mark", ..] => return Err(invalid("invalid XFRM state mark")),
+                _ => {}
+            }
+        }
+        let fields = identity.ok_or_else(|| invalid("missing XFRM state protocol"))?;
+        if fields[1] != "esp" {
+            continue;
+        }
+        let field = |name| {
+            fields
+                .windows(2)
+                .find(|pair| pair[0] == name)
+                .ok_or_else(|| invalid("incomplete ESP state key"))
+                .and_then(|pair| number(pair[1]))
+        };
+        let src: IpAddr = src
+            .parse()
+            .map_err(|_| invalid("invalid ESP source address"))?;
+        let dst: IpAddr = dst
+            .parse()
+            .map_err(|_| invalid("invalid ESP destination address"))?;
+        if src.is_ipv4() != dst.is_ipv4() {
+            return Err(invalid("inconsistent ESP address family"));
+        }
+        states.push(EspState {
+            src,
+            dst,
+            spi: field("spi")?,
+            reqid: field("reqid")?,
+            if_id,
+            mark,
+        });
+    }
+    Ok(states)
+}
+
+struct XfrmPolicyKey<'a> {
+    index: u32,
+    direction: &'a str,
+    if_id: u32,
+    policy_type: Option<&'a str>,
+    mark: Option<(u32, u32)>,
+}
+
+fn xfrm_policy_keys(text: &str, owner: u32) -> io::Result<Vec<XfrmPolicyKey<'_>>> {
+    let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
+    let mut keys = Vec::new();
+    while let Some(header) = lines.next() {
+        if !header.starts_with("src ") {
+            return Err(invalid("unrecognized XFRM policy dump"));
+        }
+        let mut direction = None;
+        let mut mark = None;
+        let mut if_id = None;
+        for line in std::iter::from_fn(|| lines.next_if(|line| line.starts_with('\t'))) {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            match fields.as_slice() {
+                ["if_id", value] if if_id.is_none() => if_id = Some(number(value)?),
+                ["if_id", ..] => return Err(invalid("invalid XFRM policy if_id")),
+                ["dir", ..] if direction.is_none() => direction = Some(fields),
+                ["dir", ..] => return Err(invalid("ambiguous XFRM policy direction")),
+                ["mark", value] if mark.is_none() => mark = Some(*value),
+                ["mark", ..] => return Err(invalid("invalid XFRM policy mark")),
+                _ => {}
+            }
+        }
+        let Some(if_id) = if_id.filter(|if_id| *if_id == owner) else {
+            continue;
+        };
+        let Some(fields) = direction else {
+            return Err(invalid("missing XFRM policy direction"));
+        };
+        let ["dir", direction @ ("out" | "in" | "fwd"), ..] = fields.as_slice() else {
+            return Err(invalid("invalid XFRM policy direction"));
+        };
+        let field = |name| {
+            fields
+                .windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1])
+        };
+        let index = field("index")
+            .map(number)
+            .transpose()?
+            .filter(|index| *index != 0)
+            .ok_or_else(|| invalid("missing XFRM policy index"))?;
+        let policy_type = field("ptype");
+        if !matches!(policy_type, None | Some("main" | "sub")) {
+            return Err(invalid("invalid XFRM policy type"));
+        }
+        let mark = mark.map(xfrm_mark).transpose()?;
+        keys.push(XfrmPolicyKey {
+            index,
+            direction,
+            if_id,
+            policy_type,
+            mark,
+        });
+    }
+    Ok(keys)
 }
 
 pub(super) fn cidr_text(cidr: &CidrV4) -> String {
@@ -1114,14 +1251,23 @@ impl Network {
 
     pub(super) fn clean(
         &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        receipt: &Receipt,
+    ) -> io::Result<()> {
+        self.clean_interface(guard, directory, receipt)?;
+        self.clean_stopped_xfrm(guard, receipt)
+    }
+
+    pub(super) fn clean_interface(
+        &self,
         _guard: &NetworkGuard,
         directory: &Path,
         receipt: &Receipt,
     ) -> io::Result<()> {
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
-        self.clean_link(receipt)?;
-        self.verify_xfrm_clear(receipt)
+        self.clean_link(receipt)
     }
 
     // State and policies belong to the still-running instance. The immediate
@@ -1174,9 +1320,121 @@ impl Network {
     }
 
     pub(super) fn verify_xfrm_clear(&self, receipt: &Receipt) -> io::Result<()> {
-        let ids = self.xfrm_ids()?;
-        if ids.0.contains(&receipt.if_id) || ids.1.contains(&u32::from(receipt.reqid)) {
+        Self::verify_xfrm_ids(receipt, self.xfrm_ids()?)
+    }
+
+    fn verify_xfrm_ids(
+        receipt: &Receipt,
+        (if_ids, reqids): (Vec<u32>, Vec<u32>),
+    ) -> io::Result<()> {
+        if if_ids.contains(&receipt.if_id) || reqids.contains(&u32::from(receipt.reqid)) {
             return Err(invalid("XFRM state or policy still occupies reserved IDs"));
+        }
+        Ok(())
+    }
+
+    /// The producer's unit has stopped and the writer lock is held.
+    pub(super) fn clean_stopped_xfrm(
+        &self,
+        _guard: &NetworkGuard,
+        receipt: &Receipt,
+    ) -> io::Result<()> {
+        let ids = self.xfrm_ids()?;
+        if !ids.0.contains(&receipt.if_id) {
+            return Self::verify_xfrm_ids(receipt, ids);
+        }
+        self.delete_orphaned_esp(receipt)?;
+        let bytes = self.ip(&["-s", "xfrm", "policy", "list", "nosock"])?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM policy dump"))?;
+        for key in xfrm_policy_keys(text, receipt.if_id)? {
+            // The kernel matches if_id under its policy lock, even if the
+            // policy disappeared or its index was reused after the dump.
+            let index = key.index.to_string();
+            let if_id = key.if_id.to_string();
+            let mut args = vec![
+                "xfrm",
+                "policy",
+                "delete",
+                "index",
+                &index,
+                "dir",
+                key.direction,
+                "if_id",
+                &if_id,
+            ];
+            if let Some(policy_type) = key.policy_type {
+                args.extend(["ptype", policy_type]);
+            }
+            let mark;
+            let mask;
+            if let Some((value, bits)) = key.mark {
+                mark = value.to_string();
+                mask = bits.to_string();
+                args.extend(["mark", &mark, "mask", &mask]);
+            }
+            if let Err(error) = self.ip(&args)
+                && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("delete XFRM policy {index} {}: {error}", key.direction),
+                ));
+            }
+        }
+        self.verify_xfrm_clear(receipt)
+    }
+
+    fn delete_orphaned_esp(&self, receipt: &Receipt) -> io::Result<()> {
+        let bytes = self.ip(&["xfrm", "state", "list", "nokeys"])?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM state dump"))?;
+        let states = esp_states(text)?;
+        let owned: Vec<_> = states
+            .iter()
+            .filter(|state| {
+                state.reqid == u32::from(receipt.reqid) && state.if_id == Some(receipt.if_id)
+            })
+            .collect();
+        for state in &owned {
+            let (value, mask) = state.mark.unwrap_or_default();
+            // iproute2 omits zero-effective marks. Older kernels also match
+            // the request against each entry's mask, so reject an alias.
+            if state.spi == 0 || value & mask != value || value == 0 && mask != 0 {
+                return Err(invalid("ESP state key is not representable by iproute2"));
+            }
+            if states.iter().any(|other| {
+                let (other_value, other_mask) = other.mark.unwrap_or_default();
+                !std::ptr::eq(*state, other)
+                    && state.dst == other.dst
+                    && state.spi == other.spi
+                    && value & other_mask == other_value
+            }) {
+                return Err(invalid("ambiguous ESP state deletion key"));
+            }
+        }
+        for state in owned {
+            // The vpnt lock cannot prevent an external writer from replacing
+            // an SA with the same kernel key between this dump and deletion.
+            let src = state.src.to_string();
+            let dst = state.dst.to_string();
+            let spi = format!("{:#x}", state.spi);
+            let mut args = vec![
+                "xfrm", "state", "delete", "src", &src, "dst", &dst, "proto", "esp", "spi", &spi,
+            ];
+            let mark;
+            let mask;
+            if let Some((value, bits)) = state.mark {
+                mark = value.to_string();
+                mask = bits.to_string();
+                args.extend(["mark", &mark, "mask", &mask]);
+            }
+            if let Err(error) = self.ip(&args)
+                && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("delete XFRM ESP state SPI {spi}: {error}"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1249,6 +1507,20 @@ fn run_command(
                 drain(&mut stdout, &mut output)?;
                 drain(&mut stderr, &mut diagnostics)?;
                 if !status.success() {
+                    if program == "/usr/bin/ip"
+                        && matches!(args, ["xfrm", "policy" | "state", "delete", ..])
+                        && status.code() == Some(2)
+                    {
+                        match diagnostics.as_slice() {
+                            b"RTNETLINK answers: No such file or directory\n" => {
+                                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                            }
+                            b"RTNETLINK answers: No such process\n" => {
+                                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                            }
+                            _ => {}
+                        }
+                    }
                     return Err(io::Error::other(format!("{program} exited with {status}")));
                 }
                 // iproute2 can print an interrupted-dump warning with a zero exit.
