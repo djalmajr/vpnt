@@ -3,7 +3,7 @@
 //! bookkeeping that a later launch reads.
 use super::dispatch::dispatch_with_diagnostics;
 use super::*;
-use crate::preferences::ProbeInterval;
+use crate::{diagnostic_sink::Memory, preferences::ProbeInterval};
 
 struct InertAttempt;
 impl Attempt for InertAttempt {
@@ -105,7 +105,7 @@ fn dispatch_diagnostics_record_slot_and_generation_rejections_and_disconnects() 
                 &interval,
                 false,
                 false,
-                &mut diagnostics,
+                &mut Memory(&mut diagnostics),
             );
             std::mem::take(&mut output)
         };
@@ -174,7 +174,7 @@ fn dispatch_diagnostics_record_slot_and_generation_rejections_and_disconnects() 
             &interval,
             false,
             false,
-            &mut diagnostics,
+            &mut Memory(&mut diagnostics),
         );
         assert!(matches!(
             output.get(1),

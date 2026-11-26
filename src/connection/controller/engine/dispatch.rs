@@ -1,4 +1,5 @@
 use super::*;
+use crate::diagnostic_sink::{self, Sink};
 
 #[cfg(target_os = "macos")]
 pub(super) fn dispatch_sign_reply(
@@ -46,7 +47,7 @@ pub(super) fn dispatch<F: Factory>(
         interval,
         cleanup_capable,
         failure_capable,
-        &mut std::io::stderr(),
+        &mut &diagnostic_sink::ENGINE,
     );
 }
 
@@ -62,7 +63,7 @@ pub(super) fn dispatch_with_diagnostics<F: Factory>(
     interval: &ProbeClock,
     cleanup_capable: bool,
     failure_capable: bool,
-    diagnostics: &mut impl std::io::Write,
+    diagnostics: &mut impl Sink,
 ) {
     let fail = |output: &mut VecDeque<_>, error| {
         output.push_back(Message::Failed {
@@ -142,10 +143,9 @@ pub(super) fn dispatch_with_diagnostics<F: Factory>(
         fail(output, error);
         let slot_generation =
             slot_generation.map_or_else(|| "none".into(), |value| value.to_string());
-        let _ = writeln!(
-            diagnostics,
+        diagnostics.record(format!(
             "vpnt-helper: engine: command={command} event=failed id={diagnostic_id} generation={generation} slot_generation={slot_generation} error={error:?}"
-        );
+        ));
     };
     let Some(slot) = slots.get_mut(id) else {
         reject(output, None, ErrorCode::ProfileNotFound);
@@ -210,10 +210,9 @@ pub(super) fn dispatch_with_diagnostics<F: Factory>(
             } else {
                 ConnectionState::Off
             };
-            let _ = writeln!(
-                diagnostics,
+            diagnostics.record(format!(
                 "vpnt-helper: engine: command=disconnect event=accepted id={diagnostic_id} generation={generation} worker={worker}"
-            );
+            ));
         }
         Command::Probe { .. } => {
             if let Some(worker) = &slot.worker

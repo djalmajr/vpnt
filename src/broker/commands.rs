@@ -332,10 +332,9 @@ impl<S: SecretStore> Broker<S> {
             None
         };
         if let Some(command) = diagnostic_command {
-            let _ = writeln!(
-                self.diagnostic_output,
+            self.diagnostic_output.record(format!(
                 "vpnt: broker: command={command} event=submitted id={id} generation={generation}"
-            );
+            ));
         }
         c.pending = Some(Pending {
             id: request,

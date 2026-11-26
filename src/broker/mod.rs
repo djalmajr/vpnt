@@ -28,6 +28,7 @@ mod signer;
 mod snapshot;
 use crate::{
     bridge::Command,
+    diagnostic_sink::{self, Sink},
     helper::{
         client::{Client, Error},
         protocol::{self, Message, Request},
@@ -39,7 +40,6 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    io::{self, Write},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -68,7 +68,7 @@ fn needs_credentials(kind: VpnKind) -> bool {
 }
 
 pub struct Broker<S: SecretStore> {
-    diagnostic_output: Box<dyn Write + Send>,
+    diagnostic_output: Box<dyn Sink>,
     client: Option<Client>,
     retry: Option<retry::Retry>,
     secrets: S,
@@ -146,7 +146,7 @@ impl<S: SecretStore> Broker<S> {
         #[cfg(target_os = "linux")]
         let expected_build = crate::helper::client::linux_build_identity();
         let mut result = Self {
-            diagnostic_output: Box::new(io::stderr()),
+            diagnostic_output: Box::new(&diagnostic_sink::BROKER),
             client,
             retry: None,
             secrets,
@@ -394,10 +394,9 @@ impl<S: SecretStore> Broker<S> {
                     {
                         if let Some(command) = p.diagnostic_command {
                             let generation = c.generation;
-                            let _ = writeln!(
-                                self.diagnostic_output,
+                            self.diagnostic_output.record(format!(
                                 "vpnt: broker: command={command} event=accepted id={profile} generation={generation}"
-                            );
+                            ));
                         }
                         p.accepted = true;
                     }
@@ -466,10 +465,9 @@ impl<S: SecretStore> Broker<S> {
                             rejected = true;
                         }
                         if let Some(command) = pending.diagnostic_command {
-                            let _ = writeln!(
-                                self.diagnostic_output,
+                            self.diagnostic_output.record(format!(
                                 "vpnt: broker: command={command} event=failed id={profile} generation={generation} error={error:?} restored={restored}"
-                            );
+                            ));
                         }
                     }
                 }

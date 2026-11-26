@@ -5,12 +5,14 @@ use crate::{
         session::SignError,
         signing::{Hash, Padding},
     },
+    diagnostic_sink::Memory,
     helper::protocol::{
         ErrorCode, PssHashName, PssOperation, PssPaddingName, SignDataBytes, SignFields,
         SignOperation, SignOperationName, TunnelStatus,
     },
 };
 use std::{
+    io::{self, Write},
     sync::{
         Arc, Condvar, Mutex,
         atomic::AtomicBool,
@@ -44,7 +46,7 @@ fn connection_diagnostics_report_only_ids_generations_and_codes() {
         .profile
         .name = "private profile".into();
     let capture = Capture::default();
-    wire.broker.diagnostic_output = Box::new(capture.clone());
+    wire.broker.diagnostic_output = Box::new(Memory(capture.clone()));
 
     for accepted in [false, true] {
         let id = wire.submit_connect("ssl", State::Connecting);
