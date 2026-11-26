@@ -69,6 +69,7 @@ def main():
     scripts = ['identifiers.py', 'check-installation.py', 'check-app-component.py', 'prepare-installation.py', 'package-installation.py', 'installation_package.py', 'package-app.py', 'app_component.py']
     inputs = [p for folder in ['src', 'tests', 'ui/src/locales'] for p in sorted((ROOT / folder).rglob('*')) if p.is_file() and '__pycache__' not in p.parts]
     inputs += [ROOT / 'scripts/macos' / name for name in scripts]
+    inputs.append(ROOT / 'assets/macos/AppIcon.icns')
     inputs += build_inputs.source_files(ROOT)
     unique, seen = [], set()
     for path in sorted(inputs, key=lambda p: str(p.relative_to(ROOT))):
@@ -83,6 +84,8 @@ def main():
         with tempfile.TemporaryDirectory(prefix='vpnt-copy-', dir=REPORTS) as temporary:
             copy = Path(temporary)
             for name in ['Cargo.toml', 'Cargo.lock', 'LICENSE']: shutil.copy2(ROOT / name, copy / name)
+            (copy / 'assets/macos').mkdir(parents=True)
+            shutil.copy2(ROOT / 'assets/macos/AppIcon.icns', copy / 'assets/macos/AppIcon.icns')
             for name in ['src', 'tests', 'scripts/macos/patches', 'ui/src/locales']: shutil.copytree(ROOT / name, copy / name, ignore=shutil.ignore_patterns('__pycache__'))
             for name in scripts: shutil.copy2(ROOT / 'scripts/macos' / name, copy / 'scripts/macos' / name)
             build_inputs.copy_into(ROOT, copy)

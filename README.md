@@ -55,7 +55,7 @@ VPNT_CHANNEL=prd python3 scripts/macos/build-askpass.py
 VPNT_CHANNEL=prd python3 scripts/macos/build-runtime.py
 VPNT_CHANNEL=prd python3 scripts/macos/prepare-installation.py
 VPNT_CHANNEL=prd python3 scripts/macos/package-installation.py --payload "target/vpnt-installation/ID_DO_PAYLOAD"
-VPNT_CHANNEL=prd python3 scripts/macos/package-app.py --output target/prd/vpnt.app
+VPNT_CHANNEL=prd python3 scripts/macos/package-app.py --output "target/prd/VPN Tray.app" --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
 ```
 
 Os empacotadores leem uma seção Mach-O gravada no build para recusar binários
@@ -124,10 +124,13 @@ Para criar um pacote de desenvolvimento local, sem instalar:
 ```bash
 python3 scripts/macos/package-app.py
 python3 scripts/macos/build-askpass.py
-open target/vpnt.app --args --demo --show
+open "target/VPN Tray.app" --args --demo --show
 ```
 
-O pacote é gerado em `target/vpnt.app`, sem assinatura nem notarização. Use
+O pacote é gerado em `target/VPN Tray.app`, sem assinatura nem notarização, com o
+ícone de `assets/macos/AppIcon.icns`. Depois de editar `assets/macos/AppIcon.svg`,
+regenere o `.icns` com `python3 scripts/macos/build-app-icon.py` (requer
+`rsvg-convert`). Use
 `--replace` para substituir um pacote anterior do VPN Tray nesse destino. Isso
 não instala programas de VPN, componentes privilegiados ou regras do sudoers.
 O askpass é produzido separadamente em `target/debug/vpnt-askpass`, sem instalar
@@ -243,7 +246,7 @@ Para incluir esse componente no próprio `.app`, use o payload admitido:
 
 ```bash
 python3 scripts/macos/package-app.py --replace --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
-target/vpnt.app/Contents/MacOS/vpnt --inspect-component
+"target/VPN Tray.app/Contents/MacOS/vpnt" --inspect-component
 ```
 
 O empacotador audita o `.pkg` antes de copiá-lo e vincula seus hashes à versão,
