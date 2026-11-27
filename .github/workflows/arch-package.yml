@@ -43,6 +43,11 @@ jobs:
             # Build against the same libraries as a machine on a frozen mirror.
             printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' \
               "$ARCHIVE_DATE" > /etc/pacman.d/mirrorlist
+            # A rolling image may carry the openssl-3 compat package, whose
+            # libraries collide with an older openssl 3 from the snapshot.
+            if pacman -Q openssl-3 >/dev/null 2>&1; then
+              pacman -Rdd --noconfirm openssl-3
+            fi
             sync=-Syyuu
           fi
           pacman "$sync" --noconfirm --needed git unzip namcap rust \
