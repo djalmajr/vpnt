@@ -5,6 +5,11 @@ name: Arch package
 # developer machine. Runs on demand and when the packaging changes.
 on:
   workflow_dispatch:
+    inputs:
+      archive_date:
+        description: "Arch Linux Archive snapshot date (YYYY/MM/DD)"
+        required: false
+        type: string
   pull_request:
     paths:
       - packaging/**
@@ -25,8 +30,22 @@ jobs:
       image: archlinux:base-devel
     steps:
       - name: Install build dependencies
+        shell: bash
+        env:
+          ARCHIVE_DATE: ${{ inputs.archive_date }}
         run: |
-          pacman -Syu --noconfirm --needed git unzip namcap rust \
+          sync=-Syu
+          if [[ -n "$ARCHIVE_DATE" ]]; then
+            if [[ ! "$ARCHIVE_DATE" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]]; then
+              echo "archive_date must use YYYY/MM/DD" >&2
+              exit 1
+            fi
+            # Build against the same libraries as a machine on a frozen mirror.
+            printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' \
+              "$ARCHIVE_DATE" > /etc/pacman.d/mirrorlist
+            sync=-Syyuu
+          fi
+          pacman "$sync" --noconfirm --needed git unzip namcap rust \
             webkit2gtk-4.1 gtk3 libayatana-appindicator autoconf automake pkgconf openssl \
             openvpn libsecret iproute2 systemd xdg-utils strongswan ppp
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -44,16 +63,43 @@ jobs:
           bun_dir=$(dirname "$(command -v bun)")
           su builder -c "export PATH='$bun_dir':\$PATH; cd '$GITHUB_WORKSPACE' && bash packaging/arch/build.sh"
       - name: Inspect the package
+        shell: bash
         run: |
           pkg=$(ls packaging/arch/vpnt-*.pkg.tar.zst)
           sha256sum "$pkg"
-          if pacman -Qlp "$pkg" | grep -i sudoers; then
+          files=$(pacman -Qlp "$pkg")
+          if grep -i sudoers <<< "$files"; then
             echo "the package must not install sudoers" >&2
             exit 1
           fi
           for binary in vpnt-tunneld vpnt-pinentry openfortivpn; do
-            if ! pacman -Qlp "$pkg" | grep -qE "usr/lib/vpnt/$binary\$"; then
+            if ! grep -qE "usr/lib/vpnt/$binary\$" <<< "$files"; then
               echo "the package is missing usr/lib/vpnt/$binary" >&2
+              exit 1
+            fi
+          done
+          depends=$(LC_ALL=C COLUMNS=4096 pacman -Qip "$pkg" | grep '^Depends On[[:space:]]*:')
+          printf '%s\n' "$depends"
+          for library in libssl libcrypto; do
+            if ! grep -Eq "(^|[[:space:]])$library\\.so=[0-9]+-[0-9]+([[:space:]]|$)" <<< "$depends"; then
+              echo "the package is missing a versioned $library.so dependency" >&2
+              exit 1
+            fi
+          done
+          extracted=$(mktemp -d)
+          trap 'rm -rf -- "$extracted"' EXIT
+          bsdtar -xf "$pkg" -C "$extracted"
+          for binary in "$extracted/usr/bin/vpnt" "$extracted"/usr/lib/vpnt/*; do
+            if [[ "$binary" != "$extracted/usr/bin/vpnt" && ( ! -f "$binary" || ! -x "$binary" ) ]]; then
+              continue
+            fi
+            printf 'ldd %s\n' "${binary#"$extracted/"}"
+            if ! linked=$(LC_ALL=C ldd "$binary" 2>&1); then
+              printf '%s\n' "$linked" >&2
+              exit 1
+            fi
+            printf '%s\n' "$linked"
+            if [[ "$linked" == *"not found"* ]]; then
               exit 1
             fi
           done

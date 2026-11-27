@@ -257,7 +257,7 @@ pub(super) struct Delivered {
     dns_invalid: bool,
     mismatch: bool,
     failure: Option<Failure>,
-    exited: bool,
+    exited: Option<(Option<i32>, Option<i32>)>,
 }
 
 /// Why an attempt cannot go on, from what the instance reported.
@@ -267,9 +267,26 @@ pub(super) enum Fatal {
     InterfaceMismatch,
     Failure(Failure),
     /// The client ended before the network was ready.
-    Exited,
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
     /// Contradictory or invalid data from the gateway.
     Invalid,
+}
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited { code, signal } => match (code, signal) {
+                (Some(code), Some(signal)) => write!(f, "Exited (code={code}, signal={signal})"),
+                (Some(code), None) => write!(f, "Exited (code={code})"),
+                (None, Some(signal)) => write!(f, "Exited (signal={signal})"),
+                (None, None) => f.write_str("Exited"),
+            },
+            _ => write!(f, "{self:?}"),
+        }
+    }
 }
 
 impl Delivered {
@@ -291,7 +308,7 @@ impl Delivered {
                 self.dns_invalid |= self.dns_count.replace((servers, domains)).is_some();
             }
             Event::DnsInvalid => self.dns_invalid = true,
-            Event::Exited { .. } => self.exited = true,
+            Event::Exited { code, signal } => self.exited = Some((code, signal)),
         }
     }
 
@@ -301,8 +318,8 @@ impl Delivered {
             Some(Fatal::InterfaceMismatch)
         } else if let Some(kind) = self.failure {
             Some(Fatal::Failure(kind))
-        } else if self.exited {
-            Some(Fatal::Exited)
+        } else if let Some((code, signal)) = self.exited {
+            Some(Fatal::Exited { code, signal })
         } else if self.split_invalid
             || self
                 .route_count
@@ -2793,6 +2810,25 @@ mod tests {
     }
 
     #[test]
+    fn fatal_exit_message_reports_the_instance_status() {
+        for (code, signal, expected) in [
+            (Some(127), None, "instance reported Exited (code=127)"),
+            (None, Some(9), "instance reported Exited (signal=9)"),
+            (None, None, "instance reported Exited"),
+            (
+                Some(42),
+                Some(15),
+                "instance reported Exited (code=42, signal=15)",
+            ),
+        ] {
+            let mut delivered = Delivered::default();
+            delivered.absorb(Event::Exited { code, signal });
+            let fatal = delivered.fatal().expect("an exit must end the attempt");
+            assert_eq!(format!("instance reported {fatal}"), expected);
+        }
+    }
+
+    #[test]
     fn what_the_instance_reports_decides_whether_the_attempt_can_go_on() {
         let base = || {
             let mut delivered = Delivered::default();
@@ -2842,7 +2878,10 @@ mod tests {
                 code: Some(1),
                 signal: None
             }),
-            Some(Fatal::Exited)
+            Some(Fatal::Exited {
+                code: Some(1),
+                signal: None,
+            })
         );
         assert_eq!(fatal(Event::SplitInvalid), Some(Fatal::Invalid));
         assert_eq!(fatal(Event::SplitRoutes { count: 0 }), Some(Fatal::Invalid));
