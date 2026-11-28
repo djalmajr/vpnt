@@ -268,6 +268,25 @@ struct Route {
     via: Option<serde_json::Value>,
 }
 
+impl Route {
+    fn main_table(&self) -> bool {
+        self.table.as_deref().is_none_or(|table| table == "main")
+    }
+
+    fn connected_network(&self) -> bool {
+        is_connected_network(
+            self.kind.as_deref(),
+            self.protocol.as_deref(),
+            self.scope.as_deref(),
+            self.gateway.is_some()
+                || self.nhid.is_some()
+                || self.nexthops.is_some()
+                || self.via.is_some()
+                || self.encap.is_some(),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 struct AddressList {
     ifindex: u32,
@@ -509,6 +528,117 @@ pub(super) fn route_key(route: &CidrV4) -> (u32, u8) {
     (route.network().into(), route.prefix())
 }
 
+/// A non-default FIB destination in canonical form, so that it can be compared
+/// by key with an approved route.
+pub(super) fn fib_destination(text: &str) -> io::Result<(u32, u8)> {
+    let (base, length) = prefix(text)?;
+    if length == 0 || base.trailing_zeros() < u32::from(32 - length) {
+        return Err(invalid("invalid FIB destination"));
+    }
+    Ok((base, length))
+}
+
+/// Where a refused route goes out, for a message that never names an address.
+pub(super) fn holder(dev: Option<&str>) -> String {
+    dev.map_or_else(|| "without an interface".into(), |dev| format!("on {dev}"))
+}
+
+/// An existing route holds the very destination the tunnel needs. Names the
+/// interface and the prefix length, never the address.
+pub(super) fn collision(length: u8, dev: Option<&str>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "VPN route /{length} collides with an existing route {}",
+            holder(dev)
+        ),
+    )
+}
+
+/// A network the host is attached to, as the kernel lists it. `forwarded` says
+/// that the route names a next hop or an encapsulation.
+pub(super) fn is_connected_network(
+    kind: Option<&str>,
+    protocol: Option<&str>,
+    scope: Option<&str>,
+    forwarded: bool,
+) -> bool {
+    kind.is_none_or(|kind| kind == "unicast")
+        && protocol == Some("kernel")
+        && scope == Some("link")
+        && !forwarded
+}
+
+/// A main table route more specific than an approved one takes its addresses
+/// from the tunnel, which is accepted only of a connected network: anything
+/// else could steer approved traffic away, as a route pushed by DHCP does.
+pub(super) fn check_shadow(
+    approved: impl Iterator<Item = (u32, u8)>,
+    destination: (u32, u8),
+    dev: Option<&str>,
+    connected: bool,
+) -> io::Result<()> {
+    let shadowed = approved
+        .filter(|&route| destination.1 > route.1 && overlaps(route, destination))
+        .map(|route| route.1)
+        .max();
+    match shadowed {
+        Some(length) if !connected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "VPN route /{length} is shadowed by a non-connected route /{} {}",
+                destination.1,
+                holder(dev)
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The smallest address of `route` that none of the more specific destinations
+/// takes, or `None` when together they take all of it.
+fn probe_address(route: (u32, u8), others: &[(u32, u8)]) -> Option<Ipv4Addr> {
+    let last = |key: (u32, u8)| u64::from(key.0) | (u64::from(u32::MAX) >> key.1);
+    let mut inside: Vec<_> = others
+        .iter()
+        .copied()
+        .filter(|&other| other.1 > route.1 && overlaps(route, other))
+        .collect();
+    inside.sort_unstable();
+    let mut free = u64::from(route.0);
+    for other in inside {
+        if u64::from(other.0) > free {
+            break;
+        }
+        free = free.max(last(other) + 1);
+    }
+    u32::try_from(free)
+        .ok()
+        .filter(|_| free <= last(route))
+        .map(Ipv4Addr::from)
+}
+
+/// The address to look up for each approved route. A route that the more
+/// specific destinations take whole would never reach the tunnel: refused.
+pub(super) fn probe_addresses(
+    routes: impl Iterator<Item = (u32, u8)>,
+    others: &[(u32, u8)],
+) -> io::Result<Vec<Ipv4Addr>> {
+    routes
+        .map(|route| {
+            probe_address(route, others).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "VPN route /{} is entirely covered by local networks",
+                        route.1
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
 }
@@ -655,21 +785,67 @@ pub(super) fn check_ipv4_rules(
     })
 }
 
+/// Prove that the kernel selects the tunnel for the approved routes. A more
+/// specific route of the local table, or of the main table on another
+/// interface, wins by longest prefix, so each lookup uses the smallest address
+/// none of them takes. The same listing refuses a route taken whole, and a main
+/// table route that is more specific and not a connected network, so one that
+/// appeared during the configuration is seen; one added after the listing is
+/// not. Returns how many routes connected networks cover in part.
 pub(super) fn verify_tunnel_routes(
     read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
     routes: &[CidrV4],
     interface: &str,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     #[derive(Deserialize)]
     struct SelectedDevice {
         dev: String,
         #[serde(rename = "type")]
         kind: Option<String>,
     }
-    for route in routes {
-        let first = route.network().to_string();
+    let listed: Vec<Route> = decode(&read_ip(&[
+        "-4", "-j", "-d", "route", "show", "table", "all",
+    ])?)?;
+    let mut others = Vec::new();
+    // Destinations of the main table on other interfaces.
+    let mut attached = Vec::new();
+    for row in &listed {
+        let foreign_main = row.main_table() && row.dev.as_deref() != Some(interface);
+        let local = row.table.as_deref() == Some("local");
+        if !(foreign_main || local) || row.dst == "default" {
+            continue;
+        }
+        let destination = prefix(&row.dst)?;
+        if foreign_main {
+            check_shadow(
+                routes.iter().map(route_key),
+                destination,
+                row.dev.as_deref(),
+                row.connected_network(),
+            )?;
+            attached.push(destination);
+        }
+        others.push(destination);
+    }
+    let probes = probe_addresses(routes.iter().map(route_key), &others)?;
+    // The more specific ones among them passed as connected networks.
+    let partly_covered = routes
+        .iter()
+        .map(route_key)
+        .filter(|&route| {
+            attached
+                .iter()
+                .any(|&network: &(u32, u8)| network.1 > route.1 && overlaps(route, network))
+        })
+        .count();
+    if partly_covered > 0 {
+        eprintln!(
+            "vpnt-tunneld: {partly_covered} approved routes partly covered by connected networks"
+        );
+    }
+    for probe in probes {
         let selected: Vec<SelectedDevice> =
-            decode(&read_ip(&["-4", "-j", "route", "get", &first])?)?;
+            decode(&read_ip(&["-4", "-j", "route", "get", &probe.to_string()])?)?;
         let [selected] = selected.as_slice() else {
             return Err(invalid("ambiguous tunnel route lookup"));
         };
@@ -684,7 +860,7 @@ pub(super) fn verify_tunnel_routes(
             ));
         }
     }
-    Ok(())
+    Ok(partly_covered)
 }
 
 pub(super) fn rollback_error(error: io::Error, cleanup: io::Result<()>) -> io::Error {
@@ -882,6 +1058,7 @@ impl Network {
         let mut default_count = 0;
         let mut has_egress_device = false;
         let mut has_egress_default = false;
+        let mut others = Vec::new();
         for existing in self.routes("-4")? {
             if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
                 if existing.kind.as_deref() != Some("unicast")
@@ -919,11 +1096,27 @@ impl Network {
                         .is_none_or(|src| src == std::net::IpAddr::V4(egress.prefsrc));
                 continue;
             }
-            let existing = prefix(&existing.dst)?;
-            if requested.iter().any(|route| overlaps(*route, existing))
-                || vip.is_some_and(|ip| overlaps((ip.into(), 32), existing))
+            // Broader routes coexist by longest prefix; the same destination
+            // cannot be shared, and narrower ones are checked by their shape.
+            let destination = fib_destination(&existing.dst)?;
+            if requested
+                .iter()
+                .copied()
+                .chain(vip.map(|ip| (ip.into(), 32)))
+                .any(|wanted| wanted == destination)
             {
-                return Err(invalid("VPN scope conflicts with an existing route"));
+                return Err(collision(destination.1, existing.dev.as_deref()));
+            }
+            if existing.main_table() {
+                check_shadow(
+                    requested.iter().copied(),
+                    destination,
+                    existing.dev.as_deref(),
+                    existing.connected_network(),
+                )?;
+            }
+            if existing.main_table() || existing.table.as_deref() == Some("local") {
+                others.push(destination);
             }
         }
         // Preserve the direct/no-default cases; with competing defaults the
@@ -931,6 +1124,7 @@ impl Network {
         if default_count > 0 && (!has_egress_device || default_count > 1 && !has_egress_default) {
             return Err(invalid("default routes do not match the proved egress"));
         }
+        probe_addresses(requested.iter().copied(), &others)?;
         Ok(inventory)
     }
 
@@ -1721,6 +1915,15 @@ pub(super) mod coexistence_tests {
     }
 
     fn plan(rules: Vec<Value>, extra: Vec<Value>, defaults: Vec<Value>) -> io::Result<Receipt> {
+        plan_route("10.20.0.0/16", rules, extra, defaults)
+    }
+
+    fn plan_route(
+        approved: &str,
+        rules: Vec<Value>,
+        extra: Vec<Value>,
+        defaults: Vec<Value>,
+    ) -> io::Result<Receipt> {
         let root = Root::new();
         let network = Network::fake(move |_, args| {
             let data = match args {
@@ -1747,8 +1950,347 @@ pub(super) mod coexistence_tests {
             GENERATION,
             REMOTE,
             APPROVED,
-            vec![parse_cidr("10.20.0.0/16").unwrap()],
+            vec![parse_cidr(approved).unwrap()],
         )
+    }
+
+    /// A connected network of the host, as the kernel lists it.
+    fn connected(dst: &str, dev: &str) -> Value {
+        json!({
+            "dst": dst, "dev": dev, "type": "unicast", "table": "main",
+            "protocol": "kernel", "scope": "link"
+        })
+    }
+
+    fn plan_beside(approved: &str, existing: Vec<Value>) -> io::Result<Receipt> {
+        plan_route(
+            approved,
+            standard_rules(),
+            existing,
+            defaults("eth-fixture")[..1].to_vec(),
+        )
+    }
+
+    #[test]
+    fn the_probe_address_is_the_smallest_one_no_more_specific_route_takes() {
+        let probe = |approved: &str, others: &[&str]| {
+            let others: Vec<_> = others.iter().map(|dst| prefix(dst).unwrap()).collect();
+            probe_address(prefix(approved).unwrap(), &others).map(|ip| ip.to_string())
+        };
+        let some = |address: &str| Some(address.to_owned());
+        assert_eq!(probe("10.20.0.0/16", &[]), some("10.20.0.0"));
+        // Broader, equal and outside destinations take nothing from the route.
+        assert_eq!(
+            probe(
+                "10.20.0.0/16",
+                &["10.0.0.0/8", "10.20.0.0/16", "10.21.0.0/24", "10.19.0.0/17"]
+            ),
+            some("10.20.0.0")
+        );
+        // Hosts, nested and adjacent blocks, listed out of order.
+        assert_eq!(
+            probe(
+                "10.20.0.0/16",
+                &["10.20.1.0", "10.20.0.0/25", "10.20.0.0/24", "10.20.0.7"]
+            ),
+            some("10.20.1.1")
+        );
+        // A hole before the next block is the answer.
+        assert_eq!(
+            probe("10.20.0.0/16", &["10.20.0.0", "10.20.0.2"]),
+            some("10.20.0.1")
+        );
+        // Only the last address is free.
+        assert_eq!(
+            probe("10.20.0.0/30", &["10.20.0.0/31", "10.20.0.2"]),
+            some("10.20.0.3")
+        );
+        assert_eq!(
+            probe("10.20.0.0/16", &["10.20.128.0/17", "10.20.0.0/17"]),
+            None
+        );
+        assert_eq!(probe("10.20.0.0/31", &["10.20.0.1", "10.20.0.0"]), None);
+        assert_eq!(probe("10.20.0.9", &["10.20.0.9"]), some("10.20.0.9"));
+        // Covering the top of the address space does not wrap around.
+        assert_eq!(
+            probe(
+                "255.255.255.254/31",
+                &["255.255.255.254", "255.255.255.255"]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_tables_that_precede_the_tunnel_route_take_probe_addresses() {
+        let routes = [
+            parse_cidr("10.20.0.0/16").unwrap(),
+            parse_cidr("10.30.0.0/24").unwrap(),
+            parse_cidr("10.40.0.0/24").unwrap(),
+        ];
+        let looked_up = Mutex::new(Vec::new());
+        let partly_covered = verify_tunnel_routes(
+            |args| {
+                let data = match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => json!([
+                        {"dst":"default","dev":"eth-fixture"},
+                        // Without a table name, iproute2 means the main table.
+                        {"dst":"10.20.0.0","dev":"eth-lan","protocol":"kernel","scope":"link"},
+                        // The tunnel's own routes and address.
+                        {"dst":"10.20.0.0/20","dev":"vpnti1","table":"main"},
+                        {"dst":"10.20.0.1","dev":"vpnti1","table":"local","type":"local"},
+                        // Tables that no standard lookup reaches before the main one.
+                        {"dst":"10.20.0.2","dev":"eth-lan","table":"100"},
+                        {"dst":"10.20.0.2","dev":"eth-lan","table":"default"},
+                        {"dst":"10.30.0.0/25","dev":"eth-lan","table":"main",
+                         "protocol":"kernel","scope":"link"},
+                        // A host address alone is not a connected network.
+                        {"dst":"10.40.0.0","dev":"eth-lan","table":"local","type":"local"},
+                    ]),
+                    ["-4", "-j", "route", "get", dst] => {
+                        looked_up.lock().unwrap().push((*dst).to_owned());
+                        json!([{"dev":"vpnti1"}])
+                    }
+                    _ => panic!("unexpected command: {args:?}"),
+                };
+                Ok(serde_json::to_vec(&data).unwrap())
+            },
+            &routes,
+            "vpnti1",
+        )
+        .unwrap();
+        // 10.20.0.0/16 and 10.30.0.0/24; 10.40.0.0/24 only holds an address.
+        assert_eq!(partly_covered, 2);
+        assert_eq!(
+            *looked_up.lock().unwrap(),
+            ["10.20.0.2", "10.30.0.128", "10.40.0.1"]
+        );
+    }
+
+    #[test]
+    fn a_route_taken_whole_fails_the_tunnel_lookup_before_any_probe() {
+        let connected = |dst: &str| {
+            json!({
+                "dst": dst, "dev": "eth-lan", "table": "main",
+                "protocol": "kernel", "scope": "link"
+            })
+        };
+        let host = |dst: &str| json!({"dst":dst,"dev":"eth-lan","table":"local","type":"local"});
+        for (listing, length) in [
+            (
+                vec![connected("10.30.0.0/25"), connected("10.30.0.128/25")],
+                24,
+            ),
+            (vec![connected("10.30.0.0/25"), host("10.30.0.128/25")], 24),
+        ] {
+            let result = verify_tunnel_routes(
+                |args| match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                        Ok(serde_json::to_vec(&listing).unwrap())
+                    }
+                    // Nothing is looked up, not even the route that is free.
+                    _ => panic!("unexpected command: {args:?}"),
+                },
+                &[
+                    parse_cidr("10.40.0.0/24").unwrap(),
+                    parse_cidr("10.30.0.0/24").unwrap(),
+                ],
+                "vpnti1",
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("VPN route /{length} is entirely covered by local networks")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_route_listing_fails_the_tunnel_lookup() {
+        for listing in [json!({}), json!([{"dst":"10.20.0.0/33"}]), json!([{}])] {
+            let result = verify_tunnel_routes(
+                |args| match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                        Ok(serde_json::to_vec(&listing).unwrap())
+                    }
+                    _ => panic!("unexpected command: {args:?}"),
+                },
+                &[parse_cidr("10.20.0.0/16").unwrap()],
+                "vpnti1",
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_private_routes_coexist_with_the_narrower_networks_inside_them() {
+        plan_beside(
+            "172.16.0.0/12",
+            vec![
+                connected("172.17.0.0/16", "docker0"),
+                connected("172.18.0.0/16", "br-fixture"),
+                json!({"dst":"172.17.0.1","dev":"docker0","type":"local","table":"local"}),
+                json!({"dst":"172.17.255.255","dev":"docker0","type":"broadcast","table":"local"}),
+            ],
+        )
+        .unwrap();
+        plan_beside(
+            "192.168.0.0/16",
+            vec![
+                connected("192.168.0.0/24", "eth-lan"),
+                connected("192.168.1.0/24", "wlan-fixture"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_xfrm_plan_refuses_a_route_entirely_covered_by_local_networks() {
+        let error = plan_beside(
+            "10.20.0.0/16",
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/17", "wlan-fixture"),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
+        // Control: one half left to the tunnel.
+        plan_beside("10.20.0.0/16", vec![connected("10.20.0.0/17", "eth-lan")]).unwrap();
+    }
+
+    #[test]
+    fn a_broader_existing_route_coexists_with_an_xfrm_route() {
+        plan_beside("172.20.0.0/16", vec![connected("172.0.0.0/8", "eth-lan")]).unwrap();
+    }
+
+    #[test]
+    fn the_same_xfrm_destination_is_a_collision_naming_interface_and_length() {
+        for (existing, message) in [
+            (
+                connected("172.16.0.0/12", "docker0"),
+                "VPN route /12 collides with an existing route on docker0",
+            ),
+            (
+                json!({"dst":"172.16.0.0/12","dev":"tun-other","table":"100"}),
+                "VPN route /12 collides with an existing route on tun-other",
+            ),
+            (
+                json!({"dst":"172.16.0.0/12","type":"unreachable","table":"main"}),
+                "VPN route /12 collides with an existing route without an interface",
+            ),
+        ] {
+            let error = plan_beside("172.16.0.0/12", vec![existing]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    /// Shapes of the main table that would steer part of an approved route away
+    /// from the tunnel.
+    fn not_connected(dst: &str, dev: &str) -> Vec<(String, Value)> {
+        let mut shapes = Vec::new();
+        for protocol in ["dhcp", "static", "boot"] {
+            let mut route = connected(dst, dev);
+            route["protocol"] = json!(protocol);
+            route["gateway"] = json!("192.0.2.1");
+            route["scope"] = json!("global");
+            shapes.push((format!("{protocol} with a gateway"), route));
+        }
+        for (key, value) in [
+            ("protocol", json!("dhcp")),
+            ("protocol", json!("static")),
+            ("protocol", Value::Null),
+            ("scope", json!("global")),
+            ("scope", Value::Null),
+            ("gateway", json!("192.0.2.1")),
+            ("nhid", json!(7)),
+            ("nexthops", json!([{"dev": "eth-lan"}])),
+            ("via", json!({"family": "inet6", "host": "fe80::1"})),
+            ("encap", json!({"type": "mpls"})),
+        ] {
+            let mut route = connected(dst, dev);
+            route[key] = value.clone();
+            shapes.push((format!("{key} {value}"), route));
+        }
+        for kind in ["blackhole", "unreachable", "prohibit", "throw", "local"] {
+            let mut route = connected(dst, dev);
+            route["type"] = json!(kind);
+            shapes.push((kind.to_owned(), route));
+        }
+        shapes
+    }
+
+    #[test]
+    fn a_more_specific_xfrm_route_that_is_not_a_connected_network_is_refused() {
+        for (label, route) in not_connected("172.17.0.0/16", "wlan-fixture") {
+            let error = plan_beside("172.16.0.0/12", vec![route]).expect_err(&label);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "VPN route /12 is shadowed by a non-connected route /16 on wlan-fixture",
+                "{label}"
+            );
+        }
+        let error = plan_beside(
+            "172.16.0.0/12",
+            vec![json!({"dst":"172.17.0.9","type":"unreachable"})],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "VPN route /12 is shadowed by a non-connected route /32 without an interface"
+        );
+        // Controls: a connected network without a type, a routed broader route
+        // and a routed route of a table that no rule reads.
+        let mut untyped = connected("172.17.0.0/16", "docker0");
+        untyped.as_object_mut().unwrap().remove("type");
+        let mut broader = connected("172.0.0.0/8", "eth-lan");
+        broader["gateway"] = json!("192.0.2.1");
+        let mut elsewhere = connected("172.17.0.0/16", "tun-other");
+        elsewhere["gateway"] = json!("192.0.2.1");
+        elsewhere["table"] = json!("100");
+        for route in [untyped, broader, elsewhere] {
+            plan_beside("172.16.0.0/12", vec![route]).unwrap();
+        }
+    }
+
+    #[test]
+    fn xfrm_refuses_a_routed_more_specific_route_that_appears_during_configuration() {
+        // Away from the probe address, so that only the listing can show it.
+        let mut routed = connected("10.20.5.0/24", "wlan-fixture");
+        routed["protocol"] = json!("dhcp");
+        routed["gateway"] = json!("192.0.2.1");
+        let (result, ops) = install_appearing("vpnti1", None, vec![], Some(routed));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is shadowed by a non-connected route /24 on wlan-fixture"
+        );
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+        // Control: a connected network that appears is only probed around.
+        let (result, ops) = install_appearing(
+            "vpnti1",
+            None,
+            vec![],
+            Some(connected("10.20.0.0/24", "eth-lan")),
+        );
+        result.unwrap();
+        assert_eq!(probes(&ops), ["10.20.1.0"]);
+    }
+
+    #[test]
+    fn a_noncanonical_fib_destination_is_refused_and_not_compared() {
+        for dst in ["172.16.0.1/12", "172.16.0.0/0", "198.51.100.7/24"] {
+            let error = plan_beside("172.16.0.0/12", vec![connected(dst, "eth-lan")]).unwrap_err();
+            assert_eq!(error.to_string(), "invalid FIB destination", "{dst}");
+        }
     }
 
     impl Drop for Root {
@@ -1821,6 +2363,35 @@ pub(super) mod coexistence_tests {
         late_destination: Option<&str>,
         expected_error: Option<&str>,
     ) {
+        let (result, ops) = install_beside(tunnel_device, late_destination, vec![]);
+        match expected_error {
+            Some(message) => assert_eq!(result.unwrap_err().to_string(), message),
+            None => result.unwrap(),
+        }
+        assert!(ops.iter().any(|op| op.starts_with("-4 route add ")));
+        assert_eq!(
+            ops.iter().any(|op| op.starts_with("-4 route del ")),
+            expected_error.is_some()
+        );
+    }
+
+    /// Plan and install 10.20.0.0/16 beside the host's existing routes, and
+    /// prove that the receipt and the kernel agree with the outcome.
+    fn install_beside(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        existing: Vec<Value>,
+    ) -> (io::Result<()>, Vec<String>) {
+        install_appearing(tunnel_device, late_destination, existing, None)
+    }
+
+    /// The same, with a main table route that appears with the route add.
+    fn install_appearing(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        existing: Vec<Value>,
+        appearing: Option<Value>,
+    ) -> (io::Result<()>, Vec<String>) {
         #[derive(Default)]
         struct Kernel {
             alias: Option<String>,
@@ -1856,8 +2427,18 @@ pub(super) mod coexistence_tests {
                 ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
                     {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
                 ]),
-                ["-4", "-j", "route", "get", "10.20.0.0"] if state.route => {
-                    json!([{"dev":tunnel_device}])
+                ["-4", "-j", "route", "get", dst] if state.route && dst.starts_with("10.20.") => {
+                    // The longest prefix wins, as the kernel picks.
+                    let address = (prefix(dst).unwrap().0, 32);
+                    let other = existing
+                        .iter()
+                        .map(|row| (prefix(row["dst"].as_str().unwrap()).unwrap(), row))
+                        .filter(|(key, _)| key.1 >= 16 && overlaps(*key, address))
+                        .max_by_key(|(key, _)| key.1);
+                    match other {
+                        Some((_, row)) => json!([{"dev":row["dev"]}]),
+                        None => json!([{"dev":tunnel_device}]),
+                    }
                 }
                 ["-j", "-d", "link", "show"] => {
                     let mut links =
@@ -1876,6 +2457,11 @@ pub(super) mod coexistence_tests {
                     let mut rows = defaults("eth-fixture");
                     rows.truncate(1);
                     rows.extend(extra_routes());
+                    rows.extend(existing.iter().cloned());
+                    // It stays after the rollback removes the tunnel route.
+                    if state.ops.iter().any(|op| op.starts_with("-4 route add ")) {
+                        rows.extend(appearing.iter().cloned());
+                    }
                     if state.route {
                         rows.push(json!({
                             "dst":"10.20.0.0/16","dev":"vpnti1","type":"unicast","table":"main",
@@ -1992,26 +2578,96 @@ pub(super) mod coexistence_tests {
             "10.99.0.2".parse().unwrap(),
             APPROVED,
         );
-        if let Some(message) = expected_error {
-            assert_eq!(result.unwrap_err().to_string(), message);
-        } else {
-            result.unwrap();
-        }
-        let confirmed = expected_error.is_none();
+        let confirmed = result.is_ok();
         assert_eq!(receipt.confirmed, confirmed);
-        let persisted = Receipt::load(&directory, &guard).unwrap();
-        assert_eq!(persisted.confirmed, confirmed);
+        // A refusal before the first write leaves no receipt to load.
+        if directory.join(RECEIPT).exists() {
+            let persisted = Receipt::load(&directory, &guard).unwrap();
+            assert_eq!(persisted.confirmed, confirmed);
+        } else {
+            assert!(!confirmed);
+        }
         let state = kernel.lock().unwrap();
         assert_eq!(state.late_destination.as_deref(), late_destination);
         assert_eq!(
             (state.link, state.route, state.address),
             (confirmed, confirmed, confirmed)
         );
-        assert!(state.ops.iter().any(|op| op.starts_with("-4 route add ")));
-        assert_eq!(
-            state.ops.iter().any(|op| op.starts_with("-4 route del ")),
-            !confirmed
+        (result, state.ops.clone())
+    }
+
+    /// The tunnel destinations looked up after the routes were installed.
+    fn probes(ops: &[String]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| op.strip_prefix("-4 -j route get "))
+            .filter(|dst| *dst != "192.0.2.20")
+            .collect()
+    }
+
+    #[test]
+    fn xfrm_probes_the_smallest_address_outside_the_more_specific_networks() {
+        let (result, ops) = install_beside(
+            "vpnti1",
+            None,
+            vec![
+                connected("10.20.0.0/24", "eth-lan"),
+                connected("10.20.1.0/24", "wlan-fixture"),
+            ],
         );
+        result.unwrap();
+        assert_eq!(probes(&ops), ["10.20.2.0"]);
+    }
+
+    #[test]
+    fn xfrm_refuses_and_rolls_back_a_route_covered_during_configuration() {
+        let (result, ops) = install_appearing(
+            "vpnti1",
+            None,
+            vec![connected("10.20.0.0/17", "eth-lan")],
+            Some(connected("10.20.128.0/17", "wlan-fixture")),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
+        assert!(probes(&ops).is_empty(), "{ops:?}");
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+        assert!(ops.iter().any(|op| op.starts_with("link del ")));
+    }
+
+    #[test]
+    fn xfrm_still_rolls_back_a_route_leaving_by_another_interface_beside_a_lan() {
+        let (result, ops) = install_beside(
+            "eth-other",
+            None,
+            vec![connected("10.20.0.0/24", "eth-lan")],
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        assert_eq!(probes(&ops), ["10.20.1.0"]);
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+    }
+
+    #[test]
+    fn an_existing_route_to_the_virtual_address_is_a_collision_before_any_write() {
+        for (existing, accepted) in [
+            (connected("10.99.0.2/32", "eth-lan"), false),
+            // A broader route that only holds the address coexists.
+            (connected("10.99.0.0/24", "eth-lan"), true),
+        ] {
+            let (result, ops) = install_beside("vpnti1", None, vec![existing]);
+            if accepted {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "VPN route /32 collides with an existing route on eth-lan"
+                );
+                assert!(!ops.iter().any(|op| op.starts_with("link add ")), "{ops:?}");
+            }
+        }
     }
 
     #[test]
