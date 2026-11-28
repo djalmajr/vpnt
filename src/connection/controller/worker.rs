@@ -156,6 +156,7 @@ pub(super) fn run(
         let mut last_probe: Option<Instant> = None;
         let mut last_health: Option<Instant> = None;
         let mut failures = 0_u32;
+        let mut traffic_verified = false;
         #[cfg(not(target_os = "linux"))]
         let mut announced_phase = None;
         // A restart seen between or during probes owes the tunnel a fresh one.
@@ -191,6 +192,7 @@ pub(super) fn run(
                     // Attempts that never restart keep epoch 0 and never
                     // reach this branch; an OVPN attempt does on both systems.
                     failures = 0;
+                    traffic_verified = false;
                     // The busy deferral exists only on Linux.
                     #[cfg(target_os = "linux")]
                     {
@@ -265,6 +267,7 @@ pub(super) fn run(
                 };
                 if retry_probe || phase.is_some() {
                     failures = 0;
+                    traffic_verified = false;
                     busy_since = None;
                 }
                 if let Some(state) = phase
@@ -309,6 +312,7 @@ pub(super) fn run(
                 };
                 if let Some(state) = phase {
                     failures = 0;
+                    traffic_verified = false;
                     if announced_phase != phase {
                         send(state, 0, false, None);
                     }
@@ -324,17 +328,21 @@ pub(super) fn run(
                 })
             };
             if let Some(responsive) = responsive {
-                failures = if responsive { 0 } else { (failures + 1).min(3) };
-                send(
-                    if responsive {
-                        ConnectionState::Connected
+                if responsive {
+                    traffic_verified = true;
+                    failures = 0;
+                } else {
+                    failures = (failures + 1).min(3);
+                }
+                // Only a verified tunnel can tolerate one failed health probe.
+                // Count it locally because Connected carries zero on the wire.
+                let (state, reported_failures) =
+                    if responsive || (traffic_verified && failures == 1) {
+                        (ConnectionState::Connected, 0)
                     } else {
-                        ConnectionState::Unresponsive
-                    },
-                    failures,
-                    false,
-                    None,
-                );
+                        (ConnectionState::Unresponsive, failures)
+                    };
+                send(state, reported_failures, false, None);
             }
             thread::sleep(timing.poll);
         }

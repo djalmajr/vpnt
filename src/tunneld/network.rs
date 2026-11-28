@@ -2,10 +2,12 @@
 use super::protocol::{CidrV4, Generation, ProbeBinding};
 use crate::netlease::NetworkGuard;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
@@ -266,6 +268,25 @@ struct Route {
     via: Option<serde_json::Value>,
 }
 
+impl Route {
+    fn main_table(&self) -> bool {
+        self.table.as_deref().is_none_or(|table| table == "main")
+    }
+
+    fn connected_network(&self) -> bool {
+        is_connected_network(
+            self.kind.as_deref(),
+            self.protocol.as_deref(),
+            self.scope.as_deref(),
+            self.gateway.is_some()
+                || self.nhid.is_some()
+                || self.nexthops.is_some()
+                || self.via.is_some()
+                || self.encap.is_some(),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 struct AddressList {
     ifindex: u32,
@@ -290,6 +311,190 @@ fn number(s: &str) -> io::Result<u32> {
     s.strip_prefix("0x")
         .map_or_else(|| s.parse(), |hex| u32::from_str_radix(hex, 16))
         .map_err(|_| invalid("invalid XFRM identifier"))
+}
+
+fn xfrm_mark(text: &str) -> io::Result<(u32, u32)> {
+    let (value, mask) = text
+        .split_once('/')
+        .ok_or_else(|| invalid("missing XFRM mark mask"))?;
+    Ok((number(value)?, number(mask)?))
+}
+
+#[derive(PartialEq, Eq)]
+struct EspState {
+    src: IpAddr,
+    dst: IpAddr,
+    spi: u32,
+    reqid: u32,
+    if_id: Option<u32>,
+    mark: Option<(u32, u32)>,
+    tunnel: bool,
+}
+
+fn esp_states(text: &str) -> io::Result<Vec<EspState>> {
+    let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
+    let mut states = Vec::new();
+    while let Some(header) = lines.next() {
+        let fields: Vec<_> = header.split_ascii_whitespace().collect();
+        let ["src", src, "dst", dst] = fields.as_slice() else {
+            return Err(invalid("unrecognized XFRM state header"));
+        };
+        let mut identity = None;
+        let mut if_id = None;
+        let mut mark = None;
+        for line in std::iter::from_fn(|| lines.next_if(|line| line.starts_with('\t'))) {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            match fields.as_slice() {
+                ["proto", _, ..] if identity.is_none() => identity = Some(fields),
+                ["proto", ..] => return Err(invalid("ambiguous XFRM state protocol")),
+                ["if_id", value] if if_id.is_none() => if_id = Some(number(value)?),
+                ["if_id", ..] => return Err(invalid("invalid XFRM state if_id")),
+                ["mark", value, ..] if mark.is_none() => mark = Some(xfrm_mark(value)?),
+                ["mark", ..] => return Err(invalid("invalid XFRM state mark")),
+                _ => {}
+            }
+        }
+        let fields = identity.ok_or_else(|| invalid("missing XFRM state protocol"))?;
+        if fields[1] != "esp" {
+            continue;
+        }
+        let field = |name| {
+            fields
+                .windows(2)
+                .find(|pair| pair[0] == name)
+                .ok_or_else(|| invalid("incomplete ESP state key"))
+                .and_then(|pair| number(pair[1]))
+        };
+        let src: IpAddr = src
+            .parse()
+            .map_err(|_| invalid("invalid ESP source address"))?;
+        let dst: IpAddr = dst
+            .parse()
+            .map_err(|_| invalid("invalid ESP destination address"))?;
+        if src.is_ipv4() != dst.is_ipv4() {
+            return Err(invalid("inconsistent ESP address family"));
+        }
+        states.push(EspState {
+            src,
+            dst,
+            spi: field("spi")?,
+            reqid: field("reqid")?,
+            if_id,
+            mark,
+            tunnel: fields.windows(2).any(|pair| pair == ["mode", "tunnel"]),
+        });
+    }
+    Ok(states)
+}
+
+struct XfrmPolicyKey<'a> {
+    index: u32,
+    direction: &'a str,
+    if_id: u32,
+    policy_type: Option<&'a str>,
+}
+
+fn xfrm_policy_keys<'a>(text: &'a str, receipt: &Receipt) -> io::Result<Vec<XfrmPolicyKey<'a>>> {
+    let Some(vip) = receipt.vip else {
+        return Ok(Vec::new());
+    };
+    let vip = (u32::from(vip), 32);
+    let mut lines = text.lines().filter(|line| !line.is_empty()).peekable();
+    let mut keys = Vec::new();
+    while let Some(header) = lines.next() {
+        if !header.starts_with("src ") {
+            return Err(invalid("unrecognized XFRM policy dump"));
+        }
+        let mut direction = None;
+        let mut mark = None;
+        let mut if_id = None;
+        let mut templates = 0;
+        let mut owned_template = false;
+        while let Some(line) = lines.next_if(|line| line.starts_with('\t')) {
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            match fields.as_slice() {
+                ["tmpl", "src", src, "dst", dst] => {
+                    templates += 1;
+                    let details = lines
+                        .next_if(|line| line.starts_with("\t\t"))
+                        .unwrap_or_default();
+                    let details: Vec<_> = details.split_ascii_whitespace().collect();
+                    owned_template = details.starts_with(&["proto", "esp"])
+                        && details.windows(2).any(|pair| pair == ["mode", "tunnel"])
+                        && src
+                            .parse()
+                            .ok()
+                            .zip(dst.parse().ok())
+                            .is_some_and(|(src, dst)| matches_transport(receipt, src, dst));
+                }
+                ["tmpl", ..] => templates += 1,
+                ["if_id", value] if if_id.is_none() => if_id = Some(number(value)?),
+                ["if_id", ..] => return Err(invalid("invalid XFRM policy if_id")),
+                ["dir", ..] if direction.is_none() => direction = Some(fields),
+                ["dir", ..] => return Err(invalid("ambiguous XFRM policy direction")),
+                ["mark", value, ..] if mark.is_none() => mark = Some(xfrm_mark(value)?),
+                ["mark", ..] => return Err(invalid("invalid XFRM policy mark")),
+                _ => {}
+            }
+        }
+        let Some(if_id) = if_id.filter(|if_id| *if_id == receipt.if_id) else {
+            continue;
+        };
+        if mark.unwrap_or_default() != (0, 0) || templates != 1 || !owned_template {
+            continue;
+        }
+        let selectors: Vec<_> = header.split_ascii_whitespace().collect();
+        let (src, dst) = match selectors.as_slice() {
+            ["src", src, "dst", dst] => (*src, *dst),
+            ["src", src, "dst", dst, "uid", uid] if uid.parse::<u32>().is_ok() => (*src, *dst),
+            _ => continue,
+        };
+        let (Ok(src), Ok(dst)) = (prefix(src), prefix(dst)) else {
+            continue;
+        };
+        if !receipt
+            .routes
+            .iter()
+            .map(route_key)
+            .any(|route| (src == vip && dst == route) || (dst == vip && src == route))
+        {
+            continue;
+        }
+        let Some(fields) = direction else {
+            return Err(invalid("missing XFRM policy direction"));
+        };
+        let ["dir", direction @ ("out" | "in" | "fwd"), ..] = fields.as_slice() else {
+            return Err(invalid("invalid XFRM policy direction"));
+        };
+        let field = |name| {
+            fields
+                .windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1])
+        };
+        let index = field("index")
+            .map(number)
+            .transpose()?
+            .filter(|index| *index != 0)
+            .ok_or_else(|| invalid("missing XFRM policy index"))?;
+        let policy_type = field("ptype");
+        if !matches!(policy_type, None | Some("main" | "sub")) {
+            return Err(invalid("invalid XFRM policy type"));
+        }
+        keys.push(XfrmPolicyKey {
+            index,
+            direction,
+            if_id,
+            policy_type,
+        });
+    }
+    Ok(keys)
+}
+
+fn matches_transport(receipt: &Receipt, src: IpAddr, dst: IpAddr) -> bool {
+    let local = IpAddr::V4(receipt.egress.prefsrc);
+    let remote = IpAddr::V4(receipt.remote);
+    (src == local && dst == remote) || (src == remote && dst == local)
 }
 
 pub(super) fn cidr_text(cidr: &CidrV4) -> String {
@@ -323,20 +528,349 @@ pub(super) fn route_key(route: &CidrV4) -> (u32, u8) {
     (route.network().into(), route.prefix())
 }
 
+/// A non-default FIB destination in canonical form, so that it can be compared
+/// by key with an approved route.
+pub(super) fn fib_destination(text: &str) -> io::Result<(u32, u8)> {
+    let (base, length) = prefix(text)?;
+    if length == 0 || base.trailing_zeros() < u32::from(32 - length) {
+        return Err(invalid("invalid FIB destination"));
+    }
+    Ok((base, length))
+}
+
+/// Where a refused route goes out, for a message that never names an address.
+pub(super) fn holder(dev: Option<&str>) -> String {
+    dev.map_or_else(|| "without an interface".into(), |dev| format!("on {dev}"))
+}
+
+/// An existing route holds the very destination the tunnel needs. Names the
+/// interface and the prefix length, never the address.
+pub(super) fn collision(length: u8, dev: Option<&str>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "VPN route /{length} collides with an existing route {}",
+            holder(dev)
+        ),
+    )
+}
+
+/// A network the host is attached to, as the kernel lists it. `forwarded` says
+/// that the route names a next hop or an encapsulation.
+pub(super) fn is_connected_network(
+    kind: Option<&str>,
+    protocol: Option<&str>,
+    scope: Option<&str>,
+    forwarded: bool,
+) -> bool {
+    kind.is_none_or(|kind| kind == "unicast")
+        && protocol == Some("kernel")
+        && scope == Some("link")
+        && !forwarded
+}
+
+/// A main table route more specific than an approved one takes its addresses
+/// from the tunnel, which is accepted only of a connected network: anything
+/// else could steer approved traffic away, as a route pushed by DHCP does.
+pub(super) fn check_shadow(
+    approved: impl Iterator<Item = (u32, u8)>,
+    destination: (u32, u8),
+    dev: Option<&str>,
+    connected: bool,
+) -> io::Result<()> {
+    let shadowed = approved
+        .filter(|&route| destination.1 > route.1 && overlaps(route, destination))
+        .map(|route| route.1)
+        .max();
+    match shadowed {
+        Some(length) if !connected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "VPN route /{length} is shadowed by a non-connected route /{} {}",
+                destination.1,
+                holder(dev)
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The smallest address of `route` that none of the more specific destinations
+/// takes, or `None` when together they take all of it.
+fn probe_address(route: (u32, u8), others: &[(u32, u8)]) -> Option<Ipv4Addr> {
+    let last = |key: (u32, u8)| u64::from(key.0) | (u64::from(u32::MAX) >> key.1);
+    let mut inside: Vec<_> = others
+        .iter()
+        .copied()
+        .filter(|&other| other.1 > route.1 && overlaps(route, other))
+        .collect();
+    inside.sort_unstable();
+    let mut free = u64::from(route.0);
+    for other in inside {
+        if u64::from(other.0) > free {
+            break;
+        }
+        free = free.max(last(other) + 1);
+    }
+    u32::try_from(free)
+        .ok()
+        .filter(|_| free <= last(route))
+        .map(Ipv4Addr::from)
+}
+
+/// The address to look up for each approved route. A route that the more
+/// specific destinations take whole would never reach the tunnel: refused.
+pub(super) fn probe_addresses(
+    routes: impl Iterator<Item = (u32, u8)>,
+    others: &[(u32, u8)],
+) -> io::Result<Vec<Ipv4Addr>> {
+    routes
+        .map(|route| {
+            probe_address(route, others).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "VPN route /{} is entirely covered by local networks",
+                        route.1
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
 }
 
-pub(super) fn check_standard_ipv4_rules(rules: &[serde_json::Value]) -> io::Result<()> {
-    let standard = serde_json::json!([
-        {"priority":0,"src":"all","table":"local"},
-        {"priority":32766,"src":"all","table":"main"},
-        {"priority":32767,"src":"all","table":"default"}
-    ]);
-    if rules != standard.as_array().expect("rules array").as_slice() {
-        return Err(invalid("nonstandard IPv4 policy rules"));
+fn rule_word(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| number(value.as_str()?).ok())
+}
+
+#[derive(PartialEq)]
+pub(super) struct PolicyInventory {
+    rules: Vec<Value>,
+    additional_tables: BTreeMap<String, Vec<Value>>,
+}
+
+impl PolicyInventory {
+    pub(super) fn require_unchanged(&self, current: &Self) -> io::Result<()> {
+        if self != current {
+            return Err(invalid(
+                "IPv4 policy routing inventory changed during configuration",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+pub(super) fn check_ipv4_rules(
+    read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
+    protected: &[(u32, u8)],
+) -> io::Result<PolicyInventory> {
+    let rules: Vec<Value> = decode(&read_ip(&["-4", "-j", "rule", "show"])?)?;
+    let standard = [(0, "local"), (32766, "main"), (32767, "default")];
+    let mut seen = [false; 3];
+    let mut additional_tables = BTreeMap::new();
+    for rule in &rules {
+        let priority = rule.get("priority").and_then(Value::as_u64);
+        let table = rule.get("table").and_then(Value::as_str).filter(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                && name.as_bytes()[0].is_ascii_alphanumeric()
+        });
+        let reject = |reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "IPv4 policy rule priority {} table {}: {reason}",
+                    priority.map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    table.unwrap_or("-")
+                ),
+            )
+        };
+        let Some(fields) = rule.as_object() else {
+            return Err(reject("invalid rule"));
+        };
+        if !priority.is_some_and(|n| u32::try_from(n).is_ok())
+            || rule["src"] != "all"
+            || rule.get("dst").is_some_and(|dst| dst != "all")
+        {
+            return Err(reject("unsupported selector"));
+        }
+        if fields.len() == 3
+            && let Some(index) = standard
+                .iter()
+                .position(|&(pref, name)| priority == Some(pref) && table == Some(name))
+        {
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(reject("duplicate standard rule"));
+            }
+            continue;
+        }
+
+        let plain = |key: &str| matches!(key, "priority" | "src" | "dst" | "table");
+        if let Some(mark) = rule.get("fwmark") {
+            // iproute2 omits the mask for an exact mark match. The effective
+            // mark must exclude zero, and the rule must not negate the match.
+            let mask = rule.get("fwmask").map_or(Some(u32::MAX), rule_word);
+            let marked_only = rule_word(mark)
+                .zip(mask)
+                .is_some_and(|(mark, mask)| mark & mask != 0);
+            let has_table = rule.get("table").is_some();
+            let has_action = rule.get("action").is_some();
+            let lookup = !has_action && matches!(table, Some("main" | "default" | "254" | "253"));
+            let terminal = !has_table
+                && matches!(
+                    rule["action"].as_str(),
+                    Some("unreachable" | "blackhole" | "prohibit")
+                );
+            if marked_only
+                && (lookup || terminal)
+                && fields
+                    .keys()
+                    .all(|key| plain(key) || matches!(key.as_str(), "fwmark" | "fwmask" | "action"))
+            {
+                continue;
+            }
+            return Err(reject("unsupported marked rule"));
+        }
+
+        let Some(table) = table.filter(|name| {
+            !matches!(*name, "local" | "main" | "default" | "all" | "unspec")
+                && !matches!(name.parse::<u32>(), Ok(0 | 253..=255))
+        }) else {
+            return Err(reject("unsupported table"));
+        };
+        if !fields.keys().all(|key| plain(key)) {
+            return Err(reject("unsupported rule fields"));
+        }
+        if let Entry::Vacant(entry) = additional_tables.entry(table.to_owned()) {
+            let routes: Vec<Value> = read_ip(&["-4", "-j", "route", "show", "table", table])
+                .and_then(|bytes| decode(&bytes))
+                .map_err(|_| reject("could not read the routing table"))?;
+            for route in &routes {
+                let dst = route["dst"]
+                    .as_str()
+                    .ok_or_else(|| reject("could not read the routing table"))?;
+                if dst == "default" {
+                    return Err(reject("default route in an additional table"));
+                }
+                let dst = prefix(dst).map_err(|_| reject("invalid route destination"))?;
+                if dst.1 == 0 {
+                    return Err(reject("default route in an additional table"));
+                }
+                if protected.iter().any(|scope| overlaps(*scope, dst)) {
+                    return Err(reject("route overlaps protected destinations"));
+                }
+            }
+            entry.insert(routes);
+        }
+    }
+    if let Some(index) = seen.iter().position(|present| !present) {
+        let (priority, table) = standard[index];
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing IPv4 policy rule priority {priority} table {table}"),
+        ));
+    }
+    Ok(PolicyInventory {
+        rules,
+        additional_tables,
+    })
+}
+
+/// Prove that the kernel selects the tunnel for the approved routes. A more
+/// specific route of the local table, or of the main table on another
+/// interface, wins by longest prefix, so each lookup uses the smallest address
+/// none of them takes. The same listing refuses a route taken whole, and a main
+/// table route that is more specific and not a connected network, so one that
+/// appeared during the configuration is seen; one added after the listing is
+/// not. Returns how many routes connected networks cover in part.
+pub(super) fn verify_tunnel_routes(
+    read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
+    routes: &[CidrV4],
+    interface: &str,
+) -> io::Result<usize> {
+    #[derive(Deserialize)]
+    struct SelectedDevice {
+        dev: String,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    let listed: Vec<Route> = decode(&read_ip(&[
+        "-4", "-j", "-d", "route", "show", "table", "all",
+    ])?)?;
+    let mut others = Vec::new();
+    // Destinations of the main table on other interfaces.
+    let mut attached = Vec::new();
+    for row in &listed {
+        let foreign_main = row.main_table() && row.dev.as_deref() != Some(interface);
+        let local = row.table.as_deref() == Some("local");
+        if !(foreign_main || local) || row.dst == "default" {
+            continue;
+        }
+        let destination = prefix(&row.dst)?;
+        if foreign_main {
+            check_shadow(
+                routes.iter().map(route_key),
+                destination,
+                row.dev.as_deref(),
+                row.connected_network(),
+            )?;
+            attached.push(destination);
+        }
+        others.push(destination);
+    }
+    let probes = probe_addresses(routes.iter().map(route_key), &others)?;
+    // The more specific ones among them passed as connected networks.
+    let partly_covered = routes
+        .iter()
+        .map(route_key)
+        .filter(|&route| {
+            attached
+                .iter()
+                .any(|&network: &(u32, u8)| network.1 > route.1 && overlaps(route, network))
+        })
+        .count();
+    if partly_covered > 0 {
+        eprintln!(
+            "vpnt-tunneld: {partly_covered} approved routes partly covered by connected networks"
+        );
+    }
+    for probe in probes {
+        let selected: Vec<SelectedDevice> =
+            decode(&read_ip(&["-4", "-j", "route", "get", &probe.to_string()])?)?;
+        let [selected] = selected.as_slice() else {
+            return Err(invalid("ambiguous tunnel route lookup"));
+        };
+        if selected.dev != interface
+            || selected
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kind != "unicast")
+        {
+            return Err(invalid(
+                "tunnel route lookup selected a different interface",
+            ));
+        }
+    }
+    Ok(partly_covered)
+}
+
+pub(super) fn rollback_error(error: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => io::Error::new(
+            error.kind(),
+            format!("{error}; network rollback failed: {cleanup}"),
+        ),
+    }
 }
 
 impl Network {
@@ -488,35 +1022,51 @@ impl Network {
         Ok(ids)
     }
 
-    fn fib_clear(
+    fn policy_inventory(
         &self,
-        routes: &[CidrV4],
+        requested: &[(u32, u8)],
         vip: Option<Ipv4Addr>,
         approved: &[Ipv4Addr],
+        remote: Ipv4Addr,
         egress: &Egress,
-    ) -> io::Result<()> {
-        let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        check_standard_ipv4_rules(&rules)?;
+    ) -> io::Result<PolicyInventory> {
         let protected = approved
             .iter()
             .copied()
-            .chain([egress.prefsrc])
+            .chain([remote, egress.prefsrc])
             .chain(egress.gateway);
-        let requested: Vec<_> = routes.iter().map(route_key).collect();
         if protected
-            .into_iter()
+            .clone()
             .any(|ip| requested.iter().any(|r| overlaps(*r, (ip.into(), 32))) || vip == Some(ip))
         {
             return Err(invalid("VPN scope conflicts with protected transport"));
         }
-        let mut has_default = false;
+        let mut policy_scope = requested.to_vec();
+        policy_scope.extend(protected.chain(vip).map(|ip| (ip.into(), 32)));
+        check_ipv4_rules(|args| self.ip(args), &policy_scope)
+    }
+
+    fn fib_clear(
+        &self,
+        requested: &[(u32, u8)],
+        vip: Option<Ipv4Addr>,
+        approved: &[Ipv4Addr],
+        remote: Ipv4Addr,
+        egress: &Egress,
+    ) -> io::Result<PolicyInventory> {
+        let inventory = self.policy_inventory(requested, vip, approved, remote, egress)?;
+        let mut default_count = 0;
+        let mut has_egress_device = false;
+        let mut has_egress_default = false;
+        let mut others = Vec::new();
         for existing in self.routes("-4")? {
-            if existing.dst == "default" {
-                if has_default
-                    || existing.kind.as_deref() != Some("unicast")
+            if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
+                if existing.kind.as_deref() != Some("unicast")
+                    || existing.dev.as_deref().is_none_or(str::is_empty)
                     || existing.nexthops.is_some()
                     || existing.nhid.is_some()
-                    || existing.dev.as_deref() != Some(&egress.dev)
+                    || existing.encap.is_some()
+                    || existing.via.is_some()
                     || existing
                         .table
                         .as_deref()
@@ -524,17 +1074,58 @@ impl Network {
                 {
                     return Err(invalid("nonstandard default route"));
                 }
-                has_default = true;
+                for address in existing.gateway.into_iter().chain(existing.prefsrc) {
+                    let std::net::IpAddr::V4(ip) = address else {
+                        return Err(invalid("nonstandard default route"));
+                    };
+                    if requested
+                        .iter()
+                        .any(|route| overlaps(*route, (ip.into(), 32)))
+                        || vip == Some(ip)
+                    {
+                        return Err(invalid("VPN scope conflicts with protected transport"));
+                    }
+                }
+                default_count += 1;
+                let same_device = existing.dev.as_deref() == Some(&egress.dev);
+                has_egress_device |= same_device;
+                has_egress_default |= same_device
+                    && existing.gateway == egress.gateway.map(Into::into)
+                    && existing
+                        .prefsrc
+                        .is_none_or(|src| src == std::net::IpAddr::V4(egress.prefsrc));
                 continue;
             }
-            let existing = prefix(&existing.dst)?;
-            if requested.iter().any(|route| overlaps(*route, existing))
-                || vip.is_some_and(|ip| overlaps((ip.into(), 32), existing))
+            // Broader routes coexist by longest prefix; the same destination
+            // cannot be shared, and narrower ones are checked by their shape.
+            let destination = fib_destination(&existing.dst)?;
+            if requested
+                .iter()
+                .copied()
+                .chain(vip.map(|ip| (ip.into(), 32)))
+                .any(|wanted| wanted == destination)
             {
-                return Err(invalid("VPN scope conflicts with an existing route"));
+                return Err(collision(destination.1, existing.dev.as_deref()));
+            }
+            if existing.main_table() {
+                check_shadow(
+                    requested.iter().copied(),
+                    destination,
+                    existing.dev.as_deref(),
+                    existing.connected_network(),
+                )?;
+            }
+            if existing.main_table() || existing.table.as_deref() == Some("local") {
+                others.push(destination);
             }
         }
-        Ok(())
+        // Preserve the direct/no-default cases; with competing defaults the
+        // full egress must identify one of the default paths.
+        if default_count > 0 && (!has_egress_device || default_count > 1 && !has_egress_default) {
+            return Err(invalid("default routes do not match the proved egress"));
+        }
+        probe_addresses(requested.iter().copied(), &others)?;
+        Ok(inventory)
     }
 
     pub(super) fn plan(
@@ -547,7 +1138,8 @@ impl Network {
     ) -> io::Result<Receipt> {
         let namespace = Namespace::current()?;
         let egress = self.egress(remote)?;
-        self.fib_clear(&routes, None, approved, &egress)?;
+        let requested: Vec<_> = routes.iter().map(route_key).collect();
+        self.fib_clear(&requested, None, approved, remote, &egress)?;
         let links = self.links(None)?;
         let ids = self.xfrm_ids()?;
         let link_ids: Vec<_> = links.iter().map(Link::xfrm_id).collect::<io::Result<_>>()?;
@@ -614,7 +1206,14 @@ impl Network {
         if self.egress(receipt.remote)? != receipt.egress {
             return Err(invalid("egress changed between start and establishment"));
         }
-        self.fib_clear(&receipt.routes, Some(vip), approved, &receipt.egress)?;
+        let requested: Vec<_> = receipt.routes.iter().map(route_key).collect();
+        let inventory = self.fib_clear(
+            &requested,
+            Some(vip),
+            approved,
+            receipt.remote,
+            &receipt.egress,
+        )?;
         let name = receipt.name();
         if self.link(receipt)?.is_some() {
             return Err(invalid("reserved interface name is already in use"));
@@ -682,9 +1281,26 @@ impl Network {
         if !current.flags.iter().any(|flag| flag == "UP")
             || !self.address_present(receipt, &current)?
             || self.applied_routes(receipt)?.len() != receipt.routes.len()
-            || self.egress(receipt.remote)? != receipt.egress
         {
             return Err(invalid("network configuration confirmation failed"));
+        }
+        let paths = (|| {
+            if self.egress(receipt.remote)? != receipt.egress {
+                return Err(invalid("network configuration confirmation failed"));
+            }
+            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &name)?;
+            // Recheck the entire protected scope after the sampled lookups.
+            let current_inventory = self.policy_inventory(
+                &requested,
+                Some(vip),
+                approved,
+                receipt.remote,
+                &receipt.egress,
+            )?;
+            inventory.require_unchanged(&current_inventory)
+        })();
+        if let Err(error) = paths {
+            return Err(rollback_error(error, self.clean_link(receipt)));
         }
         cancel.check()?;
         receipt.confirmed = true;
@@ -876,12 +1492,28 @@ impl Network {
 
     pub(super) fn clean(
         &self,
+        guard: &NetworkGuard,
+        directory: &Path,
+        receipt: &Receipt,
+    ) -> io::Result<()> {
+        self.clean_interface(guard, directory, receipt)?;
+        self.clean_stopped_xfrm(guard, receipt)
+    }
+
+    pub(super) fn clean_interface(
+        &self,
         _guard: &NetworkGuard,
         directory: &Path,
         receipt: &Receipt,
     ) -> io::Result<()> {
         let namespace = Namespace::current()?;
         receipt.validate(directory, &namespace)?;
+        self.clean_link(receipt)
+    }
+
+    // State and policies belong to the still-running instance. The immediate
+    // rollback only removes the link, address and routes owned by this writer.
+    fn clean_link(&self, receipt: &Receipt) -> io::Result<()> {
         if receipt.creating {
             if let Some(link) = self.owned_link(receipt)? {
                 let routes = self.applied_routes(receipt)?;
@@ -925,13 +1557,120 @@ impl Network {
                 return Err(invalid("XFRM interface or route remains after deletion"));
             }
         }
-        self.verify_xfrm_clear(receipt)
+        Ok(())
     }
 
     pub(super) fn verify_xfrm_clear(&self, receipt: &Receipt) -> io::Result<()> {
-        let ids = self.xfrm_ids()?;
-        if ids.0.contains(&receipt.if_id) || ids.1.contains(&u32::from(receipt.reqid)) {
+        Self::verify_xfrm_ids(receipt, self.xfrm_ids()?)
+    }
+
+    fn verify_xfrm_ids(
+        receipt: &Receipt,
+        (if_ids, reqids): (Vec<u32>, Vec<u32>),
+    ) -> io::Result<()> {
+        if if_ids.contains(&receipt.if_id) || reqids.contains(&u32::from(receipt.reqid)) {
             return Err(invalid("XFRM state or policy still occupies reserved IDs"));
+        }
+        Ok(())
+    }
+
+    /// The producer's unit has stopped and the writer lock is held.
+    pub(super) fn clean_stopped_xfrm(
+        &self,
+        _guard: &NetworkGuard,
+        receipt: &Receipt,
+    ) -> io::Result<()> {
+        let ids = self.xfrm_ids()?;
+        if !ids.0.contains(&receipt.if_id) {
+            return Self::verify_xfrm_ids(receipt, ids);
+        }
+        self.delete_orphaned_esp(receipt)?;
+        let bytes = self.ip(&["-s", "xfrm", "policy", "list", "nosock"])?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM policy dump"))?;
+        for key in xfrm_policy_keys(text, receipt)? {
+            // The kernel matches if_id under its policy lock, even if the
+            // policy disappeared or its index was reused after the dump.
+            let index = key.index.to_string();
+            let if_id = key.if_id.to_string();
+            let mut args = vec![
+                "xfrm",
+                "policy",
+                "delete",
+                "index",
+                &index,
+                "dir",
+                key.direction,
+                "if_id",
+                &if_id,
+            ];
+            if let Some(policy_type) = key.policy_type {
+                args.extend(["ptype", policy_type]);
+            }
+            if let Err(error) = self.ip(&args)
+                && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("delete XFRM policy {index} {}: {error}", key.direction),
+                ));
+            }
+        }
+        self.verify_xfrm_clear(receipt)
+    }
+
+    fn esp_inventory(&self) -> io::Result<Vec<EspState>> {
+        let bytes = self.ip(&["xfrm", "state", "list", "nokeys"])?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid("invalid XFRM state dump"))?;
+        esp_states(text)
+    }
+
+    fn delete_orphaned_esp(&self, receipt: &Receipt) -> io::Result<()> {
+        let owned = |state: &EspState| {
+            state.reqid == u32::from(receipt.reqid)
+                && state.if_id == Some(receipt.if_id)
+                && state.tunnel
+                && state.mark.unwrap_or_default() == (0, 0)
+                && matches_transport(receipt, state.src, state.dst)
+        };
+        for state in self.esp_inventory()?.into_iter().filter(owned) {
+            if state.spi == 0 {
+                return Err(invalid("ESP state key is not representable by iproute2"));
+            }
+            let fresh = self.esp_inventory()?;
+            if !fresh
+                .iter()
+                .any(|current| current == &state && owned(current))
+            {
+                continue;
+            }
+            if fresh
+                .iter()
+                .filter(|other| {
+                    other.dst == state.dst
+                        && other.spi == state.spi
+                        && other.mark.unwrap_or_default().0 == 0
+                })
+                .count()
+                > 1
+            {
+                return Err(invalid("ambiguous ESP state deletion key"));
+            }
+            // The fresh dump narrows the window. Kernel key replacement and
+            // a privileged XFRM_MSG_MIGRATE can still race the deletion.
+            let src = state.src.to_string();
+            let dst = state.dst.to_string();
+            let spi = format!("{:#x}", state.spi);
+            let args = [
+                "xfrm", "state", "delete", "src", &src, "dst", &dst, "proto", "esp", "spi", &spi,
+            ];
+            if let Err(error) = self.ip(&args)
+                && !matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("delete XFRM ESP state SPI {spi}: {error}"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1004,6 +1743,20 @@ fn run_command(
                 drain(&mut stdout, &mut output)?;
                 drain(&mut stderr, &mut diagnostics)?;
                 if !status.success() {
+                    if program == "/usr/bin/ip"
+                        && matches!(args, ["xfrm", "policy" | "state", "delete", ..])
+                        && status.code() == Some(2)
+                    {
+                        match diagnostics.as_slice() {
+                            b"RTNETLINK answers: No such file or directory\n" => {
+                                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                            }
+                            b"RTNETLINK answers: No such process\n" => {
+                                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                            }
+                            _ => {}
+                        }
+                    }
                     return Err(io::Error::other(format!("{program} exited with {status}")));
                 }
                 // iproute2 can print an interrupted-dump warning with a zero exit.
@@ -1085,5 +1838,880 @@ mod cancellation_tests {
                 io::ErrorKind::ConnectionAborted
             );
         });
+    }
+}
+
+#[cfg(test)]
+pub(super) mod coexistence_tests {
+    use super::*;
+    use crate::netlease::NetworkLock;
+    use serde_json::{Value, json};
+
+    const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+    const REMOTE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
+    const APPROVED: &[Ipv4Addr] = &[REMOTE, Ipv4Addr::new(192, 0, 2, 21)];
+
+    pub(super) fn standard_rules() -> Vec<Value> {
+        vec![
+            json!({"priority":0,"src":"all","table":"local"}),
+            json!({"priority":32766,"src":"all","table":"main"}),
+            json!({"priority":32767,"src":"all","table":"default"}),
+        ]
+    }
+
+    pub(crate) fn tailscale_rules() -> Vec<Value> {
+        let mut rules = standard_rules();
+        rules.splice(1..1, [
+            json!({"priority":5210,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","table":"main"}),
+            json!({"priority":5230,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","table":"default"}),
+            json!({"priority":5250,"src":"all","fwmark":"0x80000","fwmask":"0xff0000","action":"unreachable"}),
+            json!({"priority":5270,"src":"all","table":"52"}),
+        ]);
+        rules
+    }
+
+    pub(crate) fn unsupported_rules() -> Vec<Value> {
+        vec![
+            json!({"priority":500,"src":"all","table":"52","iif":"eth-other"}),
+            json!({"priority":500,"src":"all","table":"52","oif":"eth-other"}),
+            json!({"priority":500,"src":"all","table":"52","uid_start":1000,"uid_end":1000}),
+            json!({"priority":500,"src":"all","goto":32766}),
+            json!({"priority":500,"src":"203.0.113.0/24","table":"main"}),
+            json!({"priority":500,"src":"all","dst":"203.0.113.0/24","table":"main"}),
+            json!({"priority":500,"src":"all","table":"52","suppress_prefixlen":0}),
+            json!({"priority":500,"src":"all","table":"52","protocol":"static"}),
+            json!({"priority":500,"src":"all","l3mdev":null}),
+            json!({"priority":500,"src":"all","nop":null}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x0"}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x80000","fwmask":"0x0"}),
+            json!({"priority":500,"src":"all","table":"main","fwmark":"0x80000","not":null}),
+        ]
+    }
+
+    pub(crate) fn defaults(dev: &str) -> Vec<Value> {
+        vec![
+            json!({"dst":"default","type":"unicast","table":"main","dev":dev,"gateway":"192.0.2.1","metric":100}),
+            json!({"dst":"default","type":"unicast","table":"main","dev":"wlan-fixture","gateway":"198.51.100.1","metric":600}),
+        ]
+    }
+
+    struct Root(std::path::PathBuf);
+
+    impl Root {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "vpnt-xfrm-coexistence-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            Self(path)
+        }
+
+        fn guard(&self) -> NetworkGuard {
+            NetworkLock::acquire_test(&self.0, Instant::now() + Duration::from_secs(2)).unwrap()
+        }
+    }
+
+    fn plan(rules: Vec<Value>, extra: Vec<Value>, defaults: Vec<Value>) -> io::Result<Receipt> {
+        plan_route("10.20.0.0/16", rules, extra, defaults)
+    }
+
+    fn plan_route(
+        approved: &str,
+        rules: Vec<Value>,
+        extra: Vec<Value>,
+        defaults: Vec<Value>,
+    ) -> io::Result<Receipt> {
+        let root = Root::new();
+        let network = Network::fake(move |_, args| {
+            let data = match args {
+                ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
+                    {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
+                ]),
+                ["-j", "-d", "link", "show"] => {
+                    json!([{"ifname":"eth-fixture","ifindex":2,"flags":["UP"]}])
+                }
+                ["-4", "-j", "rule", "show"] => json!(rules),
+                ["-4", "-j", "route", "show", "table", "52"] => json!(extra),
+                ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                    json!(defaults.iter().chain(&extra).collect::<Vec<_>>())
+                }
+                ["xfrm", "state", "list", "nokeys"] | ["xfrm", "policy", "list"] => {
+                    return Ok(vec![]);
+                }
+                _ => panic!("unexpected command: {args:?}"),
+            };
+            Ok(serde_json::to_vec(&data).unwrap())
+        });
+        network.plan(
+            &root.guard(),
+            GENERATION,
+            REMOTE,
+            APPROVED,
+            vec![parse_cidr(approved).unwrap()],
+        )
+    }
+
+    /// A connected network of the host, as the kernel lists it.
+    fn connected(dst: &str, dev: &str) -> Value {
+        json!({
+            "dst": dst, "dev": dev, "type": "unicast", "table": "main",
+            "protocol": "kernel", "scope": "link"
+        })
+    }
+
+    fn plan_beside(approved: &str, existing: Vec<Value>) -> io::Result<Receipt> {
+        plan_route(
+            approved,
+            standard_rules(),
+            existing,
+            defaults("eth-fixture")[..1].to_vec(),
+        )
+    }
+
+    #[test]
+    fn the_probe_address_is_the_smallest_one_no_more_specific_route_takes() {
+        let probe = |approved: &str, others: &[&str]| {
+            let others: Vec<_> = others.iter().map(|dst| prefix(dst).unwrap()).collect();
+            probe_address(prefix(approved).unwrap(), &others).map(|ip| ip.to_string())
+        };
+        let some = |address: &str| Some(address.to_owned());
+        assert_eq!(probe("10.20.0.0/16", &[]), some("10.20.0.0"));
+        // Broader, equal and outside destinations take nothing from the route.
+        assert_eq!(
+            probe(
+                "10.20.0.0/16",
+                &["10.0.0.0/8", "10.20.0.0/16", "10.21.0.0/24", "10.19.0.0/17"]
+            ),
+            some("10.20.0.0")
+        );
+        // Hosts, nested and adjacent blocks, listed out of order.
+        assert_eq!(
+            probe(
+                "10.20.0.0/16",
+                &["10.20.1.0", "10.20.0.0/25", "10.20.0.0/24", "10.20.0.7"]
+            ),
+            some("10.20.1.1")
+        );
+        // A hole before the next block is the answer.
+        assert_eq!(
+            probe("10.20.0.0/16", &["10.20.0.0", "10.20.0.2"]),
+            some("10.20.0.1")
+        );
+        // Only the last address is free.
+        assert_eq!(
+            probe("10.20.0.0/30", &["10.20.0.0/31", "10.20.0.2"]),
+            some("10.20.0.3")
+        );
+        assert_eq!(
+            probe("10.20.0.0/16", &["10.20.128.0/17", "10.20.0.0/17"]),
+            None
+        );
+        assert_eq!(probe("10.20.0.0/31", &["10.20.0.1", "10.20.0.0"]), None);
+        assert_eq!(probe("10.20.0.9", &["10.20.0.9"]), some("10.20.0.9"));
+        // Covering the top of the address space does not wrap around.
+        assert_eq!(
+            probe(
+                "255.255.255.254/31",
+                &["255.255.255.254", "255.255.255.255"]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_tables_that_precede_the_tunnel_route_take_probe_addresses() {
+        let routes = [
+            parse_cidr("10.20.0.0/16").unwrap(),
+            parse_cidr("10.30.0.0/24").unwrap(),
+            parse_cidr("10.40.0.0/24").unwrap(),
+        ];
+        let looked_up = Mutex::new(Vec::new());
+        let partly_covered = verify_tunnel_routes(
+            |args| {
+                let data = match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => json!([
+                        {"dst":"default","dev":"eth-fixture"},
+                        // Without a table name, iproute2 means the main table.
+                        {"dst":"10.20.0.0","dev":"eth-lan","protocol":"kernel","scope":"link"},
+                        // The tunnel's own routes and address.
+                        {"dst":"10.20.0.0/20","dev":"vpnti1","table":"main"},
+                        {"dst":"10.20.0.1","dev":"vpnti1","table":"local","type":"local"},
+                        // Tables that no standard lookup reaches before the main one.
+                        {"dst":"10.20.0.2","dev":"eth-lan","table":"100"},
+                        {"dst":"10.20.0.2","dev":"eth-lan","table":"default"},
+                        {"dst":"10.30.0.0/25","dev":"eth-lan","table":"main",
+                         "protocol":"kernel","scope":"link"},
+                        // A host address alone is not a connected network.
+                        {"dst":"10.40.0.0","dev":"eth-lan","table":"local","type":"local"},
+                    ]),
+                    ["-4", "-j", "route", "get", dst] => {
+                        looked_up.lock().unwrap().push((*dst).to_owned());
+                        json!([{"dev":"vpnti1"}])
+                    }
+                    _ => panic!("unexpected command: {args:?}"),
+                };
+                Ok(serde_json::to_vec(&data).unwrap())
+            },
+            &routes,
+            "vpnti1",
+        )
+        .unwrap();
+        // 10.20.0.0/16 and 10.30.0.0/24; 10.40.0.0/24 only holds an address.
+        assert_eq!(partly_covered, 2);
+        assert_eq!(
+            *looked_up.lock().unwrap(),
+            ["10.20.0.2", "10.30.0.128", "10.40.0.1"]
+        );
+    }
+
+    #[test]
+    fn a_route_taken_whole_fails_the_tunnel_lookup_before_any_probe() {
+        let connected = |dst: &str| {
+            json!({
+                "dst": dst, "dev": "eth-lan", "table": "main",
+                "protocol": "kernel", "scope": "link"
+            })
+        };
+        let host = |dst: &str| json!({"dst":dst,"dev":"eth-lan","table":"local","type":"local"});
+        for (listing, length) in [
+            (
+                vec![connected("10.30.0.0/25"), connected("10.30.0.128/25")],
+                24,
+            ),
+            (vec![connected("10.30.0.0/25"), host("10.30.0.128/25")], 24),
+        ] {
+            let result = verify_tunnel_routes(
+                |args| match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                        Ok(serde_json::to_vec(&listing).unwrap())
+                    }
+                    // Nothing is looked up, not even the route that is free.
+                    _ => panic!("unexpected command: {args:?}"),
+                },
+                &[
+                    parse_cidr("10.40.0.0/24").unwrap(),
+                    parse_cidr("10.30.0.0/24").unwrap(),
+                ],
+                "vpnti1",
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("VPN route /{length} is entirely covered by local networks")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_route_listing_fails_the_tunnel_lookup() {
+        for listing in [json!({}), json!([{"dst":"10.20.0.0/33"}]), json!([{}])] {
+            let result = verify_tunnel_routes(
+                |args| match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                        Ok(serde_json::to_vec(&listing).unwrap())
+                    }
+                    _ => panic!("unexpected command: {args:?}"),
+                },
+                &[parse_cidr("10.20.0.0/16").unwrap()],
+                "vpnti1",
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_private_routes_coexist_with_the_narrower_networks_inside_them() {
+        plan_beside(
+            "172.16.0.0/12",
+            vec![
+                connected("172.17.0.0/16", "docker0"),
+                connected("172.18.0.0/16", "br-fixture"),
+                json!({"dst":"172.17.0.1","dev":"docker0","type":"local","table":"local"}),
+                json!({"dst":"172.17.255.255","dev":"docker0","type":"broadcast","table":"local"}),
+            ],
+        )
+        .unwrap();
+        plan_beside(
+            "192.168.0.0/16",
+            vec![
+                connected("192.168.0.0/24", "eth-lan"),
+                connected("192.168.1.0/24", "wlan-fixture"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_xfrm_plan_refuses_a_route_entirely_covered_by_local_networks() {
+        let error = plan_beside(
+            "10.20.0.0/16",
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/17", "wlan-fixture"),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
+        // Control: one half left to the tunnel.
+        plan_beside("10.20.0.0/16", vec![connected("10.20.0.0/17", "eth-lan")]).unwrap();
+    }
+
+    #[test]
+    fn a_broader_existing_route_coexists_with_an_xfrm_route() {
+        plan_beside("172.20.0.0/16", vec![connected("172.0.0.0/8", "eth-lan")]).unwrap();
+    }
+
+    #[test]
+    fn the_same_xfrm_destination_is_a_collision_naming_interface_and_length() {
+        for (existing, message) in [
+            (
+                connected("172.16.0.0/12", "docker0"),
+                "VPN route /12 collides with an existing route on docker0",
+            ),
+            (
+                json!({"dst":"172.16.0.0/12","dev":"tun-other","table":"100"}),
+                "VPN route /12 collides with an existing route on tun-other",
+            ),
+            (
+                json!({"dst":"172.16.0.0/12","type":"unreachable","table":"main"}),
+                "VPN route /12 collides with an existing route without an interface",
+            ),
+        ] {
+            let error = plan_beside("172.16.0.0/12", vec![existing]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    /// Shapes of the main table that would steer part of an approved route away
+    /// from the tunnel.
+    fn not_connected(dst: &str, dev: &str) -> Vec<(String, Value)> {
+        let mut shapes = Vec::new();
+        for protocol in ["dhcp", "static", "boot"] {
+            let mut route = connected(dst, dev);
+            route["protocol"] = json!(protocol);
+            route["gateway"] = json!("192.0.2.1");
+            route["scope"] = json!("global");
+            shapes.push((format!("{protocol} with a gateway"), route));
+        }
+        for (key, value) in [
+            ("protocol", json!("dhcp")),
+            ("protocol", json!("static")),
+            ("protocol", Value::Null),
+            ("scope", json!("global")),
+            ("scope", Value::Null),
+            ("gateway", json!("192.0.2.1")),
+            ("nhid", json!(7)),
+            ("nexthops", json!([{"dev": "eth-lan"}])),
+            ("via", json!({"family": "inet6", "host": "fe80::1"})),
+            ("encap", json!({"type": "mpls"})),
+        ] {
+            let mut route = connected(dst, dev);
+            route[key] = value.clone();
+            shapes.push((format!("{key} {value}"), route));
+        }
+        for kind in ["blackhole", "unreachable", "prohibit", "throw", "local"] {
+            let mut route = connected(dst, dev);
+            route["type"] = json!(kind);
+            shapes.push((kind.to_owned(), route));
+        }
+        shapes
+    }
+
+    #[test]
+    fn a_more_specific_xfrm_route_that_is_not_a_connected_network_is_refused() {
+        for (label, route) in not_connected("172.17.0.0/16", "wlan-fixture") {
+            let error = plan_beside("172.16.0.0/12", vec![route]).expect_err(&label);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "VPN route /12 is shadowed by a non-connected route /16 on wlan-fixture",
+                "{label}"
+            );
+        }
+        let error = plan_beside(
+            "172.16.0.0/12",
+            vec![json!({"dst":"172.17.0.9","type":"unreachable"})],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "VPN route /12 is shadowed by a non-connected route /32 without an interface"
+        );
+        // Controls: a connected network without a type, a routed broader route
+        // and a routed route of a table that no rule reads.
+        let mut untyped = connected("172.17.0.0/16", "docker0");
+        untyped.as_object_mut().unwrap().remove("type");
+        let mut broader = connected("172.0.0.0/8", "eth-lan");
+        broader["gateway"] = json!("192.0.2.1");
+        let mut elsewhere = connected("172.17.0.0/16", "tun-other");
+        elsewhere["gateway"] = json!("192.0.2.1");
+        elsewhere["table"] = json!("100");
+        for route in [untyped, broader, elsewhere] {
+            plan_beside("172.16.0.0/12", vec![route]).unwrap();
+        }
+    }
+
+    #[test]
+    fn xfrm_refuses_a_routed_more_specific_route_that_appears_during_configuration() {
+        // Away from the probe address, so that only the listing can show it.
+        let mut routed = connected("10.20.5.0/24", "wlan-fixture");
+        routed["protocol"] = json!("dhcp");
+        routed["gateway"] = json!("192.0.2.1");
+        let (result, ops) = install_appearing("vpnti1", None, vec![], Some(routed));
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is shadowed by a non-connected route /24 on wlan-fixture"
+        );
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+        // Control: a connected network that appears is only probed around.
+        let (result, ops) = install_appearing(
+            "vpnti1",
+            None,
+            vec![],
+            Some(connected("10.20.0.0/24", "eth-lan")),
+        );
+        result.unwrap();
+        assert_eq!(probes(&ops), ["10.20.1.0"]);
+    }
+
+    #[test]
+    fn a_noncanonical_fib_destination_is_refused_and_not_compared() {
+        for dst in ["172.16.0.1/12", "172.16.0.0/0", "198.51.100.7/24"] {
+            let error = plan_beside("172.16.0.0/12", vec![connected(dst, "eth-lan")]).unwrap_err();
+            assert_eq!(error.to_string(), "invalid FIB destination", "{dst}");
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn tailscale_rules_admit_disjoint_routes_in_table_52() {
+        assert!(
+            plan(
+                tailscale_rules(),
+                vec![
+                    json!({"dst":"100.64.0.0/10","dev":"tailscale0","table":"52"}),
+                    json!({"dst":"100.110.20.1","dev":"tailscale0","table":"52"}),
+                ],
+                defaults("eth-fixture")[..1].to_vec()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn extra_policy_tables_refuse_default_and_protected_destinations() {
+        for (dst, kind) in [
+            ("default", "unicast"),
+            ("0.0.0.0/0", "throw"),
+            ("192.0.2.1", "unicast"),
+            ("192.0.2.20", "unicast"),
+            ("192.0.2.21", "unreachable"),
+            ("10.20.1.0/24", "throw"),
+        ] {
+            let error = plan(
+                tailscale_rules(),
+                vec![json!({"dst":dst,"type":kind,"table":"52"})],
+                defaults("eth-fixture")[..1].to_vec(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("priority 5270 table 52"),
+                "{error}"
+            );
+            if dst != "default" {
+                assert!(!error.to_string().contains(dst));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_policy_rules_identify_priority_without_selector_addresses() {
+        for rule in unsupported_rules() {
+            let mut rules = standard_rules();
+            rules.insert(1, rule);
+            let error = plan(rules, vec![], defaults("eth-fixture")).unwrap_err();
+            assert!(error.to_string().contains("priority 500 table"), "{error}");
+            assert!(!error.to_string().contains("203.0.113.0"));
+        }
+    }
+
+    #[test]
+    fn distinct_defaults_are_admitted_when_the_kernel_egress_matches() {
+        plan(standard_rules(), vec![], defaults("eth-fixture")).unwrap();
+    }
+
+    fn check_xfrm_confirmation(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        expected_error: Option<&str>,
+    ) {
+        let (result, ops) = install_beside(tunnel_device, late_destination, vec![]);
+        match expected_error {
+            Some(message) => assert_eq!(result.unwrap_err().to_string(), message),
+            None => result.unwrap(),
+        }
+        assert!(ops.iter().any(|op| op.starts_with("-4 route add ")));
+        assert_eq!(
+            ops.iter().any(|op| op.starts_with("-4 route del ")),
+            expected_error.is_some()
+        );
+    }
+
+    /// Plan and install 10.20.0.0/16 beside the host's existing routes, and
+    /// prove that the receipt and the kernel agree with the outcome.
+    fn install_beside(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        existing: Vec<Value>,
+    ) -> (io::Result<()>, Vec<String>) {
+        install_appearing(tunnel_device, late_destination, existing, None)
+    }
+
+    /// The same, with a main table route that appears with the route add.
+    fn install_appearing(
+        tunnel_device: &str,
+        late_destination: Option<&str>,
+        existing: Vec<Value>,
+        appearing: Option<Value>,
+    ) -> (io::Result<()>, Vec<String>) {
+        #[derive(Default)]
+        struct Kernel {
+            alias: Option<String>,
+            link: bool,
+            address: bool,
+            route: bool,
+            late_destination: Option<String>,
+            ops: Vec<String>,
+        }
+
+        let root = Root::new();
+        let directory = root.0.join(GENERATION);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let guard = root.guard();
+        let kernel = Arc::new(Mutex::new(Kernel::default()));
+        let state = kernel.clone();
+        let tunnel_device = tunnel_device.to_owned();
+        let destination_on_add = late_destination.map(str::to_owned);
+        let network = Network::fake(move |_, args| {
+            let mut state = state.lock().unwrap();
+            state.ops.push(args.join(" "));
+            let extra_routes = || {
+                [Some("100.64.0.0/10"), state.late_destination.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|dst| json!({"dst":dst,"table":"52","dev":"tailscale0"}))
+                    .collect::<Vec<_>>()
+            };
+            let data = match args {
+                ["-4", "-j", "route", "get", "192.0.2.20"] => json!([
+                    {"dev":"eth-fixture","gateway":"192.0.2.1","prefsrc":"192.0.2.2"}
+                ]),
+                ["-4", "-j", "route", "get", dst] if state.route && dst.starts_with("10.20.") => {
+                    // The longest prefix wins, as the kernel picks.
+                    let address = (prefix(dst).unwrap().0, 32);
+                    let other = existing
+                        .iter()
+                        .map(|row| (prefix(row["dst"].as_str().unwrap()).unwrap(), row))
+                        .filter(|(key, _)| key.1 >= 16 && overlaps(*key, address))
+                        .max_by_key(|(key, _)| key.1);
+                    match other {
+                        Some((_, row)) => json!([{"dev":row["dev"]}]),
+                        None => json!([{"dev":tunnel_device}]),
+                    }
+                }
+                ["-j", "-d", "link", "show"] => {
+                    let mut links =
+                        vec![json!({"ifname":"eth-fixture","ifindex":2,"flags":["UP"]})];
+                    if state.link {
+                        links.push(json!({
+                            "ifname":"vpnti1","ifindex":3,"flags":["UP"],"link":"eth-fixture",
+                            "ifalias":state.alias,"linkinfo":{"info_kind":"xfrm","info_data":{"if_id":"0x1"}}
+                        }));
+                    }
+                    json!(links)
+                }
+                ["-4", "-j", "rule", "show"] => json!(tailscale_rules()),
+                ["-4", "-j", "route", "show", "table", "52"] => json!(extra_routes()),
+                ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                    let mut rows = defaults("eth-fixture");
+                    rows.truncate(1);
+                    rows.extend(extra_routes());
+                    rows.extend(existing.iter().cloned());
+                    // It stays after the rollback removes the tunnel route.
+                    if state.ops.iter().any(|op| op.starts_with("-4 route add ")) {
+                        rows.extend(appearing.iter().cloned());
+                    }
+                    if state.route {
+                        rows.push(json!({
+                            "dst":"10.20.0.0/16","dev":"vpnti1","type":"unicast","table":"main",
+                            "scope":"link","protocol":"boot"
+                        }));
+                    }
+                    json!(rows)
+                }
+                ["-6", "-j", "-d", "route", "show", "table", "all"] => json!([]),
+                ["-j", "addr", "show", "dev", "vpnti1"] => {
+                    let addresses = if state.address {
+                        vec![json!({"family":"inet","local":"10.99.0.2","prefixlen":32})]
+                    } else {
+                        vec![]
+                    };
+                    json!([{"ifindex":3,"addr_info":addresses}])
+                }
+                ["xfrm", "state", "list", "nokeys"] | ["xfrm", "policy", "list"] => {
+                    return Ok(vec![]);
+                }
+                [
+                    "link",
+                    "add",
+                    "name",
+                    "vpnti1",
+                    "type",
+                    "xfrm",
+                    "dev",
+                    "eth-fixture",
+                    "if_id",
+                    "1",
+                ] => {
+                    state.link = true;
+                    return Ok(vec![]);
+                }
+                ["link", "set", "dev", "vpnti1", "alias", alias] => {
+                    state.alias = Some((*alias).into());
+                    return Ok(vec![]);
+                }
+                ["link", "set", "dev", "vpnti1", "addrgenmode", "none"]
+                | ["link", "set", "dev", "vpnti1", "up"] => return Ok(vec![]),
+                [
+                    "-4",
+                    "addr",
+                    "add",
+                    "10.99.0.2/32",
+                    "dev",
+                    "vpnti1",
+                    "noprefixroute",
+                ] => {
+                    state.address = true;
+                    return Ok(vec![]);
+                }
+                ["-4", "addr", "del", "10.99.0.2/32", "dev", "vpnti1"] => {
+                    state.address = false;
+                    return Ok(vec![]);
+                }
+                [
+                    "-4",
+                    "route",
+                    "add",
+                    "10.20.0.0/16",
+                    "dev",
+                    "vpnti1",
+                    "table",
+                    "main",
+                    "proto",
+                    "boot",
+                    "scope",
+                    "link",
+                ] => {
+                    state.route = true;
+                    state.late_destination.clone_from(&destination_on_add);
+                    return Ok(vec![]);
+                }
+                [
+                    "-4",
+                    "route",
+                    "del",
+                    "10.20.0.0/16",
+                    "dev",
+                    "vpnti1",
+                    "table",
+                    "main",
+                    "proto",
+                    "boot",
+                    "scope",
+                    "link",
+                ] => {
+                    state.route = false;
+                    return Ok(vec![]);
+                }
+                ["link", "del", "dev", "vpnti1"] if !state.route && !state.address => {
+                    state.link = false;
+                    return Ok(vec![]);
+                }
+                _ => panic!("unexpected command: {args:?}"),
+            };
+            Ok(serde_json::to_vec(&data).unwrap())
+        });
+        let mut receipt = network
+            .plan(
+                &guard,
+                GENERATION,
+                REMOTE,
+                APPROVED,
+                vec![parse_cidr("10.20.0.0/16").unwrap()],
+            )
+            .unwrap();
+        let result = network.install(
+            &guard,
+            &directory,
+            &mut receipt,
+            "10.99.0.2".parse().unwrap(),
+            APPROVED,
+        );
+        let confirmed = result.is_ok();
+        assert_eq!(receipt.confirmed, confirmed);
+        // A refusal before the first write leaves no receipt to load.
+        if directory.join(RECEIPT).exists() {
+            let persisted = Receipt::load(&directory, &guard).unwrap();
+            assert_eq!(persisted.confirmed, confirmed);
+        } else {
+            assert!(!confirmed);
+        }
+        let state = kernel.lock().unwrap();
+        assert_eq!(state.late_destination.as_deref(), late_destination);
+        assert_eq!(
+            (state.link, state.route, state.address),
+            (confirmed, confirmed, confirmed)
+        );
+        (result, state.ops.clone())
+    }
+
+    /// The tunnel destinations looked up after the routes were installed.
+    fn probes(ops: &[String]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| op.strip_prefix("-4 -j route get "))
+            .filter(|dst| *dst != "192.0.2.20")
+            .collect()
+    }
+
+    #[test]
+    fn xfrm_probes_the_smallest_address_outside_the_more_specific_networks() {
+        let (result, ops) = install_beside(
+            "vpnti1",
+            None,
+            vec![
+                connected("10.20.0.0/24", "eth-lan"),
+                connected("10.20.1.0/24", "wlan-fixture"),
+            ],
+        );
+        result.unwrap();
+        assert_eq!(probes(&ops), ["10.20.2.0"]);
+    }
+
+    #[test]
+    fn xfrm_refuses_and_rolls_back_a_route_covered_during_configuration() {
+        let (result, ops) = install_appearing(
+            "vpnti1",
+            None,
+            vec![connected("10.20.0.0/17", "eth-lan")],
+            Some(connected("10.20.128.0/17", "wlan-fixture")),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
+        assert!(probes(&ops).is_empty(), "{ops:?}");
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+        assert!(ops.iter().any(|op| op.starts_with("link del ")));
+    }
+
+    #[test]
+    fn xfrm_still_rolls_back_a_route_leaving_by_another_interface_beside_a_lan() {
+        let (result, ops) = install_beside(
+            "eth-other",
+            None,
+            vec![connected("10.20.0.0/24", "eth-lan")],
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        assert_eq!(probes(&ops), ["10.20.1.0"]);
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+    }
+
+    #[test]
+    fn an_existing_route_to_the_virtual_address_is_a_collision_before_any_write() {
+        for (existing, accepted) in [
+            (connected("10.99.0.2/32", "eth-lan"), false),
+            // A broader route that only holds the address coexists.
+            (connected("10.99.0.0/24", "eth-lan"), true),
+        ] {
+            let (result, ops) = install_beside("vpnti1", None, vec![existing]);
+            if accepted {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "VPN route /32 collides with an existing route on eth-lan"
+                );
+                assert!(!ops.iter().any(|op| op.starts_with("link add ")), "{ops:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_policy_lookup_outside_xfrm_after_installation_rolls_back() {
+        check_xfrm_confirmation(
+            "eth-other",
+            None,
+            Some("tunnel route lookup selected a different interface"),
+        );
+    }
+
+    #[test]
+    fn xfrm_rechecks_additional_tables_before_confirmation() {
+        for (destination, error) in [
+            (None, None),
+            (
+                Some("10.20.1.0/24"),
+                Some(
+                    "IPv4 policy rule priority 5270 table 52: route overlaps protected destinations",
+                ),
+            ),
+            (
+                Some("203.0.113.0/24"),
+                Some("IPv4 policy routing inventory changed during configuration"),
+            ),
+        ] {
+            check_xfrm_confirmation("vpnti1", destination, error);
+        }
+    }
+
+    #[test]
+    fn every_default_must_be_simple_and_its_addresses_clear_of_the_tunnel_scope() {
+        for (field, value) in [
+            ("nhid", json!(8)),
+            ("nexthops", json!([{"dev":"wlan-fixture"}])),
+            ("encap", json!({"type":"mpls"})),
+            ("table", json!("52")),
+            ("gateway", json!("10.20.1.1")),
+            ("prefsrc", json!("10.20.1.2")),
+        ] {
+            let mut rows = defaults("eth-fixture");
+            rows[1][field] = value;
+            assert!(plan(standard_rules(), vec![], rows).is_err(), "{field}");
+        }
+        assert!(plan(standard_rules(), vec![], defaults("other-device")).is_err());
     }
 }

@@ -156,8 +156,113 @@ fn isolated_xfrm_writer_creates_and_removes_kernel_objects() {
             .iter()
             .all(|r| r["protocol"] == "boot")
     );
+
+    // This fixture has no charon. Seed the SAD and SPD entries a dead producer
+    // would leave, alongside foreign objects with both distinct and reused IDs.
+    for (src, dst, spi, reqid, id) in [
+        ("192.0.2.1", "192.0.2.2", "0x126", "1", "1"),
+        ("192.0.2.2", "192.0.2.1", "0x127", "1", "1"),
+        ("192.0.2.1", "192.0.2.2", "0x129", "2", "2"),
+        ("192.0.2.77", "192.0.2.2", "0x12a", "1", "1"),
+    ] {
+        ip(&[
+            "xfrm",
+            "state",
+            "add",
+            "src",
+            src,
+            "dst",
+            dst,
+            "proto",
+            "esp",
+            "spi",
+            spi,
+            "reqid",
+            reqid,
+            "if_id",
+            id,
+            "mode",
+            "tunnel",
+            "aead",
+            "rfc4106(gcm(aes))",
+            "0x0123456789abcdef0123456789abcdef01234567",
+            "128",
+        ]);
+    }
+    let states = ip(&["xfrm", "state", "list", "nokeys"]);
+    let states = String::from_utf8(states.stdout).unwrap();
+    for spi in ["0x00000126", "0x00000127", "0x00000129", "0x0000012a"] {
+        assert!(states.contains(spi), "{states}");
+    }
+
+    for (direction, id, route, remote) in [
+        ("out", "1", "10.20.0.0/15", "192.0.2.1"),
+        ("in", "1", "10.20.0.0/15", "192.0.2.1"),
+        ("fwd", "1", "10.20.0.0/15", "192.0.2.1"),
+        ("out", "2", "10.20.0.0/15", "192.0.2.1"),
+        ("out", "1", "172.16.0.0/12", "192.0.2.77"),
+        ("out", "1", "10.50.0.0/16", "192.0.2.1"),
+    ] {
+        let (src, dst, outer_src, outer_dst) = if direction == "out" {
+            ("10.99.0.2/32", route, "192.0.2.2", remote)
+        } else {
+            (route, "10.99.0.2/32", remote, "192.0.2.2")
+        };
+        ip(&[
+            "xfrm", "policy", "add", "src", src, "dst", dst, "dir", direction, "if_id", id, "tmpl",
+            "src", outer_src, "dst", outer_dst, "proto", "esp", "mode", "tunnel",
+        ]);
+    }
     let receipt = network::Receipt::load(&directory, &guard).unwrap();
+    assert!(backend.verify_xfrm_clear(&receipt).is_err());
+    assert!(backend.clean(&guard, &directory, &receipt).is_err());
+    assert!(guard.tunnels_present().unwrap());
+
+    let states = ip(&["xfrm", "state", "list", "nokeys"]);
+    let states = String::from_utf8(states.stdout).unwrap();
+    for spi in ["0x00000129", "0x0000012a"] {
+        assert!(states.contains(spi), "{states}");
+    }
+    for spi in ["0x00000126", "0x00000127"] {
+        assert!(!states.contains(spi), "{states}");
+    }
+
+    let policies = ip(&["xfrm", "policy", "list"]);
+    let policies = String::from_utf8(policies.stdout).unwrap();
+    assert_eq!(policies.matches("if_id 0x2").count(), 1, "{policies}");
+    assert_eq!(policies.matches("if_id 0x1").count(), 2, "{policies}");
+    assert!(policies.contains("172.16.0.0/12"), "{policies}");
+    assert!(policies.contains("10.50.0.0/16"), "{policies}");
+    assert!(policies.contains("192.0.2.77"), "{policies}");
+
+    ip(&[
+        "xfrm",
+        "state",
+        "delete",
+        "dst",
+        "192.0.2.2",
+        "proto",
+        "esp",
+        "spi",
+        "0x12a",
+    ]);
+    for route in ["172.16.0.0/12", "10.50.0.0/16"] {
+        ip(&[
+            "xfrm",
+            "policy",
+            "delete",
+            "src",
+            "10.99.0.2/32",
+            "dst",
+            route,
+            "dir",
+            "out",
+            "if_id",
+            "1",
+        ]);
+    }
     backend.clean(&guard, &directory, &receipt).unwrap();
+    backend.verify_xfrm_clear(&receipt).unwrap();
     guard.withdraw(generation).unwrap();
     assert!(!guard.tunnels_present().unwrap());
 

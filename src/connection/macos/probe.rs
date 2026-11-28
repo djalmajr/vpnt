@@ -9,6 +9,7 @@ use crate::model::{Profile, VpnKind};
 use icmp::ping;
 use std::{
     net::{IpAddr, SocketAddr},
+    os::fd::OwnedFd,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -99,6 +100,35 @@ fn run_until(
     deadline: Instant,
     allow_local_fixture: bool,
 ) -> Outcome {
+    run_with(
+        link,
+        profile,
+        canceled,
+        deadline,
+        allow_local_fixture,
+        Instant::now,
+        |index, source, target, attempt, canceled| {
+            tcp::connect(index, source, target, attempt, canceled)
+        },
+    )
+}
+
+/// The very same loop as `run_until`, with only its clock and TCP dial
+/// injectable. Production passes `Instant::now` and `tcp::connect`; a test
+/// passes a deterministic clock and a dial that records the deadline it got.
+fn run_with<N, D>(
+    link: &impl Link,
+    profile: &Profile,
+    canceled: &AtomicBool,
+    deadline: Instant,
+    allow_local_fixture: bool,
+    now: N,
+    dial: D,
+) -> Outcome
+where
+    N: Fn() -> Instant,
+    D: Fn(u32, IpAddr, SocketAddr, Instant, &AtomicBool) -> Result<OwnedFd, tcp::Error>,
+{
     // Precedence: profile/kind, cancel, total expiry, then link validity.
     if profile.validate().is_err() || profile.kind != link.kind().vpn() {
         return Outcome::InvalidTarget;
@@ -108,7 +138,7 @@ fn run_until(
     }
     // Keep a traffic reserve when only one DNS family completes; the half cap
     // is derived from the remaining total, never from a fresh timeout.
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+    let Some(remaining) = deadline.checked_duration_since(now()) else {
         return Outcome::Unresponsive;
     };
     if remaining.is_zero() {
@@ -117,7 +147,7 @@ fn run_until(
     let interface = link.interface();
     let protocol = u32::from(interface.addresses.iter().any(IpAddr::is_ipv4))
         | (u32::from(interface.addresses.iter().any(IpAddr::is_ipv6)) << 1);
-    let dns_deadline = (Instant::now() + (remaining / 2).min(Duration::from_secs(2))).min(deadline);
+    let dns_deadline = (now() + (remaining / 2).min(Duration::from_secs(2))).min(deadline);
     let targets = match resolve::resolve(
         &profile.probe_host,
         interface.index,
@@ -138,18 +168,17 @@ fn run_until(
         Ok(local) => local,
         Err(_) => return failure_or(canceled, deadline, Outcome::InvalidLink),
     };
-    let mut attempted = false;
-    for target in targets {
-        if !remote(target, &local, allow_local_fixture) {
-            continue;
-        }
-        let Some(source) = source(interface, target) else {
-            continue;
-        };
-        if source.is_loopback() && !allow_local_fixture {
-            continue;
-        }
-        attempted = true;
+    // Only targets this probe can actually use take a share of the budget.
+    // Both filters are pure against the local interface snapshot above.
+    let candidates: Vec<_> = targets
+        .iter()
+        .copied()
+        .filter(|target| remote(*target, &local, allow_local_fixture))
+        .filter_map(|target| source(interface, target).map(|source| (target, source)))
+        .filter(|(_, source)| !source.is_loopback() || allow_local_fixture)
+        .collect();
+    let target_count = candidates.len();
+    for (index, (target, source)) in candidates.into_iter().enumerate() {
         if let Err(outcome) = checked_current(link, canceled, deadline) {
             return outcome;
         }
@@ -160,8 +189,8 @@ fn run_until(
         if let Err(outcome) = checked_current(link, canceled, deadline) {
             return outcome;
         }
-        let attempt = (Instant::now() + Duration::from_secs(1)).min(deadline);
-        match tcp::connect(
+        let attempt = tcp_attempt_deadline(now(), deadline, target_count - index);
+        match dial(
             interface.index,
             source,
             SocketAddr::new(target, profile.probe_port),
@@ -173,17 +202,32 @@ fn run_until(
             Err(tcp::Error::Canceled) => return Outcome::Canceled,
             Err(_) => {}
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             break;
         }
     }
     if let Err(outcome) = checked_current(link, canceled, deadline) {
         return outcome;
     }
-    if attempted {
+    if target_count > 0 {
         Outcome::Unresponsive
     } else {
         Outcome::InvalidTarget
+    }
+}
+
+/// Give each target still to be tried (the current one included) an equal
+/// share of the remaining total budget, with a one-second floor whenever the
+/// deadline allows it. The absolute deadline always caps the result.
+fn tcp_attempt_deadline(now: Instant, deadline: Instant, targets_left: usize) -> Instant {
+    let remaining = deadline.saturating_duration_since(now);
+    let share = u32::try_from(targets_left)
+        .ok()
+        .and_then(|targets| remaining.checked_div(targets))
+        .unwrap_or(remaining);
+    match now.checked_add(share.max(Duration::from_secs(1))) {
+        Some(candidate) => candidate.min(deadline),
+        None => deadline,
     }
 }
 

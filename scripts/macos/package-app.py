@@ -15,7 +15,7 @@ version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path, default=Path("target/debug/vpnt"))
-parser.add_argument("--output", type=Path, default=Path("target/vpnt.app"))
+parser.add_argument("--output", type=Path, default=Path("target/VPN Tray.app"))
 parser.add_argument("--replace", action="store_true")
 parser.add_argument("--component-payload", type=Path, help="Include the audited local component from this admitted payload")
 args = parser.parse_args()
@@ -31,7 +31,7 @@ if args.output.exists():
             parser.error("Refusing to replace a different application.")
 args.output.parent.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent) as temporary:
-    bundle = Path(temporary) / "vpnt.app"
+    bundle = Path(temporary) / "VPN Tray.app"
     executable = bundle / "Contents/MacOS/vpnt"
     executable.parent.mkdir(parents=True)
     shutil.copy2(args.binary, executable)
@@ -40,6 +40,7 @@ with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent)
     resources = bundle / "Contents/Resources"
     resources.mkdir()
     shutil.copy2(root / "LICENSE", resources / "LICENSE")
+    shutil.copy2(root / "assets/macos/AppIcon.icns", resources / "AppIcon.icns")
     notices = root / "LICENSES"
     if notices.is_dir():
         shutil.copytree(notices, resources / "LICENSES")
@@ -47,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="vpnt-package-", dir=args.output.parent)
     if args.component_payload:
         minimum = include_component(args.component_payload.resolve(), resources, executable)
     with (bundle / "Contents/Info.plist").open("wb") as handle:
-        plistlib.dump({"CFBundleIdentifier": identifier("app"), "CFBundleName": "VPN Tray", "CFBundleDisplayName": "VPN Tray", "CFBundleExecutable": "vpnt", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": minimum, "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
+        plistlib.dump({"CFBundleIdentifier": identifier("app"), "CFBundleName": "VPN Tray", "CFBundleDisplayName": "VPN Tray", "CFBundleExecutable": "vpnt", "CFBundleIconFile": "AppIcon", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": version, "CFBundleVersion": "1", "LSMinimumSystemVersion": minimum, "LSUIElement": True, "NSHighResolutionCapable": True}, handle)
     if args.output.exists():
         shutil.rmtree(args.output)
     shutil.move(str(bundle), str(args.output))

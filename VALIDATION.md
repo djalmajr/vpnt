@@ -1809,7 +1809,7 @@ cargo build --locked --bins
 python3 scripts/macos/build-askpass.py
 python3 scripts/macos/prepare-installation.py
 python3 scripts/macos/package-app.py --replace --component-payload "target/vpnt-installation/ID_DO_PAYLOAD"
-target/vpnt.app/Contents/MacOS/vpnt --inspect-component
+"target/VPN Tray.app/Contents/MacOS/vpnt" --inspect-component
 ```
 
 [executed, filesystem/byte binding] Sete testes do leitor Rust vinculam versão,
@@ -3015,6 +3015,22 @@ Achados:
 - **Falso alarme no cartão:** uma única sonda falhou e o cartão foi para "sem resposta". O host de teste não responde a ICMP, e a tentativa TCP tem 1 s. A sonda seguinte voltou a Conectado. O alarme está em correção.
 
 Não observados nesta rodada: cancelar durante a aprovação, Reconnect manual, renegociação TLS depois de uma hora e convivência com perfis IPsec e Fortinet conectados ao mesmo tempo. Esta evidência não cobre os outros clientes listados acima.
+
+### Canal prd em /Applications com IPsec, Fortinet SSL e OpenVPN (25/11/2026)
+
+[real VPN, manual] Primeiro uso do canal `prd` (`dev.djalmajr.vpnt.app`), com o build da `main` em `2bfc5db`.
+- **Troca de canal:** o dono desconectou as VPNs, removeu o componente dev pelo app dev e instalou o componente prd pelo app prd, com uma senha em cada passo. Depois digitou de novo as senhas dos perfis, porque o chaveiro do prd é outro serviço.
+- **Local:** o app rodou a partir de `/Applications`; a admissão do componente embutido aceitou esse ancestral. Depois, o mesmo binário e o mesmo componente foram reempacotados como `VPN Tray.app` com ícone (branch `feat/app-name-icon`); `cmp` e `diff -r` confirmaram host e componente idênticos, sem nova instalação.
+- **Conexões:** um perfil IPsec IKEv2 (charon), um Fortinet SSL (openfortivpn e pppd) e um OpenVPN com token PKCS#11, todos ligados ao mesmo tempo, com o Tailscale ativo.
+- **Tráfego:** a rota de cada host de teste saía pela interface do próprio túnel. IPsec: ping e TCP respondendo; Fortinet SSL: ping e SSH; OpenVPN: TCP 53. A internet continuou pela rota padrão física, e o Tailscale respondeu ao peer em 1 ms.
+
+Achados:
+- **Quit derruba as conexões:** o helper roda como filho do app (`sudo -n -- helper runtime`). Fechar o app encerrou o helper e os três túneis; o app novo abriu um helper novo com tudo desligado. Isso confirma o que R3 e R4 já registravam, mas o dono foi avisado do contrário antes da troca.
+- **Sobras do dev:** a remoção do componente dev deixou `dev.djalmajr.vpnt-dev.runtime` e `dev.djalmajr.vpnt-dev.staging` em `/Library/PrivilegedHelperTools`.
+
+- **Ícone da barra:** o dono confirmou o ícone correto no prd com as três ligadas, incluindo o OpenVPN (a correção do PR #57 está no build).
+
+Não observado nesta rodada: abertura no login.
 
 ## Arquivo e estrutura
 

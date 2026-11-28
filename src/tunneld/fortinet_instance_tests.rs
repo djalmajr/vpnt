@@ -1882,6 +1882,59 @@ fn the_real_parser_types_any_other_interface_as_a_mismatch() {
     }
 }
 
+/// What the instance writes to its journal, kept in memory.
+#[derive(Clone, Default)]
+struct Journal(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Journal {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_instance_journals_only_fixed_client_states_once() {
+    let scratch = Scratch::new();
+    // The same recognized pppd line on both pipes and twice on one of them, and
+    // an unknown line carrying an address on each.
+    let body = r#"
+print("Peer refused to agree to his IP address", file=sys.stderr, flush=True)
+print("Peer refused to agree to his IP address", file=sys.stderr, flush=True)
+print("Peer refused to agree to his IP address", flush=True)
+print("rcvd address 10.20.30.40 for alice", file=sys.stderr, flush=True)
+print("INFO:   Got addresses: [10.20.30.41]", flush=True)
+put("done", {})
+idle()
+"#;
+    let journal = Journal::default();
+    let instance = Instance::start_with(
+        &scratch,
+        body,
+        params(Some(PIN)),
+        Duration::from_secs(2),
+        journaling_observer(journal.clone()),
+    );
+    instance.writer.credential(PASSWORD);
+    scratch.json("done");
+    instance.writer.stop();
+    let events = instance.writer.events();
+    assert_eq!(instance.join().unwrap().reason, Reason::Stop);
+    assert_eq!(
+        String::from_utf8(journal.0.lock().unwrap().clone()).unwrap(),
+        "vpnt-tunneld: fortinet client: Peer refused to agree to his IP address\n"
+    );
+    // The journal is the only new destination: nothing of it reaches the writer.
+    let wire = serde_json::to_string(&events).unwrap();
+    for raw in ["Peer refused", "10.20.30.4", "alice"] {
+        assert!(!wire.contains(raw), "{raw} reached the writer");
+    }
+}
+
 #[test]
 fn the_sweep_reports_a_kill_of_a_live_process_and_only_then() {
     let scratch = Scratch::new();

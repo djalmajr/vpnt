@@ -5,12 +5,14 @@ use crate::{
         session::SignError,
         signing::{Hash, Padding},
     },
+    diagnostic_sink::Memory,
     helper::protocol::{
         ErrorCode, PssHashName, PssOperation, PssPaddingName, SignDataBytes, SignFields,
         SignOperation, SignOperationName, TunnelStatus,
     },
 };
 use std::{
+    io::{self, Write},
     sync::{
         Arc, Condvar, Mutex,
         atomic::AtomicBool,
@@ -21,6 +23,89 @@ use std::{
 
 const BUDGET: Duration = Duration::from_secs(15);
 const EPOCH: u64 = 73;
+
+#[test]
+fn connection_diagnostics_report_only_ids_generations_and_codes() {
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut wire = Wire::new(None, None, None);
+    wire.broker
+        .connections
+        .get_mut("ssl")
+        .unwrap()
+        .view
+        .profile
+        .name = "private profile".into();
+    let capture = Capture::default();
+    wire.broker.diagnostic_output = Box::new(Memory(capture.clone()));
+
+    for accepted in [false, true] {
+        let id = wire.submit_connect("ssl", State::Connecting);
+        if accepted {
+            wire.send(Message::Accepted { id });
+        } else {
+            wire.send(Message::Failed {
+                id,
+                error: ErrorCode::ProfileBusy,
+            });
+            assert_eq!(wire.broker.connections["ssl"].generation, 0);
+            assert_eq!(wire.broker.connections["ssl"].view.state, State::Off);
+        }
+    }
+    wire.send(Message::Changed {
+        profile_id: "ssl".into(),
+        generation: 1,
+        state: State::Connected,
+        failures: 0,
+        cleaning: false,
+        failure: None,
+    });
+    for accepted in [false, true] {
+        wire.broker.disconnect("ssl").unwrap();
+        let id = wire.request().id;
+        if accepted {
+            wire.send(Message::Accepted { id: id.clone() });
+        }
+        wire.send(Message::Failed {
+            id,
+            error: ErrorCode::InvalidRequest,
+        });
+        let connection = &wire.broker.connections["ssl"];
+        assert_eq!(connection.generation, if accepted { 2 } else { 1 });
+        assert_eq!(
+            connection.view.state,
+            if accepted {
+                State::Disconnecting
+            } else {
+                State::Connected
+            }
+        );
+    }
+
+    assert_eq!(
+        std::str::from_utf8(&capture.0.lock().unwrap()).unwrap(),
+        concat!(
+            "vpnt: broker: command=connect event=submitted id=ssl generation=1\n",
+            "vpnt: broker: command=connect event=failed id=ssl generation=1 error=ProfileBusy restored=true\n",
+            "vpnt: broker: command=connect event=submitted id=ssl generation=1\n",
+            "vpnt: broker: command=connect event=accepted id=ssl generation=1\n",
+            "vpnt: broker: command=disconnect event=submitted id=ssl generation=2\n",
+            "vpnt: broker: command=disconnect event=failed id=ssl generation=2 error=InvalidRequest restored=true\n",
+            "vpnt: broker: command=disconnect event=submitted id=ssl generation=2\n",
+            "vpnt: broker: command=disconnect event=accepted id=ssl generation=2\n",
+            "vpnt: broker: command=disconnect event=failed id=ssl generation=2 error=InvalidRequest restored=false\n",
+        )
+    );
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Event {

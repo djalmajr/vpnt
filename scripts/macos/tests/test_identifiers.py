@@ -140,6 +140,9 @@ class Channels(unittest.TestCase):
             info = bundle / 'Contents/Info.plist'
             original = info.read_bytes()
             self.assertEqual(plistlib.loads(original)['CFBundleIdentifier'], 'dev.djalmajr.vpnt-dev.app')
+            self.assertEqual(plistlib.loads(original)['CFBundleIconFile'], 'AppIcon')
+            self.assertEqual((bundle / 'Contents/Resources/AppIcon.icns').read_bytes(),
+                             (ROOT / 'assets/macos/AppIcon.icns').read_bytes())
             self.assertNotEqual(package('prd', 'dev').returncode, 0)
             self.assertEqual(info.read_bytes(), original)
             self.assertNotEqual(package('prd', 'prd').returncode, 0)

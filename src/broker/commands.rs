@@ -324,8 +324,21 @@ impl<S: SecretStore> Broker<S> {
         }
         self.next = next;
         let c = self.connections.get_mut(id).ok_or("not_found")?;
+        let diagnostic_command = if connecting {
+            Some("connect")
+        } else if disconnecting {
+            Some("disconnect")
+        } else {
+            None
+        };
+        if let Some(command) = diagnostic_command {
+            self.diagnostic_output.record(format!(
+                "vpnt: broker: command={command} event=submitted id={id} generation={generation}"
+            ));
+        }
         c.pending = Some(Pending {
             id: request,
+            diagnostic_command,
             previous: (c.generation, c.view.state, c.view.failure),
             accepted: false,
         });

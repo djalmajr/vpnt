@@ -22,15 +22,13 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOVERY_REPLY_TIMEOUT: Duration = Duration::from_millis(100);
 const SESSION_IDLE_MS: libc::c_int = 24 * 60 * 60 * 1000;
 const MAX_PER_UID: usize = 2;
 const MAX_CONNECTIONS: usize = 8;
@@ -43,7 +41,46 @@ struct Server {
     policy: PolicyStore,
     launcher: Arc<dyn Launch>,
     cleanup: Option<Arc<Store>>,
-    recovered: Arc<AtomicBool>,
+    recovered: Arc<StartupRecovery>,
+}
+
+struct StartupRecovery {
+    completed_at: Mutex<Option<Instant>>,
+    completed: Condvar,
+}
+
+impl StartupRecovery {
+    fn new(ready: bool) -> Self {
+        Self {
+            completed_at: Mutex::new(ready.then(Instant::now)),
+            completed: Condvar::new(),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.completed_at
+            .lock()
+            .expect("startup recovery")
+            .is_some()
+    }
+
+    fn mark_ready(&self) {
+        *self.completed_at.lock().expect("startup recovery") = Some(Instant::now());
+        self.completed.notify_all();
+    }
+
+    fn wait_until_ready(&self, deadline: Instant) -> bool {
+        let completed_at = self.completed_at.lock().expect("startup recovery");
+        let (completed_at, _) = self
+            .completed
+            .wait_timeout_while(
+                completed_at,
+                deadline.saturating_duration_since(Instant::now()),
+                |completed| completed.is_none(),
+            )
+            .expect("startup recovery");
+        completed_at.is_some_and(|completed| completed < deadline)
+    }
 }
 
 #[derive(Default)]
@@ -90,9 +127,9 @@ impl Default for Server {
 
 impl Server {
     fn new(policy: PolicyStore) -> io::Result<Self> {
-        let launcher = Arc::new(Launcher::system(IpRoute::system()));
         let cleanup = Arc::new(Store::open(Path::new(RUNTIME_DIRECTORY))?);
-        let recovered = Arc::new(AtomicBool::new(false));
+        let launcher = Arc::new(Launcher::system(IpRoute::system(), cleanup.clone()));
+        let recovered = Arc::new(StartupRecovery::new(false));
         let worker = (launcher.clone(), cleanup.clone(), recovered.clone());
         thread::Builder::new()
             .name("vpnt-tunneld-recovery".into())
@@ -124,7 +161,7 @@ impl Server {
             policy,
             launcher: Arc::from(launcher),
             cleanup: None,
-            recovered: Arc::new(AtomicBool::new(true)),
+            recovered: Arc::new(StartupRecovery::new(true)),
         }
     }
 
@@ -187,7 +224,7 @@ impl Server {
 /// A single worker owns startup recovery. After admission opens it only
 /// retries publication of already-proved results, never live network teardown.
 fn reconcile(
-    recovered: &AtomicBool,
+    recovered: &StartupRecovery,
     mut recover: impl FnMut() -> io::Result<()>,
     mut publish: impl FnMut() -> io::Result<()>,
     mut wait: impl FnMut(Duration) -> bool,
@@ -195,11 +232,13 @@ fn reconcile(
     let mut delay = RECONCILE_MIN;
     let mut reporting_failure = false;
     loop {
-        let ready = recovered.load(Ordering::Acquire);
+        let ready = recovered.is_ready();
         let result = if ready { publish() } else { recover() };
         match result {
             Ok(()) => {
-                recovered.store(true, Ordering::Release);
+                if !ready {
+                    recovered.mark_ready();
+                }
                 reporting_failure = false;
                 delay = RECONCILE_MIN;
                 if !wait(delay) {
@@ -231,7 +270,7 @@ fn serve(
     policy: &PolicyStore,
     launcher: &dyn Launch,
     cleanup: Option<&Store>,
-    recovered: &AtomicBool,
+    recovered: &StartupRecovery,
     accepted: Instant,
 ) -> Result<(), FrameError> {
     let hello_deadline = accepted + FRAME_TIMEOUT;
@@ -273,8 +312,11 @@ fn serve(
         }
         Err(error) => return Err(error),
     };
-    if !recovered.load(Ordering::Acquire) {
-        return decoder.reject(ErrorCode::Busy, prepare_deadline);
+    if !recovered.wait_until_ready(prepare_deadline) {
+        eprintln!("vpnt-tunneld: admission ended: startup recovery still running");
+        // The prepare budget has expired. Give only the terminal reply a
+        // short write budget so the peer can still receive the typed error.
+        return decoder.reject(ErrorCode::Busy, Instant::now() + RECOVERY_REPLY_TIMEOUT);
     }
     let read_policy = || {
         let directory = policy.open()?;
@@ -653,7 +695,7 @@ pub(super) fn serve_fixture(
         policy,
         launcher,
         None,
-        &AtomicBool::new(true),
+        &StartupRecovery::new(true),
         Instant::now(),
     )
 }
@@ -672,7 +714,7 @@ pub(super) fn serve_cleanup_fixture(
         policy,
         launcher,
         Some(cleanup),
-        &AtomicBool::new(true),
+        &StartupRecovery::new(true),
         Instant::now(),
     )
 }
@@ -689,7 +731,7 @@ where
     N: crate::netd::iproute::Backend,
     A: super::handshake::UnitAttestor + Send + Sync,
 {
-    let recovered = AtomicBool::new(false);
+    let recovered = StartupRecovery::new(false);
     reconcile(
         &recovered,
         || launcher.recover_with(Some(cleanup)),
@@ -876,12 +918,76 @@ mod policy_dialogue_tests {
         code
     }
 
-    fn tests_receive(stream: &UnixStream) -> Response {
+    fn receive_by(stream: &UnixStream, deadline: Instant) -> Result<Response, FrameError> {
         read_control(
-            &mut timed(stream, Instant::now() + FRAME_TIMEOUT).unwrap(),
+            &mut timed(stream, deadline)?,
             super::super::protocol::decode_response,
         )
-        .unwrap()
+    }
+
+    fn tests_receive(stream: &UnixStream) -> Response {
+        receive_by(stream, Instant::now() + FRAME_TIMEOUT).unwrap()
+    }
+
+    fn open_dialogue(server: &Arc<Server>, version: u32) -> (UnixStream, thread::JoinHandle<()>) {
+        let (mut client, stream) = UnixStream::pair().unwrap();
+        let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
+        writeln!(client, r#"{{"op":"hello","version":{version}}}"#).unwrap();
+        assert!(
+            matches!(tests_receive(&client), Response::Version { version: received } if received == version)
+        );
+        (client, worker)
+    }
+
+    fn send_recovery_offer(client: &mut UnixStream) {
+        writeln!(client, r#"{{"op":"prepare_ipsec","endpoint":{{"host":"vpn.example","port":500}},"username":"fixture","networks":[{{"network":"10.20.0.0","prefix":16}}]}}"#).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_timeout_replies_busy_and_logs() {
+        const CHILD: &str = "VPNT_TEST_STARTUP_RECOVERY_TIMEOUT";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Process::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tunneld::server::policy_dialogue_tests::startup_recovery_timeout_replies_busy_and_logs",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.lines().any(|line| {
+                    line == "vpnt-tunneld: admission ended: startup recovery still running"
+                }),
+                "{stderr}"
+            );
+            return;
+        }
+
+        let server = Arc::new(Server {
+            recovered: Arc::new(StartupRecovery::new(false)),
+            ..Server::default()
+        });
+        let started = Instant::now();
+        let (mut client, worker) = open_dialogue(&server, VERSION);
+        send_recovery_offer(&mut client);
+        let response = receive_by(
+            &client,
+            Instant::now() + FRAME_TIMEOUT + Duration::from_secs(1),
+        );
+        drop(client);
+        worker.join().unwrap();
+        assert!(matches!(
+            response.unwrap(),
+            Response::Error {
+                code: ErrorCode::Busy
+            }
+        ));
+        assert!(started.elapsed() >= FRAME_TIMEOUT);
     }
 
     #[test]
@@ -889,7 +995,7 @@ mod policy_dialogue_tests {
         let policy = PolicyFixture::new();
         policy.install();
         let mut server = Server::with_launcher(policy.store.clone(), Box::new(Unavailable));
-        server.recovered.store(false, Ordering::Release);
+        server.recovered = Arc::new(StartupRecovery::new(false));
         let store = Arc::new(Store::open(policy.path().parent().unwrap()).unwrap());
         let reservation = store.reserve(1000).unwrap();
         let id = reservation.generation().clone();
@@ -897,8 +1003,8 @@ mod policy_dialogue_tests {
         server.cleanup = Some(store);
         let server = Arc::new(server);
         let (observed, next) = std::sync::mpsc::channel();
-        let (resume, continued) = std::sync::mpsc::channel();
         thread::scope(|scope| {
+            let (resume, continued) = std::sync::mpsc::channel();
             let recovered = &server.recovered;
             let scheduler = scope.spawn(move || {
                 let mut attempts = 0;
@@ -922,22 +1028,13 @@ mod policy_dialogue_tests {
                 );
                 attempts
             });
-            let open = |version| {
-                let (mut client, stream) = UnixStream::pair().unwrap();
-                let worker = server.dispatch(stream, |_| Ok(1000)).unwrap();
-                writeln!(client, r#"{{"op":"hello","version":{version}}}"#).unwrap();
-                assert!(
-                    matches!(tests_receive(&client), Response::Version { version: received } if received == version)
-                );
-                (client, worker)
-            };
-            let offer = br#"{"op":"prepare_ipsec","endpoint":{"host":"vpn.example","port":500},"username":"fixture","networks":[{"network":"10.20.0.0","prefix":16}]}"#;
-            for seconds in [1, 2, 4, 8, 8] {
+            let backoff = [1, 2, 4, 8, 8];
+            for (attempt, seconds) in backoff.into_iter().enumerate() {
                 assert_eq!(
                     next.recv_timeout(Duration::from_secs(5)).unwrap(),
                     Duration::from_secs(seconds)
                 );
-                let (mut client, worker) = open(2);
+                let (mut client, worker) = open_dialogue(&server, CLEANUP_VERSION);
                 write_control(
                     &mut client,
                     &Request::CleanupStatus {
@@ -953,33 +1050,51 @@ mod policy_dialogue_tests {
                 ));
                 worker.join().unwrap();
 
-                let (mut client, worker) = open(1);
-                client.write_all(offer).unwrap();
-                client.write_all(b"\n").unwrap();
-                assert!(matches!(
-                    tests_receive(&client),
-                    Response::Error {
-                        code: ErrorCode::Busy
-                    }
-                ));
-                worker.join().unwrap();
-                resume.send(true).unwrap();
+                if attempt + 1 < backoff.len() {
+                    resume.send(true).unwrap();
+                }
             }
+            let mut sessions = Vec::new();
+            for version in [VERSION, CLEANUP_VERSION] {
+                let (mut client, worker) = open_dialogue(&server, version);
+                send_recovery_offer(&mut client);
+                sessions.push((version, client, worker));
+            }
+            let pending = sessions
+                .iter()
+                .map(|(_, client, _)| {
+                    receive_by(client, Instant::now() + Duration::from_millis(100))
+                })
+                .collect::<Vec<_>>();
+            resume.send(true).unwrap();
             assert_eq!(
                 next.recv_timeout(Duration::from_secs(5)).unwrap(),
                 RECONCILE_MIN
             );
-            let (mut client, worker) = open(1);
-            client.write_all(offer).unwrap();
-            client.write_all(b"\n").unwrap();
-            assert!(matches!(
-                tests_receive(&client),
-                Response::Prepared { generation: None }
-            ));
-            drop(client);
-            worker.join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let admitted = sessions
+                .into_iter()
+                .map(|(version, client, worker)| {
+                    let response = receive_by(&client, deadline);
+                    drop(client);
+                    worker.join().unwrap();
+                    (version, response)
+                })
+                .collect::<Vec<_>>();
             resume.send(false).unwrap();
             assert_eq!(scheduler.join().unwrap(), 6);
+            for response in pending {
+                assert!(
+                    matches!(response, Err(FrameError::Io(io::ErrorKind::TimedOut))),
+                    "unexpected admission reply before recovery: {response:?}"
+                );
+            }
+            for (version, response) in admitted {
+                assert!(
+                    matches!(&response, Ok(Response::Prepared { generation }) if generation.is_some() == (version == CLEANUP_VERSION)),
+                    "unexpected admission reply after recovery for v{version}: {response:?}"
+                );
+            }
         });
     }
 

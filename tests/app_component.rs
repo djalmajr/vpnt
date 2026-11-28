@@ -34,6 +34,12 @@ impl App {
             .unwrap();
         }
         fs::copy(source.join("LICENSE"), repository.root.join("LICENSE")).unwrap();
+        fs::create_dir_all(repository.root.join("assets/macos")).unwrap();
+        fs::copy(
+            source.join("assets/macos/AppIcon.icns"),
+            repository.root.join("assets/macos/AppIcon.icns"),
+        )
+        .unwrap();
         fs::copy(
             env!("CARGO_BIN_EXE_vpnt"),
             repository.root.join("target/debug/vpnt"),
@@ -47,7 +53,9 @@ impl App {
         );
         let result: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
         assert_eq!(result["uid"], repository.uid());
-        let bundle = repository.root.join("packaged/vpnt.app");
+        // The packager's default output, run from the fixture root, so the
+        // default name (with its space) is what the host is admitted from.
+        let bundle = repository.root.join("target/VPN Tray.app");
         Self {
             repository,
             payload: PathBuf::from(result["payload"].as_str().unwrap()),
@@ -60,8 +68,7 @@ impl App {
             .arg(self.repository.root.join("scripts/macos/package-app.py"))
             .arg("--binary")
             .arg(self.repository.root.join("target/debug/vpnt"))
-            .arg("--output")
-            .arg(&self.bundle)
+            .current_dir(&self.repository.root)
             .arg("--replace");
         if component {
             command.arg("--component-payload").arg(&self.payload);

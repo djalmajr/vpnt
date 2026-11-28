@@ -305,6 +305,15 @@ impl Store {
 
     fn stopped(&self, generation: &Generation, uid: u32) -> io::Result<()> {
         let mut deferred = self.access.lock().expect("cleanup receipt store");
+        self.publish_or_defer(&mut deferred, generation, uid)
+    }
+
+    fn publish_or_defer(
+        &self,
+        deferred: &mut Vec<Publication>,
+        generation: &Generation,
+        uid: u32,
+    ) -> io::Result<()> {
         if let Some(index) = deferred
             .iter()
             .position(|entry| entry.generation == *generation)
@@ -343,11 +352,11 @@ impl Store {
 
     /// The backend has proved cleanup and withdrawn this specific lease.
     pub(super) fn recovered(&self, generation: &str) -> io::Result<()> {
-        let _access = self.access.lock().expect("cleanup receipt store");
+        let mut deferred = self.access.lock().expect("cleanup receipt store");
         let generation =
             Generation::parse(generation.to_owned()).expect("validated receipt directory");
         match self.read(&generation) {
-            Ok(receipt) => self.publish(receipt, (self.clock)()?),
+            Ok(receipt) => self.publish_or_defer(&mut deferred, &generation, receipt.uid),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
@@ -606,6 +615,35 @@ mod tests {
         store.republish().unwrap();
         assert!(store.access.lock().unwrap().is_empty());
         assert_eq!(store.status(1000, &generation), CleanupState::Stopped);
+    }
+
+    #[test]
+    fn recovery_publication_is_retried_by_the_background_store_worker() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let mut record = store.reserve(1000).unwrap();
+        record.begin_network().unwrap();
+        record.arm().unwrap();
+        let generation = record.generation();
+        store
+            .fail_terminal_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            store.recovered(generation.as_str()).unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert_eq!(store.status(1000, generation), CleanupState::Pending);
+        assert_eq!(
+            store.republish().unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        store
+            .fail_terminal_write
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        store.republish().unwrap();
+        assert_eq!(store.status(1000, generation), CleanupState::Stopped);
+        assert!(store.access.lock().unwrap().is_empty());
     }
 
     #[test]

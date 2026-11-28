@@ -12,8 +12,9 @@
 use super::{
     fortinet_instance::{Event, Failure},
     network::{
-        SetupCancellation, check_deadline, check_standard_ipv4_rules, cidr_text, overlaps, prefix,
-        route_key, valid_generation,
+        PolicyInventory, SetupCancellation, check_deadline, check_ipv4_rules, check_shadow,
+        cidr_text, collision, fib_destination, holder, is_connected_network, overlaps, prefix,
+        probe_addresses, rollback_error, route_key, valid_generation, verify_tunnel_routes,
     },
     policy::Entry,
     protocol::{CidrV4, Generation, ProbeBinding},
@@ -225,6 +226,7 @@ pub(super) struct Grant {
     pub certificate_sha256: String,
     #[serde(deserialize_with = "deserialize_local_scope")]
     pub fortinet_local_cidr: CidrV4,
+    route_cidrs: Vec<String>,
     pub dns_domains: Vec<String>,
     pub dns_servers: Vec<Ipv4Addr>,
 }
@@ -256,7 +258,7 @@ pub(super) struct Delivered {
     dns_invalid: bool,
     mismatch: bool,
     failure: Option<Failure>,
-    exited: bool,
+    exited: Option<(Option<i32>, Option<i32>)>,
 }
 
 /// Why an attempt cannot go on, from what the instance reported.
@@ -266,9 +268,26 @@ pub(super) enum Fatal {
     InterfaceMismatch,
     Failure(Failure),
     /// The client ended before the network was ready.
-    Exited,
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
     /// Contradictory or invalid data from the gateway.
     Invalid,
+}
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited { code, signal } => match (code, signal) {
+                (Some(code), Some(signal)) => write!(f, "Exited (code={code}, signal={signal})"),
+                (Some(code), None) => write!(f, "Exited (code={code})"),
+                (None, Some(signal)) => write!(f, "Exited (signal={signal})"),
+                (None, None) => f.write_str("Exited"),
+            },
+            _ => write!(f, "{self:?}"),
+        }
+    }
 }
 
 impl Delivered {
@@ -290,7 +309,7 @@ impl Delivered {
                 self.dns_invalid |= self.dns_count.replace((servers, domains)).is_some();
             }
             Event::DnsInvalid => self.dns_invalid = true,
-            Event::Exited { .. } => self.exited = true,
+            Event::Exited { code, signal } => self.exited = Some((code, signal)),
         }
     }
 
@@ -300,8 +319,8 @@ impl Delivered {
             Some(Fatal::InterfaceMismatch)
         } else if let Some(kind) = self.failure {
             Some(Fatal::Failure(kind))
-        } else if self.exited {
-            Some(Fatal::Exited)
+        } else if let Some((code, signal)) = self.exited {
+            Some(Fatal::Exited { code, signal })
         } else if self.split_invalid
             || self
                 .route_count
@@ -318,9 +337,23 @@ impl Delivered {
 
     /// The interface is up and both lists are complete (their count lines seen).
     pub(super) fn ready(&self) -> bool {
-        self.interface.is_some()
-            && self.route_count.is_some()
-            && (self.dns_count.is_some() || self.dns_invalid)
+        self.progress() == [true; 3]
+    }
+
+    /// What `ready` waits for, as booleans, for the message of a setup that ran
+    /// out of time. Nothing the instance reported is copied into it.
+    pub(super) fn arrived(&self) -> String {
+        let [interface, routes, dns] = self.progress();
+        format!("(interface={interface} routes={routes} dns={dns})")
+    }
+
+    /// The interface, the complete route list and the DNS offer, valid or not.
+    fn progress(&self) -> [bool; 3] {
+        [
+            self.interface.is_some(),
+            self.route_count.is_some(),
+            self.dns_count.is_some() || self.dns_invalid,
+        ]
     }
 }
 
@@ -404,6 +437,19 @@ impl Route {
         Ok(named)
     }
 
+    fn connected_network(&self) -> bool {
+        is_connected_network(
+            self.kind.as_deref(),
+            self.protocol.as_deref(),
+            self.scope.as_deref(),
+            self.gateway.is_some()
+                || self.nhid.is_some()
+                || self.nexthops.is_some()
+                || self.via.is_some()
+                || self.encap.is_some(),
+        )
+    }
+
     fn direct(&self) -> bool {
         self.gateway.is_none()
             && self.metric.is_none()
@@ -415,10 +461,10 @@ impl Route {
             && self.extra.is_empty()
     }
 
-    fn is_egress_default(&self, egress: &Egress) -> bool {
+    fn is_simple_default(&self) -> bool {
         self.main_table()
             && self.kind.as_deref() == Some("unicast")
-            && self.dev.as_deref() == Some(&egress.dev)
+            && self.dev.as_deref().is_some_and(|dev| !dev.is_empty())
             && self
                 .scope
                 .as_deref()
@@ -482,6 +528,23 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 
 fn contains(route: &CidrV4, ip: Ipv4Addr) -> bool {
     overlaps(route_key(route), (ip.into(), 32))
+}
+
+/// The path to a tunnel DNS server must be the tunnel: `destination` may not
+/// hold a server with a longer prefix than every accepted route that does.
+fn takes_dns_server(receipt: &Receipt, destination: (u32, u8)) -> bool {
+    receipt
+        .dns
+        .iter()
+        .flat_map(|dns| &dns.servers)
+        .any(|&server| {
+            overlaps(destination, (server.into(), 32))
+                && receipt
+                    .routes
+                    .iter()
+                    .filter(|route| contains(route, server))
+                    .all(|route| route.prefix() < destination.1)
+        })
 }
 
 impl FortinetNetwork {
@@ -613,7 +676,7 @@ impl FortinetNetwork {
                 return Err(invalid("Fortinet local scope overlaps a host address"));
             }
         }
-        self.fib_clear(&receipt, scope)?;
+        self.fib_clear(&receipt, grant)?;
         Ok(receipt)
     }
 
@@ -731,9 +794,20 @@ impl FortinetNetwork {
         Ok(applied)
     }
 
-    fn fib_clear(&self, receipt: &Receipt, local_scope: CidrV4) -> io::Result<()> {
-        let rules: Vec<serde_json::Value> = self.json(&["-4", "-j", "rule", "show"])?;
-        check_standard_ipv4_rules(&rules)?;
+    fn fib_clear(&self, receipt: &Receipt, grant: &Grant) -> io::Result<PolicyInventory> {
+        let local_scope = grant.fortinet_local_cidr;
+        let mut policy_scope = grant
+            .route_cidrs
+            .iter()
+            .map(|route| prefix(route))
+            .collect::<io::Result<Vec<_>>>()?;
+        policy_scope.extend(
+            receipt
+                .protected_transport()
+                .map(|ip| (ip.into(), 32))
+                .chain([PPP_PEER_PREFIX, route_key(&local_scope)]),
+        );
+        let inventory = check_ipv4_rules(|args| self.ip(args), &policy_scope)?;
         let routes = self.routes()?;
         // Planning has no PPP link. Once identified, the technical peer
         // and all intended routes must be present in this same snapshot.
@@ -744,13 +818,16 @@ impl FortinetNetwork {
         if applied.routes.len() != receipt.routes_intended {
             return Err(invalid("network configuration confirmation failed"));
         }
-        let mut has_default = false;
+        let mut default_count = 0;
+        let mut has_egress_device = false;
+        let mut has_egress_default = false;
+        let mut others = Vec::new();
         for existing in routes
             .iter()
             .filter(|r| r.dev.as_deref() != Some(&receipt.ifname))
         {
-            if existing.dst == "default" {
-                if has_default || !existing.is_egress_default(&receipt.egress) {
+            if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
+                if !existing.is_simple_default() {
                     return Err(invalid("nonstandard default route"));
                 }
                 if existing
@@ -772,7 +849,14 @@ impl FortinetNetwork {
                 {
                     return Err(invalid("Fortinet local scope overlaps the default route"));
                 }
-                has_default = true;
+                default_count += 1;
+                let same_device = existing.dev.as_deref() == Some(&receipt.egress.dev);
+                has_egress_device |= same_device;
+                has_egress_default |= same_device
+                    && existing.gateway == receipt.egress.gateway
+                    && existing
+                        .prefsrc
+                        .is_none_or(|src| src == receipt.egress.prefsrc);
                 continue;
             }
             // So are the next hops and sources of every other route.
@@ -783,28 +867,50 @@ impl FortinetNetwork {
             {
                 return Err(invalid("Fortinet local scope overlaps a host route"));
             }
-            let dst = prefix(&existing.dst)?;
-            if dst.1 == 0 || dst.0.trailing_zeros() < u32::from(32 - dst.1) {
-                return Err(invalid("invalid FIB destination"));
-            }
+            let dst = fib_destination(&existing.dst)?;
             if overlaps(PPP_PEER_PREFIX, dst) {
                 return Err(invalid("PPP peer conflicts with an existing route"));
             }
             if overlaps(route_key(&local_scope), dst) {
                 return Err(invalid("Fortinet local scope overlaps a host route"));
             }
-            if receipt
-                .routes
-                .iter()
-                .any(|route| overlaps(route_key(route), dst))
+            // Broader routes coexist by longest prefix; the same destination
+            // cannot be shared, and narrower ones are checked by their shape.
+            if receipt.routes.iter().any(|route| route_key(route) == dst) {
+                return Err(collision(dst.1, existing.dev.as_deref()));
+            }
+            if existing.main_table() {
+                check_shadow(
+                    receipt.routes.iter().map(route_key),
+                    dst,
+                    existing.dev.as_deref(),
+                    existing.connected_network(),
+                )?;
+            }
+            if (existing.main_table() || existing.table.as_deref() == Some("local"))
+                && takes_dns_server(receipt, dst)
             {
-                return Err(invalid("VPN scope conflicts with an existing route"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "VPN DNS server is shadowed by a more specific route /{} {}",
+                        dst.1,
+                        holder(existing.dev.as_deref())
+                    ),
+                ));
+            }
+            if existing.main_table() || existing.table.as_deref() == Some("local") {
+                others.push(dst);
             }
         }
-        if !has_default {
+        if default_count == 0 {
             return Err(invalid("missing default route"));
         }
-        Ok(())
+        if !has_egress_device || default_count > 1 && !has_egress_default {
+            return Err(invalid("default routes do not match the proved egress"));
+        }
+        probe_addresses(receipt.routes.iter().map(route_key), &others)?;
+        Ok(inventory)
     }
 
     fn dns_state(&self, name: &str) -> io::Result<Dns> {
@@ -900,7 +1006,6 @@ impl FortinetNetwork {
         }
         receipt.routes = accepted.clone();
         receipt.refused_routes = refused;
-        self.fib_clear(receipt, local_scope)?;
 
         // Fixed servers take precedence. Either source must be reachable via
         // an accepted route. Domains always come from policy.
@@ -928,11 +1033,15 @@ impl FortinetNetwork {
             receipt.refused_dns = denied.len();
             allowed.into_iter().copied().collect()
         };
-        if !domains.is_empty() && servers.is_empty() {
-            return Err(invalid("no reachable DNS server for policy domains"));
-        }
+        let unreachable = !domains.is_empty() && servers.is_empty();
         let dns = (!domains.is_empty()).then_some(Dns { servers, domains });
         receipt.dns = dns.clone();
+        // Before any write, the existing routes are checked against the
+        // accepted routes and against the path to each server to be published.
+        let inventory = self.fib_clear(receipt, scope.grant)?;
+        if unreachable {
+            return Err(invalid("no reachable DNS server for policy domains"));
+        }
         receipt.save(directory, guard)?;
 
         for (index, route) in accepted.iter().enumerate() {
@@ -940,9 +1049,16 @@ impl FortinetNetwork {
             receipt.save(directory, guard)?;
             self.route_change("add", route, &link.ifname, Some(cancel))?;
         }
+        if dns.is_some() {
+            // Prove the installed FIB entries before publishing resolver state.
+            self.fib_clear(receipt, scope.grant)?;
+        }
+        if let Err(error) =
+            verify_tunnel_routes(|args| self.ip(args), &receipt.routes, &link.ifname)
+        {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
+        }
         if let Some(dns) = &dns {
-            // Prove the installed paths before making them visible to the resolver.
-            self.fib_clear(receipt, local_scope)?;
             receipt.dns_intended = true;
             receipt.save(directory, guard)?;
             self.resolvectl(&["revert", &link.ifname], Some(cancel))?;
@@ -966,8 +1082,17 @@ impl FortinetNetwork {
                     && current.flags.iter().any(|flag| flag == "UP")
             })
             .ok_or_else(|| invalid("PPP link changed during configuration"))?;
-        if self.address(&current)? != local || self.egress(receipt.remote)? != receipt.egress {
+        if self.address(&current)? != local {
             return Err(invalid("network configuration confirmation failed"));
+        }
+        let gateway = self.egress(receipt.remote).and_then(|egress| {
+            if egress != receipt.egress {
+                return Err(invalid("network configuration confirmation failed"));
+            }
+            Ok(())
+        });
+        if let Err(error) = gateway {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
         }
         if let Some(dns) = &dns
             && (self.dns_state(&current.ifname)? != *dns
@@ -975,7 +1100,12 @@ impl FortinetNetwork {
         {
             return Err(invalid("DNS confirmation failed"));
         }
-        self.fib_clear(receipt, local_scope)?;
+        let confirmation = self
+            .fib_clear(receipt, scope.grant)
+            .and_then(|current_inventory| inventory.require_unchanged(&current_inventory));
+        if let Err(error) = confirmation {
+            return Err(rollback_error(error, self.clean(guard, directory, receipt)));
+        }
         receipt.confirmed = true;
         receipt.save(directory, guard)
     }
@@ -1212,6 +1342,7 @@ pub(super) mod fixture {
         pub routes: Vec<String>,
         pub host_address: &'static str,
         pub foreign: Vec<serde_json::Value>,
+        pub wrong_tunnel_path: bool,
         pub default_override: Option<Vec<serde_json::Value>>,
         pub rules: Vec<serde_json::Value>,
         pub foreign_on_add: Option<serde_json::Value>,
@@ -1245,6 +1376,7 @@ pub(super) mod fixture {
                 routes: Vec::new(),
                 host_address: "192.0.2.2",
                 foreign: Vec::new(),
+                wrong_tunnel_path: false,
                 default_override: None,
                 rules: vec![
                     json!({"priority": 0, "src": "all", "table": "local"}),
@@ -1345,9 +1477,35 @@ pub(super) mod fixture {
             }
             assert_eq!(program, IP);
             match args {
-                ["-4", "-j", "route", "get", _] => say(json!([
-                    {"dev": k.egress_dev, "prefsrc": "192.0.2.2", "gateway": "192.0.2.1"}
-                ])),
+                ["-4", "-j", "route", "get", dst] => {
+                    // The longest prefix among the tunnel routes and the other
+                    // routes of the main and local tables, as the kernel picks.
+                    let address = (dst.parse::<Ipv4Addr>().unwrap().to_bits(), 32);
+                    let length = |text: &str| {
+                        prefix(text)
+                            .ok()
+                            .filter(|&key| overlaps(key, address))
+                            .map(|key| key.1)
+                    };
+                    let tunnel = k.routes.iter().filter_map(|route| length(route)).max();
+                    let other = k
+                        .foreign
+                        .iter()
+                        .filter(|route| route["table"] == "main" || route["table"] == "local")
+                        .filter_map(|route| Some((length(route["dst"].as_str()?)?, route)))
+                        .max_by_key(|(length, _)| *length);
+                    match (tunnel, other) {
+                        (Some(tunnel), Some((length, route))) if length >= tunnel => {
+                            say(json!([{"dev": route["dev"]}]))
+                        }
+                        (Some(_), _) => say(json!([
+                            {"dev": if k.wrong_tunnel_path { k.egress_dev } else { NAME }}
+                        ])),
+                        (None, _) => say(json!([
+                            {"dev": k.egress_dev, "prefsrc": "192.0.2.2", "gateway": "192.0.2.1"}
+                        ])),
+                    }
+                }
                 ["-j", "-d", "link", "show"] => {
                     let mut links = vec![json!({
                         "ifname": k.egress_dev, "ifindex": k.egress_index,
@@ -1374,6 +1532,12 @@ pub(super) mod fixture {
                     "addr_info": [{"family": "inet", "local": k.host_address, "prefixlen": 24}]
                 }])),
                 ["-4", "-j", "rule", "show"] => say(json!(k.rules)),
+                ["-4", "-j", "route", "show", "table", table] => say(json!(
+                    k.foreign
+                        .iter()
+                        .filter(|route| route["table"] == *table)
+                        .collect::<Vec<_>>()
+                )),
                 ["-4", "-j", "-d", "route", "show", "table", "all"] => {
                     let mut routes = k.default_override.clone().unwrap_or_else(|| {
                         vec![json!({
@@ -1475,6 +1639,7 @@ pub(super) mod fixture {
 mod tests {
     use super::{fixture::*, *};
     use crate::netlease::NetworkLock;
+    use crate::tunneld::network::coexistence_tests;
     use serde_json::{Value, json};
     use std::{
         os::unix::fs::PermissionsExt,
@@ -1608,6 +1773,43 @@ mod tests {
 
     fn up(fixture: &Fixture) {
         fixture.kernel.lock().unwrap().ppp = true;
+    }
+
+    #[test]
+    fn a_setup_timeout_lists_what_arrived_as_booleans_only() {
+        let arrived = |delivered: &Delivered, expected: &str| {
+            assert_eq!(delivered.arrived(), expected, "{delivered:?}");
+        };
+        let mut delivered = Delivered::default();
+        arrived(&delivered, "(interface=false routes=false dns=false)");
+        // A route or a server without its count line is not a complete list.
+        delivered.absorb(Event::SplitRoute {
+            network: "10.1.0.0".parse().unwrap(),
+            prefix: 16,
+        });
+        delivered.absorb(Event::DnsServer {
+            address: "10.1.1.1".parse().unwrap(),
+        });
+        arrived(&delivered, "(interface=false routes=false dns=false)");
+        delivered.absorb(Event::SplitRoutes { count: 1 });
+        arrived(&delivered, "(interface=false routes=true dns=false)");
+        delivered.absorb(Event::DnsCount {
+            servers: 1,
+            domains: 0,
+        });
+        arrived(&delivered, "(interface=false routes=true dns=true)");
+        assert!(!delivered.ready());
+        delivered.absorb(Event::Interface { name: NAME.into() });
+        arrived(&delivered, "(interface=true routes=true dns=true)");
+        assert!(delivered.ready());
+        // Each one on its own, and an invalid DNS offer counts as delivered, as
+        // `ready` counts it.
+        let mut interface = Delivered::default();
+        interface.absorb(Event::Interface { name: NAME.into() });
+        arrived(&interface, "(interface=true routes=false dns=false)");
+        let mut dns = Delivered::default();
+        dns.absorb(Event::DnsInvalid);
+        arrived(&dns, "(interface=false routes=false dns=true)");
     }
 
     #[test]
@@ -1999,23 +2201,607 @@ mod tests {
     }
 
     #[test]
-    fn same_prefix_supernet_and_subnet_in_any_table_are_conflicts() {
-        for (dst, table) in [
-            ("10.20.0.0/16", "main"),
-            ("10.0.0.0/8", "main"),
-            ("10.20.1.0/24", "100"),
-            ("10.20.1.53", "local"),
+    fn the_same_destination_in_any_table_is_a_collision_naming_interface_and_length() {
+        for table in ["main", "100", "local", "default"] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let mut route = external_route("10.20.0.0/16", table);
+            route["dev"] = json!("docker0");
+            fixture.kernel.lock().unwrap().foreign.push(route);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{table}");
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 collides with an existing route on docker0",
+                "{table}"
+            );
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn the_collision_names_the_colliding_route_among_several_and_one_without_a_device() {
+        for (existing, message) in [
+            (
+                json!({"dst": "10.21.7.9", "dev": "eth-other", "type": "unicast", "table": "main"}),
+                "VPN route /32 collides with an existing route on eth-other",
+            ),
+            (
+                json!({"dst": "10.21.7.9", "type": "blackhole", "table": "main"}),
+                "VPN route /32 collides with an existing route without an interface",
+            ),
         ] {
             let fixture = Fixture::new();
             let mut receipt = fixture.plan();
             up(&fixture);
+            fixture.kernel.lock().unwrap().foreign.push(existing);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16), ("10.21.7.9", 32)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn a_broader_route_holding_the_local_scope_is_still_refused() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        fixture
+            .kernel
+            .lock()
+            .unwrap()
+            .foreign
+            .push(external_route("10.0.0.0/8", "main"));
+        let error = apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &[], &[]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Fortinet local scope overlaps a host route"
+        );
+        assert_no_network_effects(&fixture);
+    }
+
+    /// A connected network of the host, as the kernel lists it.
+    fn connected(dst: &str, dev: &str) -> Value {
+        json!({
+            "dst": dst, "dev": dev, "type": "unicast", "table": "main",
+            "protocol": "kernel", "scope": "link"
+        })
+    }
+
+    /// The local table entry of a host address or of its broadcast.
+    fn host_entry(dst: &str, dev: &str, kind: &str) -> Value {
+        json!({
+            "dst": dst, "dev": dev, "type": kind, "table": "local", "protocol": "kernel"
+        })
+    }
+
+    /// Plan and apply one approved route beside the host's existing routes.
+    fn apply_beside(
+        approved: &str,
+        existing: Vec<Value>,
+        wrong_tunnel_path: bool,
+    ) -> (Fixture, Receipt, io::Result<()>) {
+        let fixture = Fixture::new();
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.foreign = existing;
+            kernel.wrong_tunnel_path = wrong_tunnel_path;
+        }
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        let (network, length) = approved.split_once('/').unwrap();
+        let result = apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[(network, length.parse().unwrap())], &[]),
+            &entry(&[approved], &[], &[]),
+        );
+        (fixture, receipt, result)
+    }
+
+    /// The tunnel destinations looked up after the routes were installed.
+    fn probes(fixture: &Fixture) -> Vec<String> {
+        let lookup = format!("{IP} -4 -j route get ");
+        fixture
+            .ops()
+            .iter()
+            .filter_map(|op| op.strip_prefix(&lookup))
+            .filter(|dst| *dst != REMOTE.to_string())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn assert_applied(fixture: &Fixture, receipt: &Receipt, approved: &str) {
+        assert!(receipt.confirmed);
+        assert_eq!(fixture.kernel.lock().unwrap().routes, [approved]);
+        assert!(!fixture.writes().iter().any(|op| op.contains(" route del ")));
+    }
+
+    #[test]
+    fn a_wide_private_route_coexists_with_the_container_networks_inside_it() {
+        let (fixture, receipt, result) = apply_beside(
+            "172.16.0.0/12",
+            vec![
+                connected("172.17.0.0/16", "docker0"),
+                connected("172.18.0.0/16", "br-fixture"),
+                host_entry("172.17.0.1", "docker0", "local"),
+                host_entry("172.17.255.255", "docker0", "broadcast"),
+                host_entry("172.18.0.1", "br-fixture", "local"),
+            ],
+            false,
+        );
+        result.unwrap();
+        assert_applied(&fixture, &receipt, "172.16.0.0/12");
+        assert_eq!(probes(&fixture), ["172.16.0.0"]);
+    }
+
+    #[test]
+    fn a_route_holding_two_lans_is_applied_and_probed_outside_them() {
+        let (fixture, receipt, result) = apply_beside(
+            "192.168.0.0/16",
+            vec![
+                connected("192.168.0.0/24", "eth-lan"),
+                connected("192.168.1.0/24", "wlan-fixture"),
+                host_entry("192.168.1.20", "wlan-fixture", "local"),
+            ],
+            false,
+        );
+        result.unwrap();
+        assert_applied(&fixture, &receipt, "192.168.0.0/16");
+        // The smallest address that no more specific route takes.
+        assert_eq!(probes(&fixture), ["192.168.2.0"]);
+    }
+
+    #[test]
+    fn a_broader_existing_route_coexists_with_the_approved_one() {
+        let mut routed = connected("172.0.0.0/8", "eth-lan");
+        routed["protocol"] = json!("static");
+        routed["gateway"] = json!("192.0.2.1");
+        for existing in [connected("172.0.0.0/8", "eth-lan"), routed] {
+            let (fixture, receipt, result) = apply_beside("172.20.0.0/16", vec![existing], false);
+            result.unwrap();
+            assert_applied(&fixture, &receipt, "172.20.0.0/16");
+            assert_eq!(probes(&fixture), ["172.20.0.0"]);
+        }
+    }
+
+    /// Shapes of the main table that would steer part of an approved route away
+    /// from the tunnel.
+    fn not_connected(dst: &str, dev: &str) -> Vec<(String, Value)> {
+        let mut shapes = Vec::new();
+        for protocol in ["dhcp", "static", "boot"] {
+            let mut route = connected(dst, dev);
+            route["protocol"] = json!(protocol);
+            route["gateway"] = json!("192.0.2.1");
+            route["scope"] = json!("global");
+            shapes.push((format!("{protocol} with a gateway"), route));
+        }
+        for (key, value) in [
+            ("protocol", json!("dhcp")),
+            ("protocol", json!("static")),
+            ("protocol", Value::Null),
+            ("scope", json!("global")),
+            ("scope", Value::Null),
+            ("gateway", json!("192.0.2.1")),
+            ("nhid", json!(7)),
+            ("nexthops", json!([{"dev": "eth-lan"}])),
+            ("via", json!({"family": "inet6", "host": "fe80::1"})),
+            ("encap", json!({"type": "mpls"})),
+        ] {
+            let mut route = connected(dst, dev);
+            route[key] = value.clone();
+            shapes.push((format!("{key} {value}"), route));
+        }
+        for kind in ["blackhole", "unreachable", "prohibit", "throw", "local"] {
+            let mut route = connected(dst, dev);
+            route["type"] = json!(kind);
+            shapes.push((kind.to_owned(), route));
+        }
+        shapes
+    }
+
+    #[test]
+    fn a_more_specific_main_route_that_is_not_a_connected_network_is_refused() {
+        for (label, route) in not_connected("10.20.1.0/24", "wlan-fixture") {
+            let (fixture, receipt, result) = apply_beside("10.20.0.0/16", vec![route], false);
+            assert_eq!(
+                result.expect_err(&label).to_string(),
+                "VPN route /16 is shadowed by a non-connected route /24 on wlan-fixture",
+                "{label}"
+            );
+            assert!(!receipt.confirmed);
+            assert_no_network_effects(&fixture);
+        }
+        // A route that discards traffic has no interface to name.
+        let (fixture, _, result) = apply_beside(
+            "10.20.0.0/16",
+            vec![json!({"dst": "10.20.1.7", "type": "blackhole", "table": "main"})],
+            false,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is shadowed by a non-connected route /32 without an interface"
+        );
+        assert_no_network_effects(&fixture);
+    }
+
+    #[test]
+    fn a_connected_network_inside_the_route_coexists_as_the_kernel_lists_it() {
+        let mut metric = connected("10.20.0.0/24", "wlan-fixture");
+        metric["metric"] = json!(600);
+        metric["prefsrc"] = json!("10.20.0.20");
+        let mut down = connected("10.20.0.0/24", "br-fixture");
+        down["flags"] = json!(["linkdown"]);
+        let mut untyped = connected("10.20.0.0/24", "eth-lan");
+        untyped.as_object_mut().unwrap().remove("type");
+        untyped.as_object_mut().unwrap().remove("table");
+        for route in [metric, down, untyped] {
+            let (fixture, receipt, result) =
+                apply_beside("10.20.0.0/16", vec![route.clone()], false);
+            result.unwrap_or_else(|error| panic!("{route}: {error}"));
+            assert_applied(&fixture, &receipt, "10.20.0.0/16");
+        }
+    }
+
+    /// Plan and apply 10.20.0.0/16, publishing the policy's servers, beside the
+    /// host's existing routes.
+    fn apply_dns_beside(
+        servers: &[&str],
+        delivered: &[&str],
+        existing: Vec<Value>,
+    ) -> (Fixture, io::Result<()>) {
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().foreign = existing;
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        let result = apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], delivered),
+            &entry(&["10.20.0.0/16"], servers, &["corp.example"]),
+        );
+        (fixture, result)
+    }
+
+    #[test]
+    fn a_dns_server_taken_by_a_more_specific_route_is_refused_before_any_write() {
+        const MESSAGE: &str = "VPN DNS server is shadowed by a more specific route";
+        for (label, servers, delivered, existing, tail) in [
+            (
+                "fixed server in a connected network",
+                &["10.20.9.9"][..],
+                &[][..],
+                connected("10.20.9.0/24", "eth-lan"),
+                "/24 on eth-lan",
+            ),
+            (
+                "gateway server in a connected network",
+                &[][..],
+                &["10.20.9.9"][..],
+                connected("10.20.9.0/24", "eth-lan"),
+                "/24 on eth-lan",
+            ),
+            (
+                "second of two servers",
+                &["10.20.0.53", "10.20.9.9"][..],
+                &[][..],
+                connected("10.20.9.0/24", "eth-lan"),
+                "/24 on eth-lan",
+            ),
+            (
+                "a host address",
+                &["10.20.9.9"][..],
+                &[][..],
+                host_entry("10.20.9.9", "docker0", "local"),
+                "/32 on docker0",
+            ),
+        ] {
+            let (fixture, result) = apply_dns_beside(servers, delivered, vec![existing]);
+            let error = result.expect_err(label);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(error.to_string(), format!("{MESSAGE} {tail}"), "{label}");
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn a_dns_server_reached_by_the_tunnel_is_published_beside_connected_networks() {
+        let (fixture, result) = apply_dns_beside(
+            &["10.20.9.9"],
+            &[],
+            vec![
+                // Neither holds the server.
+                connected("10.20.8.0/24", "eth-lan"),
+                host_entry("10.20.9.8", "docker0", "local"),
+                // A table that no rule reads takes nothing.
+                external_route("10.20.9.0/24", "100"),
+                // Broader than the accepted route: the tunnel wins.
+                connected("10.20.0.0/15", "wlan-fixture"),
+            ],
+        );
+        result.unwrap();
+        assert_eq!(fixture.kernel.lock().unwrap().dns, ["10.20.9.9"]);
+    }
+
+    #[test]
+    fn the_longest_accepted_route_decides_whether_a_dns_server_is_taken() {
+        // A connected /20 lies inside the accepted /16 and holds the server, but
+        // the accepted /24 is more specific than it.
+        for (existing, accepted) in [("10.20.0.0/20", true), ("10.20.9.0/28", false)] {
+            let fixture = Fixture::new();
+            fixture.kernel.lock().unwrap().foreign = vec![connected(existing, "eth-lan")];
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let result = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16), ("10.20.9.0", 24)], &[]),
+                &entry(&["10.20.0.0/16"], &["10.20.9.9"], &["corp.example"]),
+            );
+            if accepted {
+                result.unwrap();
+                assert_eq!(fixture.kernel.lock().unwrap().dns, ["10.20.9.9"]);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "VPN DNS server is shadowed by a more specific route /28 on eth-lan"
+                );
+                assert_no_network_effects(&fixture);
+            }
+        }
+    }
+
+    #[test]
+    fn a_covered_server_that_is_not_published_does_not_refuse_the_routes() {
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().foreign = vec![connected("10.20.9.0/24", "eth-lan")];
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &["10.20.9.9"]),
+            &entry(&["10.20.0.0/16"], &[], &[]),
+        )
+        .unwrap();
+        assert!(!fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL)));
+    }
+
+    #[test]
+    fn a_network_covering_the_dns_server_during_configuration_prevents_confirmation() {
+        for after_dns in [false, true] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                let route = connected("10.20.9.0/24", "eth-lan");
+                if after_dns {
+                    kernel.foreign_after_dns = Some(route);
+                } else {
+                    kernel.foreign_on_add = Some(route);
+                }
+            }
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/16"], &["10.20.9.9"], &["corp.example"]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "VPN DNS server is shadowed by a more specific route /24 on eth-lan"
+            );
+            assert!(!receipt.confirmed);
+            let wrote_dns = fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL));
+            assert_eq!(wrote_dns, after_dns, "{:?}", fixture.ops());
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.dns.is_empty() && kernel.domains.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_more_specific_route_outside_the_main_table_coexists() {
+        // A table that no policy rule reads, and the host's own address.
+        for (dst, table) in [("10.20.1.0/24", "100"), ("10.20.1.53", "local")] {
+            let (fixture, receipt, result) =
+                apply_beside("10.20.0.0/16", vec![external_route(dst, table)], false);
+            result.unwrap_or_else(|error| panic!("{table}: {error}"));
+            assert_applied(&fixture, &receipt, "10.20.0.0/16");
+            assert_eq!(probes(&fixture), ["10.20.0.0"], "{table}");
+        }
+    }
+
+    #[test]
+    fn a_route_entirely_covered_by_local_networks_is_refused_before_any_write() {
+        // Both halves are taken, so nothing approved would reach the tunnel.
+        for existing in [
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/17", "wlan-fixture"),
+            ],
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/18", "wlan-fixture"),
+                connected("10.20.192.0/18", "br-fixture"),
+            ],
+        ] {
+            let (fixture, receipt, result) = apply_beside("10.20.0.0/16", existing, false);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 is entirely covered by local networks"
+            );
+            assert!(!receipt.confirmed);
+            assert!(probes(&fixture).is_empty());
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn a_route_covered_during_configuration_is_refused_and_cleanup_converges() {
+        // With and without DNS, after the route adds and after the DNS writes.
+        for (domains, after_dns) in [(true, false), (true, true), (false, false)] {
+            let fixture = Fixture::new();
+            let first = connected("10.20.0.0/17", "eth-lan");
+            let second = connected("10.20.128.0/17", "wlan-fixture");
+            fixture.kernel.lock().unwrap().foreign = vec![first.clone()];
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                if after_dns {
+                    kernel.foreign_after_dns = Some(second.clone());
+                } else {
+                    kernel.foreign_on_add = Some(second.clone());
+                }
+            }
+            let (servers, names): (&[&str], &[&str]) = if domains {
+                (&["10.21.0.53"], &["corp.example"])
+            } else {
+                (&[], &[])
+            };
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16), ("10.21.0.0", 24)], &[]),
+                &entry(&["10.20.0.0/15"], servers, names),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 is entirely covered by local networks",
+                "domains {domains}, after DNS {after_dns}"
+            );
+            assert!(!receipt.confirmed);
+            let wrote_dns = fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL));
+            assert_eq!(wrote_dns, after_dns);
+            assert!(fixture.ops().iter().any(|op| op.contains(" route add ")));
+            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+            assert!(!saved.confirmed);
             fixture
-                .kernel
-                .lock()
-                .unwrap()
-                .foreign
-                .push(external_route(dst, table));
-            assert_rejected_before_writes(&fixture, &mut receipt);
+                .network
+                .clean(&fixture.guard(), &fixture.directory, &saved)
+                .unwrap();
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty() && kernel.dns.is_empty() && kernel.domains.is_empty());
+            assert_eq!(kernel.foreign, [first, second]);
+        }
+    }
+
+    #[test]
+    fn a_route_leaving_by_another_interface_beside_a_lan_still_rolls_back() {
+        let (fixture, receipt, result) = apply_beside(
+            "10.20.0.0/16",
+            vec![connected("10.20.0.0/24", "eth-lan")],
+            true,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        assert_eq!(probes(&fixture), ["10.20.1.0"]);
+        assert!(!receipt.confirmed);
+        let kernel = fixture.kernel.lock().unwrap();
+        assert!(kernel.routes.is_empty());
+        assert!(kernel.ops.iter().any(|op| op.contains(" route del ")));
+        assert_eq!(kernel.foreign, [connected("10.20.0.0/24", "eth-lan")]);
+    }
+
+    #[test]
+    fn a_routed_more_specific_route_added_during_configuration_prevents_confirmation() {
+        // With and without DNS, after the route adds and after the DNS writes.
+        for (domains, after_dns) in [(true, false), (true, true), (false, false)] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let mut route = connected("10.20.1.0/24", "wlan-fixture");
+            route["protocol"] = json!("dhcp");
+            route["scope"] = json!("global");
+            route["gateway"] = json!("192.0.2.1");
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                if after_dns {
+                    kernel.foreign_after_dns = Some(route);
+                } else {
+                    kernel.foreign_on_add = Some(route);
+                }
+            }
+            let (servers, names): (&[&str], &[&str]) = if domains {
+                (&["10.20.0.53"], &["corp.example"])
+            } else {
+                (&[], &[])
+            };
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], servers, names),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 is shadowed by a non-connected route /24 on wlan-fixture",
+                "domains {domains}, after DNS {after_dns}"
+            );
+            assert!(!receipt.confirmed);
+            let wrote_dns = fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL));
+            assert_eq!(wrote_dns, after_dns);
+            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+            fixture
+                .network
+                .clean(&fixture.guard(), &fixture.directory, &saved)
+                .unwrap();
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty() && kernel.dns.is_empty() && kernel.domains.is_empty());
+            assert_eq!(kernel.foreign.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_connected_network_added_during_configuration_does_not_prevent_confirmation() {
+        for after_dns in [false, true] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let route = connected("10.20.1.0/24", "eth-lan");
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                if after_dns {
+                    kernel.foreign_after_dns = Some(route);
+                } else {
+                    kernel.foreign_on_add = Some(route);
+                }
+            }
+            apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &["10.20.0.53"]),
+                &entry(&["10.20.0.0/15"], &[], &["corp.example"]),
+            )
+            .unwrap();
+            assert!(receipt.confirmed);
         }
     }
 
@@ -2043,24 +2829,195 @@ mod tests {
     }
 
     #[test]
-    fn the_default_must_be_single_unicast_main_and_use_the_proved_egress() {
-        let standard =
-            json!({"dst": "default", "dev": "eth-fixture", "table": "main", "type": "unicast"});
-        let mut variants = vec![vec![], vec![standard.clone(), standard.clone()]];
+    fn tailscale_rules_admit_disjoint_routes_in_table_52() {
+        let fixture = Fixture::new();
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.rules = coexistence_tests::tailscale_rules();
+            kernel.foreign.push(external_route("100.64.0.0/10", "52"));
+            kernel.foreign.push(external_route("100.110.20.1", "52"));
+        }
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &[], &[]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn extra_policy_tables_refuse_default_and_protected_destinations() {
+        for dst in ["default", "192.0.2.20", "10.20.1.0/24", PEER, "10.99.0.8"] {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                kernel.rules = coexistence_tests::tailscale_rules();
+                kernel.foreign.push(external_route(dst, "52"));
+            }
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("priority 5270 table 52"),
+                "{error}"
+            );
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn planning_checks_the_approved_route_ceiling_before_ppp_starts() {
+        let fixture = Fixture::new();
+        let grant = Grant::from_entry(&entry(&["10.20.0.0/15"], &[], &[])).unwrap();
+        {
+            let mut kernel = fixture.kernel.lock().unwrap();
+            kernel.rules = coexistence_tests::tailscale_rules();
+            kernel.foreign.push(external_route("10.21.1.0/24", "52"));
+        }
+        let result = fixture
+            .network
+            .plan(&fixture.guard(), GENERATION, REMOTE, &grant);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("priority 5270 table 52")
+        );
+        assert!(!fixture.directory.join(RECEIPT).exists());
+        assert!(fixture.writes().is_empty());
+    }
+
+    #[test]
+    fn unsupported_policy_rules_identify_priority_without_selector_addresses() {
+        for rule in coexistence_tests::unsupported_rules() {
+            let fixture = Fixture::new();
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            fixture.kernel.lock().unwrap().rules.insert(1, rule);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &[], &[]),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("priority 500 table"), "{error}");
+            assert!(!error.to_string().contains("203.0.113.0"));
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn distinct_defaults_are_admitted_when_the_kernel_egress_matches() {
+        let fixture = Fixture::new();
+        fixture.kernel.lock().unwrap().default_override =
+            Some(coexistence_tests::defaults("eth-fixture"));
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &[], &[]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_policy_lookup_outside_ppp_after_installation_rolls_back_before_dns() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.plan();
+        up(&fixture);
+        fixture.kernel.lock().unwrap().wrong_tunnel_path = true;
+        let error = apply(
+            &fixture,
+            &mut receipt,
+            &ready(&[("10.20.0.0", 16)], &[]),
+            &entry(&["10.20.0.0/15"], &["10.20.0.53"], &["corp.example"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "tunnel route lookup selected a different interface"
+        );
+        let kernel = fixture.kernel.lock().unwrap();
+        assert!(kernel.routes.is_empty());
+        assert!(kernel.dns.is_empty());
+        assert!(kernel.ops.iter().any(|op| op.contains(" route add ")));
+        assert!(kernel.ops.iter().any(|op| op.contains(" route del ")));
+        assert!(!receipt.confirmed);
+    }
+
+    #[test]
+    fn ppp_rechecks_additional_tables_before_confirmation() {
+        for (destination, message) in [
+            (
+                "10.20.1.0/24",
+                "IPv4 policy rule priority 5270 table 52: route overlaps protected destinations",
+            ),
+            (
+                "203.0.113.0/24",
+                "IPv4 policy routing inventory changed during configuration",
+            ),
+        ] {
+            let fixture = Fixture::new();
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                kernel.rules = coexistence_tests::tailscale_rules();
+                kernel.foreign.push(external_route("100.64.0.0/10", "52"));
+                kernel.foreign_after_dns = Some(external_route(destination, "52"));
+            }
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16)], &[]),
+                &entry(&["10.20.0.0/15"], &["10.20.0.53"], &["corp.example"]),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), message);
+            assert!(!receipt.confirmed);
+            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+            assert!(!saved.confirmed);
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty());
+            assert!(kernel.dns.is_empty() && kernel.domains.is_empty() && kernel.dns_default_route);
+            assert!(kernel.foreign.contains(&external_route(destination, "52")));
+        }
+    }
+
+    #[test]
+    fn defaults_must_be_unicast_main_and_include_the_proved_egress() {
+        let defaults = coexistence_tests::defaults;
+        let mut variants = vec![vec![], defaults("eth-other")];
         for (key, value) in [
             ("type", json!("blackhole")),
             ("table", json!("default")),
-            ("dev", json!("eth-other")),
             ("nhid", json!(12)),
             ("nexthops", json!([{"dev": "eth-other"}])),
+            ("encap", json!({"type":"mpls"})),
             ("tos", json!("0x10")),
             ("gateway", json!("10.20.1.1")),
+            ("gateway", json!(PEER)),
             ("prefsrc", json!("10.20.1.2")),
         ] {
-            let mut default = standard.clone();
-            default[key] = value;
-            variants.push(vec![default]);
+            let mut rows = defaults("eth-fixture");
+            rows[1][key] = value;
+            variants.push(rows);
         }
+        let mut wrong_gateway = defaults("eth-fixture");
+        wrong_gateway[0]["gateway"] = json!("192.0.2.3");
+        variants.push(wrong_gateway);
         for defaults in variants {
             let fixture = Fixture::new();
             let mut receipt = fixture.plan();
@@ -2257,7 +3214,7 @@ mod tests {
 
     #[test]
     fn a_route_or_rule_added_during_configuration_prevents_confirmation_and_cleanup_converges() {
-        let route = external_route("10.20.1.0/24", "main");
+        let route = external_route("10.20.0.0/16", "main");
         for (foreign_on_add, rule, foreign_after_dns) in [
             (Some(route.clone()), None, None),
             (Some(external_route(PEER, "local")), None, None),
@@ -2289,11 +3246,10 @@ mod tests {
             );
             {
                 let k = fixture.kernel.lock().unwrap();
-                assert_eq!(k.routes, ["10.20.0.0/16"]);
                 if dns_written {
-                    assert_eq!(k.dns, ["10.20.1.53"]);
-                    assert_eq!(k.domains, ["~corp.example"]);
+                    assert!(k.routes.is_empty() && k.dns.is_empty() && k.domains.is_empty());
                 } else {
+                    assert_eq!(k.routes, ["10.20.0.0/16"]);
                     assert!(k.dns.is_empty() && k.domains.is_empty());
                     assert!(k.ops.iter().all(|op| !op.starts_with(RESOLVECTL)));
                 }
@@ -2562,6 +3518,25 @@ mod tests {
     }
 
     #[test]
+    fn fatal_exit_message_reports_the_instance_status() {
+        for (code, signal, expected) in [
+            (Some(127), None, "instance reported Exited (code=127)"),
+            (None, Some(9), "instance reported Exited (signal=9)"),
+            (None, None, "instance reported Exited"),
+            (
+                Some(42),
+                Some(15),
+                "instance reported Exited (code=42, signal=15)",
+            ),
+        ] {
+            let mut delivered = Delivered::default();
+            delivered.absorb(Event::Exited { code, signal });
+            let fatal = delivered.fatal().expect("an exit must end the attempt");
+            assert_eq!(format!("instance reported {fatal}"), expected);
+        }
+    }
+
+    #[test]
     fn what_the_instance_reports_decides_whether_the_attempt_can_go_on() {
         let base = || {
             let mut delivered = Delivered::default();
@@ -2611,7 +3586,10 @@ mod tests {
                 code: Some(1),
                 signal: None
             }),
-            Some(Fatal::Exited)
+            Some(Fatal::Exited {
+                code: Some(1),
+                signal: None,
+            })
         );
         assert_eq!(fatal(Event::SplitInvalid), Some(Fatal::Invalid));
         assert_eq!(fatal(Event::SplitRoutes { count: 0 }), Some(Fatal::Invalid));
