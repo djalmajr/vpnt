@@ -267,6 +267,16 @@ enum Setup {
     Fortinet(FortinetStart),
 }
 
+/// A Fortinet setup wait that ended. A timeout also says what had arrived, in
+/// booleans only.
+fn setup_wait_failure(error: &io::Error, delivered: &fortinet_network::Delivered) -> Failure {
+    let mut failure = Failure::io("instance setup event", error);
+    if error.kind() == io::ErrorKind::TimedOut {
+        failure.cause = format!("{} {}", failure.cause, delivered.arrived());
+    }
+    failure
+}
+
 /// What an attempt ended with, in the codes the writer's clients know.
 fn fatal_code(fatal: &fortinet_network::Fatal) -> ErrorCode {
     use fortinet_instance::Failure as Reported;
@@ -594,7 +604,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         let mut delivered = fortinet_network::Delivered::default();
         loop {
             let event = wait_event(channel, cancel, deadline)
-                .map_err(|e| Failure::io("instance setup event", &e))?;
+                .map_err(|e| setup_wait_failure(&e, &delivered))?;
             delivered.absorb(event);
             if let Some(fatal) = delivered.fatal() {
                 return Err(Failure::new(
@@ -1922,6 +1932,30 @@ mod tests {
             Backend::Ipsec,
             "ipsec",
         );
+    }
+
+    #[test]
+    fn only_a_fortinet_setup_timeout_says_what_arrived() {
+        let mut delivered = fortinet_network::Delivered::default();
+        delivered.absorb(fortinet_instance::Event::SplitRoutes { count: 0 });
+        delivered.absorb(fortinet_instance::Event::DnsCount {
+            servers: 0,
+            domains: 0,
+        });
+        // The error `wait_event` returns once the establishment deadline passed.
+        let late = setup_wait_failure(&io::Error::from(io::ErrorKind::TimedOut), &delivered);
+        assert_eq!(late.code, ErrorCode::Timeout);
+        assert_eq!(
+            late.cause,
+            "instance setup event: timed out (interface=false routes=true dns=true)"
+        );
+        // Any other end of the wait keeps its message.
+        let closed = setup_wait_failure(
+            &io::Error::new(io::ErrorKind::UnexpectedEof, "channel closed"),
+            &delivered,
+        );
+        assert_eq!(closed.code, ErrorCode::Backend);
+        assert_eq!(closed.cause, "instance setup event: channel closed");
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //! observations stay in memory; the only retained copy of raw output is the
 //! root-only `logs/openfortivpn.log` diagnostic, one timestamped line at a
 //! time with secret-bearing lines redacted. Nothing raw reaches snapshots,
-//! IPC, error values, app logs or the UI.
+//! IPC, error values, app logs or the UI. The Linux instance also asks for the
+//! client's fixed states in its journal (`fortinet_state`), never its text.
+use super::fortinet_state::StateJournal;
 use super::ssl::{InterfaceName, SslFailure};
 #[cfg(test)]
 use crate::helper::redaction::SECRET_KEYWORDS;
@@ -67,6 +69,7 @@ pub(crate) struct Output {
     log: Option<LogSender>,
     writer: Option<LogWriter>,
     finalized: bool,
+    states: Option<Arc<StateJournal>>,
 }
 
 impl Output {
@@ -116,6 +119,12 @@ impl Output {
             .expected_interface = Some(name.to_owned());
         Ok(())
     }
+    /// Linux supervisor: write each fixed client state to `journal` once. Set
+    /// before any pipe is attached.
+    #[cfg(target_os = "linux")]
+    pub fn journal_states(&mut self, journal: impl Write + Send + 'static) {
+        self.states = Some(Arc::new(StateJournal::new(journal)));
+    }
     /// Enable per-attempt diagnostic logging. Never fails: any failure leaves
     /// logging disabled and the connection proceeds without it.
     pub fn open_log(&mut self, state: &Path, owner: u32) {
@@ -134,17 +143,18 @@ impl Output {
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let (observed, canceled, done, log) = (
+        let (observed, canceled, done, log, states) = (
             Arc::clone(&self.observed),
             Arc::clone(&self.canceled),
             Arc::clone(&self.done),
             self.log.clone(),
+            self.states.clone(),
         );
         self.workers.push(
             thread::Builder::new()
                 .name("vpnt-ssl-output".into())
                 .spawn(move || {
-                    drain(pipe, &observed, &canceled, &log);
+                    drain(pipe, &observed, &canceled, &log, &states);
                     done.fetch_add(1, Ordering::Release);
                 })?,
         );
@@ -516,12 +526,21 @@ fn timestamp() -> String {
     }
 }
 
-fn observe(line: &[u8], discarded: bool, observed: &Mutex<Observation>, log: &Option<LogSender>) {
+fn observe(
+    line: &[u8],
+    discarded: bool,
+    observed: &Mutex<Observation>,
+    log: &Option<LogSender>,
+    states: &Option<Arc<StateJournal>>,
+) {
     if !discarded {
         parse(
             line,
             &mut observed.lock().unwrap_or_else(|error| error.into_inner()),
         );
+        if let Some(states) = states {
+            states.note(line);
+        }
     }
     if let Some(log) = log {
         log.push_line(line, discarded);
@@ -533,6 +552,7 @@ fn drain(
     observed: &Mutex<Observation>,
     canceled: &AtomicBool,
     log: &Option<LogSender>,
+    states: &Option<Arc<StateJournal>>,
 ) {
     let mut line = Zeroizing::new(Vec::with_capacity(4096));
     let mut chunk = Zeroizing::new([0; 4096]);
@@ -569,7 +589,7 @@ fn drain(
         };
         for byte in &chunk[..length] {
             if *byte == b'\n' {
-                observe(&line, discarded, observed, log);
+                observe(&line, discarded, observed, log, states);
                 line.zeroize();
                 discarded = false;
             } else if !discarded {
@@ -850,7 +870,7 @@ mod tests {
         drop(pipe_writer);
         let observed = Mutex::new(Observation::default());
         let canceled = AtomicBool::new(false);
-        drain(reader, &observed, &canceled, &Some(sender));
+        drain(reader, &observed, &canceled, &Some(sender), &None);
         writer.wait();
         observed.into_inner().unwrap()
     }
