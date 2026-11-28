@@ -618,6 +618,27 @@ fn probe_address(route: (u32, u8), others: &[(u32, u8)]) -> Option<Ipv4Addr> {
         .map(Ipv4Addr::from)
 }
 
+/// The address to look up for each approved route. A route that the more
+/// specific destinations take whole would never reach the tunnel: refused.
+pub(super) fn probe_addresses(
+    routes: impl Iterator<Item = (u32, u8)>,
+    others: &[(u32, u8)],
+) -> io::Result<Vec<Ipv4Addr>> {
+    routes
+        .map(|route| {
+            probe_address(route, others).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "VPN route /{} is entirely covered by local networks",
+                        route.1
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 fn contains(route: &CidrV4, selected: &CidrV4) -> bool {
     route.prefix() <= selected.prefix() && overlaps(route_key(route), route_key(selected))
 }
@@ -767,10 +788,10 @@ pub(super) fn check_ipv4_rules(
 /// Prove that the kernel selects the tunnel for the approved routes. A more
 /// specific route of the local table, or of the main table on another
 /// interface, wins by longest prefix, so each lookup uses the smallest address
-/// none of them takes. A route taken whole is not looked up; returns how many
-/// were left that way. The same listing refuses a main table route that is
-/// more specific and not a connected network, so one that appeared during the
-/// configuration is seen; one added after the listing is not.
+/// none of them takes. The same listing refuses a route taken whole, and a main
+/// table route that is more specific and not a connected network, so one that
+/// appeared during the configuration is seen; one added after the listing is
+/// not. Returns how many routes connected networks cover in part.
 pub(super) fn verify_tunnel_routes(
     read_ip: impl Fn(&[&str]) -> io::Result<Vec<u8>>,
     routes: &[CidrV4],
@@ -786,6 +807,8 @@ pub(super) fn verify_tunnel_routes(
         "-4", "-j", "-d", "route", "show", "table", "all",
     ])?)?;
     let mut others = Vec::new();
+    // Destinations of the main table on other interfaces.
+    let mut attached = Vec::new();
     for row in &listed {
         let foreign_main = row.main_table() && row.dev.as_deref() != Some(interface);
         let local = row.table.as_deref() == Some("local");
@@ -800,17 +823,24 @@ pub(super) fn verify_tunnel_routes(
                 row.dev.as_deref(),
                 row.connected_network(),
             )?;
+            attached.push(destination);
         }
         others.push(destination);
     }
-    let probes: Vec<_> = routes
+    let probes = probe_addresses(routes.iter().map(route_key), &others)?;
+    // The more specific ones among them passed as connected networks.
+    let partly_covered = routes
         .iter()
-        .filter_map(|route| probe_address(route_key(route), &others))
-        .collect();
-    let unprobed = routes.len() - probes.len();
-    if unprobed > 0 {
+        .map(route_key)
+        .filter(|&route| {
+            attached
+                .iter()
+                .any(|&network: &(u32, u8)| network.1 > route.1 && overlaps(route, network))
+        })
+        .count();
+    if partly_covered > 0 {
         eprintln!(
-            "vpnt-tunneld: {unprobed} approved routes not probed: covered by more specific routes"
+            "vpnt-tunneld: {partly_covered} approved routes partly covered by connected networks"
         );
     }
     for probe in probes {
@@ -830,7 +860,7 @@ pub(super) fn verify_tunnel_routes(
             ));
         }
     }
-    Ok(unprobed)
+    Ok(partly_covered)
 }
 
 pub(super) fn rollback_error(error: io::Error, cleanup: io::Result<()>) -> io::Error {
@@ -1028,6 +1058,7 @@ impl Network {
         let mut default_count = 0;
         let mut has_egress_device = false;
         let mut has_egress_default = false;
+        let mut others = Vec::new();
         for existing in self.routes("-4")? {
             if matches!(existing.dst.as_str(), "default" | "0.0.0.0/0") {
                 if existing.kind.as_deref() != Some("unicast")
@@ -1084,12 +1115,16 @@ impl Network {
                     existing.connected_network(),
                 )?;
             }
+            if existing.main_table() || existing.table.as_deref() == Some("local") {
+                others.push(destination);
+            }
         }
         // Preserve the direct/no-default cases; with competing defaults the
         // full egress must identify one of the default paths.
         if default_count > 0 && (!has_egress_device || default_count > 1 && !has_egress_default) {
             return Err(invalid("default routes do not match the proved egress"));
         }
+        probe_addresses(requested.iter().copied(), &others)?;
         Ok(inventory)
     }
 
@@ -1994,7 +2029,7 @@ pub(super) mod coexistence_tests {
             parse_cidr("10.40.0.0/24").unwrap(),
         ];
         let looked_up = Mutex::new(Vec::new());
-        let unprobed = verify_tunnel_routes(
+        let partly_covered = verify_tunnel_routes(
             |args| {
                 let data = match args {
                     ["-4", "-j", "-d", "route", "show", "table", "all"] => json!([
@@ -2009,8 +2044,8 @@ pub(super) mod coexistence_tests {
                         {"dst":"10.20.0.2","dev":"eth-lan","table":"default"},
                         {"dst":"10.30.0.0/25","dev":"eth-lan","table":"main",
                          "protocol":"kernel","scope":"link"},
-                        {"dst":"10.30.0.128/25","dev":"wlan-fixture","type":"unicast",
-                         "protocol":"kernel","scope":"link"},
+                        // A host address alone is not a connected network.
+                        {"dst":"10.40.0.0","dev":"eth-lan","table":"local","type":"local"},
                     ]),
                     ["-4", "-j", "route", "get", dst] => {
                         looked_up.lock().unwrap().push((*dst).to_owned());
@@ -2024,8 +2059,49 @@ pub(super) mod coexistence_tests {
             "vpnti1",
         )
         .unwrap();
-        assert_eq!(unprobed, 1);
-        assert_eq!(*looked_up.lock().unwrap(), ["10.20.0.2", "10.40.0.0"]);
+        // 10.20.0.0/16 and 10.30.0.0/24; 10.40.0.0/24 only holds an address.
+        assert_eq!(partly_covered, 2);
+        assert_eq!(
+            *looked_up.lock().unwrap(),
+            ["10.20.0.2", "10.30.0.128", "10.40.0.1"]
+        );
+    }
+
+    #[test]
+    fn a_route_taken_whole_fails_the_tunnel_lookup_before_any_probe() {
+        let connected = |dst: &str| {
+            json!({
+                "dst": dst, "dev": "eth-lan", "table": "main",
+                "protocol": "kernel", "scope": "link"
+            })
+        };
+        let host = |dst: &str| json!({"dst":dst,"dev":"eth-lan","table":"local","type":"local"});
+        for (listing, length) in [
+            (
+                vec![connected("10.30.0.0/25"), connected("10.30.0.128/25")],
+                24,
+            ),
+            (vec![connected("10.30.0.0/25"), host("10.30.0.128/25")], 24),
+        ] {
+            let result = verify_tunnel_routes(
+                |args| match args {
+                    ["-4", "-j", "-d", "route", "show", "table", "all"] => {
+                        Ok(serde_json::to_vec(&listing).unwrap())
+                    }
+                    // Nothing is looked up, not even the route that is free.
+                    _ => panic!("unexpected command: {args:?}"),
+                },
+                &[
+                    parse_cidr("10.40.0.0/24").unwrap(),
+                    parse_cidr("10.30.0.0/24").unwrap(),
+                ],
+                "vpnti1",
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("VPN route /{length} is entirely covered by local networks")
+            );
+        }
     }
 
     #[test]
@@ -2069,6 +2145,25 @@ pub(super) mod coexistence_tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_xfrm_plan_refuses_a_route_entirely_covered_by_local_networks() {
+        let error = plan_beside(
+            "10.20.0.0/16",
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/17", "wlan-fixture"),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
+        // Control: one half left to the tunnel.
+        plan_beside("10.20.0.0/16", vec![connected("10.20.0.0/17", "eth-lan")]).unwrap();
     }
 
     #[test]
@@ -2524,17 +2619,20 @@ pub(super) mod coexistence_tests {
     }
 
     #[test]
-    fn xfrm_does_not_probe_a_route_entirely_covered_by_more_specific_ones() {
-        let (result, ops) = install_beside(
+    fn xfrm_refuses_and_rolls_back_a_route_covered_during_configuration() {
+        let (result, ops) = install_appearing(
             "vpnti1",
             None,
-            vec![
-                connected("10.20.0.0/17", "eth-lan"),
-                connected("10.20.128.0/17", "wlan-fixture"),
-            ],
+            vec![connected("10.20.0.0/17", "eth-lan")],
+            Some(connected("10.20.128.0/17", "wlan-fixture")),
         );
-        result.unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "VPN route /16 is entirely covered by local networks"
+        );
         assert!(probes(&ops).is_empty(), "{ops:?}");
+        assert!(ops.iter().any(|op| op.starts_with("-4 route del ")));
+        assert!(ops.iter().any(|op| op.starts_with("link del ")));
     }
 
     #[test]

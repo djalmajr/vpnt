@@ -14,7 +14,7 @@ use super::{
     network::{
         PolicyInventory, SetupCancellation, check_deadline, check_ipv4_rules, check_shadow,
         cidr_text, collision, fib_destination, holder, is_connected_network, overlaps, prefix,
-        rollback_error, route_key, valid_generation, verify_tunnel_routes,
+        probe_addresses, rollback_error, route_key, valid_generation, verify_tunnel_routes,
     },
     policy::Entry,
     protocol::{CidrV4, Generation, ProbeBinding},
@@ -821,6 +821,7 @@ impl FortinetNetwork {
         let mut default_count = 0;
         let mut has_egress_device = false;
         let mut has_egress_default = false;
+        let mut others = Vec::new();
         for existing in routes
             .iter()
             .filter(|r| r.dev.as_deref() != Some(&receipt.ifname))
@@ -898,6 +899,9 @@ impl FortinetNetwork {
                     ),
                 ));
             }
+            if existing.main_table() || existing.table.as_deref() == Some("local") {
+                others.push(dst);
+            }
         }
         if default_count == 0 {
             return Err(invalid("missing default route"));
@@ -905,6 +909,7 @@ impl FortinetNetwork {
         if !has_egress_device || default_count > 1 && !has_egress_default {
             return Err(invalid("default routes do not match the proved egress"));
         }
+        probe_addresses(receipt.routes.iter().map(route_key), &others)?;
         Ok(inventory)
     }
 
@@ -2628,19 +2633,81 @@ mod tests {
     }
 
     #[test]
-    fn a_route_entirely_covered_by_more_specific_routes_is_not_probed() {
-        // Both halves are taken, so a lookup could never select the tunnel.
-        let (fixture, receipt, result) = apply_beside(
-            "10.20.0.0/16",
+    fn a_route_entirely_covered_by_local_networks_is_refused_before_any_write() {
+        // Both halves are taken, so nothing approved would reach the tunnel.
+        for existing in [
             vec![
                 connected("10.20.0.0/17", "eth-lan"),
                 connected("10.20.128.0/17", "wlan-fixture"),
             ],
-            false,
-        );
-        result.unwrap();
-        assert_applied(&fixture, &receipt, "10.20.0.0/16");
-        assert!(probes(&fixture).is_empty(), "{:?}", probes(&fixture));
+            vec![
+                connected("10.20.0.0/17", "eth-lan"),
+                connected("10.20.128.0/18", "wlan-fixture"),
+                connected("10.20.192.0/18", "br-fixture"),
+            ],
+        ] {
+            let (fixture, receipt, result) = apply_beside("10.20.0.0/16", existing, false);
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 is entirely covered by local networks"
+            );
+            assert!(!receipt.confirmed);
+            assert!(probes(&fixture).is_empty());
+            assert_no_network_effects(&fixture);
+        }
+    }
+
+    #[test]
+    fn a_route_covered_during_configuration_is_refused_and_cleanup_converges() {
+        // With and without DNS, after the route adds and after the DNS writes.
+        for (domains, after_dns) in [(true, false), (true, true), (false, false)] {
+            let fixture = Fixture::new();
+            let first = connected("10.20.0.0/17", "eth-lan");
+            let second = connected("10.20.128.0/17", "wlan-fixture");
+            fixture.kernel.lock().unwrap().foreign = vec![first.clone()];
+            let mut receipt = fixture.plan();
+            up(&fixture);
+            {
+                let mut kernel = fixture.kernel.lock().unwrap();
+                if after_dns {
+                    kernel.foreign_after_dns = Some(second.clone());
+                } else {
+                    kernel.foreign_on_add = Some(second.clone());
+                }
+            }
+            let (servers, names): (&[&str], &[&str]) = if domains {
+                (&["10.21.0.53"], &["corp.example"])
+            } else {
+                (&[], &[])
+            };
+            let error = apply(
+                &fixture,
+                &mut receipt,
+                &ready(&[("10.20.0.0", 16), ("10.21.0.0", 24)], &[]),
+                &entry(&["10.20.0.0/15"], servers, names),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "VPN route /16 is entirely covered by local networks",
+                "domains {domains}, after DNS {after_dns}"
+            );
+            assert!(!receipt.confirmed);
+            let wrote_dns = fixture.ops().iter().any(|op| op.starts_with(RESOLVECTL));
+            assert_eq!(wrote_dns, after_dns);
+            assert!(fixture.ops().iter().any(|op| op.contains(" route add ")));
+            let saved = Receipt::load(&fixture.directory, &fixture.guard()).unwrap();
+            assert!(!saved.confirmed);
+            fixture
+                .network
+                .clean(&fixture.guard(), &fixture.directory, &saved)
+                .unwrap();
+            let kernel = fixture.kernel.lock().unwrap();
+            assert!(kernel.routes.is_empty() && kernel.dns.is_empty() && kernel.domains.is_empty());
+            assert_eq!(kernel.foreign, [first, second]);
+        }
     }
 
     #[test]
