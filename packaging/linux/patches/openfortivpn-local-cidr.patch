@@ -194,8 +194,8 @@ diff --git a/src/tunnel.c b/src/tunnel.c
 +				/*
 +				 * vpnt: the peer address stays the fixed one. pppd 2.5
 +				 * closes IPCP ("Peer refused to agree to his IP address")
-+				 * when the gateway sends none; with noremoteip it uses the
-+				 * configured one. Another address is still refused.
++				 * unless the peer agrees to it; noremoteip skips that check.
++				 * reqci still NAKs any other address and vpnt-tunneld checks it.
 +				 */
 +				"noremoteip",
  				"receive-all",
