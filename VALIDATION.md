@@ -262,8 +262,187 @@ read -r pid && kill -USR1 "$pid"
    até o host interno funcionaram, e o `SIGKILL` no app deixou o diff vazio
    contra o estado guardado depois da remoção.
 
-IPv6, `redirect-gateway` e IPsec/SSL no Linux estão fora do escopo. Um teste de
-fixture não substitui essa validação com VPN real.
+IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
+seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
+
+### Regressão OVPN com a exclusão de rede do #42
+
+**[PASS, VPN real, 21/11/2026]** Pacote Arch `0.1.0-1` construído do merge
+local `00a7f32dce306128c9cfed3a9992e8509dfeb6e9`, que inclui o head
+`aa3eb2465ce15794144e21d4e4856276de365fe4` do #42. O app, o helper e a unit
+instalados eram idênticos aos arquivos do pacote.
+
+O operador conectou o perfil OVPN já importado pelo ícone e aprovou pelo
+celular. A rota e a sonda TCP passaram pela interface do túnel, e a sonda
+HTTPS retornou 302. Depois da desconexão, as fotos completas da rede ficaram
+idênticas byte a byte e nenhuma interface de túnel restou. O roteiro saiu com
+código 0. Uma execução anterior registrou mudanças na rede de contêineres. A
+rechecagem usou uma nova foto inicial com o mesmo pacote instalado e manteve
+a comparação integral. O #42 entrou na `main` pelo merge
+`7f381fa7c2ca3a6f5dc4c9cd4c34c425d355fb87`, com CI verde no head validado.
+
+## Linux: IPsec (strongSwan) e SSL (Fortinet) pelo vpnt-tunneld
+
+O `vpnt-tunneld.service`, ativado por `vpnt-tunneld.socket`
+(`/run/vpnt/tunneld.sock`, `0660 root:vpnt`), inicia por geração uma instância
+`vpnt-tunneld-ipsec@` (charon privado) ou `vpnt-tunneld-fortinet@`
+(openfortivpn 1.24.1 com os patches do vpnt). A rede fica no próprio
+`vpnt-tunneld`: a interface `vpntiN` (XFRM) ou `vpntpN` (PPP), as rotas e, no
+Fortinet, o DNS por link. A política root `/etc/vpnt/tunnel-policy.json` guarda
+as aprovações. O pacote não instala sudoers.
+
+### Gates
+
+Os mesmos da seção Linux anterior. A CI roda também:
+
+- o job `linux-openfortivpn`: `scripts/linux/build-openfortivpn.sh` compila o
+  openfortivpn 1.24.1 com os oito patches, na ordem do `PKGBUILD`, e roda
+  `check-openfortivpn-pin.sh`, `check-openfortivpn-pinentry.sh` e
+  `check-openfortivpn-local-cidr.sh` contra fixtures TLS em loopback;
+- o workflow `arch-package.yml`, que gera o pacote num container Arch como
+  usuário comum, exige `vpnt-tunneld`, `vpnt-pinentry` e `openfortivpn` em
+  `/usr/lib/vpnt/`, recusa sudoers e publica o pacote como artefato. O
+  pacote declara `libssl.so`/`libcrypto.so` com a versão do build, e a
+  inspeção roda `ldd` em cada executável. Para um host com espelho congelado,
+  gere o pacote com `gh workflow run arch-package.yml -f
+  archive_date=AAAA/MM/DD`, a data do snapshot do host.
+
+### Autorizar um perfil
+
+```sh
+vpnt tunnel-policy <profile-id> [--dns-server <ipv4>]... \
+  [--fortinet-local-cidr <ipv4-cidr>] \
+  | sudo /usr/lib/vpnt/vpnt-tunneld policy apply
+```
+
+- O snapshot é gerado a partir do perfil e não tem segredo. O `policy apply`
+  mostra o documento no terminal e grava sob lock.
+- A chave da aprovação é o usuário, o backend, o gateway e a porta. Reaplicar
+  com a mesma chave, inclusive a partir de outro perfil, substitui a
+  aprovação anterior.
+- `--dns-server` vale só para o Fortinet; uma entrada IPsec exige listas de DNS
+  vazias. No Fortinet, o DNS por link é publicado quando a política tem
+  domínios e um servidor alcançável pelas rotas aceitas.
+- Um gateway IPsec com IPv4 literal ganha a identidade IKE `ipv4:`, aceita só
+  quando corresponde a um endereço de transporte da mesma entrada.
+- Uma entrada Fortinet precisa de `fortinet_local_cidr`. Entradas antigas sem o
+  campo continuam legíveis, mas não conectam até a nova aprovação. A barreira
+  IPCP do openfortivpn descarta o quadro que daria ao PPP um IPv4 local fora da
+  faixa antes de ele chegar ao `pppd`.
+
+### Evidência nativa (Linux, sem VPN real)
+
+Na CI Linux da `main` em `a9d05ea` (Ubuntu 24.04, Rust 1.99.0),
+`cargo test --locked --all-targets --all-features` passou com 883 testes na
+biblioteca (2 ignorados). Entre eles, 270 casos distintos do `tunneld` (269
+aprovados e 1 ignorado: servidor, handshake, backends IPsec e Fortinet,
+política, recuperação e limpeza) e 6 de `tunnel_policy`. O caso do handshake
+com namespace de PID privado roda à parte com `VPNT_REQUIRE_USERNS=1`.
+
+```sh
+VPNT_TEST_NETNS=1 cargo test --locked --test tunneld_xfrm_netns -- --nocapture
+```
+
+Exercita o escritor XFRM real num namespace de rede e usuário privado: cria a
+interface XFRM, o endereço virtual e as rotas, e confere que a retirada remove
+tudo. Exige `unshare` sem privilégio e o módulo `xfrm_interface` carregado. Sem
+`VPNT_TEST_NETNS=1`, o caso sai sem tocar o kernel. A CI o roda com o opt-in
+desde este PR.
+
+**[PASS, verificação nativa isolada, 21/11/2026]** O
+`systemd-analyze verify --instance=0123456789abcdef0123456789abcdef` passou
+nos dois templates do #53 em `fb6a66cc5003858f33c9ecb993c3f06c72f33191`.
+O namespace isolado montou o binário extraído do pacote de ensaio no caminho
+absoluto de `ExecStart`. Os sete checks da CI passaram nesse head, integrado à
+`main` pelo merge `13afdb4f6392013858eea57e2335f9c7ca5528b7`.
+
+A ativação das instâncias e a prova de limpeza com os dois gateways estão na
+validação real abaixo.
+
+### Evidência simulada
+
+Charon e VICI falsos, openfortivpn e pppd falsos e efeitos de rede simulados
+cobrem conexão, sonda ligada à geração, prazo de confirmação,
+`CleanupUnconfirmed`, recuperação depois de queda do escritor (fase
+`PreparingNetwork`) e limpeza.
+
+### Evidência de fixture (cliente real em loopback)
+
+- Pin TLS obrigatório; senha pelo fd 3 de uso único, pedida só depois do pin;
+  prazo comum de estabelecimento (`timerfd` no fd 4) que cobre o login
+  inteiro, inclusive o reenvio depois de reconexão TLS.
+- Barreira IPCP: formatos `CI_ADDR` e `CI_ADDRS`, quadros truncados e
+  malformados, CCP e compressão recusados, e um oráculo comportamental no
+  binário real.
+
+### Validação real manual
+
+Resultado: **passou**, em 2026-11-27 e 2026-11-28, num host Arch com espelho
+congelado (snapshot de 2026-10-22), Tailscale ativo, duas rotas padrão (cabo e
+Wi-Fi) e bridges do Docker. O pacote foi gerado pelo `arch-package.yml` com
+`archive_date=2026/10/22`, a partir da `main` com os PRs #70 a #74. Antes de
+instalar, o `ldd` do `openfortivpn` extraído do pacote resolveu
+`libssl.so.3`/`libcrypto.so.3`, e `--version` respondeu `1.24.1`.
+
+O roteiro guardou o estado de rede antes (`estado_rede`, como na seção
+anterior) e repetiu cada passo com o diff contra ele:
+
+| Passo | Cluster (IPsec) | Appliance (Fortinet) |
+|---|---|---|
+| Conectar pelo ícone | `vpntiN` e a unit `vpnt-tunneld-ipsec@` ativas | `vpntpN` ativa; `fortinet network ready: routes accepted 27 refused 1, DNS servers 2 refused 0` |
+| Desconectar pelo ícone | diff vazio, sem interface nem `charon` | diff vazio, sem interface, `openfortivpn` nem `pppd` |
+| `SIGKILL` no cliente com o túnel ativo | diff vazio | diff vazio |
+| `SIGKILL` no app com o túnel ativo | diff vazio | diff vazio |
+
+- A rota recusada do Appliance estava fora da política aprovada, como
+  previsto.
+- O Cluster passou de novo depois dos PRs #73 e #74, que mexem também no
+  escritor XFRM.
+- O OVPN (certificado em token PKCS#11) conectou e desconectou com diff vazio
+  em 2026-11-27, com o pacote do #72. Os PRs seguintes não mexem nele.
+- O pacote não instala sudoers.
+
+A validação revelou e corrigiu, nesta ordem:
+
+1. Stop v2 respondido com `Stopping`, sem chegar à limpeza (#70), e o
+   diagnóstico da cadeia do Desconectar (#71).
+2. O `openfortivpn` ligado ao OpenSSL do container rolante não iniciava no
+   host (#72).
+3. O `pppd` 2.5 recusava o peer fixo `169.254.2.1`. Agora recebe
+   `noremoteip`, e a instância registra no journal só rótulos fixos dos
+   estados do cliente (#73).
+4. As rotas largas do Appliance cobriam redes conectadas do host. Agora convivem
+   pela regra abaixo (#74).
+
+O tempo até o túnel pronto foi de cerca de 1 s no Cluster e de cerca de 9 s no
+Appliance, quase todo na negociação LCP/IPCP do `pppd`.
+
+### Limites conhecidos
+
+- Só split tunnel IPv4. IPv6, rota padrão pelo túnel, OTP/2FA/SAML e
+  coexistência gerenciada com o OVPN ficam fora.
+- A admissão de rede aceita regras de política de terceiros só de dois tipos:
+  com `fwmark` e ação `lookup main`/`default` ou terminal, como as do
+  Tailscale; ou `lookup <tabela>` sem rota padrão e sem nada sobre o gateway,
+  os transportes, o VIP, o par PPP, a faixa local ou as rotas do túnel. Aceita
+  várias rotas padrão quando a saída do gateway escolhida pelo kernel é uma
+  delas. Depois de instalar, confere com `ip route get` o gateway e cada rota
+  do túnel e desfaz tudo se algo sair por outra interface.
+- Rotas existentes e rotas do túnel: o destino igual ao de uma rota aprovada
+  ou do VIP é recusado. Uma rota mais específica dentro de uma rota aprovada só
+  convive se for rede conectada (`proto kernel`, `scope link`, sem gateway);
+  qualquer outra (DHCP com gateway, `blackhole`, `unreachable`, `prohibit`,
+  `throw`) é recusada (TunnelVision). Uma rota aprovada inteiramente coberta por
+  redes locais é recusada e, no Fortinet, um servidor DNS coberto também. A
+  sonda usa o menor endereço que nenhuma rota mais específica toma.
+- Risco aceito, como no macOS: uma rede conectada com máscara larga, vinda de
+  DHCP hostil, pode cobrir parte de uma rota aprovada, e esse trecho sai pela
+  rede local (TunnelCrack LocalNet). O journal registra só a contagem de rotas
+  parcialmente cobertas.
+- A conferência vale no estabelecimento. Mudanças posteriores nas tabelas de
+  terceiros e tráfego já marcado por firewall do host não são observados
+  durante a sessão (VPT-44).
+- Follow-ups no Cinzel: VPT-34 a VPT-44.
 
 ## Checkpoint atual — 14/11/2026
 
