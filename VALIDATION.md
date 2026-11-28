@@ -349,6 +349,16 @@ tudo. Exige `unshare` sem privilégio e o módulo `xfrm_interface` carregado. Se
 `VPNT_TEST_NETNS=1`, o caso sai sem tocar o kernel. A CI o roda com o opt-in
 desde este PR.
 
+**[PASS, verificação nativa isolada, 21/11/2026]** O
+`systemd-analyze verify --instance=0123456789abcdef0123456789abcdef` passou
+nos dois templates do #53 em `fb6a66cc5003858f33c9ecb993c3f06c72f33191`.
+O namespace isolado montou o binário extraído do pacote de ensaio no caminho
+absoluto de `ExecStart`. Os sete checks do CI passaram nesse head, integrado à
+`main` pelo merge `13afdb4f6392013858eea57e2335f9c7ca5528b7`.
+
+A ativação das instâncias, o filtro de rede e a prova de limpeza com os dois
+gateways estão na validação real abaixo.
+
 ### Evidência simulada
 
 Charon e VICI falsos, openfortivpn e pppd falsos e efeitos de rede simulados
@@ -423,8 +433,8 @@ Appliance, quase todo na negociação LCP/IPCP do `pppd`.
   convive se for rede conectada (`proto kernel`, `scope link`, sem gateway);
   qualquer outra (DHCP com gateway, `blackhole`, `unreachable`, `prohibit`,
   `throw`) é recusada (TunnelVision). Uma rota aprovada inteiramente coberta por
-  redes locais é recusada e, no Fortinet, um servidor DNS coberto também. A sonda usa o menor
-  endereço que nenhuma rota mais específica toma.
+  redes locais é recusada e, no Fortinet, um servidor DNS coberto também. A
+  sonda usa o menor endereço que nenhuma rota mais específica toma.
 - Risco aceito, como no macOS: uma rede conectada com máscara larga, vinda de
   DHCP hostil, pode cobrir parte de uma rota aprovada, e esse trecho sai pela
   rede local (TunnelCrack LocalNet). O journal registra só a contagem de rotas
@@ -433,18 +443,6 @@ Appliance, quase todo na negociação LCP/IPCP do `pppd`.
   terceiros e tráfego já marcado por firewall do host não são observados
   durante a sessão (VPT-44).
 - Follow-ups no Cinzel: VPT-34 a VPT-44.
-
-### Units Linux do IPsec e Fortinet
-
-**[PASS, verificação nativa isolada, 21/11/2026]** O
-`systemd-analyze verify --instance=0123456789abcdef0123456789abcdef` passou
-nos dois templates do #53 em `fb6a66cc5003858f33c9ecb993c3f06c72f33191`.
-O namespace isolado montou o binário extraído do pacote de ensaio no caminho
-absoluto de `ExecStart`. Os sete checks do CI passaram nesse head, integrado à
-`main` pelo merge `13afdb4f6392013858eea57e2335f9c7ca5528b7`.
-
-A ativação das instâncias, o filtro de rede e a prova de limpeza com os dois
-gateways ficam para a validação real do pacote integrado.
 
 ## Checkpoint atual — 14/11/2026
 
