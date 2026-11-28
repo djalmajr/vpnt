@@ -275,7 +275,7 @@ fn fatal_code(fatal: &fortinet_network::Fatal) -> ErrorCode {
         Fatal::Failure(Reported::CredentialsRejected) => ErrorCode::PermissionDenied,
         Fatal::Failure(Reported::GatewayTimeout) => ErrorCode::Timeout,
         Fatal::Failure(Reported::LocalAddressDenied) => ErrorCode::FortinetLocalAddressDenied,
-        Fatal::InterfaceMismatch | Fatal::Exited | Fatal::Invalid => ErrorCode::Backend,
+        Fatal::InterfaceMismatch | Fatal::Exited { .. } | Fatal::Invalid => ErrorCode::Backend,
     }
 }
 
@@ -599,7 +599,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
             if let Some(fatal) = delivered.fatal() {
                 return Err(Failure::new(
                     fatal_code(&fatal),
-                    format_args!("instance reported {fatal:?}"),
+                    format_args!("instance reported {fatal}"),
                 ));
             }
             if delivered.ready() {
@@ -619,7 +619,7 @@ impl<N: NetworkBackend, A: UnitAttestor + Send + Sync> Launcher<N, A> {
         if let Some(fatal) = delivered.fatal() {
             return Err(Failure::new(
                 fatal_code(&fatal),
-                format_args!("instance reported {fatal:?}"),
+                format_args!("instance reported {fatal}"),
             ));
         }
         cancel
