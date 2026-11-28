@@ -405,9 +405,9 @@ Appliance, quase todo na negociação LCP/IPCP do `pppd`.
 - Rotas existentes e rotas do túnel: o destino igual ao de uma rota aprovada
   ou do VIP é recusado. Uma rota mais específica dentro de uma rota aprovada só
   convive se for rede conectada (`proto kernel`, `scope link`, sem gateway);
-  rota de DHCP com gateway, `blackhole`, `unreachable`, `prohibit` e `throw` são
-  recusadas (TunnelVision). Uma rota aprovada inteiramente coberta por redes
-  locais é recusada, e um servidor DNS coberto também. A sonda usa o menor
+  qualquer outra (DHCP com gateway, `blackhole`, `unreachable`, `prohibit`,
+  `throw`) é recusada (TunnelVision). Uma rota aprovada inteiramente coberta por
+  redes locais é recusada e, no Fortinet, um servidor DNS coberto também. A sonda usa o menor
   endereço que nenhuma rota mais específica toma.
 - Risco aceito, como no macOS: uma rede conectada com máscara larga, vinda de
   DHCP hostil, pode cobrir parte de uma rota aprovada, e esse trecho sai pela
