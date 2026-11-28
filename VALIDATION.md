@@ -262,6 +262,9 @@ read -r pid && kill -USR1 "$pid"
    até o host interno funcionaram, e o `SIGKILL` no app deixou o diff vazio
    contra o estado guardado depois da remoção.
 
+IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
+seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
+
 ### Regressão OVPN com a exclusão de rede do #42
 
 **[PASS, VPN real, 21/11/2026]** Pacote Arch `0.1.0-1` construído do merge
@@ -277,9 +280,6 @@ código 0. Uma execução anterior registrou mudanças na rede de contêineres. 
 rechecagem usou uma nova foto inicial com o mesmo pacote instalado e manteve
 a comparação integral. O #42 entrou na `main` pelo merge
 `7f381fa7c2ca3a6f5dc4c9cd4c34c425d355fb87`, com CI verde no head validado.
-
-IPv6 e `redirect-gateway` estão fora do escopo; IPsec e SSL no Linux têm a
-seção seguinte. Um teste de fixture não substitui essa validação com VPN real.
 
 ## Linux: IPsec (strongSwan) e SSL (Fortinet) pelo vpnt-tunneld
 
@@ -353,11 +353,11 @@ desde este PR.
 `systemd-analyze verify --instance=0123456789abcdef0123456789abcdef` passou
 nos dois templates do #53 em `fb6a66cc5003858f33c9ecb993c3f06c72f33191`.
 O namespace isolado montou o binário extraído do pacote de ensaio no caminho
-absoluto de `ExecStart`. Os sete checks do CI passaram nesse head, integrado à
+absoluto de `ExecStart`. Os sete checks da CI passaram nesse head, integrado à
 `main` pelo merge `13afdb4f6392013858eea57e2335f9c7ca5528b7`.
 
-A ativação das instâncias, o filtro de rede e a prova de limpeza com os dois
-gateways estão na validação real abaixo.
+A ativação das instâncias e a prova de limpeza com os dois gateways estão na
+validação real abaixo.
 
 ### Evidência simulada
 
