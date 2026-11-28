@@ -285,7 +285,11 @@ Os mesmos da seção Linux anterior. A CI roda também:
   `check-openfortivpn-local-cidr.sh` contra fixtures TLS em loopback;
 - o workflow `arch-package.yml`, que gera o pacote num container Arch como
   usuário comum, exige `vpnt-tunneld`, `vpnt-pinentry` e `openfortivpn` em
-  `/usr/lib/vpnt/`, recusa sudoers e publica o pacote como artefato.
+  `/usr/lib/vpnt/`, recusa sudoers e publica o pacote como artefato. O
+  pacote declara `libssl.so`/`libcrypto.so` com a versão do build, e a
+  inspeção roda `ldd` em cada executável. Para um host com espelho congelado,
+  gere o pacote com `gh workflow run arch-package.yml -f
+  archive_date=AAAA/MM/DD`, a data do snapshot do host.
 
 ### Autorizar um perfil
 
@@ -347,7 +351,45 @@ cobrem conexão, sonda ligada à geração, prazo de confirmação,
 
 ### Validação real manual
 
-VALIDACAO_REAL
+Resultado: **passou**, em 2026-11-27 e 2026-11-28, num host Arch com espelho
+congelado (snapshot de 2026-10-22), Tailscale ativo, duas rotas padrão (cabo e
+Wi-Fi) e bridges do Docker. O pacote foi gerado pelo `arch-package.yml` com
+`archive_date=2026/10/22`, a partir da `main` com os PRs #70 a #74. Antes de
+instalar, o `ldd` do `openfortivpn` extraído do pacote resolveu
+`libssl.so.3`/`libcrypto.so.3`, e `--version` respondeu `1.24.1`.
+
+O roteiro guardou o estado de rede antes (`estado_rede`, como na seção
+anterior) e repetiu cada passo com o diff contra ele:
+
+| Passo | Cluster (IPsec) | Appliance (Fortinet) |
+|---|---|---|
+| Conectar pelo ícone | `vpntiN` e a unit `vpnt-tunneld-ipsec@` ativas | `vpntpN` ativa; `fortinet network ready: routes accepted 27 refused 1, DNS servers 2 refused 0` |
+| Desconectar pelo ícone | diff vazio, sem interface nem `charon` | diff vazio, sem interface, `openfortivpn` nem `pppd` |
+| `SIGKILL` no cliente com o túnel ativo | diff vazio | diff vazio |
+| `SIGKILL` no app com o túnel ativo | diff vazio | diff vazio |
+
+- A rota recusada do Appliance estava fora da política aprovada, como
+  previsto.
+- O Cluster passou de novo depois dos PRs #73 e #74, que mexem também no
+  escritor XFRM.
+- O OVPN (certificado em token PKCS#11) conectou e desconectou com diff vazio
+  em 2026-11-27, com o pacote do #72. Os PRs seguintes não mexem nele.
+- O pacote não instala sudoers.
+
+A validação revelou e corrigiu, nesta ordem:
+
+1. Stop v2 respondido com `Stopping`, sem chegar à limpeza (#70), e o
+   diagnóstico da cadeia do Desconectar (#71).
+2. O `openfortivpn` ligado ao OpenSSL do container rolante não iniciava no
+   host (#72).
+3. O `pppd` 2.5 recusava o peer fixo `169.254.2.1`. Agora recebe
+   `noremoteip`, e a instância registra no journal só rótulos fixos dos
+   estados do cliente (#73).
+4. As rotas largas do Appliance cobriam redes conectadas do host. Agora convivem
+   pela regra abaixo (#74).
+
+O tempo até o túnel pronto foi de cerca de 1 s no Cluster e de cerca de 9 s no
+Appliance, quase todo na negociação LCP/IPCP do `pppd`.
 
 ### Limites conhecidos
 
@@ -360,6 +402,17 @@ VALIDACAO_REAL
   várias rotas padrão quando a saída do gateway escolhida pelo kernel é uma
   delas. Depois de instalar, confere com `ip route get` o gateway e cada rota
   do túnel e desfaz tudo se algo sair por outra interface.
+- Rotas existentes e rotas do túnel: o destino igual ao de uma rota aprovada
+  ou do VIP é recusado. Uma rota mais específica dentro de uma rota aprovada só
+  convive se for rede conectada (`proto kernel`, `scope link`, sem gateway);
+  rota de DHCP com gateway, `blackhole`, `unreachable`, `prohibit` e `throw` são
+  recusadas (TunnelVision). Uma rota aprovada inteiramente coberta por redes
+  locais é recusada, e um servidor DNS coberto também. A sonda usa o menor
+  endereço que nenhuma rota mais específica toma.
+- Risco aceito, como no macOS: uma rede conectada com máscara larga, vinda de
+  DHCP hostil, pode cobrir parte de uma rota aprovada, e esse trecho sai pela
+  rede local (TunnelCrack LocalNet). O journal registra só a contagem de rotas
+  parcialmente cobertas.
 - A conferência vale no estabelecimento. Mudanças posteriores nas tabelas de
   terceiros e tráfego já marcado por firewall do host não são observados
   durante a sessão (VPT-44).
