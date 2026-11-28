@@ -63,8 +63,10 @@ CASES = [
      [LCP_A, MULTILINK], [LCP_A], True),
 ]
 
-# Options pppd must receive: compression off, so the kernel never decompresses.
-REQUIRED_ARGV = ["noccp", "nobsdcomp", "nodeflate", "nopredictor1"]
+# Options pppd must receive: compression off, so the kernel never decompresses,
+# and noremoteip, so pppd 2.5 keeps the fixed peer address when the gateway
+# sends none instead of closing IPCP. Only the argv is checked here.
+REQUIRED_ARGV = ["noccp", "nobsdcomp", "nodeflate", "nopredictor1", "noremoteip"]
 DENIED_EXIT = 3  # VPNT_IPCP_DENIED_EXIT
 
 

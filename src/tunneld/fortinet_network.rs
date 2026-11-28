@@ -336,9 +336,23 @@ impl Delivered {
 
     /// The interface is up and both lists are complete (their count lines seen).
     pub(super) fn ready(&self) -> bool {
-        self.interface.is_some()
-            && self.route_count.is_some()
-            && (self.dns_count.is_some() || self.dns_invalid)
+        self.progress() == [true; 3]
+    }
+
+    /// What `ready` waits for, as booleans, for the message of a setup that ran
+    /// out of time. Nothing the instance reported is copied into it.
+    pub(super) fn arrived(&self) -> String {
+        let [interface, routes, dns] = self.progress();
+        format!("(interface={interface} routes={routes} dns={dns})")
+    }
+
+    /// The interface, the complete route list and the DNS offer, valid or not.
+    fn progress(&self) -> [bool; 3] {
+        [
+            self.interface.is_some(),
+            self.route_count.is_some(),
+            self.dns_count.is_some() || self.dns_invalid,
+        ]
     }
 }
 
@@ -1686,6 +1700,43 @@ mod tests {
 
     fn up(fixture: &Fixture) {
         fixture.kernel.lock().unwrap().ppp = true;
+    }
+
+    #[test]
+    fn a_setup_timeout_lists_what_arrived_as_booleans_only() {
+        let arrived = |delivered: &Delivered, expected: &str| {
+            assert_eq!(delivered.arrived(), expected, "{delivered:?}");
+        };
+        let mut delivered = Delivered::default();
+        arrived(&delivered, "(interface=false routes=false dns=false)");
+        // A route or a server without its count line is not a complete list.
+        delivered.absorb(Event::SplitRoute {
+            network: "10.1.0.0".parse().unwrap(),
+            prefix: 16,
+        });
+        delivered.absorb(Event::DnsServer {
+            address: "10.1.1.1".parse().unwrap(),
+        });
+        arrived(&delivered, "(interface=false routes=false dns=false)");
+        delivered.absorb(Event::SplitRoutes { count: 1 });
+        arrived(&delivered, "(interface=false routes=true dns=false)");
+        delivered.absorb(Event::DnsCount {
+            servers: 1,
+            domains: 0,
+        });
+        arrived(&delivered, "(interface=false routes=true dns=true)");
+        assert!(!delivered.ready());
+        delivered.absorb(Event::Interface { name: NAME.into() });
+        arrived(&delivered, "(interface=true routes=true dns=true)");
+        assert!(delivered.ready());
+        // Each one on its own, and an invalid DNS offer counts as delivered, as
+        // `ready` counts it.
+        let mut interface = Delivered::default();
+        interface.absorb(Event::Interface { name: NAME.into() });
+        arrived(&interface, "(interface=true routes=false dns=false)");
+        let mut dns = Delivered::default();
+        dns.absorb(Event::DnsInvalid);
+        arrived(&dns, "(interface=false routes=false dns=true)");
     }
 
     #[test]

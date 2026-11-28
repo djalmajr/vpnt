@@ -178,7 +178,7 @@ diff --git a/src/tunnel.c b/src/tunnel.c
  	if (access(ppp_path, F_OK) != 0) {
  		log_error("%s: %s.\n", ppp_path, strerror(errno));
  		return 1;
-@@ -299,6 +307,15 @@
+@@ -299,6 +307,22 @@
  				"noauth",
  				"default-asyncmap",
  				"nopcomp",
@@ -191,10 +191,17 @@ diff --git a/src/tunnel.c b/src/tunnel.c
 +				"nobsdcomp",
 +				"nodeflate",
 +				"nopredictor1",
++				/*
++				 * vpnt: the peer address stays the fixed one. pppd 2.5
++				 * closes IPCP ("Peer refused to agree to his IP address")
++				 * unless the peer agrees to it; noremoteip skips that check.
++				 * reqci still NAKs any other address and vpnt-tunneld checks it.
++				 */
++				"noremoteip",
  				"receive-all",
  				"nodefaultroute",
  				"nodetach",
-@@ -1657,5 +1674,7 @@
+@@ -1657,5 +1681,7 @@
  		free(tunnel.ipv4.split_rt);
  		tunnel.ipv4.split_rt = NULL;
  	}

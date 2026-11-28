@@ -423,12 +423,20 @@ fn serve_with(
 }
 
 /// What the `instance fortinet` subcommand runs after its handshake, with the
-/// parser shared with macOS.
+/// parser shared with macOS. The client's fixed states go to stderr, which the
+/// unit sends to the journal.
 pub fn run_instance(mut channel: super::handshake::AuthenticatedChannel) -> io::Result<Exit> {
-    serve(
-        &mut channel,
-        &mut crate::connection::ssl_output::Output::default(),
-    )
+    serve(&mut channel, &mut journaling_observer(io::stderr()))
+}
+
+/// The production observer: the shared parser, writing each of the client's
+/// fixed states to `journal` once.
+fn journaling_observer(
+    journal: impl io::Write + Send + 'static,
+) -> crate::connection::ssl_output::Output {
+    let mut output = crate::connection::ssl_output::Output::default();
+    output.journal_states(journal);
+    output
 }
 
 /// Other processes of the same UID must not read the supervisor's memory, and
